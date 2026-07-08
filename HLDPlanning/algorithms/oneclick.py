@@ -578,21 +578,11 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         except Exception:
             return None
         return n if n is not None and n >= 0 else None
+
+    def _stage_error(self, stage, err):
         return self.tr(
             "Pipeline failed during {stage}\n\nOriginal Error:\n{err}"
         ).format(stage=stage, err=str(err))
-
-    def _resolve_layer(self, value, context):
-        if value is None:
-            return None
-        if isinstance(value, str):
-            if not value.strip():
-                return None
-            try:
-                return QgsProcessingUtils.mapLayerFromString(value, context)
-            except Exception:
-                return None
-        return value
 
     def _find_layer(self, val, context):
         """Find a layer by string ID / source path.
@@ -628,18 +618,6 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             pass
 
         return None
-
-    def _count(self, layer):
-        if layer is None:
-            return None
-        try:
-            n = layer.featureCount()
-        except Exception:
-            return None
-        return n if n is not None and n >= 0 else None
-
-    def _fmt_count(self, n):
-        return self.tr("unknown") if n is None else str(n)
 
     def _has_field(self, layer, candidates):
         if layer is None:
@@ -844,71 +822,6 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         feedback.pushInfo(self.tr(
             "Cable pre-flight — feeder: {f}, garden: {g}, distribution: {d} features."
         ).format(f=fb(n_f), g=fb(n_g), d=fb(n_d)))
-    def _check_tangent_intersections(self, results, context, feedback):
-        """Warn if any OUT_FINAL_TANGENT_TRENCHES features don't intersect
-        any feeder or distribution trench (orphan drills)."""
-        from qgis.core import QgsSpatialIndex, QgsFeatureRequest
-
-        final_tan = self._resolve_layer(results.get("final_tan"), context)
-        if final_tan is None:
-            return
-        n_tan = self._count(final_tan)
-        if n_tan is None or n_tan == 0:
-            feedback.pushInfo(self.tr(
-                "Tangent check: no final tangent trenches to check."
-            ))
-            return
-
-        feeder = self._resolve_layer(results.get("feeder"), context)
-        dist = self._resolve_layer(results.get("distribution"), context)
-
-        # Build a combined spatial index of feeder + distribution
-        ref_feats = []
-        if feeder:
-            ref_feats.extend(list(feeder.getFeatures()))
-        if dist:
-            ref_feats.extend(list(dist.getFeatures()))
-
-        if not ref_feats:
-            feedback.pushWarning(self.tr(
-                "Tangent check: {n} tangent trench(es) exist but no feeder or "
-                "distribution trenches to intersect against."
-            ).format(n=n_tan))
-            return
-
-        ref_idx = QgsSpatialIndex()
-        for rf in ref_feats:
-            ref_idx.addFeature(rf)
-        fid_map = {f.id(): f for f in ref_feats}
-
-        orphan_count = 0
-        for tf in final_tan.getFeatures():
-            g = tf.geometry()
-            if g is None or g.isEmpty():
-                orphan_count += 1
-                continue
-            box = g.boundingBox()
-            hits = ref_idx.intersects(box)
-            intersects = False
-            for fid in hits:
-                rf = fid_map.get(fid)
-                if rf and rf.geometry() and g.intersects(rf.geometry()):
-                    intersects = True
-                    break
-            if not intersects:
-                orphan_count += 1
-
-        if orphan_count > 0:
-            feedback.pushWarning(self.tr(
-                "\u26a0\ufe0f {n} of {total} tangent trench feature(s) do not intersect "
-                "any feeder or distribution path — they may be orphaned drill "
-                "crossings that no route uses. Check OUT_FINAL_TANGENT_TRENCHES."
-            ).format(n=orphan_count, total=n_tan))
-        else:
-            feedback.pushInfo(self.tr(
-                "Tangent check: all {n} tangent trench(es) intersect a feeder "
-                "or distribution path.".format(n=n_tan)
-            ))
 
     def _preflight_duct(self, results, context, feedback):
         trenches_val = results.get("trenches")
