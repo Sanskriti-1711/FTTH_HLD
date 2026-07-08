@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 import shutil
+import datetime
 
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
@@ -18,10 +19,12 @@ from qgis.core import (
     QgsProcessingParameterVectorLayer,
     QgsProcessingParameterMultipleLayers,
     QgsProcessingParameterFeatureSink,
+    QgsProcessingFeedback,
     QgsProcessingUtils,
     QgsCoordinateReferenceSystem,
     QgsVectorFileWriter,
     QgsMapLayer,
+    Qgis,
 )
 from qgis import processing
 
@@ -30,6 +33,60 @@ from ..utils.params import ALG, LAYERNAMES
 
 class PipelineStageError(QgsProcessingException):
     pass
+
+
+class _LoggingFeedback(QgsProcessingFeedback):
+    """Wraps a QgsProcessingFeedback and also appends messages to a log file."""
+
+    def __init__(self, feedback, log_path):
+        super().__init__()
+        self._inner = feedback
+        self._log_path = log_path
+
+    def pushInfo(self, msg):
+        self._write(msg)
+        self._inner.pushInfo(msg)
+
+    def pushWarning(self, msg):
+        self._write(f"WARNING: {msg}")
+        self._inner.pushWarning(msg)
+
+    def pushCommandInfo(self, msg):
+        self._write(msg)
+        self._inner.pushCommandInfo(msg)
+
+    def pushDebugInfo(self, msg):
+        self._inner.pushDebugInfo(msg)
+
+    def pushConsoleInfo(self, msg):
+        self._inner.pushConsoleInfo(msg)
+
+    def reportError(self, msg, fatal=False):
+        self._write(f"ERROR{' (fatal)' if fatal else ''}: {msg}")
+        self._inner.reportError(msg, fatal)
+
+    def setProgress(self, progress):
+        self._inner.setProgress(progress)
+
+    def setProgressText(self, msg):
+        self._inner.setProgressText(msg)
+
+    def _write(self, msg):
+        try:
+            with open(self._log_path, 'a', encoding='utf-8') as f:
+                f.write(msg + '\n')
+        except Exception:
+            pass
+
+    @property
+    def progress(self):
+        return self._inner.progress
+
+    def isCanceled(self):
+        return self._inner.isCanceled()
+
+    def cancel(self):
+        self._inner.cancel()
 
 
 class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
@@ -1118,8 +1175,71 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
                 "all clipped roads."
             ) % roads.name())
 
+    def _setup_logging(self, parameters, context, feedback):
+        """Open a timestamped log file and set up a LoggingFeedback wrapper.
+        Returns (log_feedback, log_path) — log_feedback wraps the original
+        feedback and also writes to the file; log_path is the file path or None."""
+        try:
+            log_dir = os.path.join(os.path.dirname(__file__), "..", "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_path = os.path.join(log_dir, f"OC_{ts}.txt")
+            lines = [
+                f"QGIS version: {Qgis.version()}",
+                f"QGIS code revision: {Qgis.devVersion()}",
+            ]
+            try:
+                from qgis.PyQt.QtCore import QT_VERSION_STR
+                lines.append(f"Qt version: {QT_VERSION_STR}")
+            except Exception:
+                pass
+            lines.append("")
+            lines.append(f"Algorithm started at: {datetime.datetime.now().isoformat()}")
+            lines.append("Algorithm 'One Click – End-to-End HLD Pipeline' starting...")
+            lines.append("Input parameters:")
+            lines.append(repr({k: v for k, v in parameters.items()
+                               if not k.startswith("_")}))
+            lines.append("")
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+            return _LoggingFeedback(feedback, log_path), log_path
+        except Exception as exc:
+            feedback.pushWarning(self.tr(
+                "Could not set up log file: %s"
+            ) % exc)
+            return feedback, None
+
+    def _finalize_logging(self, log_path, out, exc_info=None):
+        """Append final results (or error info) to the log file."""
+        if not log_path:
+            return
+        try:
+            lines = []
+            if exc_info:
+                lines.append("")
+                lines.append(f"Execution FAILED after {exc_info}.")
+            else:
+                lines.append("")
+                lines.append("Results:")
+                for k, v in out.items():
+                    lines.append(f"  {k}: {v}")
+                lines.append("")
+                lines.append("Loading resulting layers")
+                lines.append("Algorithm 'One Click – End-to-End HLD Pipeline' finished")
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        except Exception:
+            pass
+
     def processAlgorithm(self, parameters, context, feedback):
-        self._validate_inputs(parameters, context, feedback)
-        out = self.execute_pipeline(parameters, context, feedback)
-        self._copy_hardcoded_reports(parameters, context, feedback)
-        return out
+        log_feedback, log_path = self._setup_logging(
+            parameters, context, feedback)
+        try:
+            self._validate_inputs(parameters, context, log_feedback)
+            out = self.execute_pipeline(parameters, context, log_feedback)
+            self._copy_hardcoded_reports(parameters, context, log_feedback)
+            self._finalize_logging(log_path, out)
+            return out
+        except Exception as exc:
+            self._finalize_logging(log_path, None, exc_info=str(exc))
+            raise
