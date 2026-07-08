@@ -36,12 +36,17 @@ class PipelineStageError(QgsProcessingException):
 
 
 class _LoggingFeedback(QgsProcessingFeedback):
-    """Wraps a QgsProcessingFeedback and also appends messages to a log file."""
+    """Wraps a QgsProcessingFeedback and also appends messages to a log file.
+    Buffers writes and flushes periodically for performance."""
+
+    _FLUSH_INTERVAL = 50  # flush to disk every N messages
 
     def __init__(self, feedback, log_path):
         super().__init__()
         self._inner = feedback
         self._log_path = log_path
+        self._buf = []
+        self._count = 0
 
     def pushInfo(self, msg):
         self._write(msg)
@@ -72,11 +77,23 @@ class _LoggingFeedback(QgsProcessingFeedback):
         self._inner.setProgressText(msg)
 
     def _write(self, msg):
+        self._buf.append(msg + '\n')
+        self._count += 1
+        if self._count % self._FLUSH_INTERVAL == 0:
+            self._flush()
+
+    def _flush(self):
+        if not self._buf:
+            return
         try:
             with open(self._log_path, 'a', encoding='utf-8') as f:
-                f.write(msg + '\n')
+                f.writelines(self._buf)
+            self._buf = []
         except Exception:
-            pass
+            self._buf = []
+
+    def flush(self):
+        self._flush()
 
     @property
     def progress(self):
@@ -86,6 +103,7 @@ class _LoggingFeedback(QgsProcessingFeedback):
         return self._inner.isCanceled()
 
     def cancel(self):
+        self._flush()
         self._inner.cancel()
 
 
@@ -1087,7 +1105,8 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         put(self.OUT_FEEDER_DUCTS, ducts.get(self._DU_OUT_FEEDER))
         put(self.OUT_DIST_DUCTS, ducts.get(self._DU_OUT_DIST))
 
-        # ── Save ALL outputs to GPKG files in the output folder ──
+        # ── Fallback save: only for outputs that weren't captured by inline saving ──
+        # (inline saving in execute_pipeline already handles the happy path)
         out_dir = self._output_dir(parameters, context)
         if out_dir:
             saved = 0
@@ -1096,35 +1115,29 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
                 if not val or not isinstance(val, str):
                     continue
                 dst = os.path.join(out_dir, fname)
+                # Already saved inline? Skip.
+                if val == dst or os.path.isfile(dst):
+                    # Ensure the out dict points to the file path
+                    if val != dst:
+                        out[key] = dst
+                        saved += 1
+                    continue
                 try:
-                    # Resolve the layer via comprehensive search
-                    layer = self._find_layer(val, context)
-                    if layer is not None:
-                        # Already points to our desired destination? Skip.
-                        if val == dst:
-                            continue
+                    fl = self._find_layer(val, context)
+                    if fl is not None:
                         opts = QgsVectorFileWriter.SaveVectorOptions()
                         opts.driverName = "GPKG"
                         opts.layerName = fname.replace(".gpkg", "")
                         err = QgsVectorFileWriter.writeAsVectorFormatV3(
-                            layer, dst, context.transformContext(), opts
+                            fl, dst, context.transformContext(), opts
                         )
                         if err[0] == QgsVectorFileWriter.NoError:
                             out[key] = dst
                             saved += 1
-                        else:
-                            feedback.pushWarning(self.tr(
-                                "Could not write %s to output folder: %s"
-                            ) % (fname, err[1]))
                     elif os.path.isfile(val):
-                        # File on disk that wasn't resolvable as a layer — copy it
                         shutil.copy2(val, dst)
                         out[key] = dst
                         saved += 1
-                    else:
-                        feedback.pushWarning(self.tr(
-                            "Could not resolve layer '%s' to save as %s"
-                        ) % (val, fname))
                 except Exception as exc:
                     feedback.pushWarning(self.tr(
                         "Could not save %s to output folder: %s"
@@ -1209,10 +1222,16 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             ) % exc)
             return feedback, None
 
-    def _finalize_logging(self, log_path, out, exc_info=None):
+    def _finalize_logging(self, log_path, log_feedback, out, exc_info=None):
         """Append final results (or error info) to the log file."""
         if not log_path:
             return
+        # Flush any buffered log messages before writing final results
+        if hasattr(log_feedback, 'flush'):
+            try:
+                log_feedback.flush()
+            except Exception:
+                pass
         try:
             lines = []
             if exc_info:
@@ -1238,8 +1257,8 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             self._validate_inputs(parameters, context, log_feedback)
             out = self.execute_pipeline(parameters, context, log_feedback)
             self._copy_hardcoded_reports(parameters, context, log_feedback)
-            self._finalize_logging(log_path, out)
+            self._finalize_logging(log_path, log_feedback, out)
             return out
         except Exception as exc:
-            self._finalize_logging(log_path, None, exc_info=str(exc))
+            self._finalize_logging(log_path, log_feedback, None, exc_info=str(exc))
             raise

@@ -7,7 +7,7 @@ import shutil
 
 from qgis.core import (
         QgsVectorLayer, QgsVectorFileWriter, QgsCoordinateTransformContext,
-        QgsWkbTypes, QgsVectorFileWriter, QgsFields, QgsProject
+        QgsWkbTypes, QgsFields, QgsProject
     )
 from qgis import processing
 
