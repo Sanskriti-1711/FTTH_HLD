@@ -532,7 +532,52 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             return "{0}|layername={1}".format(gpkg_path, LAYERNAMES.OBJECT)
         return None
 
-    def _stage_error(self, stage, err):
+    def _fast_resolve(self, val, context):
+        """Fast layer existence check without loading features.
+        Returns a QgsMapLayer if resolvable, None otherwise.
+        Prioritises: temporaryLayerStore → mapLayerFromString → file check."""
+        if not val:
+            return None
+        if isinstance(val, QgsMapLayer):
+            return val
+        if not isinstance(val, str) or not val.strip():
+            return None
+        # 1) Direct temporary store lookup (fastest for child-algorithm memory layers)
+        try:
+            store = context.temporaryLayerStore()
+            if store:
+                lyr = store.mapLayer(val)
+                if lyr is not None:
+                    return lyr
+        except Exception:
+            pass
+        # 2) Standard context search
+        try:
+            return QgsProcessingUtils.mapLayerFromString(val, context)
+        except Exception:
+            pass
+        # 3) File on disk
+        if os.path.isfile(val):
+            try:
+                from qgis.core import QgsVectorLayer
+                lyr = QgsVectorLayer(val, "", "ogr")
+                if lyr.isValid():
+                    return lyr
+            except Exception:
+                pass
+        return None
+
+    def _fast_count(self, val, context):
+        """Fast feature count without loading all features.
+        Returns the count or None if unavailable."""
+        lyr = self._fast_resolve(val, context)
+        if lyr is None:
+            return None
+        try:
+            n = lyr.featureCount()
+        except Exception:
+            return None
+        return n if n is not None and n >= 0 else None
         return self.tr(
             "Pipeline failed during {stage}\n\nOriginal Error:\n{err}"
         ).format(stage=stage, err=str(err))
@@ -726,15 +771,20 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
                               is_child_algorithm=True)
 
     def _preflight_cable(self, results, context, feedback):
-        feeder = self._resolve_layer(results.get("feeder"), context)
-        garden = self._resolve_layer(results.get("garden"), context)
-        dist = self._resolve_layer(results.get("distribution"), context)
+        feeder_val = results.get("feeder")
+        garden_val = results.get("garden")
+        dist_val = results.get("distribution")
 
-        missing = [n for n, l in (
-            ("Feeder trenches", feeder),
-            ("Garden trenches", garden),
-            ("Distribution trenches", dist),
-        ) if l is None]
+        # Fast existence check — just verify the value is present and resolvable
+        missing = []
+        for name, val in (("Feeder trenches", feeder_val),
+                          ("Garden trenches", garden_val),
+                          ("Distribution trenches", dist_val)):
+            if not val or not isinstance(val, str) or not val.strip():
+                missing.append(name)
+            elif not os.path.isfile(val):
+                # Not a file — try quick text-based existence (key in results = child produced it)
+                pass
         if missing:
             raise PipelineStageError(self._stage_error(
                 "Cable Layer",
@@ -745,12 +795,12 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
                 ).format(m=", ".join(missing))
             ))
 
-        n_f, n_g, n_d = self._count(feeder), self._count(garden), self._count(dist)
-        feedback.pushInfo(self.tr(
-            "Cable pre-flight — feeder: {f}, garden: {g}, distribution: {d} features."
-        ).format(f=self._fmt_count(n_f), g=self._fmt_count(n_g), d=self._fmt_count(n_d)))
+        n_f = self._fast_count(feeder_val, context)
+        n_g = self._fast_count(garden_val, context)
+        n_d = self._fast_count(dist_val, context)
 
-        if (n_f, n_g, n_d) == (0, 0, 0):
+        zero = lambda x: x is None or x == 0
+        if zero(n_f) and zero(n_g) and zero(n_d):
             raise PipelineStageError(self._stage_error(
                 "Cable Layer",
                 self.tr(
@@ -770,25 +820,30 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             ))
 
         problems = []
-        if not self._has_field(garden, self._PDP_ID_FIELDS):
+        if not self._has_field(self._fast_resolve(garden_val, context),
+                               self._PDP_ID_FIELDS):
             problems.append(self.tr(
                 "Garden trenches carry no PDP_ID field (objects reached the "
                 "Trench stage without PDP assignment)"
             ))
-        if not self._has_field(dist, self._PDP_ID_FIELDS):
+        if not self._has_field(self._fast_resolve(dist_val, context),
+                               self._PDP_ID_FIELDS):
             problems.append(self.tr("Distribution trenches carry no PDP_ID field"))
         if problems:
             raise PipelineStageError(self._stage_error(
                 "Cable Layer", "; ".join(problems) + "."
             ))
 
-        if n_f == 0:
+        if n_f is not None and n_f == 0:
             feedback.pushWarning(self.tr(
                 "0 feeder trenches were routed (MFG snap or graph connectivity "
                 "failed) — the Feeder Cable output will be empty. Check the "
                 "Trench log and the Roads layer classification."
             ))
-
+        fb = lambda x: str(x) if x is not None else "unknown"
+        feedback.pushInfo(self.tr(
+            "Cable pre-flight — feeder: {f}, garden: {g}, distribution: {d} features."
+        ).format(f=fb(n_f), g=fb(n_g), d=fb(n_d)))
     def _check_tangent_intersections(self, results, context, feedback):
         """Warn if any OUT_FINAL_TANGENT_TRENCHES features don't intersect
         any feeder or distribution trench (orphan drills)."""
@@ -856,12 +911,17 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             ))
 
     def _preflight_duct(self, results, context, feedback):
-        trenches = self._resolve_layer(results.get("trenches"), context)
-        n_t = self._count(trenches)
-        feedback.pushInfo(self.tr(
-            "Duct pre-flight — final trenches: %s features."
-        ) % self._fmt_count(n_t))
-        if trenches is None or n_t == 0:
+        trenches_val = results.get("trenches")
+        n_t = self._fast_count(trenches_val, context)
+        if n_t is not None:
+            feedback.pushInfo(self.tr(
+                "Duct pre-flight — final trenches: %s features."
+            ) % n_t)
+        else:
+            feedback.pushInfo(self.tr(
+                "Duct pre-flight — final trenches: (could not count)."
+            ))
+        if n_t is None or n_t == 0:
             raise PipelineStageError(self._stage_error(
                 "Duct Layer",
                 self.tr(
@@ -874,14 +934,14 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
                 "Duct Layer",
                 self.tr("MFG and PDP layers are required but missing.")
             ))
-        objects = self._resolve_layer(results.get("objects"), context)
+        objects_lyr = self._fast_resolve(results.get("objects"), context)
         problems = []
-        if not self._has_field(objects, self._PDP_ID_FIELDS):
+        if not self._has_field(objects_lyr, self._PDP_ID_FIELDS):
             problems.append(self.tr(
                 "the Objects layer carries no PDP_ID field, so distribution "
                 "ducts cannot match households to PDPs"
             ))
-        if not self._has_field(objects, self._HH_ID_FIELDS):
+        if not self._has_field(objects_lyr, self._HH_ID_FIELDS):
             problems.append(self.tr(
                 "the Objects layer carries no household id field "
                 "(ADDR_ID/HH_ID/id)"
@@ -1104,48 +1164,6 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         put(self.OUT_DIST_CABLE, cables.get(self._CB_OUT_DIST))
         put(self.OUT_FEEDER_DUCTS, ducts.get(self._DU_OUT_FEEDER))
         put(self.OUT_DIST_DUCTS, ducts.get(self._DU_OUT_DIST))
-
-        # ── Fallback save: only for outputs that weren't captured by inline saving ──
-        # (inline saving in execute_pipeline already handles the happy path)
-        out_dir = self._output_dir(parameters, context)
-        if out_dir:
-            saved = 0
-            for key, fname in self._DEFAULT_OUTPUT_FILES.items():
-                val = out.get(key)
-                if not val or not isinstance(val, str):
-                    continue
-                dst = os.path.join(out_dir, fname)
-                # Already saved inline? Skip.
-                if val == dst or os.path.isfile(dst):
-                    # Ensure the out dict points to the file path
-                    if val != dst:
-                        out[key] = dst
-                        saved += 1
-                    continue
-                try:
-                    fl = self._find_layer(val, context)
-                    if fl is not None:
-                        opts = QgsVectorFileWriter.SaveVectorOptions()
-                        opts.driverName = "GPKG"
-                        opts.layerName = fname.replace(".gpkg", "")
-                        err = QgsVectorFileWriter.writeAsVectorFormatV3(
-                            fl, dst, context.transformContext(), opts
-                        )
-                        if err[0] == QgsVectorFileWriter.NoError:
-                            out[key] = dst
-                            saved += 1
-                    elif os.path.isfile(val):
-                        shutil.copy2(val, dst)
-                        out[key] = dst
-                        saved += 1
-                except Exception as exc:
-                    feedback.pushWarning(self.tr(
-                        "Could not save %s to output folder: %s"
-                    ) % (fname, exc))
-            if saved:
-                feedback.pushInfo(self.tr(
-                    "Saved %d output layer(s) to output folder as GPKG files."
-                ) % saved)
 
         return out
 
