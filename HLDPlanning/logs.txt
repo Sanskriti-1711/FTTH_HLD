@@ -1,0 +1,494 @@
+QGIS version: 3.44.3-Solothurn
+QGIS code revision: 1d1d67e9edd
+Qt version: 5.15.13
+Python version: 3.12.3
+GDAL version: 3.8.4
+GEOS version: 3.12.1-CAPI-1.18.1
+PROJ version: Rel. 9.4.0, March 1st, 2024
+Algorithm started at: 2025-11-15T12:02:42
+Algorithm 'End-to-End Pipeline' starting…
+Input parameters:
+{ 'add_to_project' : True, 'addr_prefix' : 'ADDR', 'aoi_buffer_m' : 100, 'aoi_gpkg' : 'TEMPORARY_OUTPUT', 'boq_bom_xlsx' : 'TEMPORARY_OUTPUT', 'buildings_gpkg' : 'TEMPORARY_OUTPUT', 'cache_strict' : False, 'email' : 'test@example.com', 'force_live' : False, 'generate_job_pack' : True, 'job_pack_docx' : 'TEMPORARY_OUTPUT', 'live_preview' : False, 'min_delay' : 1.2, 'object_gpkg' : 'TEMPORARY_OUTPUT', 'object_shp' : 'TEMPORARY_OUTPUT', 'object_strategy' : 0, 'osm_pbf' : '/home/sowrabh/TEST_SET/berlin-latest.osm.pbf', 'out_crs' : QgsCoordinateReferenceSystem('EPSG:25833'), 'out_dir' : '/home/sowrabh/TEST_SET/OP', 'poly_buffer_m' : 18, 'poly_clip' : None, 'poly_gpkg' : 'TEMPORARY_OUTPUT', 'poly_inset_m' : 0, 'poly_method' : 0, 'poly_road_lobe_w_m' : 8, 'poly_road_pull_m' : 25, 'roads_gpkg' : 'TEMPORARY_OUTPUT', 'run_cable' : True, 'run_duct' : True, 'seed_buffer_m' : 18, 'use_cache' : True, 'write_shp' : False, 'xlsx_in' : '/home/sowrabh/TEST_SET/Objektliste_OXG_Mariendorf_MFG_14.xlsx', 'xlsx_sheet' : 'Tabelle1' }
+
+hldplanning:01_object_layer parameters: Input Excel (.xlsx) [EXCEL], Sheet name (blank = first) [SHEET], Email for Nominatim User-Agent [EMAIL], Min seconds between requests (>= 1.0) [MIN_DELAY], Output CRS [OUT_CRS], Output Shapefile (.shp) [OUT_SHP], Output GeoPackage (.gpkg) [recommended] [OUT_GPKG], Include ALL rows (place non-geocoded at 0,85 with flag) [INCLUDE_ALL], Force live geocoding (ignore cache) [FORCE_LIVE], ADDR_ID prefix (used if column missing/blank) [ADDRESS_ID_PREFIX]
+HLDPlanning provider algs: hldplanning:01_object_layer, hldplanning:02_polygon_layer, hldplanning:03_network_layer, hldplanning:04_trench_layer, hldplanning:05_duct_layer, hldplanning:06_cable_layer, hldplanning:end_to_end_pipeline
+Price list not found; continuing without unit-price mapping.
+Aliased params:
+EXCEL ← /home/sowrabh/TEST_SET/Objektliste_OXG_Mariendorf_MFG_14.xlsx
+SHEET ← Tabelle1
+EMAIL ← test@example.com
+MIN_DELAY ← 1.2
+OUT_CRS ← <QgsCoordinateReferenceSystem: EPSG:25833>
+INCLUDE_ALL ← True
+FORCE_LIVE ← False
+ADDRESS_ID_PREFIX ← ADDR
+OUT_GPKG ← /home/sowrabh/TEST_SET/OP/01_object_layer.gpkg
+Cache: using existing 01_object_layer outputs.
+Field name WORKFLOW already exists and will be replaced
+Results: {'OUTPUT': 'Calculated_45c2f78e_2fe3_472d_98e9_8465085c141d'}
+Field name RUN_DT already exists and will be replaced
+Results: {'OUTPUT': 'Calculated_bdc5e570_6ee1_4d8c_8fe5_4f445ffc7025'}
+Results: {'FILE_PATH': '/home/sowrabh/TEST_SET/OP/01_object_layer.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/home/sowrabh/TEST_SET/OP/01_object_layer.gpkg'}
+Creating AOI from Object Layer…
+Results: {'OUTPUT': 'Dissolved_c17de953_cb65_423e_80a5_c631962d96e4'}
+Results: {'OUTPUT': 'Convex_hulls_db25fd39_a8b5_4359_93f0_e7ea9bdfb0c2'}
+Results: {'OUTPUT': 'Buffered_c9459e3e_0e47_4060_9f67_63c94380492c'}
+Results: {'OUTPUT': 'Fixed_geometries_f0099e27_bc5b_42c9_a26e_94b6bf1509f5'}
+Results: {'FILE_PATH': '/home/sowrabh/TEST_SET/OP/aoi.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/home/sowrabh/TEST_SET/OP/aoi.gpkg'}
+Saved AOI: aoi.gpkg
+Extracting OSM Roads/Buildings…
+Results: {'OUTPUT': 'Reprojected_4b243da3_584f_46a0_9422_097224ab00ef'}
+Results: {'OUTPUT': 'Reprojected_17b41815_bfd4_4587_b9fd_4d164b4e41aa'}
+Results: {'OUTPUT': 'Reprojected_4b243da3_584f_46a0_9422_097224ab00ef'}
+Results: {'OUTPUT': 'Reprojected_17b41815_bfd4_4587_b9fd_4d164b4e41aa'}
+Results: {'OUTPUT': 'Clipped_1fd89502_259f_410e_bbd2_392c22c56d89'}
+Results: {'OUTPUT': 'Clipped_9dd4e79f_0a36_4bcc_9cf7_790474135d29'}
+Results: {'FILE_PATH': '/home/sowrabh/TEST_SET/OP/roads_utm.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/home/sowrabh/TEST_SET/OP/roads_utm.gpkg'}
+Saved Roads: roads_utm.gpkg
+Results: {'FILE_PATH': '/home/sowrabh/TEST_SET/OP/buildings_utm.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/home/sowrabh/TEST_SET/OP/buildings_utm.gpkg'}
+Saved Buildings: buildings_utm.gpkg
+Normalizing road attributes (persisting after each step)…
+Results: {'FILE_PATH': '/home/sowrabh/TEST_SET/OP/roads_norm.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/home/sowrabh/TEST_SET/OP/roads_norm.gpkg'}
+Results: {'OUTPUT': 'Calculated_f93fcc3f_e330_4570_a69a_c9859f5bf02c'}
+Results: {'FILE_PATH': '/home/sowrabh/TEST_SET/OP/roads_norm.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/home/sowrabh/TEST_SET/OP/roads_norm.gpkg'}
+Results: {'OUTPUT': 'Calculated_d23d0dda_b9a2_4819_9c6b_7c2e61aaef3b'}
+Results: {'FILE_PATH': '/home/sowrabh/TEST_SET/OP/roads_norm.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/home/sowrabh/TEST_SET/OP/roads_norm.gpkg'}
+Field name name already exists and will be replaced
+Results: {'OUTPUT': 'Calculated_ac35f7cc_01a3_4219_92cf_0a65969c3761'}
+Results: {'FILE_PATH': '/home/sowrabh/TEST_SET/OP/roads_norm.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/home/sowrabh/TEST_SET/OP/roads_norm.gpkg'}
+Results: {'OUTPUT': 'Calculated_7f6f4ed9_a637_4969_b66c_7e0f5fcf9165'}
+Results: {'FILE_PATH': '/home/sowrabh/TEST_SET/OP/roads_norm.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/home/sowrabh/TEST_SET/OP/roads_norm.gpkg'}
+Results: {'OUTPUT': 'Calculated_4dfd83e9_2024_45ad_bc42_7a51dd0a619c'}
+Results: {'FILE_PATH': '/home/sowrabh/TEST_SET/OP/roads_norm.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/home/sowrabh/TEST_SET/OP/roads_norm.gpkg'}
+Results: {'OUTPUT': 'Calculated_dfbaa292_59a2_4402_b3e5_161199933928'}
+Results: {'FILE_PATH': '/home/sowrabh/TEST_SET/OP/roads_norm.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/home/sowrabh/TEST_SET/OP/roads_norm.gpkg'}
+Results: {'OUTPUT': 'Calculated_da98fdfb_3983_4d86_b899_db2593661aab'}
+Results: {'FILE_PATH': '/home/sowrabh/TEST_SET/OP/roads_norm.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/home/sowrabh/TEST_SET/OP/roads_norm.gpkg'}
+Results: {'OUTPUT': 'Calculated_54ae0fe4_7bbd_4ea6_9366_2eb5e093817f'}
+Results: {'FILE_PATH': '/home/sowrabh/TEST_SET/OP/roads_norm.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/home/sowrabh/TEST_SET/OP/roads_norm.gpkg'}
+Results: {'OUTPUT': 'Calculated_4f2d15d7_38e3_47fe_8247_1aad03b5ca8a'}
+Results: {'FILE_PATH': '/home/sowrabh/TEST_SET/OP/roads_norm.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/home/sowrabh/TEST_SET/OP/roads_norm.gpkg'}
+Results: {'OUTPUT': 'Calculated_1b650f6d_252e_41c6_9d44_5b3f5b719a6c'}
+Results: {'FILE_PATH': '/home/sowrabh/TEST_SET/OP/roads_norm.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/home/sowrabh/TEST_SET/OP/roads_norm.gpkg'}
+Results: {'OUTPUT': 'Calculated_c24b748d_bfc2_431c_acc9_fdb5b70b9dea'}
+Results: {'FILE_PATH': '/home/sowrabh/TEST_SET/OP/roads_norm.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/home/sowrabh/TEST_SET/OP/roads_norm.gpkg'}
+Results: {'OUTPUT': 'Calculated_80559a31_9423_4714_9920_c3e576421dd9'}
+Results: {'FILE_PATH': '/home/sowrabh/TEST_SET/OP/roads_norm.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/home/sowrabh/TEST_SET/OP/roads_norm.gpkg'}
+Results: {'OUTPUT': 'Calculated_c165086c_4a42_4eaa_9eed_a5683183b944'}
+Results: {'FILE_PATH': '/home/sowrabh/TEST_SET/OP/roads_norm.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/home/sowrabh/TEST_SET/OP/roads_norm.gpkg'}
+Results: {'OUTPUT': 'Calculated_f85a1fa2_6db3_4d93_bba7_4521fc00b7e6'}
+Results: {'FILE_PATH': '/home/sowrabh/TEST_SET/OP/roads_norm.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/home/sowrabh/TEST_SET/OP/roads_norm.gpkg'}
+Results: {'OUTPUT': 'Calculated_141f68fc_5324_477f_8d5b_8ca0a63a1e93'}
+Results: {'FILE_PATH': '/home/sowrabh/TEST_SET/OP/roads_norm.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/home/sowrabh/TEST_SET/OP/roads_norm.gpkg'}
+Results: {'FILE_PATH': '/home/sowrabh/TEST_SET/OP/roads_utm.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/home/sowrabh/TEST_SET/OP/roads_utm.gpkg'}
+Saved Roads (normalized): roads_utm.gpkg
+Building planning polygons…
+Results: {'OUT': 'Output_polygons_9a222dd7_c4c6_49f4_aa39_9300fc23425f'}
+Field name WORKFLOW already exists and will be replaced
+Results: {'OUTPUT': 'Calculated_c58d5eba_bf9e_4343_bf1f_6899a18ecb2f'}
+Results: {'OUTPUT': 'Calculated_330ecc51_6c13_4e20_b405_0b8b66fc15b4'}
+Results: {'FILE_PATH': '/home/sowrabh/TEST_SET/OP/02_polygon_layer.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/home/sowrabh/TEST_SET/OP/02_polygon_layer.gpkg'}
+Saved 02_polygon_layer: 02_polygon_layer.gpkg
+Polygons created.
+Polygon expansion skipped (pull or lobe width is 0).
+Aggregating object attrs onto polygons…
+Skipped aggregation/join: no grouping field requested.
+Running Network Layer (+ centroid MFG)…
+Results: {'OUTPUT': 'Extracted__location__804d769b_82ca_40f7_8204_1404b72eb29f'}
+Results: {'OUTPUT': 'output_5af43f39_2dbe_4e2a_9a1c_9243d3726e1e'}
+Results: {'OUTPUT': 'output_3dfffb91_9295_4af4_9693_ad2bff8c10a3'}
+Results: {'OUTPUT': 'output_3e70522e_cf5f_4fd9_b96f_444d66fe2f4c'}
+Results: {'OUTPUT': 'output_3e70522e_cf5f_4fd9_b96f_444d66fe2f4c'}
+Results: {'OUTPUT': 'output_b13eddff_0e64_497e_a4d4_c1fb915b9573'}
+Results: {'OUTPUT': 'output_9ad62cf7_244b_424c_b242_4939a4e20b11'}
+Results: {'OUTPUT': 'output_19b5ace3_ca5a_491c_8f0a_f7c844779c92'}
+Results: {'OUTPUT': 'output_1643c4c7_30c4_41eb_8b9b_706b863cbfd5'}
+0 duplicate features removed
+Results: {'DUPLICATE_COUNT': 0, 'OUTPUT': 'output_34b974d8_0ab2_4612_bac6_4ebe507fcf49', 'RETAINED_COUNT': 299}
+Results: {'OUTPUT': 'output_34b974d8_0ab2_4612_bac6_4ebe507fcf49'}
+Results: {'OUTPUT': 'output_97645e89_e30c_4d2b_8f88_c7fe3322d700'}
+Results: {'OUTPUT': 'output_50265dd5_5945_49c6_ac65_2d5f0e78db58'}
+Results: {'OUTPUT': 'output_50265dd5_5945_49c6_ac65_2d5f0e78db58'}
+Results: {'OUTPUT': 'output_b663798e_62fd_4b47_b744_5eccc0aeb101'}
+Creating spatial index
+Calculating difference
+Results: {'OUTPUT': 'output_1b7eeebb_b6c8_4707_abde_66eafc54b432'}
+0 duplicate features removed
+Results: {'DUPLICATE_COUNT': 0, 'OUTPUT': 'output_48e21111_4e7e_471a_8f9c_0de1f70e47af', 'RETAINED_COUNT': 299}
+Results: {'OUTPUT': 'output_0ee86258_edb8_41f5_afcb_bc6076924924'}
+Results: {'OUTPUT': 'output_0ee86258_edb8_41f5_afcb_bc6076924924'}
+Assigned 19 PDP candidates to polygons.
+Results: {'OUTPUT': 'output_9051ed79_94ba_42f4_a346_1f7783ecb6e2'}
+Results: {'OUTPUT': 'output_aa4af383_4204_4630_8caf_b9764205adc5'}
+Results: {'OUTPUT': 'output_a8e34a09_6281_42f5_881a_de886253e035'}
+MFG placed outside polygons on walkable edge.
+PDPs placed: 19 / 19
+Results: {'OUT_ASSIGNED': '03_network_layer_3201e018_a5da_4549_8b38_416cc8875dfb', 'OUT_CAND': 'candidate_pdps_6e174427_326b_464f_80e5_6c40a6799fdf', 'OUT_CLEAN': 'clean_pdps_369d0694_3e19_400b_b867_89a2837fdf9a', 'OUT_EDGES': 'buffer_edges_d1d59551_3ced_4a6c_922e_76877cda8fb1', 'OUT_MFG_POINT': 'MFG_Point__optional__68396986_e7d8_4056_935b_647b48621022', 'OUT_REMOVED': 'pdps_to_remove_d13a6967_d265_482c_b953_2a4f8a92a003'}
+Results: {'FILE_PATH': '/home/sowrabh/TEST_SET/OP/03_network_layer.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/home/sowrabh/TEST_SET/OP/03_network_layer.gpkg'}
+Saved Networks Per Polygon: 03_network_layer.gpkg
+Results: {'FILE_PATH': '/home/sowrabh/TEST_SET/OP/mfg_point.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/home/sowrabh/TEST_SET/OP/mfg_point.gpkg'}
+Saved MFG Point: mfg_point.gpkg
+Network Layer completed (centroid MFG).
+Post-fix MFG: snap to roads outside polygons…
+Results: {'OUTPUT': 'Buffered_af55d73d_d337_47db_a3b5_f43f3b128f65'}
+Results: {'OUTPUT': 'Extracted__location__7ac9de94_ed5b_4089_b205_978923742b72'}
+Results: {'OUTPUT': 'Matching_features_b7e3cb3b_0e37_4445_863e_c43dfb52ea43'}
+No vehicular roads found; falling back to ALL roads for MFG snap.
+Results: {'OUTPUT': 'Snapped_geometry_72577997_a673_4fd6_acb4_e8e9d4c84420'}
+Results: {'FILE_PATH': '/home/sowrabh/TEST_SET/OP/mfg_point.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/home/sowrabh/TEST_SET/OP/mfg_point.gpkg'}
+Results: {'OUTPUT': 'Extracted__location__fb51c870_3eaf_489f_a890_d628ede0b3cc'}
+MFG snapped to outside walkable edge.
+Results: {'JOINED_COUNT': 21, 'OUTPUT': 'Joined_layer_bf489e5e_6704_402a_b02e_adfc7b2fcab3'}
+Results: {'OUTPUT': 'Matching_features_a78c8b0d_7563_4243_88fe_af8809a6f5a0'}
+Saved style: /home/sowrabh/TEST_SET/OP/03_network_layer.qml
+Running Trench Layer (FOOTWAY + crossings)…
+Resolved PDP layer: PDP
+Resolved HH layer: 01_object_layer
+Trench SNAP_TOL (map units): 1
+Results: {'OUTPUT': 'Reprojected_2e35ddfd_4375_4869_8080_d3e6098061b9'}
+Results: {'OUTPUT': 'Reprojected_6d111373_6336_42db_946c_4cbd46a9d457'}
+Results: {'OUTPUT': 'Reprojected_32c54a37_a1d7_45d3_b206_bddd559cc718'}
+Results: {'OUTPUT': 'Reprojected_ce2cb60b_84f6_4a32_8830_f6e514fee483'}
+Results: {'OUTPUT': 'Reprojected_e9dadd2d_afb1_48cc_ac42_332b35359fb4'}
+Results: {'OUTPUT': 'Reprojected_65c248a3_a4f6_4c1f_994a_34554c73a299'}
+Results: {'OUTPUT': 'Reprojected_6d111373_6336_42db_946c_4cbd46a9d457'}
+Results: {'OUTPUT': 'Buffered_d86ffdab_76be_47a9_be3b_5c9852cc920e'}
+Results: {'OUTPUT': 'Buffered_c2d71cf2_631d_4b3a_b33d_35fa62c20a22'}
+Results: {'OUTPUT': 'Dissolved_141883da_1482_4744_b60b_20ebce52f888'}
+Results: {'OUTPUT': 'Lines_25e91e29_5502_487d_8814_2bbb3db77647'}
+Results: {'OUTPUT': 'Extracted__location__1b3584f6_c299_4d18_93ec_f61ee991d7c3'}
+Results: {'OUTPUT': 'Matching_features_882b051d_df61_4c93_b966_55fe01b3fba7'}
+Results: {'OUTPUT': 'Matching_features_9e6f55bc_9a66_4935_bebd_fd1e9a60bcab'}
+Results: {'OUTPUT': 'Matching_features_413ce42d_6935_4704_bd40_dfae1ac2da71'}
+Results: {'OUTPUT': 'Matching_features_302ddd5f_e227_4702_a618_e391ad75bc63'}
+Results: {'OUTPUT': 'Exploded_bb052df0_b68c_4ab7_bbce_0173ff7195de'}
+Results: {'OUTPUT': 'Intersections_6d3fad77_2c12_4d51_8933_419774b3f592'}
+Using specified destination CRS EPSG:25833
+Setting output type to MultiLineString
+Packaging layer 1/2: Matching features
+Packaging layer 2/2: Matching features
+Results: {'OUTPUT': 'Merged_4faa5099_db45_4a4f_82bb_1263b39c0ac7'}
+Results: {'OUTPUT': 'Fixed_geometries_6deae3cf_9f6e_4f1b_86f6_f86e2f51267b'}
+Results: {'OUTPUT': 'Fixed_geometries_6deae3cf_9f6e_4f1b_86f6_f86e2f51267b'}
+Results: {'OUTPUT': 'Dissolved_c05d2428_9891_4d11_9263_d560a6156b84'}
+Results: {'OUTPUT': 'Offset_fa6d1ef0_0964_45be_b6d7_633987a3014f'}
+Results: {'OUTPUT': 'Offset_97ae2421_30e4_4200_87eb_7a5c30047ea4'}
+Results: {'OUTPUT': 'Buffered_cbc3ae86_1583_4b61_ae95_a5c94a67bd1f'}
+Results: {'OUTPUT': 'Buffered_ffb78733_a81a_40b4_9077_a7e6f4d1a38c'}
+Taking destination CRS EPSG:25833 from layer
+Setting output type to MultiPolygon
+Packaging layer 1/2: Buffered
+Packaging layer 2/2: Buffered
+Results: {'OUTPUT': 'Merged_7e2a1f3c_9d0b_47f4_8502_e5f9ef1e7bfc'}
+ℹ️ No valid centers/roads for tangent drills.
+Results: {'FILE_PATH': '/tmp/processing_tyogrh/34e7094bff67412f85a7bdaa88d10fb2/OUTPUT.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/tmp/processing_tyogrh/34e7094bff67412f85a7bdaa88d10fb2/OUTPUT.gpkg'}
+Projected 19 PDP(s) and created 19 pseudo PDP points (search ≤ 250.0 m).
+Results: {'FILE_PATH': '/tmp/processing_tyogrh/f9da2948326b4bdb8eb6cb4af802e6dc/OUTPUT.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/tmp/processing_tyogrh/f9da2948326b4bdb8eb6cb4af802e6dc/OUTPUT.gpkg'}
+Results: {'FILE_PATH': '/tmp/processing_tyogrh/a12038f837c6478f9b53a1b5c333a779/OUTPUT.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/tmp/processing_tyogrh/a12038f837c6478f9b53a1b5c333a779/OUTPUT.gpkg'}
+✅ Created 19 feeder trenches on sidewalks.
+Results: {'FILE_PATH': '/tmp/processing_tyogrh/a6bd284ce3bf46cdaddb4b04e0123d51/OUTPUT.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/tmp/processing_tyogrh/a6bd284ce3bf46cdaddb4b04e0123d51/OUTPUT.gpkg'}
+Results: {'FILE_PATH': '/tmp/processing_tyogrh/8dbf3fdbeddb4e3da7abfaea5e5ef8bd/OUTPUT.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/tmp/processing_tyogrh/8dbf3fdbeddb4e3da7abfaea5e5ef8bd/OUTPUT.gpkg'}
+Creating spatial index
+Calculating difference
+Results: {'OUTPUT': 'Difference_e306c22c_1a15_4e88_8bad_b832d6e7cebc'}
+Results: {'FILE_PATH': '/tmp/processing_tyogrh/5d284ecc7a444dafafa14466f7cd18d7/OUTPUT.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/tmp/processing_tyogrh/5d284ecc7a444dafafa14466f7cd18d7/OUTPUT.gpkg'}
+Results: {'FILE_PATH': '/tmp/processing_tyogrh/5264dea56fdd4aae92703cc2313f726e/OUTPUT.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/tmp/processing_tyogrh/5264dea56fdd4aae92703cc2313f726e/OUTPUT.gpkg'}
+✅ Step 8: merged 19 trenches (skipped 0).
+Results: {'FILE_PATH': '/tmp/processing_tyogrh/b3083bd0fac94a1489754b08957ae8c0/OUTPUT.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/tmp/processing_tyogrh/b3083bd0fac94a1489754b08957ae8c0/OUTPUT.gpkg'}
+Creating spatial index
+Calculating difference
+Results: {'OUTPUT': 'Difference_8ad71529_5289_49c5_81e6_877310e35c1b'}
+Results: {'FILE_PATH': '/tmp/processing_tyogrh/7c76e959fd2c43eca4edca7bb57129d6/OUTPUT.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/tmp/processing_tyogrh/7c76e959fd2c43eca4edca7bb57129d6/OUTPUT.gpkg'}
+✅ Created 272 pseudo household points.
+✅ Garden trenches created: 277
+ℹ️ Proceeding to Stage-9 Distribution …
+🚀 Stage-9: Building Distribution Trenches (strict PDP → Objects) ...
+✅ Stage-9: Created 272 distribution paths across 19 PDPs.
+ℹ️ Final Tangent Trenches: created empty layer (no tangent candidates).
+ℹ️ No used tangent crossings to export.
+Results: {'FILE_PATH': '/tmp/processing_tyogrh/0a4dc342c83942db90696f9c4a9f6412/OUTPUT.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/tmp/processing_tyogrh/0a4dc342c83942db90696f9c4a9f6412/OUTPUT.gpkg'}
+Results: {'FILE_PATH': '/tmp/processing_tyogrh/fdf003cd57144026820df5e5e8a922b5/OUTPUT.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/tmp/processing_tyogrh/fdf003cd57144026820df5e5e8a922b5/OUTPUT.gpkg'}
+Results: {'FILE_PATH': '/tmp/processing_tyogrh/8e38215f778146a298acdb131ad39473/OUTPUT.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/tmp/processing_tyogrh/8e38215f778146a298acdb131ad39473/OUTPUT.gpkg'}
+Results: {'FILE_PATH': '/tmp/processing_tyogrh/da2d53a8b3e24d97b04df8bd0f1825de/OUTPUT.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/tmp/processing_tyogrh/da2d53a8b3e24d97b04df8bd0f1825de/OUTPUT.gpkg'}
+Results: {'FILE_PATH': '/tmp/processing_tyogrh/beac94edcc3b43c78ab4f71a0bfd7344/OUTPUT.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/tmp/processing_tyogrh/beac94edcc3b43c78ab4f71a0bfd7344/OUTPUT.gpkg'}
+Using specified destination CRS EPSG:25833
+Setting output type to MultiLineString
+Packaging layer 1/3: mem
+Packaging layer 2/3: mem
+Packaging layer 3/3: mem
+Results: {'OUTPUT': 'Merged_ada5471b_9084_461f_b2e1_59658041962a'}
+Results: {'OUTPUT': 'Collected_b34fbf64_5438_4b85_b211_9f381a1c4a85'}
+Creating spatial index
+Calculating difference
+Results: {'OUTPUT': 'Difference_ca4143bb_00b5_412e_920b_4ef699323ec5'}
+✅ Final_Trenches layer written with 1 features.
+✅ All routing and trench layers generated successfully.
+Results: {'OUT_DISTRIBUTION_DISS': 'Distribution_Dissolved_95939993_668b_4d89_98ae_f88f1760bb46', 'OUT_DISTRIBUTION_LINES': 'Distribution_Lines__MFG_Pseudo_HH__82e80b42_03bf_4653_b5ef_fbb461fcccd2', 'OUT_FEEDER_FINAL': 'Feeder_Trench__multi_lines__id_only__17aeec4c_cc6a_4523_bc5b_ba4f64ade44f', 'OUT_FEEDER_TRENCH': 'Feeder_Trench__merged__080c3295_6a60_438a_b416_2fe9cad52a3e', 'OUT_FINAL_TANGENT_TRENCHES': 'Final_Tangent_Trenches_9e4c6faa_4714_4f05_9fc1_905f588617f6', 'OUT_FINAL_TRENCHES': 'Final_Trenches__merged___tagged__4e376c47_c064_4408_a44e_19351149bc35', 'OUT_GARDEN_TRENCHES': 'Garden_Trenches__HH_Footway_Service__236b94cb_adf2_4dd8_8ed2_8d646d994b34', 'OUT_MERGED_PDP': 'Merged_Trenches_per_PDP__multi_lines__40c57b95_bca6_4d99_81eb_a5c66778642d', 'OUT_MFG_POINT': 'MFG_Point__pass_through__ac72f126_72a3_4d71_9f11_377640ba96b1', 'OUT_PDP_TO_SIDE': 'PDP_Footway_Service_Projections_f9820bee_e213_4a7f_aed4_bfc8b4307fd8', 'OUT_PSEUDO_HH': 'Pseudo_HH_Points_on_Footway_Service_52c1bde5_70c1_4c59_a2cc_1672736c67a3', 'OUT_PSEUDO_PDP': 'Pseudo_PDP_Points_8b477b5a_8a70_4a27_a778_a763ba5a718e', 'OUT_S1_AOI_BUFFER_DISSOLVED': 'Buffered_polygon__dissolved__4c720f7f_b565_461b_940c_757229f72273', 'OUT_S1_AOI_OUTLINE_LINES': 'Buffered_outline__lines__7ea7a9e3_e388_4062_9cfa_66b67bed1309', 'OUT_S1_ROADS_FILTERED': 'Filtered_roads__by_expression__63d34185_2c3e_485e_87b0_5eab1b82b7f3', 'OUT_S1_ROADS_NEAR': 'Roads_near_polygon__within_buffer__b25048c2_9f5b_4a65_8a4f_3caf2cb16153', 'OUT_SIDEWALK_LEFT': 'Sidewalk_Left__lines__c57320e1_0a91_4512_be13_d92ecb14823e', 'OUT_SIDEWALK_RIGHT': 'Sidewalk_Right__lines__8237d35a_ff1f_485e_92ee_b125960af07a', 'OUT_TANGENT_TRENCHES': 'Drill_Crossings__designed__02956115_d77c_4eee_a52f_bb17f15c7e8c', 'OUT_TANGENT_TRENCHES_USED': 'Drill_Crossings__used__fb9b216c_781b_4bc4_ad88_813160399834', 'OUT_TRENCHES_MFG_TO_PDP': 'Trenches__MFG_PDP_8f829a84_a440_4067_bb21_9ed4ad856ba4', 'OUT_VALID_INTERSECTIONS': None}
+Results: {'FILE_PATH': '/tmp/processing_tyogrh/c7ad0c9a785e470b9e9d901cb4e09b3e/OUTPUT.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/tmp/processing_tyogrh/c7ad0c9a785e470b9e9d901cb4e09b3e/OUTPUT.gpkg'}
+Results: {'FILE_PATH': '/tmp/processing_tyogrh/3255758b383844d794d1d3e21e5296ba/OUTPUT.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/tmp/processing_tyogrh/3255758b383844d794d1d3e21e5296ba/OUTPUT.gpkg'}
+Results: {'FILE_PATH': '/tmp/processing_tyogrh/7de3314540c949eebc670c65df54f9b9/OUTPUT.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/tmp/processing_tyogrh/7de3314540c949eebc670c65df54f9b9/OUTPUT.gpkg'}
+Results: {'FILE_PATH': '/tmp/processing_tyogrh/45867ba178f04b20bdea36611ea7cd33/OUTPUT.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/tmp/processing_tyogrh/45867ba178f04b20bdea36611ea7cd33/OUTPUT.gpkg'}
+Results: {'FILE_PATH': '/tmp/processing_tyogrh/71b2e22f2f8d40269e61c54dd8901a45/OUTPUT.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/tmp/processing_tyogrh/71b2e22f2f8d40269e61c54dd8901a45/OUTPUT.gpkg'}
+Results: {'FILE_PATH': '/tmp/processing_tyogrh/401e3f916381465bb457799832937073/OUTPUT.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/tmp/processing_tyogrh/401e3f916381465bb457799832937073/OUTPUT.gpkg'}
+Results: {'FILE_PATH': '/tmp/processing_tyogrh/6fb22c6d217b45779fb3ef6e864d8dac/OUTPUT.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/tmp/processing_tyogrh/6fb22c6d217b45779fb3ef6e864d8dac/OUTPUT.gpkg'}
+Results: {'FILE_PATH': '/tmp/processing_tyogrh/0eeb55be50384eb5989e4ffc17adbd71/OUTPUT.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/tmp/processing_tyogrh/0eeb55be50384eb5989e4ffc17adbd71/OUTPUT.gpkg'}
+Results: {'FILE_PATH': '/tmp/processing_tyogrh/e0cea26554934e1ca35c9ec7d82c0457/OUTPUT.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/tmp/processing_tyogrh/e0cea26554934e1ca35c9ec7d82c0457/OUTPUT.gpkg'}
+Results: {'FILE_PATH': '/tmp/processing_tyogrh/d6f31da9a9fc42339faad07a53312e0c/OUTPUT.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/tmp/processing_tyogrh/d6f31da9a9fc42339faad07a53312e0c/OUTPUT.gpkg'}
+Results: {'FILE_PATH': '/tmp/processing_tyogrh/56a4dcdf1b5d49ecb699353c4a6ab217/OUTPUT.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/tmp/processing_tyogrh/56a4dcdf1b5d49ecb699353c4a6ab217/OUTPUT.gpkg'}
+Results: {'FILE_PATH': '/tmp/processing_tyogrh/d166113b5c5e4d97a4b8f850964d851e/OUTPUT.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/tmp/processing_tyogrh/d166113b5c5e4d97a4b8f850964d851e/OUTPUT.gpkg'}
+Results: {'FILE_PATH': '/tmp/processing_tyogrh/ef7c0a078f2d4a65931f1b9a229d8461/OUTPUT.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/tmp/processing_tyogrh/ef7c0a078f2d4a65931f1b9a229d8461/OUTPUT.gpkg'}
+Results: {'FILE_PATH': '/tmp/processing_tyogrh/65f94eb55eb54dee8b138001fba0efc1/OUTPUT.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/tmp/processing_tyogrh/65f94eb55eb54dee8b138001fba0efc1/OUTPUT.gpkg'}
+Results: {'FILE_PATH': '/tmp/processing_tyogrh/b7c7a69b594849f1acc80aa8691fe4eb/OUTPUT.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/tmp/processing_tyogrh/b7c7a69b594849f1acc80aa8691fe4eb/OUTPUT.gpkg'}
+Results: {'FILE_PATH': '/tmp/processing_tyogrh/8da7acd50d8a4a618c60e40c2ef6c75f/OUTPUT.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/tmp/processing_tyogrh/8da7acd50d8a4a618c60e40c2ef6c75f/OUTPUT.gpkg'}
+Results: {'FILE_PATH': '/tmp/processing_tyogrh/f71780b3b2d54fd0b280af438dad180e/OUTPUT.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/tmp/processing_tyogrh/f71780b3b2d54fd0b280af438dad180e/OUTPUT.gpkg'}
+Skip persist 'OUT_VALID_INTERSECTIONS': missing
+Results: {'FILE_PATH': '/tmp/processing_tyogrh/f544957a64ad4c66a8052f04b96019b0/OUTPUT.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/tmp/processing_tyogrh/f544957a64ad4c66a8052f04b96019b0/OUTPUT.gpkg'}
+Results: {'FILE_PATH': '/tmp/processing_tyogrh/566268d4677e47caa32e8fdd00eec9d8/OUTPUT.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/tmp/processing_tyogrh/566268d4677e47caa32e8fdd00eec9d8/OUTPUT.gpkg'}
+Results: {'FILE_PATH': '/tmp/processing_tyogrh/97403b2a80404f31baaa97a4af6433f4/OUTPUT.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/tmp/processing_tyogrh/97403b2a80404f31baaa97a4af6433f4/OUTPUT.gpkg'}
+Results: {'FILE_PATH': '/tmp/processing_tyogrh/328ef8f21d634258a64004a67a976556/OUTPUT.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/tmp/processing_tyogrh/328ef8f21d634258a64004a67a976556/OUTPUT.gpkg'}
+Trench Layer completed.
+Hardening trenches: keeping only near-polygon walkable-road corridor…
+No tangent drills present; skipping drill influence in hardening.
+No tangent drills present; skipping drill influence in hardening.
+Results: {'OUTPUT': 'Matching_features_15b3a66e_1698_4780_8db9_b2ba56aed5bf'}
+Results: {'OUTPUT': 'Buffered_4dd12008_38da_44d7_97db_9cc45698dd33'}
+Results: {'OUTPUT': 'Extracted__location__2f943b87_3884_47b7_8cfe_91475bcf1c29'}
+Results: {'OUTPUT': 'Buffered_c97ec2c5_7c26_4817_ab2b_6640aae66158'}
+Hardening mask empty; leaving trenches unchanged.
+Unable to execute algorithm
+Could not load source layer for INPUT: invalid value
+Field-avoidance post-filter skipped due to error: Unable to execute algorithm
+Could not load source layer for INPUT: invalid value
+Running Duct Layer (Feeder + Distribution)…
+Duct input network: Feeder_Trench_Final (features=19)
+Duct field mapping: PDP_ID='PDP', HH_ID='HH', OBJ_PDP_ID='PDP', MFG_ID='None'
+⚙️ Running embedded Feeder algorithm …
+Feeder resolve → network=Feeder_Trench_Final; mfg=mfg_point; pdp=_tmp_inputs
+Results: {'OUTPUT': 'output_bf63bd41_18cc_4055_a8c4_f45f98ff8cea'}
+Results: {'OUTPUT': 'output_8b6a59ad_d359_488e_9d87_3d86a2db2eb7'}
+Results: {'OUTPUT': 'output_1cd8108b_6371_4f3c_87b8_1be3a4ebc17a'}
+175 duplicate features removed
+Results: {'DUPLICATE_COUNT': 175, 'OUTPUT': 'output_4bfc6b05_611a_4426_9c15_51296fe39100', 'RETAINED_COUNT': 1}
+✅ Feeder ducts created: 11
+Edges: 34 Nodes: 36 MFGs: 1 PDPs: 19
+⚙️ Running embedded Distribution algorithm …
+🔧 Building sidewalk+tangent graph …
+🔗 Bridges added: 104
+🩹 Healing gaps ≤ 3.0 m …
+📈 Graph: 6195 nodes / 6982 edges (healed: 791)
+📋 Indexing PDPs by ID …
+🧩 Grouping HH by PDP ID …
+✅ Distribution ducts created: 61
+Results: {'OUT_DISTRIBUTION_DUCTS': '/home/sowrabh/TEST_SET/OP/Distribution_Ducts.gpkg', 'OUT_FEEDER_DUCTS': '/home/sowrabh/TEST_SET/OP/Feeder_Ducts.gpkg'}
+Duct Layer completed.
+Running Cable Layer (Feeder + Distribution)…
+Feeder: copied 19 features.
+Results: {'OUTPUT': 'output_3798b99f_ed3d_490b_bbde_c261706f7d65'}
+Results: {'OUTPUT': 'output_8506273b_1d89_4d17_a95e_c0053b344cf8'}
+Using specified destination CRS EPSG:25833
+Setting output type to MultiLineString
+Packaging layer 1/2: output
+Packaging layer 2/2: output
+Results: {'OUTPUT': 'output_deeec63d_cde0_49d1_8274_e8e4d32f3019'}
+Using specified destination CRS EPSG:25833
+Setting output type to MultiLineString
+Packaging layer 1/2: _subset
+Packaging layer 2/2: _subset
+Results: {'OUTPUT': 'output_02676bab_657c_4226_b6fa_8b3f7f076d2f'}
+Results: {'OUTPUT': 'output_d4150c52_1737_4bf6_aea0_ad2aa2604218'}
+Results: {'OUTPUT': 'output_5c292823_9986_4341_b5d0_457842dcccb9'}
+1 duplicate feature removed
+Results: {'DUPLICATE_COUNT': 1, 'OUTPUT': 'output_2416c404_4c75_49ea_b459_e353a502b1dc', 'RETAINED_COUNT': 23}
+Using specified destination CRS EPSG:25833
+Setting output type to MultiLineString
+Packaging layer 1/2: _subset
+Packaging layer 2/2: _subset
+Results: {'OUTPUT': 'output_3161ebfe_b77c_47dc_902e_4993c1d56e8f'}
+Results: {'OUTPUT': 'output_2e8afc49_b1bd_428d_8159_3fcc9e799ed6'}
+Results: {'OUTPUT': 'output_88acc91d_27c6_45cc_a023_7f32bf1f3104'}
+0 duplicate features removed
+Results: {'DUPLICATE_COUNT': 0, 'OUTPUT': 'output_382b1ecc_2c79_41a8_9479_dcea6887279f', 'RETAINED_COUNT': 16}
+Using specified destination CRS EPSG:25833
+Setting output type to MultiLineString
+Packaging layer 1/2: _subset
+Packaging layer 2/2: _subset
+Results: {'OUTPUT': 'output_4b56dbd3_f075_4d6c_951c_002f4b1dcb7d'}
+Results: {'OUTPUT': 'output_9495b31e_3185_43c7_b560_36f62844d5a0'}
+Results: {'OUTPUT': 'output_5a0023f4_aaef_4bd0_81a6_777920514ecd'}
+0 duplicate features removed
+Results: {'DUPLICATE_COUNT': 0, 'OUTPUT': 'output_88b82a45_e6c0_40ba_809e_b3a15c0f8d71', 'RETAINED_COUNT': 11}
+Using specified destination CRS EPSG:25833
+Setting output type to MultiLineString
+Packaging layer 1/2: _subset
+Packaging layer 2/2: _subset
+Results: {'OUTPUT': 'output_f5f6bf0f_cf73_4708_9bb7_6f4d89a2ca67'}
+Results: {'OUTPUT': 'output_630f26b0_c28a_4b6c_81d8_698490c5e948'}
+Results: {'OUTPUT': 'output_d7d4e7ff_6aa0_4ce3_a49a_4096795cbb11'}
+0 duplicate features removed
+Results: {'DUPLICATE_COUNT': 0, 'OUTPUT': 'output_ced921b8_3a8c_4b5e_8071_ddb4b8eec7e5', 'RETAINED_COUNT': 25}
+Using specified destination CRS EPSG:25833
+Setting output type to MultiLineString
+Packaging layer 1/2: _subset
+Packaging layer 2/2: _subset
+Results: {'OUTPUT': 'output_1735f674_f327_4125_ac0f_932ff8fe5209'}
+Results: {'OUTPUT': 'output_b0aa37ab_13f9_44ad_bf3d_01edcc2da07c'}
+Results: {'OUTPUT': 'output_4012ab85_2fbb_46cb_b438_72f880d1a780'}
+0 duplicate features removed
+Results: {'DUPLICATE_COUNT': 0, 'OUTPUT': 'output_dd19cc92_7e5d_4fec_ae95_cb83245cacf3', 'RETAINED_COUNT': 11}
+Using specified destination CRS EPSG:25833
+Setting output type to MultiLineString
+Packaging layer 1/2: _subset
+Packaging layer 2/2: _subset
+Results: {'OUTPUT': 'output_21f89506_df56_43f5_aa4f_99e78501e1ca'}
+Results: {'OUTPUT': 'output_566f25de_38b6_448c_b4d0_29c1484f815b'}
+Results: {'OUTPUT': 'output_65eaeafb_f27a_42c5_9070_2c89084e24c3'}
+1 duplicate feature removed
+Results: {'DUPLICATE_COUNT': 1, 'OUTPUT': 'output_71602fe1_5c95_4a91_a326_8c91a379c1f5', 'RETAINED_COUNT': 7}
+Using specified destination CRS EPSG:25833
+Setting output type to MultiLineString
+Packaging layer 1/2: _subset
+Packaging layer 2/2: _subset
+Results: {'OUTPUT': 'output_c8b15f32_e332_4b46_a610_ae7316c54921'}
+Results: {'OUTPUT': 'output_fbf774da_a94d_4725_9c16_0c0af4eae680'}
+Results: {'OUTPUT': 'output_fc4fece3_8dda_465d_9608_fe0e07134ff5'}
+0 duplicate features removed
+Results: {'DUPLICATE_COUNT': 0, 'OUTPUT': 'output_b6521f1c_0041_4d58_a530_a5c68eec3a3a', 'RETAINED_COUNT': 11}
+Using specified destination CRS EPSG:25833
+Setting output type to MultiLineString
+Packaging layer 1/2: _subset
+Packaging layer 2/2: _subset
+Results: {'OUTPUT': 'output_0185360d_06f3_4304_a167_25e9863580b4'}
+Results: {'OUTPUT': 'output_893070c2_168e_4c09_9307_ede93067103f'}
+Results: {'OUTPUT': 'output_5f059d0d_24a2_474f_90b6_90e876ad29c4'}
+0 duplicate features removed
+Results: {'DUPLICATE_COUNT': 0, 'OUTPUT': 'output_099d3ebf_fa0d_4621_914e_02cf51912f34', 'RETAINED_COUNT': 19}
+Using specified destination CRS EPSG:25833
+Setting output type to MultiLineString
+Packaging layer 1/2: _subset
+Packaging layer 2/2: _subset
+Results: {'OUTPUT': 'output_74bb9bcf_089b_4b55_a402_f6b107d577c8'}
+Results: {'OUTPUT': 'output_bbdce426_07bf_4d7b_aab0_cf694113288b'}
+Results: {'OUTPUT': 'output_f301fd9a_360b_46fd_adaf_680cbfaf7269'}
+0 duplicate features removed
+Results: {'DUPLICATE_COUNT': 0, 'OUTPUT': 'output_cf6116b8_8ad2_4fee_bc9f_8068eefe5555', 'RETAINED_COUNT': 10}
+Using specified destination CRS EPSG:25833
+Setting output type to MultiLineString
+Packaging layer 1/2: _subset
+Packaging layer 2/2: _subset
+Results: {'OUTPUT': 'output_824c103e_80ec_4c5b_897d_9d2838c04825'}
+Results: {'OUTPUT': 'output_1f688cb3_1faf_40df_86fd_073e8bdbc28a'}
+Results: {'OUTPUT': 'output_be303b67_3551_4761_9634_ab5181ded522'}
+0 duplicate features removed
+Results: {'DUPLICATE_COUNT': 0, 'OUTPUT': 'output_d80fcc50_9303_493f_946b_141e219afabb', 'RETAINED_COUNT': 7}
+Using specified destination CRS EPSG:25833
+Setting output type to MultiLineString
+Packaging layer 1/2: _subset
+Packaging layer 2/2: _subset
+Results: {'OUTPUT': 'output_bcc517cd_3a5d_44f6_9e76_0eabef86d3e1'}
+Results: {'OUTPUT': 'output_457c16d7_10fe_452a_a2e8_7dff879d5935'}
+Results: {'OUTPUT': 'output_465ac3a3_25b3_45b9_b8c3_ef41a44eba08'}
+0 duplicate features removed
+Results: {'DUPLICATE_COUNT': 0, 'OUTPUT': 'output_9994780c_0a10_4ea7_9868_246f2808de62', 'RETAINED_COUNT': 18}
+Using specified destination CRS EPSG:25833
+Setting output type to MultiLineString
+Packaging layer 1/2: _subset
+Packaging layer 2/2: _subset
+Results: {'OUTPUT': 'output_7277d26e_8f7a_495e_b4aa_cc40dbbf755a'}
+Results: {'OUTPUT': 'output_1ac5028d_6c62_4410_8734_20384d4ab408'}
+Results: {'OUTPUT': 'output_9e04b1fb_9765_4a2d_afa7_3f174a791df5'}
+0 duplicate features removed
+Results: {'DUPLICATE_COUNT': 0, 'OUTPUT': 'output_41ee117e_53c1_4bb4_8302_e432721ce3bc', 'RETAINED_COUNT': 27}
+Using specified destination CRS EPSG:25833
+Setting output type to MultiLineString
+Packaging layer 1/2: _subset
+Packaging layer 2/2: _subset
+Results: {'OUTPUT': 'output_42536b68_72e8_4fb4_8f8c_03189268e5b6'}
+Results: {'OUTPUT': 'output_162d60b8_45fe_406c_a612_45472dfc23e8'}
+Results: {'OUTPUT': 'output_ffce0bfc_8002_49d8_a34e_22b253601705'}
+0 duplicate features removed
+Results: {'DUPLICATE_COUNT': 0, 'OUTPUT': 'output_e5f9fdb1_b423_4cd3_8947_887b79aca40a', 'RETAINED_COUNT': 10}
+Using specified destination CRS EPSG:25833
+Setting output type to MultiLineString
+Packaging layer 1/2: _subset
+Packaging layer 2/2: _subset
+Results: {'OUTPUT': 'output_1ce2f3d7_c492_4166_a2c5_958170eb8501'}
+Results: {'OUTPUT': 'output_8f8ab3dc_57b7_4f10_80c2_17c7ed0e5db4'}
+Results: {'OUTPUT': 'output_23e0f074_bfe1_4ccd_a75e_f09014bc5fe9'}
+0 duplicate features removed
+Results: {'DUPLICATE_COUNT': 0, 'OUTPUT': 'output_69558b70_426a_4141_80e6_f4e808f29bb8', 'RETAINED_COUNT': 20}
+Using specified destination CRS EPSG:25833
+Setting output type to MultiLineString
+Packaging layer 1/2: _subset
+Packaging layer 2/2: _subset
+Results: {'OUTPUT': 'output_48591f58_9288_42e9_a281_2e5901462c37'}
+Results: {'OUTPUT': 'output_9fef5308_792d_4d0a_bbd8_7e73da803d3d'}
+Results: {'OUTPUT': 'output_a87b01ea_c0d3_4e46_9421_d731ee6d5461'}
+0 duplicate features removed
+Results: {'DUPLICATE_COUNT': 0, 'OUTPUT': 'output_fc4950d5_7310_46ca_a9ec_c7e224053866', 'RETAINED_COUNT': 18}
+Using specified destination CRS EPSG:25833
+Setting output type to MultiLineString
+Packaging layer 1/2: _subset
+Packaging layer 2/2: _subset
+Results: {'OUTPUT': 'output_e29535b7_f3d4_4bba_b15b_102a62c9fea0'}
+Results: {'OUTPUT': 'output_88bab8cd_dc6b_4d36_ad73_3b49d8fa7b6f'}
+Results: {'OUTPUT': 'output_b97b38ce_155b_4321_8fc0_12faff4b009b'}
+0 duplicate features removed
+Results: {'DUPLICATE_COUNT': 0, 'OUTPUT': 'output_752baa3e_ac48_4239_b2cc_09aa975c1b87', 'RETAINED_COUNT': 14}
+Using specified destination CRS EPSG:25833
+Setting output type to MultiLineString
+Packaging layer 1/2: _subset
+Packaging layer 2/2: _subset
+Results: {'OUTPUT': 'output_63e39559_07eb_4d34_bc2c_cd1485fd1857'}
+Results: {'OUTPUT': 'output_f7e126f3_3f1b_4d17_b195_63433398c10a'}
+Results: {'OUTPUT': 'output_7c25ad71_d42f_486f_b955_72c570bcab2e'}
+0 duplicate features removed
+Results: {'DUPLICATE_COUNT': 0, 'OUTPUT': 'output_15c6696a_d4cb_43d8_9a0c_58ead5d8ba80', 'RETAINED_COUNT': 18}
+Using specified destination CRS EPSG:25833
+Setting output type to MultiLineString
+Packaging layer 1/2: _subset
+Packaging layer 2/2: _subset
+Results: {'OUTPUT': 'output_9ee634fd_26a1_4ada_bee5_3a164fb7008e'}
+Results: {'OUTPUT': 'output_88ef9757_03fd_484b_aa4f_6a1f7d6c0263'}
+Results: {'OUTPUT': 'output_18be7aee_e4e4_4991_9ae9_0898c84abd7e'}
+0 duplicate features removed
+Results: {'DUPLICATE_COUNT': 0, 'OUTPUT': 'output_50f56caf_36f9_41b9_8723_2fa8dd235b18', 'RETAINED_COUNT': 12}
+Using specified destination CRS EPSG:25833
+Setting output type to MultiLineString
+Packaging layer 1/2: _subset
+Packaging layer 2/2: _subset
+Results: {'OUTPUT': 'output_d117bf31_0bde_4f4b_88c8_ca4075841bb8'}
+Results: {'OUTPUT': 'output_839ff96a_a7c5_48ba_9ba8_a42d113375e5'}
+Results: {'OUTPUT': 'output_74d6e202_96dc_473f_a924_930f3189e3f7'}
+0 duplicate features removed
+Results: {'DUPLICATE_COUNT': 0, 'OUTPUT': 'output_319e97e7_cac9_4860_96cf_aa41b5482bfb', 'RETAINED_COUNT': 12}
+Distribution: PDP groups=19, parts=289
+Results: {'OUT_DISTRIBUTION_CABLE': 'Distribution_Cable__by_PDP__51d45338_0d2f_4a15_974b_45b870df63db', 'OUT_FEEDER_CABLE': 'Feeder_Cable__copy_of_Feeder_Trench__78f5a4f6_eb61_467f_9ec7_ba991e7ed00a', 'OUT_MERGED_INPUTS': None}
+Results: {'FILE_PATH': '/home/sowrabh/TEST_SET/OP/Feeder_Cable.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/home/sowrabh/TEST_SET/OP/Feeder_Cable.gpkg'}
+Results: {'FILE_PATH': '/home/sowrabh/TEST_SET/OP/Distribution_Cable.gpkg', 'LAYER_NAME': NULL, 'OUTPUT': '/home/sowrabh/TEST_SET/OP/Distribution_Cable.gpkg'}
+Cable Layer completed.
+OneClick finished — outputs written to folder and added to project (if enabled).
+BoQ/BoM written to /home/sowrabh/TEST_SET/OP (CSV + XLSX)
+Stamped PDP onto 19 feeder trench feature(s).
+DEBUG: entering Job Pack generation block
+DEBUG: job pack out_dir = /home/sowrabh/TEST_SET/OP
+DEBUG: jobpack_path resolved to /home/sowrabh/TEST_SET/OP/FTTH_Prechecks_Job_Pack.docx
+DEBUG: collected job pack data with keys: ['layers', 'pdp_rows', 'mfg_rows', 'summary']
+Job Pack written: /home/sowrabh/TEST_SET/OP/FTTH_Prechecks_Job_Pack.docx
+Job Pack written to: /home/sowrabh/TEST_SET/OP/FTTH_Prechecks_Job_Pack.docx
+BoQ/BoM XLSX → /home/sowrabh/TEST_SET/OP/Report_BOQ.xlsx
+Job Pack → /home/sowrabh/TEST_SET/OP/FTTH_Prechecks_Job_Pack.docx
+Saved outline-blue style sidecar.
+Outputs added to the current project (with styling).
+Execution completed in 104.73 seconds (1 minute 45 seconds)
+Results:
+  object_gpkg: /home/sowrabh/TEST_SET/OP/01_object_layer.gpkg
+  object_shp: /home/sowrabh/TEST_SET/OP/01_object_layer.shp
+  aoi_gpkg: /home/sowrabh/TEST_SET/OP/aoi.gpkg
+  roads_gpkg: /home/sowrabh/TEST_SET/OP/roads_utm.gpkg
+  buildings_gpkg: /home/sowrabh/TEST_SET/OP/buildings_utm.gpkg
+  poly_gpkg: /home/sowrabh/TEST_SET/OP/02_polygon_layer.gpkg
+  boq_bom_xlsx: /home/sowrabh/TEST_SET/OP/Report_BOQ.xlsx
+  job_pack_docx: /home/sowrabh/TEST_SET/OP/FTTH_Prechecks_Job_Pack.docx
+
+Loading resulting layers
+Algorithm 'End-to-End Pipeline' finished

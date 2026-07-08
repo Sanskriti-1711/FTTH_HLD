@@ -1,0 +1,1125 @@
+# -*- coding: utf-8 -*-
+import os
+import shutil
+
+from qgis.PyQt.QtCore import QCoreApplication
+from qgis.core import (
+    QgsProcessing,
+    QgsProcessingAlgorithm,
+    QgsProcessingException,
+    QgsProcessingMultiStepFeedback,
+    QgsProcessingParameterFile,
+    QgsProcessingParameterString,
+    QgsProcessingParameterCrs,
+    QgsProcessingParameterBoolean,
+    QgsProcessingParameterNumber,
+    QgsProcessingParameterEnum,
+    QgsProcessingParameterField,
+    QgsProcessingParameterVectorLayer,
+    QgsProcessingParameterMultipleLayers,
+    QgsProcessingParameterFeatureSink,
+    QgsProcessingUtils,
+    QgsCoordinateReferenceSystem,
+    QgsVectorFileWriter,
+    QgsMapLayer,
+)
+from qgis import processing
+
+from ..utils.params import ALG, LAYERNAMES
+
+
+class PipelineStageError(QgsProcessingException):
+    pass
+
+
+class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
+
+    P_EXCEL = "EXCEL"
+    P_ROADS = "ROADS"
+
+    P_SHEET = "SHEET"
+    P_EMAIL = "EMAIL"
+    P_OUT_CRS = "OUT_CRS"
+    P_OBJ_THIN = "OBJ_THIN_EXPORT"
+    P_OUTPUT_DIR = "OUTPUT_DIR"
+
+    P_POLY_METHOD = "POLY_METHOD"
+    P_POLY_PLAN_FIRST = "POLY_PLANNING_FIRST"
+    P_POLY_MIN_HH = "POLY_MIN_HH"
+    P_POLY_MAX_HH = "POLY_MAX_HH"
+    P_POLY_NEIGH = "POLY_NEIGHBOR_DIST"
+    P_POLY_SERVICE = "POLY_SERVICE_RADIUS"
+    P_POLY_ACCESS = "POLY_ROAD_ACCESS_DIST"
+    P_POLY_BUFFER = "POLY_BUFFER"
+    P_POLY_SEEDBUF = "POLY_SEEDBUF"
+    P_POLY_CLIP = "POLY_CLIP"
+    P_POLY_BAR_ROADS = "POLY_BARRIER_ROADS"
+    P_POLY_BAR_FIELD = "POLY_BARRIER_CLASS_FIELD"
+    P_POLY_BAR_CLASSES = "POLY_BARRIER_CLASSES"
+    P_POLY_BAR_EXTRA = "POLY_BARRIER_EXTRA"
+    P_POLY_THIN = "POLY_THIN_EXPORT"
+
+    P_OSM_PBF = "OSM_PBF"
+
+    P_TR_ROADS = "TRENCH_ROADS"
+    P_BUILDINGS = "BUILDINGS"
+    P_TR_MFG = "TRENCH_MFG"
+
+    OUT_OBJECTS = "OUT_OBJECTS"
+    OUT_POLYGONS = "OUT_POLYGONS"
+    OUT_PDP = "OUT_PDP"
+    OUT_MFG = "OUT_MFG"
+    
+    OUT_TRENCHES = "OUT_TRENCHES"
+    OUT_FEEDER_CABLE = "OUT_FEEDER_CABLE"
+    OUT_DIST_CABLE = "OUT_DIST_CABLE"
+    OUT_FEEDER_DUCTS = "OUT_FEEDER_DUCTS"
+    OUT_DIST_DUCTS = "OUT_DIST_DUCTS"
+
+    _DEFAULT_OUTPUT_FILES = {
+        OUT_OBJECTS: "Objects.gpkg",
+        OUT_POLYGONS: "Polygons.gpkg",
+        OUT_PDP: "PDPs.gpkg",
+        OUT_MFG: "MFG.gpkg",
+        OUT_TRENCHES: "Final_Trenches.gpkg",
+        OUT_FEEDER_CABLE: "Feeder_Cable.gpkg",
+        OUT_DIST_CABLE: "Distribution_Cable.gpkg",
+        OUT_FEEDER_DUCTS: "Feeder_Ducts.gpkg",
+        OUT_DIST_DUCTS: "Distribution_Ducts.gpkg",
+    }
+
+    _OBJ_EXCEL, _OBJ_SHEET, _OBJ_EMAIL = "EXCEL", "SHEET", "EMAIL"
+    _OBJ_CRS, _OBJ_GPKG, _OBJ_THIN = "OUT_CRS", "OUT_GPKG", "THIN_EXPORT"
+
+    _POLY_INPUT, _POLY_OUT = "INPUT", "OUT"
+    _POLY_METHOD, _POLY_PLAN = "METHOD", "PLANNING_FIRST"
+    _POLY_MIN, _POLY_MAX = "MIN_HH_PER_POLYGON", "MAX_HH_PER_POLYGON"
+    _POLY_NEIGH, _POLY_SERVICE, _POLY_ACCESS = (
+        "NEIGHBOR_DIST", "SERVICE_RADIUS", "ROAD_ACCESS_DIST",
+    )
+    _POLY_BUF, _POLY_SEEDBUF, _POLY_CLIP, _POLY_THIN = (
+        "BUFFER", "SEEDBUF", "CLIP", "THIN_EXPORT",
+    )
+    _POLY_BAR_ROADS, _POLY_BAR_FIELD = "BARRIER_ROADS", "BARRIER_CLASS_FIELD"
+    _POLY_BAR_CLASSES, _POLY_BAR_EXTRA = "BARRIER_MAIN_CLASSES", "BARRIER_EXTRA"
+
+    _NET_POLY, _NET_ROADS, _NET_PBF, _NET_OBJECTS = (
+        "INPUT_POLY", "INPUT_ROADS", "INPUT_OSM_PBF", "INPUT_OBJECTS",
+    )
+    _NET_EDGES, _NET_CAND, _NET_REMOVED, _NET_CLEAN = (
+        "OUT_EDGES", "OUT_CAND", "OUT_REMOVED", "OUT_CLEAN",
+    )
+    _NET_ASSIGNED, _NET_MFG, _NET_FINAL_OBJECTS = (
+        "OUT_ASSIGNED", "OUT_MFG_POINT", "OUT_FINAL_OBJECTS",
+    )
+
+    _TR_POLY, _TR_ROADS_KEY, _TR_PDP = "INPUT_POLY", "INPUT_ROADS", "INPUT_PDP"
+    _TR_HH, _TR_BLDG, _TR_MFG_KEY = "INPUT_HOUSEHOLDS", "INPUT_BUILDINGS", "INPUT_MFG"
+    _TR_SIDE_L, _TR_SIDE_R = "OUT_SIDEWALK_LEFT", "OUT_SIDEWALK_RIGHT"
+    _TR_MERGED_PDP, _TR_FEEDER_FINAL = "OUT_MERGED_PDP", "OUT_FEEDER_FINAL"
+    _TR_GARDEN, _TR_FINAL, _TR_FINAL_TAN = (
+        "OUT_GARDEN_TRENCHES", "OUT_FINAL_TRENCHES", "OUT_FINAL_TANGENT_TRENCHES",
+    )
+    _TR_DIST_LINES, _TR_DIST_DISS = "OUT_DISTRIBUTION_LINES", "OUT_DISTRIBUTION_DISS"
+    _TR_ALL_OUTPUTS = (
+        "OUT_SIDEWALK_LEFT", "OUT_SIDEWALK_RIGHT", "OUT_SIDEWALK_MERGED",
+        "OUT_SIDEWALK_BUFFERED_LEFT", "OUT_SIDEWALK_BUFFERED_RIGHT",
+        "OUT_PDP_TO_SIDE", "OUT_PSEUDO_PDP", "OUT_MERGED_PDP", "OUT_MFG_POINT",
+        "OUT_VALID_INTERSECTIONS", "OUT_TANGENT_TRENCHES", "OUT_TANGENT_TRENCHES_USED",
+        "OUT_TRENCHES_MFG_TO_PDP", "OUT_FEEDER_TRENCH", "OUT_GARDEN_TRENCHES",
+        "OUT_PSEUDO_HH", "OUT_DISTRIBUTION_LINES", "OUT_DISTRIBUTION_DISS",
+        "OUT_FINAL_TANGENT_TRENCHES", "OUT_FEEDER_FINAL", "OUT_FINAL_TRENCHES",
+        "OUT_S1_AOI_BUFFER_DISSOLVED", "OUT_S1_AOI_OUTLINE_LINES",
+        "OUT_S1_ROADS_NEAR", "OUT_S1_ROADS_FILTERED",
+    )
+
+    _CB_FEEDER, _CB_GARDEN, _CB_DISTR = (
+        "FEEDER_TRENCH", "GARDEN_TRENCHES", "DISTR_TRENCHES",
+    )
+    _CB_OUT_FEEDER, _CB_OUT_DIST = "OUT_FEEDER_CABLE", "OUT_DISTRIBUTION_CABLE"
+
+    _DU_NETWORK, _DU_MFG, _DU_PDP, _DU_OBJECTS = (
+        "NETWORK_LINES", "MFG_POINTS", "PDP_POINTS", "OBJECT_POINTS",
+    )
+    _DU_SIDE_L, _DU_SIDE_R, _DU_FINAL_TAN = (
+        "SIDEWALK_LEFT", "SIDEWALK_RIGHT", "FINAL_TANGENT_TRENCHES",
+    )
+    _DU_OUT_FEEDER, _DU_OUT_DIST = "OUT_FEEDER_DUCTS", "OUT_DISTRIBUTION_DUCTS"
+
+    _METHOD_OPTIONS = [
+        "Convex Hull (optional inset)",
+        "Concave Hull (alpha shape)",
+        "Voronoi Partition → Dissolve by group",
+        "Seeded Growth (splitter-driven builder)",
+    ]
+
+    _ROAD_CLASS_FIELDS = ("fclass", "highway", "class")
+    _PDP_ID_FIELDS = ("pdp_id", "pdp_pol_id")
+    _HH_ID_FIELDS = ("addr_id", "hh_id", "address_id", "id")
+
+    _HARDCODED_REPORT_FILES = (
+        os.path.join("Drafts", "BOQ.xlsx"),
+        os.path.join("Drafts", "BOM.xlsx"),
+    )
+
+    def tr(self, s):
+        return QCoreApplication.translate("EndToEndPipelineAlgorithm", s)
+
+    def createInstance(self):
+        return EndToEndPipelineAlgorithm()
+
+    def name(self):
+        return "end_to_end_pipeline"
+
+    def displayName(self):
+        return self.tr("One Click – End-to-End HLD Pipeline")
+
+    def group(self):
+        return self.tr("00 One Click")
+
+    def groupId(self):
+        return "00_oneclick"
+
+    def flags(self):
+        return super().flags() | QgsProcessingAlgorithm.Flag.FlagNoThreading
+
+    def shortHelpString(self):
+        return self.tr(
+            "Runs the entire HLD Planning workflow in one step: Object → Polygon "
+            "→ Network → Trench → Cable → Duct. Each stage is executed as a child "
+            "Processing algorithm and its outputs are fed automatically into the "
+            "next stage.\n\n"
+            "Every stage's own inputs are exposed here, prefixed by stage number. "
+            "Layer inputs produced by an earlier stage (premises, polygons, PDPs, "
+            "MFG, trenches, sidewalks) are wired automatically and never asked "
+            "for. The processing CRS standard is EPSG:25833.\n\n"
+            "The Roads layer should be OSM lines WITH a class field "
+            "(fclass/highway) and should include footways/paths — trench routing, "
+            "sidewalk generation and cable/duct quality all depend on it.\n\n"
+            "If any stage fails the pipeline stops immediately and reports which "
+            "stage failed."
+        )
+
+    def initAlgorithm(self, config=None):
+        self.addParameter(QgsProcessingParameterFile(
+            self.P_EXCEL, self.tr("Input Excel address list (.xlsx)"), extension="xlsx"
+        ))
+        self.addParameter(QgsProcessingParameterVectorLayer(
+            self.P_ROADS,
+            self.tr("Roads (OSM lines; fclass/highway field strongly recommended)"),
+            [QgsProcessing.TypeVectorLine]
+        ))
+
+        self.addParameter(QgsProcessingParameterString(
+            self.P_SHEET, self.tr("01 Object — Excel sheet name (blank = first)"),
+            optional=True, defaultValue=""
+        ))
+        self.addParameter(QgsProcessingParameterString(
+            self.P_EMAIL, self.tr("01 Object — Email for Nominatim geocoder User-Agent"),
+            defaultValue="you@example.com"
+        ))
+        self.addParameter(QgsProcessingParameterCrs(
+            self.P_OUT_CRS, self.tr("01 Object — Output CRS"),
+            defaultValue=QgsCoordinateReferenceSystem("EPSG:25833")
+        ))
+        self.addParameter(QgsProcessingParameterBoolean(
+            self.P_OBJ_THIN, self.tr("01 Object — Thin output profile (minimal fields)"),
+            defaultValue=False
+        ))
+        self.addParameter(QgsProcessingParameterFile(
+            self.P_OUTPUT_DIR,
+            self.tr("00 One Click — Output folder (optional; stores all final layers + BOQ/BOM copies)"),
+            behavior=QgsProcessingParameterFile.Folder,
+            optional=True,
+            defaultValue=""
+        ))
+
+        self.addParameter(QgsProcessingParameterEnum(
+            self.P_POLY_METHOD, self.tr("02 Polygon — Generation method"),
+            options=self._METHOD_OPTIONS, defaultValue=3
+        ))
+        self.addParameter(QgsProcessingParameterBoolean(
+            self.P_POLY_PLAN_FIRST,
+            self.tr("02 Polygon — Planning-first (force seeded-growth builder)"),
+            defaultValue=False, optional=True
+        ))
+        self.addParameter(QgsProcessingParameterNumber(
+            self.P_POLY_MIN_HH, self.tr("02 Polygon — Growth: minimum homes per polygon"),
+            type=QgsProcessingParameterNumber.Integer, defaultValue=32, minValue=1
+        ))
+        self.addParameter(QgsProcessingParameterNumber(
+            self.P_POLY_MAX_HH, self.tr("02 Polygon — Growth: maximum homes per polygon"),
+            type=QgsProcessingParameterNumber.Integer, defaultValue=128, minValue=1
+        ))
+        self.addParameter(QgsProcessingParameterNumber(
+            self.P_POLY_NEIGH, self.tr("02 Polygon — Growth: neighbour distance rule [m]"),
+            type=QgsProcessingParameterNumber.Double, defaultValue=150.0, minValue=1.0
+        ))
+        self.addParameter(QgsProcessingParameterNumber(
+            self.P_POLY_SERVICE,
+            self.tr("02 Polygon — Growth: service radius, max building distance from FDP [m]"),
+            type=QgsProcessingParameterNumber.Double, defaultValue=300.0, minValue=10.0
+        ))
+        self.addParameter(QgsProcessingParameterNumber(
+            self.P_POLY_ACCESS,
+            self.tr("02 Polygon — Growth: road-access check distance [m] (0 = off)"),
+            type=QgsProcessingParameterNumber.Double, defaultValue=100.0, minValue=0.0
+        ))
+        self.addParameter(QgsProcessingParameterNumber(
+            self.P_POLY_BUFFER, self.tr("02 Polygon — Post-buffer (+grow / -shrink) [m]"),
+            type=QgsProcessingParameterNumber.Double, defaultValue=0.0
+        ))
+        self.addParameter(QgsProcessingParameterNumber(
+            self.P_POLY_SEEDBUF,
+            self.tr("02 Polygon — Growth: extra edge margin around built polygons [m]"),
+            type=QgsProcessingParameterNumber.Double, defaultValue=0.0, optional=True
+        ))
+        self.addParameter(QgsProcessingParameterVectorLayer(
+            self.P_POLY_CLIP, self.tr("02 Polygon — Optional clip layer / AOI [polygons]"),
+            [QgsProcessing.TypeVectorPolygon], optional=True
+        ))
+        self.addParameter(QgsProcessingParameterVectorLayer(
+            self.P_POLY_BAR_ROADS,
+            self.tr("02 Polygon — Barrier-rule road layer [lines] (blank = main Roads)"),
+            [QgsProcessing.TypeVectorLine], optional=True
+        ))
+        self.addParameter(QgsProcessingParameterField(
+            self.P_POLY_BAR_FIELD,
+            self.tr("02 Polygon — Barrier road class field (blank = fclass/highway)"),
+            parentLayerParameterName=self.P_POLY_BAR_ROADS,
+            type=QgsProcessingParameterField.Any, optional=True
+        ))
+        self.addParameter(QgsProcessingParameterString(
+            self.P_POLY_BAR_CLASSES,
+            self.tr("02 Polygon — Restricted road classes (comma-separated)"),
+            defaultValue="motorway,trunk,primary,secondary", optional=True
+        ))
+        self.addParameter(QgsProcessingParameterMultipleLayers(
+            self.P_POLY_BAR_EXTRA,
+            self.tr("02 Polygon — Extra barrier layers (railway / river / airport zone)"),
+            QgsProcessing.TypeVectorAnyGeometry, optional=True
+        ))
+        self.addParameter(QgsProcessingParameterBoolean(
+            self.P_POLY_THIN, self.tr("02 Polygon — Thin output profile (minimal fields)"),
+            defaultValue=False
+        ))
+
+        self.addParameter(QgsProcessingParameterFile(
+            self.P_OSM_PBF,
+            self.tr("03 Network — OSM PBF (optional alternative road source)"),
+            extension="pbf", optional=True
+        ))
+
+        self.addParameter(QgsProcessingParameterVectorLayer(
+            self.P_TR_ROADS,
+            self.tr("04 Trench — Roads override incl. footways [lines] (blank = main Roads)"),
+            [QgsProcessing.TypeVectorLine], optional=True
+        ))
+        self.addParameter(QgsProcessingParameterVectorLayer(
+            self.P_BUILDINGS, self.tr("04 Trench — Buildings, trim trenches inside [polygons]"),
+            [QgsProcessing.TypeVectorPolygon], optional=True
+        ))
+        self.addParameter(QgsProcessingParameterVectorLayer(
+            self.P_TR_MFG,
+            self.tr("04 Trench — Existing MFG point override (blank = MFG from Network stage)"),
+            [QgsProcessing.TypeVectorPoint], optional=True
+        ))
+
+        self.addParameter(QgsProcessingParameterFeatureSink(
+            self.OUT_OBJECTS, self.tr("Final Object Layer"),
+            QgsProcessing.TypeVectorPoint, optional=True, createByDefault=True
+        ))
+        self.addParameter(QgsProcessingParameterFeatureSink(
+            self.OUT_POLYGONS, self.tr("Polygons"),
+            QgsProcessing.TypeVectorPolygon, optional=True, createByDefault=True
+        ))
+        self.addParameter(QgsProcessingParameterFeatureSink(
+            self.OUT_PDP, self.tr("PDPs (per polygon)"),
+            QgsProcessing.TypeVectorPoint, optional=True, createByDefault=True
+        ))
+        self.addParameter(QgsProcessingParameterFeatureSink(
+            self.OUT_MFG, self.tr("MFG point"),
+            QgsProcessing.TypeVectorPoint, optional=True, createByDefault=True
+        ))
+        self.addParameter(QgsProcessingParameterFeatureSink(
+            self.OUT_TRENCHES, self.tr("Final Trenches"),
+            QgsProcessing.TypeVectorLine, optional=True, createByDefault=True
+        ))
+        self.addParameter(QgsProcessingParameterFeatureSink(
+            self.OUT_FEEDER_CABLE, self.tr("Feeder Cable"),
+            QgsProcessing.TypeVectorLine, optional=True, createByDefault=True
+        ))
+        self.addParameter(QgsProcessingParameterFeatureSink(
+            self.OUT_DIST_CABLE, self.tr("Distribution Cable"),
+            QgsProcessing.TypeVectorLine, optional=True, createByDefault=True
+        ))
+        self.addParameter(QgsProcessingParameterFeatureSink(
+            self.OUT_FEEDER_DUCTS, self.tr("Feeder Ducts"),
+            QgsProcessing.TypeVectorLine, optional=True, createByDefault=True
+        ))
+        self.addParameter(QgsProcessingParameterFeatureSink(
+            self.OUT_DIST_DUCTS, self.tr("Distribution Ducts"),
+            QgsProcessing.TypeVectorLine, optional=True, createByDefault=True
+        ))
+
+    def _output_dir(self, parameters, context):
+        out_dir = self.parameterAsFile(parameters, self.P_OUTPUT_DIR, context) or ""
+        out_dir = out_dir.strip()
+        if not out_dir:
+            return ""
+        os.makedirs(out_dir, exist_ok=True)
+        return out_dir
+
+    def _dest(self, parameters, key, context):
+        val = parameters.get(key, None)
+        is_blank = val is None or (isinstance(val, str) and not val.strip())
+        is_temp = val == QgsProcessing.TEMPORARY_OUTPUT
+        if isinstance(val, str):
+            is_temp = is_temp or val.strip().upper() == str(QgsProcessing.TEMPORARY_OUTPUT).upper()
+
+        if not is_blank and not is_temp:
+            return val
+
+        out_dir = self._output_dir(parameters, context)
+        if out_dir:
+            fname = self._DEFAULT_OUTPUT_FILES.get(key, f"{key}.gpkg")
+            return os.path.join(out_dir, fname)
+
+        if is_blank or is_temp:
+            return QgsProcessing.TEMPORARY_OUTPUT
+        return val
+
+    def _copy_hardcoded_reports(self, parameters, context, feedback):
+        out_dir = self._output_dir(parameters, context)
+        if not out_dir:
+            return
+
+        plugin_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        search_roots = [
+            plugin_root,
+            os.getcwd(),
+            os.path.dirname(plugin_root),
+        ]
+
+        workspace_root = os.environ.get("HLDPLANNING_WORKSPACE_ROOT", "").strip()
+        if workspace_root:
+            search_roots.append(workspace_root)
+
+        seen = set()
+        deduped_roots = []
+        for root in search_roots:
+            if not root:
+                continue
+            norm = os.path.abspath(root)
+            if norm in seen:
+                continue
+            seen.add(norm)
+            deduped_roots.append(norm)
+
+        copied = 0
+        missing = []
+        for rel_path in self._HARDCODED_REPORT_FILES:
+            src = None
+            rel_or_abs = rel_path
+            if os.path.isabs(rel_or_abs) and os.path.exists(rel_or_abs):
+                src = rel_or_abs
+            else:
+                for root in deduped_roots:
+                    cand = os.path.join(root, rel_or_abs)
+                    if os.path.exists(cand):
+                        src = cand
+                        break
+
+            if src is None:
+                missing.append(rel_path)
+                continue
+
+            dst = os.path.join(out_dir, os.path.basename(src))
+            try:
+                shutil.copy2(src, dst)
+                copied += 1
+            except Exception as exc:
+                feedback.pushWarning(self.tr(
+                    "Failed to copy hardcoded report template '%s': %s"
+                ) % (src, exc))
+
+        if copied:
+            feedback.pushInfo(self.tr(
+                "Copied %d hardcoded report file(s) (BOQ/BOM) to output folder."
+            ) % copied)
+        elif missing:
+            feedback.pushInfo(self.tr(
+                "BOQ/BOM template files were not found in configured hardcoded locations; skipping report copy."
+            ))
+
+    def _object_source(self, gpkg_path):
+        if gpkg_path:
+            return "{0}|layername={1}".format(gpkg_path, LAYERNAMES.OBJECT)
+        return None
+
+    def _stage_error(self, stage, err):
+        return self.tr(
+            "Pipeline failed during {stage}\n\nOriginal Error:\n{err}"
+        ).format(stage=stage, err=str(err))
+
+    def _resolve_layer(self, value, context):
+        if value is None:
+            return None
+        if isinstance(value, str):
+            if not value.strip():
+                return None
+            try:
+                return QgsProcessingUtils.mapLayerFromString(value, context)
+            except Exception:
+                return None
+        return value
+
+    def _find_layer(self, val, context):
+        """Find a layer by string ID / source path.
+        Tries: temporary layer store → mapLayerFromString → project layers."""
+        if not val or not isinstance(val, str):
+            return None
+
+        # 1) Direct ID lookup in the processing context's temporary layer store
+        layer_store = context.temporaryLayerStore()
+        if layer_store:
+            try:
+                layer = layer_store.mapLayer(val)
+                if layer is not None:
+                    return layer
+            except Exception:
+                pass
+
+        # 2) Standard mapLayerFromString (searches by ID, name, source path)
+        try:
+            layer = QgsProcessingUtils.mapLayerFromString(val, context)
+            if layer is not None:
+                return layer
+        except Exception:
+            pass
+
+        # 3) Project layers as last resort
+        try:
+            from qgis.core import QgsProject
+            layer = QgsProject.instance().mapLayer(val)
+            if layer is not None:
+                return layer
+        except Exception:
+            pass
+
+        return None
+
+    def _count(self, layer):
+        if layer is None:
+            return None
+        try:
+            n = layer.featureCount()
+        except Exception:
+            return None
+        return n if n is not None and n >= 0 else None
+
+    def _fmt_count(self, n):
+        return self.tr("unknown") if n is None else str(n)
+
+    def _has_field(self, layer, candidates):
+        if layer is None:
+            return False
+        try:
+            names = {f.name().lower() for f in layer.fields()}
+        except Exception:
+            return False
+        return any(c in names for c in candidates)
+
+    def run_object_layer(self, parameters, context, feedback):
+        params = {
+            self._OBJ_EXCEL: self.parameterAsFile(parameters, self.P_EXCEL, context),
+            self._OBJ_SHEET: self.parameterAsString(parameters, self.P_SHEET, context) or "",
+            self._OBJ_EMAIL: self.parameterAsString(parameters, self.P_EMAIL, context)
+                             or "you@example.com",
+            self._OBJ_CRS: self.parameterAsCrs(parameters, self.P_OUT_CRS, context),
+            self._OBJ_GPKG: QgsProcessing.TEMPORARY_OUTPUT,
+            self._OBJ_THIN: self.parameterAsBoolean(parameters, self.P_OBJ_THIN, context),
+        }
+        return processing.run(ALG.OBJECT, params, context=context, feedback=feedback,
+                              is_child_algorithm=True)
+
+    def run_polygon_layer(self, parameters, results, context, feedback):
+        clip = self.parameterAsVectorLayer(parameters, self.P_POLY_CLIP, context)
+        barrier_roads = self.parameterAsVectorLayer(parameters, self.P_POLY_BAR_ROADS, context)
+        if barrier_roads is None:
+            barrier_roads = self.parameterAsVectorLayer(parameters, self.P_ROADS, context)
+        barrier_field = self.parameterAsFields(parameters, self.P_POLY_BAR_FIELD, context)
+        try:
+            barrier_extra = self.parameterAsLayerList(parameters, self.P_POLY_BAR_EXTRA, context)
+        except Exception:
+            barrier_extra = None
+        params = {
+            self._POLY_INPUT: results["objects"],
+            self._POLY_METHOD: self.parameterAsEnum(parameters, self.P_POLY_METHOD, context),
+            self._POLY_PLAN: self.parameterAsBoolean(parameters, self.P_POLY_PLAN_FIRST, context),
+            self._POLY_MIN: self.parameterAsInt(parameters, self.P_POLY_MIN_HH, context),
+            self._POLY_MAX: self.parameterAsInt(parameters, self.P_POLY_MAX_HH, context),
+            self._POLY_NEIGH: self.parameterAsDouble(parameters, self.P_POLY_NEIGH, context),
+            self._POLY_SERVICE: self.parameterAsDouble(parameters, self.P_POLY_SERVICE, context),
+            self._POLY_ACCESS: self.parameterAsDouble(parameters, self.P_POLY_ACCESS, context),
+            self._POLY_BUF: self.parameterAsDouble(parameters, self.P_POLY_BUFFER, context),
+            self._POLY_SEEDBUF: self.parameterAsDouble(parameters, self.P_POLY_SEEDBUF, context),
+            self._POLY_BAR_CLASSES: self.parameterAsString(
+                parameters, self.P_POLY_BAR_CLASSES, context
+            ) or "motorway,trunk,primary,secondary",
+            self._POLY_THIN: self.parameterAsBoolean(parameters, self.P_POLY_THIN, context),
+            self._POLY_OUT: self._dest(parameters, self.OUT_POLYGONS, context),
+        }
+        if clip is not None:
+            params[self._POLY_CLIP] = clip
+        if barrier_roads is not None:
+            params[self._POLY_BAR_ROADS] = barrier_roads
+        if barrier_field:
+            params[self._POLY_BAR_FIELD] = barrier_field[0]
+        if barrier_extra:
+            params[self._POLY_BAR_EXTRA] = barrier_extra
+        return processing.run(ALG.POLYGON, params, context=context, feedback=feedback,
+                              is_child_algorithm=True)
+
+    def run_network_layer(self, parameters, results, context, feedback):
+        roads = self.parameterAsVectorLayer(parameters, self.P_ROADS, context)
+        pbf = self.parameterAsFile(parameters, self.P_OSM_PBF, context)
+        mfg_override = self.parameterAsVectorLayer(parameters, self.P_TR_MFG, context)
+        params = {
+            self._NET_POLY: results["polygons"],
+            self._NET_OBJECTS: results["objects"],
+            self._NET_EDGES: QgsProcessing.TEMPORARY_OUTPUT,
+            self._NET_CAND: QgsProcessing.TEMPORARY_OUTPUT,
+            self._NET_REMOVED: QgsProcessing.TEMPORARY_OUTPUT,
+            self._NET_CLEAN: QgsProcessing.TEMPORARY_OUTPUT,
+            self._NET_ASSIGNED: self._dest(parameters, self.OUT_PDP, context),
+            self._NET_MFG: (QgsProcessing.TEMPORARY_OUTPUT if mfg_override is not None
+                            else self._dest(parameters, self.OUT_MFG, context)),
+            self._NET_FINAL_OBJECTS: self._dest(parameters, self.OUT_OBJECTS, context),
+        }
+        if roads is not None:
+            params[self._NET_ROADS] = roads
+        if pbf:
+            params[self._NET_PBF] = pbf
+        return processing.run(ALG.NETWORK, params, context=context, feedback=feedback,
+                              is_child_algorithm=True)
+
+    def run_trench_layer(self, parameters, results, context, feedback):
+        roads = self.parameterAsVectorLayer(parameters, self.P_TR_ROADS, context)
+        if roads is None:
+            roads = self.parameterAsVectorLayer(parameters, self.P_ROADS, context)
+        buildings = self.parameterAsVectorLayer(parameters, self.P_BUILDINGS, context)
+        params = {k: QgsProcessing.TEMPORARY_OUTPUT for k in self._TR_ALL_OUTPUTS}
+        params[self._TR_POLY] = results["polygons"]
+        params[self._TR_ROADS_KEY] = roads
+        params[self._TR_PDP] = results["pdp"]
+        params[self._TR_FINAL] = self._dest(parameters, self.OUT_TRENCHES, context)
+        if results.get("objects"):
+            params[self._TR_HH] = results["objects"]
+        if results.get("mfg") is not None:
+            params[self._TR_MFG_KEY] = results["mfg"]
+        if buildings is not None:
+            params[self._TR_BLDG] = buildings
+        return processing.run(ALG.TRENCH, params, context=context, feedback=feedback,
+                              is_child_algorithm=True)
+
+    def run_cable_layer(self, parameters, results, context, feedback):
+        params = {
+            self._CB_FEEDER: results.get("feeder"),
+            self._CB_GARDEN: results.get("garden"),
+            self._CB_DISTR: results.get("distribution"),
+            self._CB_OUT_FEEDER: self._dest(parameters, self.OUT_FEEDER_CABLE, context),
+            self._CB_OUT_DIST: self._dest(parameters, self.OUT_DIST_CABLE, context),
+        }
+        return processing.run(ALG.CABLE, params, context=context, feedback=feedback,
+                              is_child_algorithm=True)
+
+    def run_duct_layer(self, parameters, results, context, feedback):
+        params = {
+            self._DU_NETWORK: results.get("trenches"),
+            self._DU_MFG: results.get("mfg"),
+            self._DU_PDP: results.get("pdp"),
+            self._DU_OBJECTS: results.get("objects"),
+            self._DU_OUT_FEEDER: self._dest(parameters, self.OUT_FEEDER_DUCTS, context),
+            self._DU_OUT_DIST: self._dest(parameters, self.OUT_DIST_DUCTS, context),
+        }
+        if results.get("sidewalk_l"):
+            params[self._DU_SIDE_L] = results["sidewalk_l"]
+        if results.get("sidewalk_r"):
+            params[self._DU_SIDE_R] = results["sidewalk_r"]
+        return processing.run(ALG.DUCT, params, context=context, feedback=feedback,
+                              is_child_algorithm=True)
+
+    def _preflight_cable(self, results, context, feedback):
+        feeder = self._resolve_layer(results.get("feeder"), context)
+        garden = self._resolve_layer(results.get("garden"), context)
+        dist = self._resolve_layer(results.get("distribution"), context)
+
+        missing = [n for n, l in (
+            ("Feeder trenches", feeder),
+            ("Garden trenches", garden),
+            ("Distribution trenches", dist),
+        ) if l is None]
+        if missing:
+            raise PipelineStageError(self._stage_error(
+                "Cable Layer",
+                self.tr(
+                    "The Trench stage did not produce: {m}. "
+                    "Cables cannot be built without them. Check the Trench stage "
+                    "log above for routing errors."
+                ).format(m=", ".join(missing))
+            ))
+
+        n_f, n_g, n_d = self._count(feeder), self._count(garden), self._count(dist)
+        feedback.pushInfo(self.tr(
+            "Cable pre-flight — feeder: {f}, garden: {g}, distribution: {d} features."
+        ).format(f=self._fmt_count(n_f), g=self._fmt_count(n_g), d=self._fmt_count(n_d)))
+
+        if (n_f, n_g, n_d) == (0, 0, 0):
+            raise PipelineStageError(self._stage_error(
+                "Cable Layer",
+                self.tr(
+                    "The Trench stage produced 0 feeder, 0 garden and 0 "
+                    "distribution trenches, so there is nothing to build cables "
+                    "from.\n\nMost likely causes:\n"
+                    "- The Roads layer has no class field (fclass/highway), so "
+                    "footways/vehicular roads could not be told apart and the "
+                    "routing graph degraded.\n"
+                    "- The MFG point could not be snapped onto the sidewalk "
+                    "graph (check the Trench log for 'MFG did not snap').\n\n"
+                    "Fix: supply OSM roads WITH an fclass/highway field that "
+                    "include footway/path/service lines (use the '04 Trench — "
+                    "Roads override' input if your main Roads layer is "
+                    "vehicular-only), then re-run."
+                )
+            ))
+
+        problems = []
+        if not self._has_field(garden, self._PDP_ID_FIELDS):
+            problems.append(self.tr(
+                "Garden trenches carry no PDP_ID field (objects reached the "
+                "Trench stage without PDP assignment)"
+            ))
+        if not self._has_field(dist, self._PDP_ID_FIELDS):
+            problems.append(self.tr("Distribution trenches carry no PDP_ID field"))
+        if problems:
+            raise PipelineStageError(self._stage_error(
+                "Cable Layer", "; ".join(problems) + "."
+            ))
+
+        if n_f == 0:
+            feedback.pushWarning(self.tr(
+                "0 feeder trenches were routed (MFG snap or graph connectivity "
+                "failed) — the Feeder Cable output will be empty. Check the "
+                "Trench log and the Roads layer classification."
+            ))
+
+    def _check_tangent_intersections(self, results, context, feedback):
+        """Warn if any OUT_FINAL_TANGENT_TRENCHES features don't intersect
+        any feeder or distribution trench (orphan drills)."""
+        from qgis.core import QgsSpatialIndex, QgsFeatureRequest
+
+        final_tan = self._resolve_layer(results.get("final_tan"), context)
+        if final_tan is None:
+            return
+        n_tan = self._count(final_tan)
+        if n_tan is None or n_tan == 0:
+            feedback.pushInfo(self.tr(
+                "Tangent check: no final tangent trenches to check."
+            ))
+            return
+
+        feeder = self._resolve_layer(results.get("feeder"), context)
+        dist = self._resolve_layer(results.get("distribution"), context)
+
+        # Build a combined spatial index of feeder + distribution
+        ref_feats = []
+        if feeder:
+            ref_feats.extend(list(feeder.getFeatures()))
+        if dist:
+            ref_feats.extend(list(dist.getFeatures()))
+
+        if not ref_feats:
+            feedback.pushWarning(self.tr(
+                "Tangent check: {n} tangent trench(es) exist but no feeder or "
+                "distribution trenches to intersect against."
+            ).format(n=n_tan))
+            return
+
+        ref_idx = QgsSpatialIndex()
+        for rf in ref_feats:
+            ref_idx.addFeature(rf)
+        fid_map = {f.id(): f for f in ref_feats}
+
+        orphan_count = 0
+        for tf in final_tan.getFeatures():
+            g = tf.geometry()
+            if g is None or g.isEmpty():
+                orphan_count += 1
+                continue
+            box = g.boundingBox()
+            hits = ref_idx.intersects(box)
+            intersects = False
+            for fid in hits:
+                rf = fid_map.get(fid)
+                if rf and rf.geometry() and g.intersects(rf.geometry()):
+                    intersects = True
+                    break
+            if not intersects:
+                orphan_count += 1
+
+        if orphan_count > 0:
+            feedback.pushWarning(self.tr(
+                "\u26a0\ufe0f {n} of {total} tangent trench feature(s) do not intersect "
+                "any feeder or distribution path — they may be orphaned drill "
+                "crossings that no route uses. Check OUT_FINAL_TANGENT_TRENCHES."
+            ).format(n=orphan_count, total=n_tan))
+        else:
+            feedback.pushInfo(self.tr(
+                "Tangent check: all {n} tangent trench(es) intersect a feeder "
+                "or distribution path.".format(n=n_tan)
+            ))
+
+    def _preflight_duct(self, results, context, feedback):
+        trenches = self._resolve_layer(results.get("trenches"), context)
+        n_t = self._count(trenches)
+        feedback.pushInfo(self.tr(
+            "Duct pre-flight — final trenches: %s features."
+        ) % self._fmt_count(n_t))
+        if trenches is None or n_t == 0:
+            raise PipelineStageError(self._stage_error(
+                "Duct Layer",
+                self.tr(
+                    "Final Trenches are empty — ducts need the trench network "
+                    "lines to route on. Check the Trench stage log."
+                )
+            ))
+        if results.get("mfg") is None or results.get("pdp") is None:
+            raise PipelineStageError(self._stage_error(
+                "Duct Layer",
+                self.tr("MFG and PDP layers are required but missing.")
+            ))
+        objects = self._resolve_layer(results.get("objects"), context)
+        problems = []
+        if not self._has_field(objects, self._PDP_ID_FIELDS):
+            problems.append(self.tr(
+                "the Objects layer carries no PDP_ID field, so distribution "
+                "ducts cannot match households to PDPs"
+            ))
+        if not self._has_field(objects, self._HH_ID_FIELDS):
+            problems.append(self.tr(
+                "the Objects layer carries no household id field "
+                "(ADDR_ID/HH_ID/id)"
+            ))
+        if problems:
+            raise PipelineStageError(self._stage_error(
+                "Duct Layer", "; ".join(problems) + "."
+            ))
+
+    def _save_layer_to_gpkg(self, val, fname, out_dir, context, feedback):
+        """
+        Save a layer (string ID, file path, or QgsMapLayer object) to GPKG.
+        Returns the output file path on success, or the original value on failure.
+        """
+        if not val or not out_dir:
+            return val
+        dst = os.path.join(out_dir, fname)
+        # Already points to the destination? Skip.
+        if isinstance(val, str) and val == dst:
+            return val
+        # Already a file on disk? Copy it.
+        if isinstance(val, str) and os.path.isfile(val):
+            try:
+                shutil.copy2(val, dst)
+                return dst
+            except Exception:
+                return val
+        # Resolve the layer: from string ID or use the object directly
+        layer = None
+        if isinstance(val, str):
+            layer = self._find_layer(val, context)
+        elif isinstance(val, QgsMapLayer):
+            layer = val
+        if layer is not None:
+            try:
+                opts = QgsVectorFileWriter.SaveVectorOptions()
+                opts.driverName = "GPKG"
+                opts.layerName = fname.replace(".gpkg", "")
+                err = QgsVectorFileWriter.writeAsVectorFormatV3(
+                    layer, dst, context.transformContext(), opts
+                )
+                if err[0] == QgsVectorFileWriter.NoError:
+                    return dst
+            except Exception:
+                pass
+        return val
+
+    def execute_pipeline(self, parameters, context, feedback):
+        results = {}
+        steps = QgsProcessingMultiStepFeedback(6, feedback)
+        out_dir = self._output_dir(parameters, context)
+
+        if feedback.isCanceled():
+            return {}
+        steps.setCurrentStep(0)
+        feedback.pushInfo(self.tr("[5%] Running Object Layer"))
+        obj = self._run("Object Layer", self.run_object_layer,
+                        parameters, context, steps, feedback)
+        results["objects_gpkg"] = obj.get(self._OBJ_GPKG, "")
+        results["objects"] = self._object_source(results["objects_gpkg"])
+        if not results["objects"]:
+            raise QgsProcessingException(self.tr(
+                "Object Layer produced no GeoPackage; cannot continue."
+            ))
+
+        if feedback.isCanceled():
+            return {}
+        steps.setCurrentStep(1)
+        feedback.pushInfo(self.tr("[20%] Running Polygon Layer"))
+        poly = self._run("Polygon Layer", self.run_polygon_layer,
+                         parameters, context, steps, feedback, results=results)
+        results["polygons"] = poly.get(self._POLY_OUT)
+        if out_dir:
+            results["polygons"] = self._save_layer_to_gpkg(
+                results["polygons"], "Polygons.gpkg", out_dir, context, feedback)
+
+        if feedback.isCanceled():
+            return {}
+        steps.setCurrentStep(2)
+        feedback.pushInfo(self.tr("[35%] Running Network Layer"))
+        net = self._run("Network Layer", self.run_network_layer,
+                        parameters, context, steps, feedback, results=results)
+        results["network"] = net.get(self._NET_EDGES)
+        results["pdp"] = net.get(self._NET_ASSIGNED)
+        results["mfg"] = net.get(self._NET_MFG)
+        if out_dir:
+            results["pdp"] = self._save_layer_to_gpkg(
+                results["pdp"], "PDPs.gpkg", out_dir, context, feedback)
+        final_objects = net.get(self._NET_FINAL_OBJECTS)
+        if final_objects:
+            results["objects"] = final_objects
+            if out_dir:
+                results["objects"] = self._save_layer_to_gpkg(
+                    results["objects"], "Objects.gpkg", out_dir, context, feedback)
+        else:
+            raise PipelineStageError(self._stage_error(
+                "Network Layer",
+                self.tr(
+                    "Final_Object_Layer was not produced — objects could not be "
+                    "linked to polygons/PDPs, and the Trench, Cable and Duct "
+                    "stages depend on that linkage."
+                )
+            ))
+        if not results.get("pdp"):
+            raise PipelineStageError(self._stage_error(
+                "Network Layer", self.tr("No PDP layer was produced.")
+            ))
+        mfg_override = self.parameterAsVectorLayer(parameters, self.P_TR_MFG, context)
+        if mfg_override is not None:
+            feedback.pushInfo(self.tr("Using the user-supplied MFG point override."))
+            results["mfg"] = mfg_override
+        elif results.get("mfg") is None:
+            raise PipelineStageError(self._stage_error(
+                "Network Layer",
+                self.tr(
+                    "No MFG point was produced — the Trench (feeder routing) and "
+                    "Duct stages require it. Supply one via '04 Trench — Existing "
+                    "MFG point override' or check the Network stage log."
+                )
+            ))
+        # Save MFG after override check so the correct MFG ends up in the output folder
+        if out_dir:
+            results["mfg"] = self._save_layer_to_gpkg(
+                results["mfg"], "MFG.gpkg", out_dir, context, feedback)
+
+        if feedback.isCanceled():
+            return {}
+        steps.setCurrentStep(3)
+        feedback.pushInfo(self.tr("[55%] Running Trench Layer"))
+        tr = self._run("Trench Layer", self.run_trench_layer,
+                       parameters, context, steps, feedback, results=results)
+        results["sidewalk_l"] = tr.get(self._TR_SIDE_L)
+        results["sidewalk_r"] = tr.get(self._TR_SIDE_R)
+        results["trenches"] = tr.get(self._TR_FINAL)
+        results["feeder"] = tr.get(self._TR_FEEDER_FINAL)
+        results["garden"] = tr.get(self._TR_GARDEN)
+        results["distribution"] = (
+            tr.get(self._TR_DIST_LINES)
+            or tr.get(self._TR_DIST_DISS)
+            or tr.get(self._TR_MERGED_PDP)
+        )
+        if out_dir:
+            results["trenches"] = self._save_layer_to_gpkg(
+                results["trenches"], "Final_Trenches.gpkg", out_dir, context, feedback)
+
+        # Tangent trenches are no longer forwarded in the OneClick flow.
+
+        if feedback.isCanceled():
+            return {}
+        steps.setCurrentStep(4)
+        feedback.pushInfo(self.tr("[75%] Running Cable Layer"))
+        self._preflight_cable(results, context, feedback)
+        cab = self._run("Cable Layer", self.run_cable_layer,
+                        parameters, context, steps, feedback, results=results)
+        results["cables"] = cab
+        if out_dir:
+            fc = results["cables"].get(self._CB_OUT_FEEDER)
+            if fc:
+                results["cables"][self._CB_OUT_FEEDER] = self._save_layer_to_gpkg(
+                    fc, "Feeder_Cable.gpkg", out_dir, context, feedback)
+            dc = results["cables"].get(self._CB_OUT_DIST)
+            if dc:
+                results["cables"][self._CB_OUT_DIST] = self._save_layer_to_gpkg(
+                    dc, "Distribution_Cable.gpkg", out_dir, context, feedback)
+
+        if feedback.isCanceled():
+            return {}
+        steps.setCurrentStep(5)
+        feedback.pushInfo(self.tr("[90%] Running Duct Layer"))
+        self._preflight_duct(results, context, feedback)
+        duct = self._run("Duct Layer", self.run_duct_layer,
+                         parameters, context, steps, feedback, results=results)
+        results["ducts"] = duct
+        if out_dir:
+            fd = results["ducts"].get(self._DU_OUT_FEEDER)
+            if fd:
+                results["ducts"][self._DU_OUT_FEEDER] = self._save_layer_to_gpkg(
+                    fd, "Feeder_Ducts.gpkg", out_dir, context, feedback)
+            dd = results["ducts"].get(self._DU_OUT_DIST)
+            if dd:
+                results["ducts"][self._DU_OUT_DIST] = self._save_layer_to_gpkg(
+                    dd, "Distribution_Ducts.gpkg", out_dir, context, feedback)
+
+        feedback.pushInfo(self.tr("[100%] Complete"))
+
+        return self._collect_outputs(results, parameters, context, feedback)
+
+    def _run(self, stage_name, runner, parameters, context, feedback, base_feedback=None,
+             results=None):
+        base = base_feedback if base_feedback is not None else feedback
+        try:
+            if results is None:
+                return runner(parameters, context, feedback)
+            return runner(parameters, results, context, feedback)
+        except PipelineStageError:
+            raise
+        except Exception as exc:
+            if base.isCanceled():
+                raise QgsProcessingException(
+                    self.tr("Pipeline canceled during %s.") % stage_name
+                )
+            raise PipelineStageError(self._stage_error(stage_name, exc))
+
+    def _collect_outputs(self, results, parameters, context, feedback):
+        out = {}
+
+        def put(key, value):
+            if value not in (None, ""):
+                out[key] = value
+
+        cables = results.get("cables") or {}
+        ducts = results.get("ducts") or {}
+
+        put(self.OUT_OBJECTS, results.get("objects"))
+        put(self.OUT_POLYGONS, results.get("polygons"))
+        put(self.OUT_PDP, results.get("pdp"))
+        put(self.OUT_MFG, results.get("mfg"))
+        put(self.OUT_TRENCHES, results.get("trenches"))
+        put(self.OUT_FEEDER_CABLE, cables.get(self._CB_OUT_FEEDER))
+        put(self.OUT_DIST_CABLE, cables.get(self._CB_OUT_DIST))
+        put(self.OUT_FEEDER_DUCTS, ducts.get(self._DU_OUT_FEEDER))
+        put(self.OUT_DIST_DUCTS, ducts.get(self._DU_OUT_DIST))
+
+        # ── Save ALL outputs to GPKG files in the output folder ──
+        out_dir = self._output_dir(parameters, context)
+        if out_dir:
+            saved = 0
+            for key, fname in self._DEFAULT_OUTPUT_FILES.items():
+                val = out.get(key)
+                if not val or not isinstance(val, str):
+                    continue
+                dst = os.path.join(out_dir, fname)
+                try:
+                    # Resolve the layer via comprehensive search
+                    layer = self._find_layer(val, context)
+                    if layer is not None:
+                        # Already points to our desired destination? Skip.
+                        if val == dst:
+                            continue
+                        opts = QgsVectorFileWriter.SaveVectorOptions()
+                        opts.driverName = "GPKG"
+                        opts.layerName = fname.replace(".gpkg", "")
+                        err = QgsVectorFileWriter.writeAsVectorFormatV3(
+                            layer, dst, context.transformContext(), opts
+                        )
+                        if err[0] == QgsVectorFileWriter.NoError:
+                            out[key] = dst
+                            saved += 1
+                        else:
+                            feedback.pushWarning(self.tr(
+                                "Could not write %s to output folder: %s"
+                            ) % (fname, err[1]))
+                    elif os.path.isfile(val):
+                        # File on disk that wasn't resolvable as a layer — copy it
+                        shutil.copy2(val, dst)
+                        out[key] = dst
+                        saved += 1
+                    else:
+                        feedback.pushWarning(self.tr(
+                            "Could not resolve layer '%s' to save as %s"
+                        ) % (val, fname))
+                except Exception as exc:
+                    feedback.pushWarning(self.tr(
+                        "Could not save %s to output folder: %s"
+                    ) % (fname, exc))
+            if saved:
+                feedback.pushInfo(self.tr(
+                    "Saved %d output layer(s) to output folder as GPKG files."
+                ) % saved)
+
+        return out
+
+    def _validate_inputs(self, parameters, context, feedback):
+        excel = self.parameterAsFile(parameters, self.P_EXCEL, context)
+        if not excel or not os.path.exists(excel):
+            raise QgsProcessingException(self.tr(
+                "Input Excel file not found: %s") % (excel or "<empty>"))
+
+        roads = self.parameterAsVectorLayer(parameters, self.P_ROADS, context)
+        if roads is None or not roads.isValid():
+            raise QgsProcessingException(self.tr(
+                "A valid Roads layer is required (Network and Trench stages need it)."
+            ))
+
+        min_hh = self.parameterAsInt(parameters, self.P_POLY_MIN_HH, context)
+        max_hh = self.parameterAsInt(parameters, self.P_POLY_MAX_HH, context)
+        if max_hh < min_hh:
+            raise QgsProcessingException(self.tr(
+                "02 Polygon — maximum homes per polygon (%d) must be >= minimum (%d)."
+            ) % (max_hh, min_hh))
+
+        tr_roads = self.parameterAsVectorLayer(parameters, self.P_TR_ROADS, context)
+        roads_for_trench = tr_roads if tr_roads is not None else roads
+        if not self._has_field(roads_for_trench, self._ROAD_CLASS_FIELDS):
+            feedback.pushWarning(self.tr(
+                "The roads layer used for trenching ('%s') has NO road class "
+                "field (fclass/highway/class). All lines will be treated as "
+                "walkable, footways and vehicular roads cannot be told apart, "
+                "and feeder/distribution routing quality will degrade — cables "
+                "and ducts may come out empty. Strongly recommended: use an OSM "
+                "roads export that keeps the fclass (Geofabrik shapefiles) or "
+                "highway (raw OSM) attribute and includes footway/path/service "
+                "lines."
+            ) % roads_for_trench.name())
+        if not self._has_field(roads, self._ROAD_CLASS_FIELDS):
+            feedback.pushWarning(self.tr(
+                "The main Roads layer ('%s') has no fclass/highway field — the "
+                "Network stage cannot filter PDP-candidate streets and will use "
+                "all clipped roads."
+            ) % roads.name())
+
+    def processAlgorithm(self, parameters, context, feedback):
+        self._validate_inputs(parameters, context, feedback)
+        out = self.execute_pipeline(parameters, context, feedback)
+        self._copy_hardcoded_reports(parameters, context, feedback)
+        return out

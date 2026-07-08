@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.pyc
+
+# QGIS processing logs / drafts (temporary)
+logs/
+Drafts/
+Versions/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# GeoPackage & QGIS style sidecars (generated)
+*.gpkg
+*.gpkg-shm
+*.gpkg-wal
+*.qml
+
+# Processing temp files
+processing_*/
+
+# ZIP archives (distribution snapshots)
+*.zip
+
+# Node / npm (used for GitHub CLI tooling)
+node_modules/
+package.json
+package-lock.json
+
+# GitHub templates / actions (auto-generated)
+.github/
+
+# Token / credential stores
+.tokensave/

@@ -1,0 +1,19 @@
+[general]
+name=HLDPlanning
+qgisMinimumVersion=3.22
+description=Processing plugin for FTTH High-Level Design planning: address geocoding, service polygons, PDP/MFG network, trenches, ducts and cables.
+version=1.2.0
+author=Sowrabh
+email=mr.sowrabh.m@gmail.com
+about=Provides seven algorithms for FTTH High Level Design (HLD) planning: 01 Object Layer (geocoding from Excel), 02 Polygon Layer (service areas), 03 Network Layer (PDP/MFG placement), 04 Trench Layer (civil-works routing), 05 Duct Layer (feeder/distribution ducts), 06 Cable Layer, and a One Click end-to-end pipeline with BoQ/BoM reporting.
+category=Analysis
+icon=icons/hldplanning.svg
+# Declares that this plugin registers a Processing provider via
+# HLDPlanningPlugin.initProcessing(). Required for qgis_process (headless/CI)
+# to load the algorithms; the desktop GUI loads them via initGui() as well.
+hasProcessingProvider=yes
+experimental=False
+homepage=https://github.com/your-repo-link
+tracker=https://github.com/your-repo-link/issues
+repository=https://github.com/your-repo-link
+changelog=Initial stable release with object layer algorithm support.
