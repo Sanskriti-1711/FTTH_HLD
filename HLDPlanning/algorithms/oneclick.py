@@ -2,6 +2,7 @@
 import os
 import shutil
 import datetime
+import time
 
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
@@ -445,6 +446,18 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         os.makedirs(out_dir, exist_ok=True)
         return out_dir
 
+    def _temp_path(self, fname):
+        """Generate a unique temp GPKG file path for an output layer."""
+        stem = os.path.splitext(fname)[0].replace(" ", "_")
+        try:
+            return QgsProcessingUtils.generateTempFilename(f"{stem}.gpkg")
+        except Exception:
+            import tempfile, uuid
+            return os.path.join(
+                tempfile.gettempdir(),
+                f"HLD_{stem}_{uuid.uuid4().hex[:12]}.gpkg"
+            )
+
     def _dest(self, parameters, key, context):
         val = parameters.get(key, None)
         is_blank = val is None or (isinstance(val, str) and not val.strip())
@@ -460,9 +473,10 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             fname = self._DEFAULT_OUTPUT_FILES.get(key, f"{key}.gpkg")
             return os.path.join(out_dir, fname)
 
-        if is_blank or is_temp:
-            return QgsProcessing.TEMPORARY_OUTPUT
-        return val
+        # No output directory — keep layers in memory for performance.
+        # Avoid writing to temp disk files which is a major bottleneck
+        # for large datasets.
+        return QgsProcessing.TEMPORARY_OUTPUT
 
     def _copy_hardcoded_reports(self, parameters, context, feedback):
         out_dir = self._output_dir(parameters, context)
@@ -867,54 +881,78 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
     def _save_layer_to_gpkg(self, val, fname, out_dir, context, feedback):
         """
         Save a layer (string ID, file path, or QgsMapLayer object) to GPKG.
+        Only writes to disk when an explicit output directory is requested.
+        When no output directory is provided, returns the value as-is to avoid
+        expensive disk I/O — layers stay in memory for downstream consumers.
         Returns the output file path on success, or the original value on failure.
         """
+        t0 = time.time()
         if not val or not out_dir:
+            feedback.pushInfo(f"  [timing] {fname}: skipped (no output dir) in {time.time() - t0:.3f}s")
             return val
+
         dst = os.path.join(out_dir, fname)
-        # Already points to the destination? Skip.
-        if isinstance(val, str) and val == dst:
-            return val
-        # Already a file on disk? Copy it.
+
+        # Already a file on disk — copy it to the output directory
         if isinstance(val, str) and os.path.isfile(val):
+            if val == dst:
+                feedback.pushInfo(f"  [timing] {fname}: already at destination in {time.time() - t0:.3f}s")
+                return val
             try:
                 shutil.copy2(val, dst)
+                feedback.pushInfo(f"  [timing] {fname}: copied to disk in {time.time() - t0:.3f}s")
                 return dst
             except Exception:
+                feedback.pushInfo(f"  [timing] {fname}: copy failed in {time.time() - t0:.3f}s")
                 return val
+
         # Resolve the layer: from string ID or use the object directly
         layer = None
         if isinstance(val, str):
             layer = self._find_layer(val, context)
         elif isinstance(val, QgsMapLayer):
             layer = val
-        if layer is not None:
-            try:
-                opts = QgsVectorFileWriter.SaveVectorOptions()
-                opts.driverName = "GPKG"
-                opts.layerName = fname.replace(".gpkg", "")
-                err = QgsVectorFileWriter.writeAsVectorFormatV3(
-                    layer, dst, context.transformContext(), opts
-                )
-                if err[0] == QgsVectorFileWriter.NoError:
-                    return dst
-            except Exception:
-                pass
+        if layer is None:
+            feedback.pushInfo(f"  [timing] {fname}: layer not found in {time.time() - t0:.3f}s")
+            return val
+
+        try:
+            opts = QgsVectorFileWriter.SaveVectorOptions()
+            opts.driverName = "GPKG"
+            opts.layerName = fname.replace(".gpkg", "")
+            err = QgsVectorFileWriter.writeAsVectorFormatV3(
+                layer, dst, context.transformContext(), opts
+            )
+            elapsed = time.time() - t0
+            if err[0] == QgsVectorFileWriter.NoError:
+                feedback.pushInfo(f"  [timing] {fname}: written to {dst} in {elapsed:.3f}s")
+                return dst
+            else:
+                feedback.pushInfo(f"  [timing] {fname}: write failed (err {err[0]}) in {elapsed:.3f}s")
+        except Exception:
+            feedback.pushInfo(f"  [timing] {fname}: write exception in {time.time() - t0:.3f}s")
         return val
 
     def execute_pipeline(self, parameters, context, feedback):
+        t_pipeline = time.time()
         results = {}
         steps = QgsProcessingMultiStepFeedback(6, feedback)
         out_dir = self._output_dir(parameters, context)
 
         if feedback.isCanceled():
             return {}
+        # --- Object Layer ---
         steps.setCurrentStep(0)
         feedback.pushInfo(self.tr("[5%] Running Object Layer"))
+        t0 = time.time()
         obj = self._run("Object Layer", self.run_object_layer,
                         parameters, context, steps, feedback)
         results["objects_gpkg"] = obj.get(self._OBJ_GPKG, "")
         results["objects"] = self._object_source(results["objects_gpkg"])
+        elapsed = time.time() - t0
+        n_obj = self._fast_count(results["objects"], context)
+        fc_str = "{} features, ".format(n_obj) if n_obj is not None else ""
+        feedback.pushInfo(self.tr("  [timing] Object Layer: {}{:.3f}s".format(fc_str, elapsed)))
         if not results["objects"]:
             raise QgsProcessingException(self.tr(
                 "Object Layer produced no GeoPackage; cannot continue."
@@ -922,33 +960,48 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
 
         if feedback.isCanceled():
             return {}
+        # --- Polygon Layer ---
         steps.setCurrentStep(1)
         feedback.pushInfo(self.tr("[20%] Running Polygon Layer"))
+        t0 = time.time()
         poly = self._run("Polygon Layer", self.run_polygon_layer,
                          parameters, context, steps, feedback, results=results)
         results["polygons"] = poly.get(self._POLY_OUT)
-        if out_dir:
-            results["polygons"] = self._save_layer_to_gpkg(
-                results["polygons"], "Polygons.gpkg", out_dir, context, feedback)
+        elapsed = time.time() - t0
+        n_poly = self._fast_count(results["polygons"], context)
+        fc_str = "{} features, ".format(n_poly) if n_poly is not None else ""
+        feedback.pushInfo(self.tr("  [timing] Polygon Layer: {}{:.3f}s".format(fc_str, elapsed)))
+        results["polygons"] = self._save_layer_to_gpkg(
+            results["polygons"], "Polygons.gpkg", out_dir, context, feedback)
 
         if feedback.isCanceled():
             return {}
+        # --- Network Layer ---
         steps.setCurrentStep(2)
         feedback.pushInfo(self.tr("[35%] Running Network Layer"))
+        t0 = time.time()
         net = self._run("Network Layer", self.run_network_layer,
                         parameters, context, steps, feedback, results=results)
         results["network"] = net.get(self._NET_EDGES)
         results["pdp"] = net.get(self._NET_ASSIGNED)
         results["mfg"] = net.get(self._NET_MFG)
-        if out_dir:
-            results["pdp"] = self._save_layer_to_gpkg(
-                results["pdp"], "PDPs.gpkg", out_dir, context, feedback)
+        elapsed = time.time() - t0
+        n_pdp = self._fast_count(results["pdp"], context)
+        n_fobj = self._fast_count(net.get(self._NET_FINAL_OBJECTS), context)
+        parts = []
+        if n_pdp is not None:
+            parts.append("PDPs: {}".format(n_pdp))
+        if n_fobj is not None:
+            parts.append("Objects: {}".format(n_fobj))
+        fc_str = ("{} features, ".format(", ".join(parts))) if parts else ""
+        feedback.pushInfo(self.tr("  [timing] Network Layer: {}{:.3f}s".format(fc_str, elapsed)))
+        results["pdp"] = self._save_layer_to_gpkg(
+            results["pdp"], "PDPs.gpkg", out_dir, context, feedback)
         final_objects = net.get(self._NET_FINAL_OBJECTS)
         if final_objects:
             results["objects"] = final_objects
-            if out_dir:
-                results["objects"] = self._save_layer_to_gpkg(
-                    results["objects"], "Objects.gpkg", out_dir, context, feedback)
+            results["objects"] = self._save_layer_to_gpkg(
+                results["objects"], "Objects.gpkg", out_dir, context, feedback)
         else:
             raise PipelineStageError(self._stage_error(
                 "Network Layer",
@@ -975,69 +1028,95 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
                     "MFG point override' or check the Network stage log."
                 )
             ))
-        # Save MFG after override check so the correct MFG ends up in the output folder
-        if out_dir:
-            results["mfg"] = self._save_layer_to_gpkg(
-                results["mfg"], "MFG.gpkg", out_dir, context, feedback)
+        results["mfg"] = self._save_layer_to_gpkg(
+            results["mfg"], "MFG.gpkg", out_dir, context, feedback)
 
         if feedback.isCanceled():
             return {}
+        # --- Trench Layer ---
         steps.setCurrentStep(3)
         feedback.pushInfo(self.tr("[55%] Running Trench Layer"))
+        t0 = time.time()
         tr = self._run("Trench Layer", self.run_trench_layer,
                        parameters, context, steps, feedback, results=results)
         results["sidewalk_l"] = tr.get(self._TR_SIDE_L)
         results["sidewalk_r"] = tr.get(self._TR_SIDE_R)
         results["trenches"] = tr.get(self._TR_FINAL)
         results["feeder"] = tr.get(self._TR_FEEDER_FINAL)
+        elapsed = time.time() - t0
+        n_tr = self._fast_count(results["trenches"], context)
+        fc_str = "{} features, ".format(n_tr) if n_tr is not None else ""
+        feedback.pushInfo(self.tr("  [timing] Trench Layer: {}{:.3f}s".format(fc_str, elapsed)))
         results["garden"] = tr.get(self._TR_GARDEN)
         results["distribution"] = (
             tr.get(self._TR_DIST_LINES)
             or tr.get(self._TR_DIST_DISS)
             or tr.get(self._TR_MERGED_PDP)
         )
-        if out_dir:
-            results["trenches"] = self._save_layer_to_gpkg(
-                results["trenches"], "Final_Trenches.gpkg", out_dir, context, feedback)
-
-        # Tangent trenches are no longer forwarded in the OneClick flow.
+        results["trenches"] = self._save_layer_to_gpkg(
+            results["trenches"], "Final_Trenches.gpkg", out_dir, context, feedback)
 
         if feedback.isCanceled():
             return {}
+        # --- Cable Layer ---
         steps.setCurrentStep(4)
         feedback.pushInfo(self.tr("[75%] Running Cable Layer"))
         self._preflight_cable(results, context, feedback)
+        t0 = time.time()
         cab = self._run("Cable Layer", self.run_cable_layer,
                         parameters, context, steps, feedback, results=results)
         results["cables"] = cab
-        if out_dir:
-            fc = results["cables"].get(self._CB_OUT_FEEDER)
-            if fc:
-                results["cables"][self._CB_OUT_FEEDER] = self._save_layer_to_gpkg(
-                    fc, "Feeder_Cable.gpkg", out_dir, context, feedback)
-            dc = results["cables"].get(self._CB_OUT_DIST)
-            if dc:
-                results["cables"][self._CB_OUT_DIST] = self._save_layer_to_gpkg(
-                    dc, "Distribution_Cable.gpkg", out_dir, context, feedback)
+        elapsed = time.time() - t0
+        n_fc = self._fast_count(cab.get(self._CB_OUT_FEEDER), context)
+        n_dc = self._fast_count(cab.get(self._CB_OUT_DIST), context)
+        parts = []
+        if n_fc is not None:
+            parts.append("Feeder: {}".format(n_fc))
+        if n_dc is not None:
+            parts.append("Dist: {}".format(n_dc))
+        fc_str = ("{} features, ".format(", ".join(parts))) if parts else ""
+        feedback.pushInfo(self.tr("  [timing] Cable Layer: {}{:.3f}s".format(fc_str, elapsed)))
+        fc = results["cables"].get(self._CB_OUT_FEEDER)
+        if fc:
+            results["cables"][self._CB_OUT_FEEDER] = self._save_layer_to_gpkg(
+                fc, "Feeder_Cable.gpkg", out_dir, context, feedback)
+        dc = results["cables"].get(self._CB_OUT_DIST)
+        if dc:
+            results["cables"][self._CB_OUT_DIST] = self._save_layer_to_gpkg(
+                dc, "Distribution_Cable.gpkg", out_dir, context, feedback)
 
         if feedback.isCanceled():
             return {}
+        # --- Duct Layer ---
         steps.setCurrentStep(5)
         feedback.pushInfo(self.tr("[90%] Running Duct Layer"))
         self._preflight_duct(results, context, feedback)
+        t0 = time.time()
         duct = self._run("Duct Layer", self.run_duct_layer,
                          parameters, context, steps, feedback, results=results)
         results["ducts"] = duct
-        if out_dir:
-            fd = results["ducts"].get(self._DU_OUT_FEEDER)
-            if fd:
-                results["ducts"][self._DU_OUT_FEEDER] = self._save_layer_to_gpkg(
-                    fd, "Feeder_Ducts.gpkg", out_dir, context, feedback)
-            dd = results["ducts"].get(self._DU_OUT_DIST)
-            if dd:
-                results["ducts"][self._DU_OUT_DIST] = self._save_layer_to_gpkg(
-                    dd, "Distribution_Ducts.gpkg", out_dir, context, feedback)
+        elapsed = time.time() - t0
+        n_fd = self._fast_count(duct.get(self._DU_OUT_FEEDER), context)
+        n_dd = self._fast_count(duct.get(self._DU_OUT_DIST), context)
+        parts = []
+        if n_fd is not None:
+            parts.append("Feeder: {}".format(n_fd))
+        if n_dd is not None:
+            parts.append("Dist: {}".format(n_dd))
+        fc_str = ("{} features, ".format(", ".join(parts))) if parts else ""
+        feedback.pushInfo(self.tr("  [timing] Duct Layer: {}{:.3f}s".format(fc_str, elapsed)))
+        fd = results["ducts"].get(self._DU_OUT_FEEDER)
+        if fd:
+            results["ducts"][self._DU_OUT_FEEDER] = self._save_layer_to_gpkg(
+                fd, "Feeder_Ducts.gpkg", out_dir, context, feedback)
+        dd = results["ducts"].get(self._DU_OUT_DIST)
+        if dd:
+            results["ducts"][self._DU_OUT_DIST] = self._save_layer_to_gpkg(
+                dd, "Distribution_Ducts.gpkg", out_dir, context, feedback)
 
+        feedback.pushInfo(self.tr(
+            "[timing] Total pipeline: {:.3f}s".format(time.time() - t_pipeline)
+        ))
         feedback.pushInfo(self.tr("[100%] Complete"))
 
         return self._collect_outputs(results, parameters, context, feedback)

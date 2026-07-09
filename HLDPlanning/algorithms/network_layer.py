@@ -56,12 +56,12 @@ def _valid_layer(input_layer, context, feedback):
     if _has("native:makevalid"):
         return as_layer(processing.run(
             "native:makevalid",
-            {"INPUT": input_layer, "OUTPUT": "memory:"},
+            {"INPUT": input_layer, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
             is_child_algorithm=True, context=context, feedback=feedback
         )["OUTPUT"], context)
     return as_layer(processing.run(
         "native:fixgeometries",
-        {"INPUT": input_layer, "OUTPUT": "memory:"},
+        {"INPUT": input_layer, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
         is_child_algorithm=True, context=context, feedback=feedback
     )["OUTPUT"], context)
 
@@ -88,7 +88,7 @@ def _snap_points_to_lines(points_layer, lines_layer, tolerance_m, context, feedb
                 "REFERENCE_LAYER": lines_layer,
                 "TOLERANCE": tol,
                 "BEHAVIOR": 0,
-                "OUTPUT": "memory:",
+                "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT,
             },
             is_child_algorithm=True, context=context, feedback=feedback
         )["OUTPUT"], context)
@@ -102,7 +102,7 @@ def _snap_points_to_lines(points_layer, lines_layer, tolerance_m, context, feedb
                 "REFERENCE_LAYER": lines_layer,
                 "TOLERANCE": tol,
                 "BEHAVIOR": 0,
-                "OUTPUT": "memory:",
+                "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT,
             },
             is_child_algorithm=True, context=context, feedback=feedback
         )["OUTPUT"], context)
@@ -531,7 +531,7 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
         if objects is not None and objects.crs() != polys_valid.crs():
             objects = as_layer(processing.run(
                 "native:reprojectlayer",
-                {"INPUT": objects, "TARGET_CRS": polys_valid.crs(), "OUTPUT": "memory:"},
+                {"INPUT": objects, "TARGET_CRS": polys_valid.crs(), "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
                 is_child_algorithm=True, context=context, feedback=feedback
             )["OUTPUT"], context)
 
@@ -540,7 +540,7 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
         if roads_aligned.crs() != polys_valid.crs():
             roads_aligned = as_layer(processing.run(
                 "native:reprojectlayer",
-                {"INPUT": roads_aligned, "TARGET_CRS": polys_valid.crs(), "OUTPUT": "memory:"},
+                {"INPUT": roads_aligned, "TARGET_CRS": polys_valid.crs(), "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
                 is_child_algorithm=True, context=context, feedback=feedback
             )["OUTPUT"], context)
 
@@ -551,7 +551,7 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
                 "DISTANCE": 100.0,
                 "SEGMENTS": 8,
                 "DISSOLVE": True,
-                "OUTPUT": "memory:",
+                "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT,
             },
             is_child_algorithm=True, context=context, feedback=feedback
         )["OUTPUT"], context)
@@ -560,7 +560,7 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
             {
                 "INPUT": roads_aligned,
                 "OVERLAY": clip_area,
-                "OUTPUT": "memory:",
+                "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT,
             },
             is_child_algorithm=True, context=context, feedback=feedback
         )["OUTPUT"], context)
@@ -575,13 +575,13 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
             )
             roads_valid = as_layer(processing.run(
                 "native:convertgeometrytype",
-                {"INPUT": roads_valid, "TYPE": 1, "OUTPUT": "memory:"},
+                {"INPUT": roads_valid, "TYPE": 1, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
                 is_child_algorithm=True, context=context, feedback=feedback
             )["OUTPUT"], context)
         elif roads_valid.wkbType() == QgsWkbTypes.Unknown:
             roads_valid = as_layer(processing.run(
                 "native:convertgeometrytype",
-                {"INPUT": roads_valid, "TYPE": 1, "OUTPUT": "memory:"},
+                {"INPUT": roads_valid, "TYPE": 1, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
                 is_child_algorithm=True, context=context, feedback=feedback
             )["OUTPUT"], context)
         feedback.pushInfo(
@@ -634,7 +634,7 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
         # Normalize roads to singleparts (cleaner intersections) + index
         roads_single = as_layer(processing.run(
             "native:multiparttosingleparts",
-            {"INPUT": roads_valid, "OUTPUT": "memory:"},
+            {"INPUT": roads_valid, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
             is_child_algorithm=True, context=context, feedback=feedback
         )["OUTPUT"], context)
 
@@ -663,7 +663,7 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
         if expr_try:
             filtered = as_layer(processing.run(
                 "native:extractbyexpression",
-                {"INPUT": roads_single, "EXPRESSION": expr_try, "OUTPUT": "memory:"},
+                {"INPUT": roads_single, "EXPRESSION": expr_try, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
                 is_child_algorithm=True, context=context, feedback=feedback
             )["OUTPUT"], context)
 
@@ -671,7 +671,7 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
         def _fallback_filter(expr_text: str):
             return as_layer(processing.run(
                 "native:extractbyexpression",
-                {"INPUT": roads_single, "EXPRESSION": expr_text, "OUTPUT": "memory:"},
+                {"INPUT": roads_single, "EXPRESSION": expr_text, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
                 is_child_algorithm=True, context=context, feedback=feedback
             )["OUTPUT"], context)
 
@@ -727,7 +727,7 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
             _no_dig_expr = f'"{_fld}" NOT IN ({_no_dig_vals})'
             _diggable = as_layer(processing.run(
                 "native:extractbyexpression",
-                {"INPUT": filtered, "EXPRESSION": _no_dig_expr, "OUTPUT": "memory:"},
+                {"INPUT": filtered, "EXPRESSION": _no_dig_expr, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
                 is_child_algorithm=True, context=context, feedback=feedback
             )["OUTPUT"], context)
             if _diggable is not None and _diggable.featureCount() > 0:
@@ -745,26 +745,26 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
         road_boundary_polys = as_layer(processing.run(
             "native:buffer",
             {"INPUT": filtered, "DISTANCE": off, "SEGMENTS": 8, "DISSOLVE": False,
-             "END_CAP_STYLE": 0, "JOIN_STYLE": 0, "MITER_LIMIT": 2, "OUTPUT": "memory:"},
+             "END_CAP_STYLE": 0, "JOIN_STYLE": 0, "MITER_LIMIT": 2, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
             is_child_algorithm=True, context=context, feedback=feedback
         )["OUTPUT"], context)
 
         road_boundary_lines = as_layer(processing.run(
             "native:polygonstolines",
-            {"INPUT": road_boundary_polys, "OUTPUT": "memory:"},
+            {"INPUT": road_boundary_polys, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
             is_child_algorithm=True, context=context, feedback=feedback
         )["OUTPUT"], context)
 
         cand = as_layer(processing.run(
             "native:pointsalonglines",
             {"INPUT": road_boundary_lines, "DISTANCE": space, "START_OFFSET": 0, "END_OFFSET": 0,
-             "OUTPUT": "memory:"},
+             "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
             is_child_algorithm=True, context=context, feedback=feedback
         )["OUTPUT"], context)
 
         cand = as_layer(processing.run(
             "native:deleteduplicategeometries",
-            {"INPUT": cand, "OUTPUT": "memory:"},
+            {"INPUT": cand, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
             is_child_algorithm=True, context=context, feedback=feedback
         )["OUTPUT"], context)
 
@@ -809,20 +809,20 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
         inter = as_layer(processing.run(
             "native:lineintersections",
             {"INPUT": filtered, "INTERSECT": filtered, "INPUT_FIELDS": [], "INTERSECT_FIELDS": [],
-             "INTERSECT_FIELDS_PREFIX": "", "OUTPUT": "memory:"},
+             "INTERSECT_FIELDS_PREFIX": "", "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
             is_child_algorithm=True, context=context, feedback=feedback
         )["OUTPUT"], context)
 
         if interbuf > 0:
             inter_buf = as_layer(processing.run(
                 "native:buffer",
-                {"INPUT": inter, "DISTANCE": interbuf, "SEGMENTS": 8, "DISSOLVE": False, "OUTPUT": "memory:"},
+                {"INPUT": inter, "DISTANCE": interbuf, "SEGMENTS": 8, "DISSOLVE": False, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
                 is_child_algorithm=True, context=context, feedback=feedback
             )["OUTPUT"], context)
         else:
             inter_buf = as_layer(processing.run(
                 "native:extractbyexpression",
-                {"INPUT": inter, "EXPRESSION": "FALSE", "OUTPUT": "memory:"},
+                {"INPUT": inter, "EXPRESSION": "FALSE", "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
                 is_child_algorithm=True, context=context, feedback=feedback
             )["OUTPUT"], context)
 
@@ -832,20 +832,20 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
 
         remove = as_layer(processing.run(
             "native:extractbylocation",
-            {"INPUT": cand, "PREDICATE": [0], "INTERSECT": inter_buf, "OUTPUT": "memory:"},
+            {"INPUT": cand, "PREDICATE": [0], "INTERSECT": inter_buf, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
             is_child_algorithm=True, context=context, feedback=feedback
         )["OUTPUT"], context)
 
         clean = (as_layer(processing.run(
             "native:difference",
-            {"INPUT": cand, "OVERLAY": remove, "OUTPUT": "memory:"},
+            {"INPUT": cand, "OVERLAY": remove, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
             is_child_algorithm=True, context=context, feedback=feedback
         )["OUTPUT"], context) if remove.featureCount() > 0 else cand)
 
         # Second de-dup + optional thinning (>= spacing/2 apart)
         clean = as_layer(processing.run(
             "native:deleteduplicategeometries",
-            {"INPUT": clean, "OUTPUT": "memory:"},
+            {"INPUT": clean, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
             is_child_algorithm=True, context=context, feedback=feedback
         )["OUTPUT"], context)
 

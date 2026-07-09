@@ -1,6 +1,7 @@
 from qgis import processing
 from qgis.core import (
     QgsApplication,
+    QgsProcessing,
     QgsVectorLayer,
     QgsFeature,
     QgsFeatureSink,
@@ -10,7 +11,7 @@ def fix_geometries(layer, context, feedback):
     """Fix invalid geometries in a layer."""
     return processing.run(
         "native:fixgeometries",
-        {"INPUT": layer, "OUTPUT": "memory:"},
+        {"INPUT": layer, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
         context=context,
         feedback=feedback,
     )["OUTPUT"]
@@ -21,7 +22,7 @@ def reproject_if_needed(layer, target_crs, context, feedback):
         return layer
     return processing.run(
         "native:reprojectlayer",
-        {"INPUT": layer, "TARGET_CRS": target_crs, "OUTPUT": "memory:"},
+        {"INPUT": layer, "TARGET_CRS": target_crs, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
         context=context,
         feedback=feedback,
     )["OUTPUT"]
@@ -70,7 +71,7 @@ def snap_layer(input_layer, ref_layer, tolerance, context, feedback):
             "REFERENCE_LAYER": ref_layer,
             "TOLERANCE": tolerance,
             "BEHAVIOR": 0,
-            "OUTPUT": "memory:",
+            "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT,
         },
         context=context,
         feedback=feedback,
@@ -82,5 +83,5 @@ def linemerge_layer(layer, context, feedback):
     if not alg:
         return layer
     return processing.run(
-        alg, {"INPUT": layer, "OUTPUT": "memory:"}, context=context, feedback=feedback
+        alg, {"INPUT": layer, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT}, context=context, feedback=feedback
     )["OUTPUT"]
