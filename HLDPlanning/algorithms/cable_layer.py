@@ -123,7 +123,7 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
         for i, key in enumerate(sorted(id_keys), 1):
             g_sub = subset_by_id(garden_t, fld_g, key, normalize_key)
             d_sub = subset_by_id(distr_t, fld_d, key, normalize_key)
-            grp = processing.run("native:mergevectorlayers", {"LAYERS": [g_sub, d_sub], "CRS": crs_t, "OUTPUT": "memory:"}, context=context, feedback=feedback)["OUTPUT"]
+            grp = processing.run("native:mergevectorlayers", {"LAYERS": [g_sub, d_sub], "CRS": crs_t, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT}, context=context, feedback=feedback)["OUTPUT"]
             snapped = snap_layer(grp, grp, snap_m, context, feedback)
             cleaned = fix_geometries(snapped, context, feedback)
             if do_merge:
@@ -131,7 +131,7 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
             if do_dedupe:
                 dd_alg = find_first_alg("native:deleteduplicategeometries", "qgis:deleteduplicategeometries")
                 if dd_alg:
-                    cleaned = processing.run(dd_alg, {"INPUT": cleaned, "OUTPUT": "memory:"}, context=context, feedback=feedback)["OUTPUT"]
+                    cleaned = processing.run(dd_alg, {"INPUT": cleaned, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT}, context=context, feedback=feedback)["OUTPUT"]
 
             for f in cleaned.getFeatures():
                 of = QgsFeature(out_fields)

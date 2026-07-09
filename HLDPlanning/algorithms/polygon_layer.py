@@ -388,7 +388,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                 "ALPHA": float(a),
                 "HOLES": bool(keep_holes),
                 "NO_MULTIGEOMETRY": False,
-                "OUTPUT": "memory:",
+                "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT,
             })["OUTPUT"]
             return out
         except Exception:
@@ -427,9 +427,9 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
         else:
             return raw
 
-        lines = processing.run("native:polygonstolines", {"INPUT": raw, "OUTPUT": "memory:"})["OUTPUT"]
-        dis   = processing.run("native:dissolve", {"INPUT": lines, "OUTPUT": "memory:"})["OUTPUT"]
-        cells = processing.run("native:polygonize", {"INPUT": dis, "KEEP_FIELDS": False, "OUTPUT": "memory:"})["OUTPUT"]
+        lines = processing.run("native:polygonstolines", {"INPUT": raw, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT})["OUTPUT"]
+        dis   = processing.run("native:dissolve", {"INPUT": lines, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT})["OUTPUT"]
+        cells = processing.run("native:polygonize", {"INPUT": dis, "KEEP_FIELDS": False, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT})["OUTPUT"]
 
         labeled = QgsVectorLayer(f"Polygon?crs={crs.authid()}", "labeled_cells", "memory")
         prl = labeled.dataProvider()
@@ -815,10 +815,10 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                         vor = processing.run("qgis:voronoipolygons", {
                             "INPUT": pts,
                             "BUFFER": float(vor_ext) if vor_ext > 0 else 50.0,
-                            "OUTPUT": "memory:",
+                            "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT,
                         })["OUTPUT"]
                         vor_diss = processing.run("native:dissolve", {
-                            "INPUT": vor, "FIELD": ["gid"], "OUTPUT": "memory:",
+                            "INPUT": vor, "FIELD": ["gid"], "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT,
                         })["OUTPUT"]
                         poly = self._collect_union_geom(vor_diss)
                 except Exception as exc:
@@ -1191,9 +1191,9 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
             vlyr.updateExtents()
 
             vor = processing.run("qgis:voronoipolygons",
-                                 {"INPUT": vlyr, "BUFFER": 100.0, "OUTPUT": "memory:"})["OUTPUT"]
+                                 {"INPUT": vlyr, "BUFFER": 100.0, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT})["OUTPUT"]
             diss = processing.run("native:dissolve",
-                                  {"INPUT": vor, "FIELD": ["cid"], "OUTPUT": "memory:"})["OUTPUT"]
+                                  {"INPUT": vor, "FIELD": ["cid"], "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT})["OUTPUT"]
             out = {}
             for f in diss.getFeatures():
                 cid = f["cid"]

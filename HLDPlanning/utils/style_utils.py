@@ -10,6 +10,8 @@ from qgis.core import (
     QgsSingleSymbolRenderer,
     QgsFillSymbol,
     QgsSymbol,
+    QgsLineSymbol,
+    QgsSimpleLineSymbolLayer,
     QgsRendererCategory,
     QgsCategorizedSymbolRenderer,
     QgsProject,
@@ -92,29 +94,16 @@ def colorize_mem_line_layer(layer, hexcolor: str, width: float = 0.8):
     if not layer:
         return
     try:
-        from qgis.core import QgsLineSymbol, QgsSimpleLineSymbolLayer, QgsSingleSymbolRenderer
-        from qgis.PyQt.QtGui import QColor
-
-        # Create a simple line symbol layer with the given color and width
         line_symbol = QgsLineSymbol()
         simple_line = QgsSimpleLineSymbolLayer()
         simple_line.setColor(QColor(hexcolor))
         simple_line.setWidth(width)
-
-        # Apply the simple line layer to the symbol
         line_symbol.changeSymbolLayer(0, simple_line)
-
-        # Wrap it in a single-symbol renderer and apply to the layer
         renderer = QgsSingleSymbolRenderer(line_symbol)
         layer.setRenderer(renderer)
-
-        # Force a visual refresh
         layer.triggerRepaint()
-
     except Exception:
-        # Styling is best-effort; never let it break the main algorithm
         pass
-
 
 
 def colorize_mem_poly_outline(layer, outline_rgba: str = "30,107,170,255", width_mm: float = 0.8):
@@ -141,7 +130,6 @@ def apply_simple_line_style(layer, hexcolor: str, width_mm: float = 0.8):
     try:
         if not (layer and layer.isValid()):
             return
-        from qgis.core import QgsLineSymbol, QgsSimpleLineSymbolLayer
         sym = QgsLineSymbol()
         base = QgsSimpleLineSymbolLayer()
         base.setColor(QColor(hexcolor))
@@ -167,7 +155,7 @@ def color_for_index(i: int) -> str:
 def distribution_color(side: str, idx: int) -> str:
     """
     Return color for Distribution ducts based on side and group index.
-    Left → red→green; Right → blue→yellow; cycles if more than 2 groups.
+    Left -> red->green; Right -> blue->yellow; cycles if more than 2 groups.
     """
     side = (side or "").upper()
     palette = DISTRIB_LEFT_COLORS if side.startswith("L") else DISTRIB_RIGHT_COLORS
@@ -201,5 +189,5 @@ def apply_color_renderer(layer_path_or_obj, layer_name="Layer", attr="color"):
         renderer = QgsCategorizedSymbolRenderer(attr, cats)
         layer.setRenderer(renderer)
         QgsProject.instance().addMapLayer(layer)
-    except Exception as e:
-        print(f"[apply_color_renderer] Error: {e}")
+    except Exception:
+        pass

@@ -213,7 +213,7 @@ class AlgFeederDuctsNoSplit(QgsProcessingAlgorithm):
                     isinstance(v, QgsProcessingFeatureSourceDefinition)):
                     return processing.run(
                         "native:savefeatures",
-                        {"INPUT": v, "OUTPUT": "memory:"},
+                        {"INPUT": v, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
                         context=context, feedback=feedback
                     )["OUTPUT"]
             except Exception:
@@ -265,23 +265,23 @@ class AlgFeederDuctsNoSplit(QgsProcessingAlgorithm):
         crs = net.crs()
 
         net_fix = processing.run("native:fixgeometries",
-                                 {"INPUT": net, "OUTPUT": "memory:"},
+                                 {"INPUT": net, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
                                  context=context, feedback=feedback)["OUTPUT"]
         net_single = processing.run("native:multiparttosingleparts",
-                                    {"INPUT": net_fix, "OUTPUT": "memory:"},
+                                    {"INPUT": net_fix, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
                                     context=context, feedback=feedback)["OUTPUT"]
 
         try:
             inter_pts = processing.run("native:lineintersections",
-                {"INPUT": net_single, "INTERSECT": net_single, "INPUT_FIELDS": [], "INTERSECT_FIELDS": [], "OUTPUT": "memory:"},
+                {"INPUT": net_single, "INTERSECT": net_single, "INPUT_FIELDS": [], "INTERSECT_FIELDS": [], "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
                 context=context, feedback=feedback)["OUTPUT"]
         except Exception:
             inter_pts = processing.run("qgis:lineintersections",
-                {"INPUT": net_single, "INTERSECT": net_single, "INPUT_FIELDS": [], "INTERSECT_FIELDS": [], "OUTPUT": "memory:"},
+                {"INPUT": net_single, "INTERSECT": net_single, "INPUT_FIELDS": [], "INTERSECT_FIELDS": [], "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
                 context=context, feedback=feedback)["OUTPUT"]
 
         inter_pts = processing.run("native:deleteduplicategeometries",
-                                   {"INPUT": inter_pts, "OUTPUT": "memory:"},
+                                   {"INPUT": inter_pts, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
                                    context=context, feedback=feedback)["OUTPUT"]
 
         seg_index = QgsSpatialIndex(net_single.getFeatures())
@@ -692,7 +692,7 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
                 target_crs = QgsProject.instance().crs() or QgsCoordinateReferenceSystem("EPSG:3857")
             return (layer if layer.crs() == target_crs else
                     processing.run("native:reprojectlayer",
-                                   {"INPUT": layer, "TARGET_CRS": target_crs, "OUTPUT": "memory:"},
+                                   {"INPUT": layer, "TARGET_CRS": target_crs, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
                                    context=context, feedback=feedback)["OUTPUT"])
 
                 # --- resolve layers and fields robustly ---
@@ -1070,7 +1070,7 @@ class DuctLayer(QgsProcessingAlgorithm):
                 try:
                     mem = processing.run(
                         "native:savefeatures",
-                        {"INPUT": src, "OUTPUT": "memory:"},
+                        {"INPUT": src, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
                         context=context, feedback=feedback
                     )["OUTPUT"]
                     if mem and mem.isValid():

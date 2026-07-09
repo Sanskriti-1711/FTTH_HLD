@@ -1,6 +1,6 @@
 # object_layer/crs_utils.py
 from qgis.core import (
-    QgsProcessingException, QgsVectorLayer, QgsCoordinateReferenceSystem,
+    QgsProcessing, QgsProcessingException, QgsVectorLayer, QgsCoordinateReferenceSystem,
     QgsProject, QgsGeometry, QgsWkbTypes, QgsCoordinateTransformContext
 )
 from qgis import processing
@@ -66,7 +66,7 @@ def ensure_declared_crs(layer: QgsVectorLayer, expected_authid: str, context, fe
         if _extent_ok(layer.extent(), _SANITY_BY_AUTHID[expected_authid]) and layer.crs().authid() != expected_authid:
             return processing.run(
                 "native:assignprojection",
-                {"INPUT": layer, "CRS": expected, "OUTPUT": "memory:"},
+                {"INPUT": layer, "CRS": expected, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
                 context=context, feedback=feedback
             )["OUTPUT"]
 
@@ -75,7 +75,7 @@ def ensure_declared_crs(layer: QgsVectorLayer, expected_authid: str, context, fe
     if guess and guess != layer.crs().authid():
         return processing.run(
             "native:assignprojection",
-            {"INPUT": layer, "CRS": QgsCoordinateReferenceSystem(guess), "OUTPUT": "memory:"},
+            {"INPUT": layer, "CRS": QgsCoordinateReferenceSystem(guess), "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
             context=context, feedback=feedback
         )["OUTPUT"]
 
@@ -129,7 +129,7 @@ def reproject_safe(layer: QgsVectorLayer, target_authid: str, context, feedback,
         aoi_layer = _geom_memory_layer_for_clip(fast_clip_extent_geom, src_crs.authid())
         layer = processing.run(
             "native:clip",
-            {"INPUT": layer, "OVERLAY": aoi_layer, "OUTPUT": "memory:"},
+            {"INPUT": layer, "OVERLAY": aoi_layer, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
             context=context, feedback=feedback
         )["OUTPUT"]
 
@@ -137,7 +137,7 @@ def reproject_safe(layer: QgsVectorLayer, target_authid: str, context, feedback,
     ctx: QgsCoordinateTransformContext = QgsProject.instance().transformContext()
     out = processing.run(
         "native:reprojectlayer",
-        {"INPUT": layer, "TARGET_CRS": tgt_crs, "OPERATION": 0, "OUTPUT": "memory:"},
+        {"INPUT": layer, "TARGET_CRS": tgt_crs, "OPERATION": 0, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
         context=context, feedback=feedback
     )["OUTPUT"]
 
