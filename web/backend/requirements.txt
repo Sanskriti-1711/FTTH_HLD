@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+geopandas
+shapely
+python-multipart
