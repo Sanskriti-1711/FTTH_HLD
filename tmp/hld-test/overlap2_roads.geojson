@@ -1,0 +1,26 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "fclass": "residential",
+        "name": "Corridor_Rd",
+        "highway": "tertiary"
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [
+            13.4025,
+            52.521
+          ],
+          [
+            13.4225,
+            52.521
+          ]
+        ]
+      }
+    }
+  ]
+}

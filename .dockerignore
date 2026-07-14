@@ -1,0 +1,9 @@
+.git
+**/__pycache__
+**/*.pyc
+web/backend/venv
+web/backend/outputs
+web/backend/logs
+tmp
+HLDPlanning/logs
+HLDPlanning/output

@@ -1,0 +1,39 @@
+services:
+  postgis:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_DB: ftth
+      POSTGRES_USER: ftth
+      POSTGRES_PASSWORD: ftth
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgis_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ftth"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  ftth-engine:
+    build:
+      context: .
+      dockerfile: web/backend/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://ftth:ftth@postgis:5432/ftth
+      QGIS_PLUGINPATH: /app
+      QT_QPA_PLATFORM: offscreen
+      QGIS_EXECUTABLE: /usr/bin/qgis_process
+    depends_on:
+      postgis:
+        condition: service_healthy
+    # Note: host port 8000 is held by a Docker Desktop ghost socket.
+    # Using 8080 instead. Access API at http://localhost:8080
+    ports:
+      - "8080:8000"
+    volumes:
+      - ./web/backend/outputs:/app/web/backend/outputs
+
+volumes:
+  postgis_data:
