@@ -294,6 +294,116 @@ def _convert_gpkg_to_geojson(gpkg_path: Path, geojson_path: Path) -> bool:
     return result.returncode == 0 and geojson_path.exists()
 
 
+def _reproject_gpkgs_to_wgs84(project_id: str, output_dir: Path) -> int:
+    """Generate EPSG:4326 (WGS84) sibling .gpkg files for every canonical
+    EPSG:25833 GPKG on disk, using `ogr2ogr` as an OUT-OF-PROCESS subprocess.
+
+    This belongs in the FastAPI backend, not the QGIS plugin, because:
+
+      * ogr2ogr is pure GDAL — no QGIS engine, no WSL2 .vhdx pressure
+        race, no containerd metadata.db write contention. Runs after
+        `qgis_process` has fully exited so the WSL2 engine is at rest.
+      * No nested `processing.run("native:reprojectlayer")` and no
+        read-back into QGIS memory — both were the sources of the
+        disk-pressure hang that previously bricked the engine.
+      * Per-file failure isolation: if ogr2ogr chokes on one GPKG, the
+        canonical layers and the other 8 siblings are unaffected.
+      * Toggle-default OFF: headless / qgis_process CLI runs and
+        back-to-back automation just don't ask for it, so there is zero
+        overhead in the common case.
+
+    Naming pattern matches the project's earlier convention: for every
+    `<stem>.gpkg` on disk, a `<stem>_wgs84.gpkg` is produced. The internal
+    layer table inside the WGS84 GPKG is also renamed to `<stem>_wgs84`
+    via the `-nln` flag, so dragging both files into the same QGIS
+    project does not collide on layer names. Files already ending in
+    `_wgs84.gpkg` are skipped so re-runs are safe.
+
+    WGS84 siblings stay on disk only; the PostGIS DB receives the
+    canonical EPSG:25833 layers via `ONECLICK_OUTPUTS` (which excludes
+    `*_wgs84.gpkg`). The DB schema is unchanged — this stage never
+    touches `postgis.load_geojson_file` and never populates any WGS84
+    rows.
+
+    Returns the number of WGS84 sibling files successfully written.
+    """
+    ogr2ogr = shutil.which("ogr2ogr")
+    if not ogr2ogr:
+        _append(
+            project_id, "warning",
+            "ogr2ogr not found in PATH; WGS84 sibling files will NOT be generated.",
+        )
+        return 0
+
+    written = 0
+    failed = 0
+    skipped_wgs = 0
+    t_started = time.time()
+    for gpkg in sorted(output_dir.glob("*.gpkg")):
+        # Skip our own previous outputs to avoid reprocessing.
+        if gpkg.stem.endswith("_wgs84"):
+            skipped_wgs += 1
+            continue
+        # Defensive: skip zero-byte inputs that often appear mid-pipeline.
+        try:
+            if gpkg.stat().st_size == 0:
+                _append(project_id, "warning",
+                        f"WGS84: skipping empty GPKG {gpkg.name}.")
+                continue
+        except OSError:
+            continue
+
+        wgs84_path = gpkg.with_name(f"{gpkg.stem}_wgs84.gpkg")
+        cmd = [
+            ogr2ogr,
+            "-f", "GPKG",
+            "-overwrite",
+            "-t_srs", "EPSG:4326",
+            "-s_srs", "EPSG:25833",
+            "-nln", f"{gpkg.stem}_wgs84",
+            str(wgs84_path),
+            str(gpkg),
+        ]
+        try:
+            res = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=300,
+            )
+            if res.returncode == 0 and wgs84_path.exists():
+                written += 1
+                _append(
+                    project_id, "info",
+                    f"WGS84 sibling created: {wgs84_path.name} "
+                    f"({gpkg.stat().st_size // 1024} KB → "
+                    f"{wgs84_path.stat().st_size // 1024} KB)",
+                )
+            else:
+                failed += 1
+                err_msg = (res.stderr or res.stdout or "unknown ogr2ogr error").strip()
+                _append(
+                    project_id, "warning",
+                    f"WGS84 sibling failed for {gpkg.name}: {err_msg[:300]}",
+                )
+        except subprocess.TimeoutExpired:
+            failed += 1
+            _append(
+                project_id, "warning",
+                f"WGS84 sibling timed out for {gpkg.name} (300 s cap).",
+            )
+        except Exception as exc:
+            failed += 1
+            _append(
+                project_id, "warning",
+                f"WGS84 sibling exception for {gpkg.name}: {exc}",
+            )
+
+    _append(
+        project_id, "info",
+        f"WGS84 stage done in {time.time() - t_started:.2f}s — "
+        f"written={written} failed={failed} skipped_existing={skipped_wgs}.",
+    )
+    return written
+
+
 def _register_downloads(project_id: str, output_dir: Path) -> List[Dict[str, Any]]:
     downloads: List[Dict[str, Any]] = []
     for path in output_dir.rglob("*"):
@@ -351,6 +461,7 @@ def _run_pipeline(
     roads_path: Path,
     output_dir: Path,
     poly_method: int = 3,
+    wgs84: bool = False,
 ) -> None:
     task = _task(project_id)
     task.update({"status": "running", "stage": PIPELINE_STAGES[0], "updated_at": _now()})
@@ -395,6 +506,29 @@ def _run_pipeline(
         _run_command(project_id, cmd, output_dir)
         layers = _ingest_outputs(project_id, output_dir)
         downloads = _register_downloads(project_id, output_dir)
+
+        # Optional WGS84 sibling generation: ENTIRELY OUT of the QGIS
+        # plugin, runs after qgis_process has exited, on the canonical
+        # GPKGs that the plugin already wrote. Pure ogr2ogr subprocesses —
+        # no nested processing.run, no QGIS engine touching, no QGIS
+        # read-back. Per-file failures don't affect the canonical
+        # pipeline. Toggle via the `wgs84` form field on POST /ftth/hld/run.
+        if wgs84:
+            # Surface the WGS84 stage in the polling UI so 9 × ogr2ogr
+            # subprocesses show as activity instead of a static "complete".
+            task.update({"stage": "WGS84 Reprojection", "progress": 99})
+            _append(
+                project_id, "info",
+                "Generating WGS84 sibling files via out-of-process ogr2ogr...",
+            )
+            n_wgs = _reproject_gpkgs_to_wgs84(project_id, output_dir)
+            _append(
+                project_id, "info",
+                f"WGS84 stage complete — {n_wgs} companion file(s) written.",
+            )
+            # Refresh downloads so the new WGS84 GPKGs appear in the
+            # download manifest after the pipeline completes.
+            downloads = _register_downloads(project_id, output_dir)
 
         task.update(
             {
@@ -464,6 +598,7 @@ async def run_hld(
     roads: UploadFile = File(...),
     project_id: Optional[str] = Form(None),
     poly_method: int = Form(3),
+    wgs84: bool = Form(False),
 ) -> Dict[str, Any]:
     project_id = project_id or uuid.uuid4().hex
     if poly_method not in (0, 1, 2, 3):
@@ -493,7 +628,7 @@ async def run_hld(
             output_dir=str(output_dir),
         )
 
-    background_tasks.add_task(_run_pipeline, project_id, excel_path, roads_path, output_dir, poly_method)
+    background_tasks.add_task(_run_pipeline, project_id, excel_path, roads_path, output_dir, poly_method, wgs84)
     return _public_task(project_id)
 
 
@@ -583,8 +718,9 @@ async def run_hld_compat(
     roads: UploadFile = File(...),
     project_id: Optional[str] = Form(None),
     poly_method: int = Form(3),
+    wgs84: bool = Form(False),
 ) -> Dict[str, Any]:
-    return await run_hld(background_tasks, excel, roads, project_id, poly_method)
+    return await run_hld(background_tasks, excel, roads, project_id, poly_method, wgs84)
 
 
 @app.get("/status/{project_id}")
