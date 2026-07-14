@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from typing import List, Optional
 from qgis.core import QgsVectorLayer, QgsFields, QgsField
-from qgis.PyQt.QtCore import QVariant
+from qgis.PyQt.QtCore import QMetaType
 
 
 # Common/core columns that can be shared across multiple algorithm outputs.
@@ -40,7 +40,7 @@ def build_fields(names: List[str]) -> QgsFields:
     """Build a QgsFields schema from column names using String type by default."""
     out = QgsFields()
     for n in names:
-        out.append(QgsField(n, QVariant.String))
+        out.append(QgsField(n, QMetaType.Type.QString))
     return out
 
 def first_field_case_insensitive(layer: QgsVectorLayer, candidates: List[str]) -> Optional[str]:

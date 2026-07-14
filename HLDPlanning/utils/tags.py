@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-from qgis.PyQt.QtCore import QVariant
+from qgis.PyQt.QtCore import QMetaType
 from qgis.core import QgsVectorLayer, QgsWkbTypes, QgsVectorLayer, QgsFields, QgsField, QgsFeature
 
 def tag_simple(layer: QgsVectorLayer, tag_value: str) -> QgsVectorLayer:
@@ -11,7 +11,7 @@ def tag_simple(layer: QgsVectorLayer, tag_value: str) -> QgsVectorLayer:
     prov = mem.dataProvider()
     fields = QgsFields(layer.fields())
     if "trench_type" not in fields.names():
-        fields.append(QgsField("trench_type", QVariant.String))
+        fields.append(QgsField("trench_type", QMetaType.Type.QString))
     prov.addAttributes(fields); mem.updateFields()
 
     trench_idx = mem.fields().indexFromName("trench_type")

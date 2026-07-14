@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 
-from qgis.PyQt.QtCore import QVariant, QCoreApplication
+from qgis.PyQt.QtCore import QCoreApplication, QMetaType
 from qgis.core import (
     QgsProcessing, QgsProcessingAlgorithm,
     QgsProcessingParameterVectorLayer, QgsProcessingParameterNumber,
@@ -442,7 +442,7 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
             try:
                 tmp_pt = QgsVectorLayer(f"Point?crs={crs_authid}", "tmp_pt", "memory")
                 pr = tmp_pt.dataProvider()
-                pr.addAttributes([QgsField("id", QVariant.Int)])
+                pr.addAttributes([QgsField("id", QMetaType.Type.Int)])
                 tmp_pt.updateFields()
                 f = QgsFeature(tmp_pt.fields())
                 f.setGeometry(pt_geom)
@@ -466,7 +466,7 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
             """Create a memory point layer with one feature."""
             vl = QgsVectorLayer(f"Point?crs={crs_authid}", "tmp_pt", "memory")
             pr = vl.dataProvider()
-            pr.addAttributes([QgsField("id", QVariant.Int)])
+            pr.addAttributes([QgsField("id", QMetaType.Type.Int)])
             vl.updateFields()
             f = QgsFeature(vl.fields())
             f.setGeometry(geom)
@@ -599,7 +599,7 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
         _cls_src = _src_road_names.get("fclass") or _src_road_names.get("highway")
         for _cf in _carry_fields:
             if roads_out_fields.indexOf(_cf) == -1:
-                roads_out_fields.append(QgsField(_cf, QVariant.String))
+                roads_out_fields.append(QgsField(_cf, QMetaType.Type.QString))
         sinkRoads, idRoads = self.parameterAsSink(
             params,
             self.OUT_CLIPPED_ROADS,
@@ -943,10 +943,10 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
         # Carry the homes count and full splitter plan onto each PDP (one PDP per
         # polygon), so the splitter sizing is available directly on the network layer.
         _pdp_extra = [
-            ("HH", QVariant.Int), ("SPLIT_SIZE", QVariant.String), ("SPLIT_CNT", QVariant.Int),
-            ("SPLIT_UTIL", QVariant.Double), ("SPLIT_OK", QVariant.Int), ("SPL_PLAN", QVariant.String),
-            ("SPL_PORTS", QVariant.Int), ("SPL_4", QVariant.Int), ("SPL_8", QVariant.Int),
-            ("SPL_16", QVariant.Int), ("SPL_32", QVariant.Int), ("SPL_64", QVariant.Int),
+            ("HH", QMetaType.Type.Int), ("SPLIT_SIZE", QMetaType.Type.QString), ("SPLIT_CNT", QMetaType.Type.Int),
+            ("SPLIT_UTIL", QMetaType.Type.Double), ("SPLIT_OK", QMetaType.Type.Int), ("SPL_PLAN", QMetaType.Type.QString),
+            ("SPL_PORTS", QMetaType.Type.Int), ("SPL_4", QMetaType.Type.Int), ("SPL_8", QMetaType.Type.Int),
+            ("SPL_16", QMetaType.Type.Int), ("SPL_32", QMetaType.Type.Int), ("SPL_64", QMetaType.Type.Int),
         ]
         for _n, _t in _pdp_extra:
             if out_fields.indexOf(_n) == -1:
@@ -1326,7 +1326,7 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
                     fo_fields.append(QgsField(_fld.name(), _fld.type(), _fld.typeName(), _fld.length(), _fld.precision()))
                 for _extra in (COMMON_FIELDS.POLYGON_ID, COMMON_FIELDS.PDP_ID, COMMON_FIELDS.MFG_ID):
                     if fo_fields.lookupField(_extra) < 0:
-                        fo_fields.append(QgsField(_extra, QVariant.String))
+                        fo_fields.append(QgsField(_extra, QMetaType.Type.QString))
 
                 # FIX: parameterAsSink silently returns (None, None) for an
                 # optional FeatureSink when no destination is provided (typical

@@ -11,7 +11,7 @@ and the styling/add-to-project cosmetics plus the dead OUT_MERGED_INPUTS
 output were removed.
 """
 
-from qgis.PyQt.QtCore import QVariant
+from qgis.PyQt.QtCore import QMetaType
 from qgis.PyQt.QtGui import QColor
 from qgis.core import (
     QgsProcessing, QgsProcessingAlgorithm,
@@ -111,7 +111,7 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
         garden_t = reproject_if_needed(fix_geometries(garden, context, feedback), crs_t, context, feedback)
         distr_t = reproject_if_needed(fix_geometries(distr, context, feedback), crs_t, context, feedback)
 
-        out_fields = QgsFields(); out_fields.append(QgsField("pdp_id", QVariant.String))
+        out_fields = QgsFields(); out_fields.append(QgsField("pdp_id", QMetaType.Type.QString))
         sinkD, outDistId = self.parameterAsSink(p, self.O_DIST, context, out_fields, QgsWkbTypes.MultiLineString, crs_t)
 
         id_keys = set()

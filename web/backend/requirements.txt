@@ -1,0 +1,6 @@
+# NOTE: Dockerfile installs deps inline (see web/backend/Dockerfile).
+# This file is kept for reference only.
+fastapi
+uvicorn
+python-multipart
+psycopg2-binary

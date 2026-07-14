@@ -4,7 +4,7 @@ from qgis.core import (
     QgsVectorLayer, QgsField, QgsFields, QgsFeature, QgsGeometry, QgsPointXY,
     QgsSpatialIndex, QgsWkbTypes
 )
-from qgis.PyQt.QtCore import QVariant
+from qgis.PyQt.QtCore import QMetaType
 
 def build_node_index_from_graph(G, crs_authid: str, snap_dist: float):
     """
@@ -13,7 +13,7 @@ def build_node_index_from_graph(G, crs_authid: str, snap_dist: float):
     """
     node_layer = QgsVectorLayer(f"Point?crs={crs_authid}", "_nodes", "memory")
     dp = node_layer.dataProvider()
-    dp.addAttributes([QgsField("nid", QVariant.Int)])
+    dp.addAttributes([QgsField("nid", QMetaType.Type.Int)])
     node_layer.updateFields()
 
     nid2node: Dict[int, Tuple[float,float]] = {}
