@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 from typing import List, Tuple, Optional
-from qgis.PyQt.QtCore import QVariant
+from qgis.PyQt.QtCore import QMetaType
 from qgis.core import (QgsVectorLayer, QgsGeometry, QgsFields, QgsField, QgsFeature,
                        QgsPointXY, QgsWkbTypes)
 from qgis import processing
@@ -70,7 +70,7 @@ def build_intersection_buffers(veh_roads: QgsVectorLayer,
     crs = veh_roads.crs().authid()
     mem = QgsVectorLayer(f"Polygon?crs={crs}", "inter_buf", "memory")
     prov = mem.dataProvider()
-    flds = QgsFields(); flds.append(QgsField("id", QVariant.Int))
+    flds = QgsFields(); flds.append(QgsField("id", QMetaType.Type.Int))
     prov.addAttributes(flds); mem.updateFields()
     for i, c in enumerate(centers, 1):
         bf = QgsFeature(flds); bf["id"] = i

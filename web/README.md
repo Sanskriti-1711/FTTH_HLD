@@ -1,66 +1,186 @@
-# Telecom HLD Web Portal
+# FTTH Engine Backend
 
-This directory contains a web interface for the HLD Planning QGIS plugin.
+This folder is now backend-only. The old React/Vite and vanilla frontend code
+has been removed.
 
-## Structure
+## Runtime Shape
 
-- `backend/`: FastAPI server that triggers the HLD algorithms.
-- `frontend/`: React application using MapLibre GL for visualization.
-
-## Prerequisites
-
-- Python 3.10+
-- Node.js 18+
-- npm 9+
-- (Optional) QGIS 3.22+ installed and `qgis_process` in your PATH. If not found, the backend will run in mock mode.
-
-## Setup & Running Locally
-
-### 1. Backend
-
-Navigate to the backend directory:
-```bash
-cd web/backend
+```
+MapLibre/static client
+        |
+        v
+FTTH Engine API (FastAPI + QGIS + HLDPlanning plugin)
+        |
+        v
+PostGIS tables:
+object_layer, polygon_layer, network_layer, trench_layer, duct_layer, cable_layer
 ```
 
-Install dependencies:
+The API runs the plugin orchestrator:
+
+```
+hldplanning:end_to_end_pipeline
+```
+
+which executes:
+
+```
+Object -> Polygon -> Network -> Trench -> Duct -> Cable
+```
+
+## Install
+
 ```bash
+cd web/backend
 pip install -r requirements.txt
 ```
 
-Run the server:
-```bash
-uvicorn main:app --reload --port 8000
-```
-The API will be available at `http://localhost:8000`.
+Set PostGIS connection variables:
 
-### 2. Frontend
-
-Navigate to the frontend directory:
 ```bash
-cd web/frontend
+set DATABASE_URL=postgresql://ftth:ftth@localhost:5432/ftth
 ```
 
-Install dependencies:
+Set QGIS if it is not already on `PATH`:
+
 ```bash
-npm install
+set QGIS_EXECUTABLE=C:\Program Files\QGIS 3.44.6\bin\qgis_process-qgis.bat
 ```
 
-Run the development server:
+Start:
+
 ```bash
-npm run dev
+uvicorn main:app --host 0.0.0.0 --port 8000
 ```
-The application will be available at `http://localhost:5173`.
 
-## Usage Workflow
+## Docker
 
-1. Open the portal at `http://localhost:5173`.
-2. Select a **Project** and **Area** (placeholders).
-3. Upload an **Excel Address List** (.xlsx) containing address information.
-4. Click **Generate HLD**.
-5. Wait for the status to show **completed**.
-6. Click on the generated layers (Objects, Polygons, PDPs, etc.) to visualize them on the map.
+From the repository root:
 
-## Configuration
+```bash
+docker compose up --build
+```
 
-You can change the API endpoint in `web/frontend/src/config.js` or by setting the `VITE_API_URL` environment variable during build.
+This starts:
+
+| Service | Port | Purpose |
+|---|---:|---|
+| `ftth-engine` | `8000` | FastAPI + QGIS + HLDPlanning plugin |
+| `postgis` | `5432` | Spatial storage for all FTTH layers |
+
+The backend image uses `web/backend/Dockerfile`. Pin the QGIS base image there
+for production builds if you need deterministic QGIS versions.
+
+## API
+
+### Health
+
+```http
+GET /health
+```
+
+Returns service status, QGIS executable detection, PostGIS status, and endpoint
+list.
+
+### Start HLD Run
+
+```http
+POST /ftth/hld/run
+Content-Type: multipart/form-data
+```
+
+Fields:
+
+| Field | Type | Required | Notes |
+|---|---|---:|---|
+| `excel` | file | yes | Address list `.xlsx` |
+| `roads` | file | yes | Roads layer, usually `.gpkg` |
+| `project_id` | form string | no | If omitted, the API creates one |
+| `poly_method` | form integer | no | Defaults to `0` convex hull. Use `3` only when the seeded-growth/Voronoi path is fixed. |
+
+Response is `202 Accepted`:
+
+```json
+{
+  "project_id": "9e2d...",
+  "status": "queued",
+  "results_url": "/ftth/hld/results/9e2d...",
+  "tile_url_template": "/tiles/{layer}/{z}/{x}/{y}.pbf?project_id=9e2d..."
+}
+```
+
+### Get Results
+
+```http
+GET /ftth/hld/results/{project_id}
+```
+
+Returns run status, progress, log messages, available layers, downloads, and
+tile URL template.
+
+### Get Layer GeoJSON
+
+```http
+GET /ftth/hld/results/{project_id}/layers/{layer}
+```
+
+Supported layer names:
+
+```text
+objects
+polygons
+network
+trenches
+ducts
+cables
+```
+
+Aliases such as `object_layer`, `polygon_layer`, and `trench_layer` also work.
+
+### Vector Tiles
+
+```http
+GET /tiles/{layer}/{z}/{x}/{y}.pbf?project_id={project_id}
+```
+
+Returns Mapbox Vector Tile bytes from PostGIS using `ST_AsMVT`.
+
+MapLibre source example:
+
+```js
+{
+  "trenches": {
+    "type": "vector",
+    "tiles": [
+      "http://localhost:8000/tiles/trenches/{z}/{x}/{y}.pbf?project_id=PROJECT_ID"
+    ]
+  }
+}
+```
+
+### Downloads
+
+```http
+GET /ftth/hld/download/{project_id}/{file_path}
+```
+
+Streams plugin-generated outputs such as `.gpkg`, `.xlsx`, `.csv`, `.geojson`,
+and logs from the project output directory.
+
+### Projects
+
+```http
+GET /ftth/projects
+```
+
+Lists recent PostGIS-backed HLD projects.
+
+## Legacy Compatibility Routes
+
+These remain temporarily for older clients:
+
+```http
+POST /run-hld
+GET  /status/{project_id}
+GET  /layers/{project_id}/{layer}
+```

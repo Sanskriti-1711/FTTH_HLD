@@ -5,7 +5,7 @@ import math
 from collections import Counter, defaultdict
 from statistics import median
 
-from qgis.PyQt.QtCore import QVariant, QCoreApplication
+from qgis.PyQt.QtCore import QCoreApplication, QMetaType
 from qgis.core import (
     QgsFeature, QgsFields, QgsField, QgsWkbTypes, QgsGeometry, QgsGeometryCollection,
     QgsProcessing, QgsProcessingAlgorithm,
@@ -262,37 +262,37 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                 continue  # GPKG reserves 'fid' as the FID column; copying it collides on write
             out.append(f)
         extra = [
-            ("stg", QVariant.String),
-            ("area_m2", QVariant.Double),
-            ("POLYGON_ID", QVariant.String),
-            ("SUM_OBJECT", QVariant.Int),
-            ("SUM_HOMES", QVariant.Int),
-            ("pDp_POL_ID", QVariant.String),
-            ("OLT_POL_ID", QVariant.String),
-            ("CLUSTER_ID", QVariant.String),
-            ("HH", QVariant.Int),
-            ("MFG", QVariant.String),
-            (COMMON_FIELDS.SRC_ID, QVariant.String),
-            (COMMON_FIELDS.STAGE, QVariant.String),
+            ("stg", QMetaType.Type.QString),
+            ("area_m2", QMetaType.Type.Double),
+            ("POLYGON_ID", QMetaType.Type.QString),
+            ("SUM_OBJECT", QMetaType.Type.Int),
+            ("SUM_HOMES", QMetaType.Type.Int),
+            ("pDp_POL_ID", QMetaType.Type.QString),
+            ("OLT_POL_ID", QMetaType.Type.QString),
+            ("CLUSTER_ID", QMetaType.Type.QString),
+            ("HH", QMetaType.Type.Int),
+            ("MFG", QMetaType.Type.QString),
+            (COMMON_FIELDS.SRC_ID, QMetaType.Type.QString),
+            (COMMON_FIELDS.STAGE, QMetaType.Type.QString),
         ]
         if include_growth:
             extra += [
-                ("CENTR_X", QVariant.Double),
-                ("CENTR_Y", QVariant.Double),
-                ("DENSITY", QVariant.Double),      # homes per hectare
-                ("SPLIT_SIZE", QVariant.String),   # primary (largest) splitter used, e.g. "1:64"
-                ("SPLIT_CNT", QVariant.Int),        # total number of splitters
-                ("SPLIT_UTIL", QVariant.Double),    # overall utilization %
-                ("SPLIT_OK", QVariant.Int),         # 1 = 60–90 % utilization
-                ("SPL_PLAN", QVariant.String),      # full mix, e.g. "2x1:64 + 1x1:16"
-                ("SPL_PORTS", QVariant.Int),        # total output ports across all splitters
-                ("SPL_4", QVariant.Int),            # count of 1:4 splitters (retired from catalogue → always 0; kept for schema stability)
-                ("SPL_8", QVariant.Int),            # count of 1:8 splitters
-                ("SPL_16", QVariant.Int),           # count of 1:16 splitters
-                ("SPL_32", QVariant.Int),           # count of 1:32 splitters
-                ("SPL_64", QVariant.Int),           # count of 1:64 splitters
-                ("NO_ACCESS", QVariant.Int),       # members failing the road-access check
-                ("REVIEW", QVariant.Int),
+                ("CENTR_X", QMetaType.Type.Double),
+                ("CENTR_Y", QMetaType.Type.Double),
+                ("DENSITY", QMetaType.Type.Double),      # homes per hectare
+                ("SPLIT_SIZE", QMetaType.Type.QString),   # primary (largest) splitter used, e.g. "1:64"
+                ("SPLIT_CNT", QMetaType.Type.Int),        # total number of splitters
+                ("SPLIT_UTIL", QMetaType.Type.Double),    # overall utilization %
+                ("SPLIT_OK", QMetaType.Type.Int),         # 1 = 60–90 % utilization
+                ("SPL_PLAN", QMetaType.Type.QString),      # full mix, e.g. "2x1:64 + 1x1:16"
+                ("SPL_PORTS", QMetaType.Type.Int),        # total output ports across all splitters
+                ("SPL_4", QMetaType.Type.Int),            # count of 1:4 splitters (retired from catalogue → always 0; kept for schema stability)
+                ("SPL_8", QMetaType.Type.Int),            # count of 1:8 splitters
+                ("SPL_16", QMetaType.Type.Int),           # count of 1:16 splitters
+                ("SPL_32", QMetaType.Type.Int),           # count of 1:32 splitters
+                ("SPL_64", QMetaType.Type.Int),           # count of 1:64 splitters
+                ("NO_ACCESS", QMetaType.Type.Int),       # members failing the road-access check
+                ("REVIEW", QMetaType.Type.Int),
             ]
         for name, qtype in extra:
             if out.indexOf(name) == -1:
@@ -332,7 +332,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
     def _collect_points_layer(self, geoms, crs, gid):
         mem = QgsVectorLayer(f"Point?crs={crs.authid()}", f"pts_{gid}", "memory")
         pr = mem.dataProvider()
-        pr.addAttributes([QgsField("gid", QVariant.String)])
+        pr.addAttributes([QgsField("gid", QMetaType.Type.QString)])
         mem.updateFields()
         feats = []
         for g in geoms:
@@ -409,7 +409,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
         """
         raw = QgsVectorLayer(f"Polygon?crs={crs.authid()}", "raw_seedlock", "memory")
         raw_dp = raw.dataProvider()
-        raw_dp.addAttributes([QgsField("gid", QVariant.String)])
+        raw_dp.addAttributes([QgsField("gid", QMetaType.Type.QString)])
         raw.updateFields()
 
         feats = []
@@ -433,7 +433,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
 
         labeled = QgsVectorLayer(f"Polygon?crs={crs.authid()}", "labeled_cells", "memory")
         prl = labeled.dataProvider()
-        prl.addAttributes([QgsField("gid", QVariant.String)])
+        prl.addAttributes([QgsField("gid", QMetaType.Type.QString)])
         labeled.updateFields()
 
         raw_union_by_gid = {gid: g for gid, g in raw_by_gid.items() if g and not g.isEmpty()}
@@ -477,9 +477,9 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
         is_numeric = {}
         for f in fields:
             is_numeric[f.name()] = f.type() in (
-                QVariant.Int, QVariant.LongLong,
-                QVariant.UInt, QVariant.ULongLong,
-                QVariant.Double
+                QMetaType.Type.Int, QMetaType.Type.LongLong,
+                QMetaType.Type.UInt, QMetaType.Type.ULongLong,
+                QMetaType.Type.Double
             )
 
         sums = defaultdict(lambda: defaultdict(float))
@@ -808,19 +808,27 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                 # Robust: a single-group Voronoi has one seed (or the EXTENT param
                 # is rejected) and errors out. Compute the Voronoi partition of ALL
                 # premises and union it; on any failure fall back to convex hull.
+                # Uses Shapely to avoid QGIS 3.44 SIGSEGV in qgis:voronoipolygons.
                 poly = None
                 try:
-                    pts = self._collect_points_layer(geoms, src.sourceCrs(), gid)
-                    if pts.featureCount() >= 3:
-                        vor = processing.run("qgis:voronoipolygons", {
-                            "INPUT": pts,
-                            "BUFFER": float(vor_ext) if vor_ext > 0 else 50.0,
-                            "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT,
-                        })["OUTPUT"]
-                        vor_diss = processing.run("native:dissolve", {
-                            "INPUT": vor, "FIELD": ["gid"], "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT,
-                        })["OUTPUT"]
-                        poly = self._collect_union_geom(vor_diss)
+                    from shapely import voronoi_polygons
+                    from shapely.geometry import MultiPoint
+                    from shapely.ops import unary_union
+
+                    all_coords = []
+                    for _g in geoms:
+                        if _g is None or _g.isEmpty():
+                            continue
+                        for pt in _g.vertices():
+                            all_coords.append((pt.x(), pt.y()))
+
+                    if len(all_coords) >= 3:
+                        mp = MultiPoint(all_coords)
+                        vor = voronoi_polygons(mp)
+                        cells = [g for g in vor.geoms if g is not None and not g.is_empty]
+                        if cells:
+                            diss = unary_union(cells)
+                            poly = QgsGeometry.fromWkt(diss.wkt)
                 except Exception as exc:
                     feedback.pushWarning(f"Voronoi failed ({exc}); using convex hull.")
                     poly = None
@@ -1128,7 +1136,8 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
             eng = QgsGeometry.createGeometryEngine(part.constGet())
             eng.prepareGeometry()
             for pt in member_pts:
-                if eng.intersects(QgsGeometry.fromPointXY(pt).constGet()):
+                _pg = QgsGeometry.fromPointXY(pt)
+                if eng.intersects(_pg.constGet()):
                     kept.append(part)
                     break
         if not kept:
@@ -1173,13 +1182,60 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
         of every building, dissolved by cluster id. Returns {cid: QgsGeometry}
         or None if the Voronoi step is unavailable (caller falls back to caps).
         Boundaries between adjacent clusters become straight midlines.
+
+        Uses Shapely's voronoi_polygons to avoid the SIGSEGV in QGIS 3.44's
+        qgis:voronoipolygons processing algorithm.
         """
+        if not owner or len(owner) < 2:
+            return None
+
+        # Primary: Shapely-based Voronoi (avoids QGIS 3.44 SIGSEGV)
         try:
-            if not owner or len(owner) < 2:
-                return None
+            from shapely import voronoi_polygons
+            from shapely.geometry import MultiPoint
+            from shapely.ops import unary_union
+
+            ordered_fids = list(pts.keys())
+            cids = [owner[fid] for fid in ordered_fids]
+            coords = [(pts[fid].x(), pts[fid].y()) for fid in ordered_fids]
+            mp = MultiPoint(coords)
+
+            # Build an explicit envelope matching QGIS's BUFFER=100.0 behavior
+            # so edge cells extend 100 m beyond the points' bounding box.
+            from shapely.geometry import box as shapely_box
+            minx = min(c[0] for c in coords)
+            miny = min(c[1] for c in coords)
+            maxx = max(c[0] for c in coords)
+            maxy = max(c[1] for c in coords)
+            envelope = shapely_box(minx - 100.0, miny - 100.0,
+                                   maxx + 100.0, maxy + 100.0)
+            vor = voronoi_polygons(mp, envelope=envelope)
+
+            cluster_cells = {}
+            for i, fid in enumerate(ordered_fids):
+                if i >= len(vor.geoms):
+                    break
+                cid = cids[i]
+                cell = vor.geoms[i]
+                if cell is None or cell.is_empty:
+                    continue
+                cluster_cells.setdefault(cid, []).append(cell)
+
+            out = {}
+            for cid, cells in cluster_cells.items():
+                dissolved = unary_union(cells)
+                out[cid] = QgsGeometry.fromWkt(dissolved.wkt)
+
+            if out:
+                return out
+        except Exception as exc:
+            feedback.pushWarning(f"Growth: Shapely Voronoi failed ({exc}); trying QGIS fallback.")
+
+        # Fallback: QGIS native voronoipolygons (may crash in QGIS 3.44)
+        try:
             vlyr = QgsVectorLayer(f"Point?crs={crs.authid()}", "vpts", "memory")
             pr = vlyr.dataProvider()
-            pr.addAttributes([QgsField("cid", QVariant.Int)])
+            pr.addAttributes([QgsField("cid", QMetaType.Type.Int)])
             vlyr.updateFields()
             feats = []
             for fid, ci in owner.items():
@@ -1773,7 +1829,8 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                     eng = QgsGeometry.createGeometryEngine(main.constGet())
                     eng.prepareGeometry()
                     for m in clusters[ci]["members"]:
-                        if not eng.intersects(QgsGeometry.fromPointXY(pts[m]).constGet()):
+                        _pg = QgsGeometry.fromPointXY(pts[m])
+                        if not eng.intersects(_pg.constGet()):
                             stranded.append((ci, m))
                 if not stranded:
                     break
@@ -1858,7 +1915,8 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                     eng = QgsGeometry.createGeometryEngine(main.constGet())
                     eng.prepareGeometry()
                     for m in clusters[ci]["members"]:
-                        if not eng.intersects(QgsGeometry.fromPointXY(pts[m]).constGet()):
+                        _pg = QgsGeometry.fromPointXY(pts[m])
+                        if not eng.intersects(_pg.constGet()):
                             stranded.append((ci, m))
                 if not stranded:
                     break
@@ -2100,7 +2158,8 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                 ci = _resolve(assigned[fid])
                 if ci not in geom_of_cluster:
                     continue
-                pgc = QgsGeometry.fromPointXY(pts[fid]).constGet()
+                _pg_tmp = QgsGeometry.fromPointXY(pts[fid])
+                pgc = _pg_tmp.constGet()
                 if ci in engines and engines[ci].intersects(pgc):
                     continue                                  # inside its own polygon
                 inside_other = next((oci for oci, e in engines.items()
@@ -2295,7 +2354,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                 pr = in_lyr.dataProvider()
                 fidx = in_lyr.fields().indexOf("POLYGON_ID")
                 if fidx == -1:
-                    pr.addAttributes([QgsField("POLYGON_ID", QVariant.String)])
+                    pr.addAttributes([QgsField("POLYGON_ID", QMetaType.Type.QString)])
                     in_lyr.updateFields()
                     fidx = in_lyr.fields().indexOf("POLYGON_ID")
                 if fidx != -1:

@@ -20,7 +20,7 @@ try:
     import networkx as nx
 except Exception:
     nx = None
-from qgis.PyQt.QtCore import QVariant, QCoreApplication
+from qgis.PyQt.QtCore import QCoreApplication, QMetaType
 from qgis.core import (
     QgsProcessing, QgsProcessingAlgorithm, QgsProcessingContext, QgsProcessingFeedback,
     QgsProcessingException, QgsProcessingParameterFileDestination, QgsProcessingParameterFeatureSource,
@@ -863,11 +863,11 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                         idIB = copy_to_sink(self, p, context, ibuf_mem, self.O_INTER_BUFF, "Intersection buffers", feedback)
                 # If still empty after fallback, allocate a schema-valid empty sink
                 if not idIB:
-                    empty_fields = QgsFields(); empty_fields.append(QgsField("id", QVariant.Int))
+                    empty_fields = QgsFields(); empty_fields.append(QgsField("id", QMetaType.Type.Int))
                     _, idIB = self.parameterAsSink(p, self.O_INTER_BUFF, context, empty_fields, QgsWkbTypes.Polygon, roads.crs())
             except Exception:
                 # Last-resort: create a schema-valid empty sink to keep downstream safe
-                empty_fields = QgsFields(); empty_fields.append(QgsField("id", QVariant.Int))
+                empty_fields = QgsFields(); empty_fields.append(QgsField("id", QMetaType.Type.Int))
                 _, idIB = self.parameterAsSink(p, self.O_INTER_BUFF, context, empty_fields, QgsWkbTypes.Polygon, roads.crs())
 
 
@@ -1051,7 +1051,7 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
             # --------------------------------------------------------
 
             tan_fields = QgsFields()
-            tan_fields.append(QgsField("id", QVariant.Int))
+            tan_fields.append(QgsField("id", QMetaType.Type.Int))
             sinkTan, idTan = self.parameterAsSink(
                 p, self.O_TANGENTS, context, tan_fields, QgsWkbTypes.LineString, roads.crs()
             )
@@ -1122,7 +1122,7 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
 
             # Also allocate an empty "designed tangents" sink so downstream never sees 'missing'
             tan_fields = QgsFields()
-            tan_fields.append(QgsField("id", QVariant.Int))
+            tan_fields.append(QgsField("id", QMetaType.Type.Int))
             sinkTan, idTan = self.parameterAsSink(
                 p, self.O_TANGENTS, context, tan_fields, QgsWkbTypes.LineString, roads.crs()
             )
@@ -1162,7 +1162,7 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
         # --------------------------------------------------------
         # MFG passthrough (selected or first)
         # --------------------------------------------------------
-        mfg_fields = QgsFields(); mfg_fields.append(QgsField("mfg_id", QVariant.Int))
+        mfg_fields = QgsFields(); mfg_fields.append(QgsField("mfg_id", QMetaType.Type.Int))
         # MFG is optional: fall back to roads.crs() so the sink can still be created,
         # and skip the MFG-derived steps downstream.
         sinkMFG, idMFG = self.parameterAsSink(
@@ -1193,19 +1193,19 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
         # PDP → Sidewalk projections (lines) + Pseudo PDP points
         # --------------------------------------------------------
         proj_fields = QgsFields()
-        proj_fields.append(QgsField("pdp_id",     QVariant.String))
-        proj_fields.append(QgsField("pdp_pol_id", QVariant.String))   # optional field from PDPs if present
-        proj_fields.append(QgsField("dist_m",     QVariant.Double))
+        proj_fields.append(QgsField("pdp_id",     QMetaType.Type.QString))
+        proj_fields.append(QgsField("pdp_pol_id", QMetaType.Type.QString))   # optional field from PDPs if present
+        proj_fields.append(QgsField("dist_m",     QMetaType.Type.Double))
         sinkProj, idProj = self.parameterAsSink(p, self.O_PDP_PROJ, context, proj_fields, QgsWkbTypes.LineString, pdps.crs())
         
         p_fields = QgsFields()
         for nm, t in (
-            ("pdp_id",     QVariant.String),
-            ("pdp_pol_id", QVariant.String),
-            ("sidewalk",   QVariant.String),   # 'left' | 'right'
-            ("method",     QVariant.String),   # 'nearest'
-            ("dist_m",     QVariant.Double),
-            ("seg_fid",    QVariant.Int),
+            ("pdp_id",     QMetaType.Type.QString),
+            ("pdp_pol_id", QMetaType.Type.QString),
+            ("sidewalk",   QMetaType.Type.QString),   # 'left' | 'right'
+            ("method",     QMetaType.Type.QString),   # 'nearest'
+            ("dist_m",     QMetaType.Type.Double),
+            ("seg_fid",    QMetaType.Type.Int),
         ):
             p_fields.append(QgsField(nm, t))
         sinkPseudo, idPseudo = self.parameterAsSink(p, self.O_PSEUDO_PDP, context, p_fields, QgsWkbTypes.Point, pdps.crs())
@@ -1401,20 +1401,20 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
         # Downstream readers should use ``first_field_case_insensitive``
         # (utils.fields) to look up either case.
         mfgpdp_fields = QgsFields()
-        mfgpdp_fields.append(QgsField("dist_m", QVariant.Double))
-        mfgpdp_fields.append(QgsField("POLYGON_ID", QVariant.String))
-        mfgpdp_fields.append(QgsField("PDP_ID", QVariant.String))
+        mfgpdp_fields.append(QgsField("dist_m", QMetaType.Type.Double))
+        mfgpdp_fields.append(QgsField("POLYGON_ID", QMetaType.Type.QString))
+        mfgpdp_fields.append(QgsField("PDP_ID", QMetaType.Type.QString))
         sinkMP, idMP = self.parameterAsSink(
             p, self.O_MFG_PDP, context, mfgpdp_fields, QgsWkbTypes.LineString, pdps.crs()
         )
 
         # Feeder_Trench schema + sink
         feeder_fields = QgsFields()
-        feeder_fields.append(QgsField("id", QVariant.Int))          # serial ID
-        feeder_fields.append(QgsField("dist_m", QVariant.Double))   # cached trench length
-        feeder_fields.append(QgsField("POLYGON_ID", QVariant.String))
-        feeder_fields.append(QgsField("PDP_ID", QVariant.String))
-        feeder_fields.append(QgsField("MFG_ID", QVariant.String))   # routing source device
+        feeder_fields.append(QgsField("id", QMetaType.Type.Int))          # serial ID
+        feeder_fields.append(QgsField("dist_m", QMetaType.Type.Double))   # cached trench length
+        feeder_fields.append(QgsField("POLYGON_ID", QMetaType.Type.QString))
+        feeder_fields.append(QgsField("PDP_ID", QMetaType.Type.QString))
+        feeder_fields.append(QgsField("MFG_ID", QMetaType.Type.QString))   # routing source device
 
         sinkFD, idFD = self.parameterAsSink(
             p, self.O_FEEDER, context, feeder_fields, QgsWkbTypes.MultiLineString, pdps.crs()
@@ -1620,34 +1620,34 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
             feedback.pushInfo("Step 8: no feeder lines to merge.")
             # still allocate empty sinks for downstream safety
             merged_fields = QgsFields()
-            merged_fields.append(QgsField("dist_m", QVariant.Double))
-            merged_fields.append(QgsField("POLYGON_ID", QVariant.String))
-            merged_fields.append(QgsField("PDP_ID", QVariant.String))
+            merged_fields.append(QgsField("dist_m", QMetaType.Type.Double))
+            merged_fields.append(QgsField("POLYGON_ID", QMetaType.Type.QString))
+            merged_fields.append(QgsField("PDP_ID", QMetaType.Type.QString))
             sinkMerged, idMergedPDP = self.parameterAsSink(
                 p, self.O_MERGED_PDP, context, merged_fields, QgsWkbTypes.MultiLineString, roads.crs()
             )
 
             final_fields = QgsFields()
-            final_fields.append(QgsField("id", QVariant.Int))
-            final_fields.append(QgsField("POLYGON_ID", QVariant.String))
-            final_fields.append(QgsField("PDP_ID", QVariant.String))
+            final_fields.append(QgsField("id", QMetaType.Type.Int))
+            final_fields.append(QgsField("POLYGON_ID", QMetaType.Type.QString))
+            final_fields.append(QgsField("PDP_ID", QMetaType.Type.QString))
             sinkFinal,  idFeederFinal = self.parameterAsSink(
                 p, self.O_FEEDER_FINAL, context, final_fields, QgsWkbTypes.MultiLineString, roads.crs()
             )
         else:
             # outputs (use source layer CRS for safety)
             merged_fields = QgsFields()
-            merged_fields.append(QgsField("dist_m", QVariant.Double))
-            merged_fields.append(QgsField("POLYGON_ID", QVariant.String))
-            merged_fields.append(QgsField("PDP_ID", QVariant.String))
+            merged_fields.append(QgsField("dist_m", QMetaType.Type.Double))
+            merged_fields.append(QgsField("POLYGON_ID", QMetaType.Type.QString))
+            merged_fields.append(QgsField("PDP_ID", QMetaType.Type.QString))
             sinkMerged, idMergedPDP = self.parameterAsSink(
                 p, self.O_MERGED_PDP, context, merged_fields, QgsWkbTypes.MultiLineString, _feeder_lines.crs()
             )
 
             final_fields = QgsFields()
-            final_fields.append(QgsField("id", QVariant.Int))
-            final_fields.append(QgsField("POLYGON_ID", QVariant.String))
-            final_fields.append(QgsField("PDP_ID", QVariant.String))
+            final_fields.append(QgsField("id", QMetaType.Type.Int))
+            final_fields.append(QgsField("POLYGON_ID", QMetaType.Type.QString))
+            final_fields.append(QgsField("PDP_ID", QMetaType.Type.QString))
             sinkFinal, idFeederFinal = self.parameterAsSink(
                 p, self.O_FEEDER_FINAL, context, final_fields, QgsWkbTypes.MultiLineString, _feeder_lines.crs()
             )
@@ -1755,16 +1755,16 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
 
             g_fields = QgsFields()
             for nm, t in (
-                ("pdp_pol_id", QVariant.String),
-                ("addr_id",    QVariant.String),
-                ("hhs",        QVariant.String),
-                ("sidewalk",   QVariant.String),
-                ("method",     QVariant.String),
-                ("distance_m", QVariant.Double),
-                ("hh_fid",     QVariant.Int),
-                ("POLYGON_ID", QVariant.String),
-                ("PDP_ID",     QVariant.String),
-                ("MFG_ID",     QVariant.String),
+                ("pdp_pol_id", QMetaType.Type.QString),
+                ("addr_id",    QMetaType.Type.QString),
+                ("hhs",        QMetaType.Type.QString),
+                ("sidewalk",   QMetaType.Type.QString),
+                ("method",     QMetaType.Type.QString),
+                ("distance_m", QMetaType.Type.Double),
+                ("hh_fid",     QMetaType.Type.Int),
+                ("POLYGON_ID", QMetaType.Type.QString),
+                ("PDP_ID",     QMetaType.Type.QString),
+                ("MFG_ID",     QMetaType.Type.QString),
             ):
                 g_fields.append(QgsField(nm, t))
 
@@ -1868,14 +1868,14 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
             # -----------------------------
             ph_fields = QgsFields()
             for nm, t in (
-                ("pdp_pol_id", QVariant.String),
-                ("addr_id",    QVariant.String),
-                ("hh_id",      QVariant.String),
-                ("sidewalk",   QVariant.String),
-                ("method",     QVariant.String),
-                ("dist_m",     QVariant.Double),
-                ("proj_fid",   QVariant.Int),
-                ("pdp_id",     QVariant.String),
+                ("pdp_pol_id", QMetaType.Type.QString),
+                ("addr_id",    QMetaType.Type.QString),
+                ("hh_id",      QMetaType.Type.QString),
+                ("sidewalk",   QMetaType.Type.QString),
+                ("method",     QMetaType.Type.QString),
+                ("dist_m",     QMetaType.Type.Double),
+                ("proj_fid",   QMetaType.Type.Int),
+                ("pdp_id",     QMetaType.Type.QString),
             ):
                 ph_fields.append(QgsField(nm, t))
 
@@ -2032,12 +2032,12 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
 
                     # --- Outputs ---
                     lines_fields = QgsFields()
-                    lines_fields.append(QgsField("obj_id",   QVariant.String))
-                    lines_fields.append(QgsField("addr_id",  QVariant.String))   # canonical ADDR_ID of the target HH
-                    lines_fields.append(QgsField("length_m", QVariant.Double))
-                    lines_fields.append(QgsField("POLYGON_ID", QVariant.String))
-                    lines_fields.append(QgsField("PDP_ID",     QVariant.String))
-                    lines_fields.append(QgsField("MFG_ID",     QVariant.String))
+                    lines_fields.append(QgsField("obj_id",   QMetaType.Type.QString))
+                    lines_fields.append(QgsField("addr_id",  QMetaType.Type.QString))   # canonical ADDR_ID of the target HH
+                    lines_fields.append(QgsField("length_m", QMetaType.Type.Double))
+                    lines_fields.append(QgsField("POLYGON_ID", QMetaType.Type.QString))
+                    lines_fields.append(QgsField("PDP_ID",     QMetaType.Type.QString))
+                    lines_fields.append(QgsField("MFG_ID",     QMetaType.Type.QString))
                     sinkDL, idDist = self.parameterAsSink(p, self.O_DIST_LINES, context, lines_fields, QgsWkbTypes.LineString, roads.crs())
                     
                     # --- At this point, you've already finished adding features to sinkDL/idDist ---
@@ -2065,11 +2065,11 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                     
                     # Now proceed to create the dissolve/summary sinks (they will use the trimmed idDist)
                     diss_fields = QgsFields()
-                    diss_fields.append(QgsField("obj_cnt", QVariant.Int))
-                    diss_fields.append(QgsField("total_m", QVariant.Double))
-                    diss_fields.append(QgsField("POLYGON_ID", QVariant.String))
-                    diss_fields.append(QgsField("PDP_ID",     QVariant.String))
-                    diss_fields.append(QgsField("MFG_ID",     QVariant.String))
+                    diss_fields.append(QgsField("obj_cnt", QMetaType.Type.Int))
+                    diss_fields.append(QgsField("total_m", QMetaType.Type.Double))
+                    diss_fields.append(QgsField("POLYGON_ID", QMetaType.Type.QString))
+                    diss_fields.append(QgsField("PDP_ID",     QMetaType.Type.QString))
+                    diss_fields.append(QgsField("MFG_ID",     QMetaType.Type.QString))
                     sinkDD, idDistD = self.parameterAsSink(p, self.O_DIST_DISS, context,
                                                            diss_fields, QgsWkbTypes.MultiLineString, roads.crs())
                     
@@ -2224,7 +2224,7 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
 
         # --- Final Tangent Trenches (always create the layer, even if empty) ---
         ft_fields = QgsFields()
-        ft_fields.append(QgsField("id", QVariant.Int))
+        ft_fields.append(QgsField("id", QMetaType.Type.Int))
 
         sinkFT, idFT = self.parameterAsSink(
             p, self.O_FINAL_TAN, context, ft_fields, QgsWkbTypes.LineString, roads.crs()
@@ -2247,7 +2247,7 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
 
         # --- Used crossings layer (materialize only the tangents that were actually used) ---
         tan_used_fields = QgsFields()
-        tan_used_fields.append(QgsField("id", QVariant.Int))
+        tan_used_fields.append(QgsField("id", QMetaType.Type.Int))
         sinkTanUsed, idTanUsed = self.parameterAsSink(
             p, self.O_TANGENTS_USED, context, tan_used_fields, QgsWkbTypes.LineString, roads.crs()
         )
@@ -2377,8 +2377,8 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                 for field in merged_final.fields():
                     if field.name() not in ("POLYGON_ID", "PDP_ID"):
                         ext_fields.append(QgsField(field.name(), field.type(), field.typeName(), field.length(), field.precision()))
-                ext_fields.append(QgsField("POLYGON_ID", QVariant.String))
-                ext_fields.append(QgsField("PDP_ID", QVariant.String))
+                ext_fields.append(QgsField("POLYGON_ID", QMetaType.Type.QString))
+                ext_fields.append(QgsField("PDP_ID", QMetaType.Type.QString))
 
                 sinkFinal, final_id = self.parameterAsSink(
                     p, self.O_FINAL, context,

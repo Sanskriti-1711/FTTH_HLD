@@ -21,7 +21,7 @@ Usage:
 """
 
 from qgis.core import QgsFeature, QgsFields, QgsField, QgsGeometry
-from qgis.PyQt.QtCore import QVariant
+from qgis.PyQt.QtCore import QMetaType
 from .network_registry import NetworkRegistry
 
 
@@ -146,11 +146,11 @@ class NetworkManager:
         provider = object_layer.dataProvider()
 
         if object_layer.fields().indexOf("POLYGON_ID") < 0:
-            provider.addAttributes([QgsField("POLYGON_ID", QVariant.String)])
+            provider.addAttributes([QgsField("POLYGON_ID", QMetaType.Type.QString)])
         if object_layer.fields().indexOf("PDP_ID") < 0:
-            provider.addAttributes([QgsField("PDP_ID", QVariant.String)])
+            provider.addAttributes([QgsField("PDP_ID", QMetaType.Type.QString)])
         if mfg_id is not None and object_layer.fields().indexOf("MFG_ID") < 0:
-            provider.addAttributes([QgsField("MFG_ID", QVariant.String)])
+            provider.addAttributes([QgsField("MFG_ID", QMetaType.Type.QString)])
 
         object_layer.updateFields()
         

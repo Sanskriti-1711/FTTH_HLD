@@ -19,7 +19,7 @@ Dependencies:
 import heapq
 import math, os
 from collections import defaultdict
-from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from qgis.PyQt.QtCore import QCoreApplication, QMetaType
 from qgis.core import (
     QgsProcessing,QgsCoordinateReferenceSystem,
     QgsProcessingAlgorithm,QgsProcessingParameterFeatureSource,
@@ -403,14 +403,14 @@ class AlgFeederDuctsNoSplit(QgsProcessingAlgorithm):
 
         # Prepare output
         fields = QgsFields()
-        fields.append(QgsField("mfg_id",    QVariant.String))
-        fields.append(QgsField("pdp_ids",   QVariant.String))
-        fields.append(QgsField("pdp_count", QVariant.Int))
-        fields.append(QgsField("part",      QVariant.String))
-        fields.append(QgsField("color",     QVariant.String))
-        fields.append(QgsField("edge_cnt",  QVariant.Int))
-        fields.append(QgsField("length_m",  QVariant.Double))
-        fields.append(QgsField("duct_idx",  QVariant.Int))
+        fields.append(QgsField("mfg_id",    QMetaType.Type.QString))
+        fields.append(QgsField("pdp_ids",   QMetaType.Type.QString))
+        fields.append(QgsField("pdp_count", QMetaType.Type.Int))
+        fields.append(QgsField("part",      QMetaType.Type.QString))
+        fields.append(QgsField("color",     QMetaType.Type.QString))
+        fields.append(QgsField("edge_cnt",  QMetaType.Type.Int))
+        fields.append(QgsField("length_m",  QMetaType.Type.Double))
+        fields.append(QgsField("duct_idx",  QMetaType.Type.Int))
 
         sink, out_id = self._make_sink(
             p, self.O_DUCTS, context, feedback,
@@ -798,7 +798,7 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
         # Node index for nearest-node snap (fast)
         node_layer = QgsVectorLayer(f"Point?crs={crs_t.authid()}", "_graph_nodes", "memory")
         prv = node_layer.dataProvider()
-        prv.addAttributes([QgsField("nid", QVariant.Int)]); node_layer.updateFields()
+        prv.addAttributes([QgsField("nid", QMetaType.Type.Int)]); node_layer.updateFields()
         nid2node, feats = {}, []
         for i, n in enumerate(G.nodes):
             f = QgsFeature(node_layer.fields())
@@ -830,14 +830,14 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
 
         # Prepare output
         fields = QgsFields()
-        fields.append(QgsField("PDP_ID",    QVariant.String))
-        fields.append(QgsField("duct_idx",  QVariant.Int))
-        fields.append(QgsField("hh_ids",    QVariant.String))
-        fields.append(QgsField("hh_count",  QVariant.Int))
-        fields.append(QgsField("length_m",  QVariant.Double))
-        fields.append(QgsField("side",      QVariant.String))
-        fields.append(QgsField("duct_uid",  QVariant.Int))
-        fields.append(QgsField("color",     QVariant.String))
+        fields.append(QgsField("PDP_ID",    QMetaType.Type.QString))
+        fields.append(QgsField("duct_idx",  QMetaType.Type.Int))
+        fields.append(QgsField("hh_ids",    QMetaType.Type.QString))
+        fields.append(QgsField("hh_count",  QMetaType.Type.Int))
+        fields.append(QgsField("length_m",  QMetaType.Type.Double))
+        fields.append(QgsField("side",      QMetaType.Type.QString))
+        fields.append(QgsField("duct_uid",  QMetaType.Type.Int))
+        fields.append(QgsField("color",     QMetaType.Type.QString))
 
         sink, out_id = self._make_sink(
             p, self.O_DUCTS, context, feedback,
