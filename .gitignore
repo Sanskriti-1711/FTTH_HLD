@@ -44,3 +44,27 @@ package-lock.json
 
 # Token / credential stores
 .tokensave/
+
+# Scratch / debug directories (not part of the project)
+# Only the throwaway bits are ignored; test scripts/fixtures under tmp/
+# stay ignored via more specific patterns so they can be `.git add`'d later
+# if the user decides to commit them.
+tmp-*/
+tmp/hld-test/screenshots/
+tmp/hld-test/uvicorn*.log
+tmp/hld-test/static.log
+tmp/hld-test/vite-stack.log
+tmp/patch_main_recovery_v*.py
+
+
+# Python virtual environments
+venv/
+.venv/
+env/
+.venv.bak/
+
+# Windows / CMD redirection artifact (e.g. accidental `> nul`)
+nul
+
+# Runtime logs
+*.log
