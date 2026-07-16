@@ -16,7 +16,7 @@ import uuid
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -43,55 +43,20 @@ PIPELINE_STAGES = [
     "Duct Layer",
 ]
 
-# Individual pipeline steps — maps step name → (alg_id, user-facing label)
-PIPELINE_STEPS: Dict[str, Tuple[str, str]] = {
-    "object":  ("hldplanning:01_object_layer",  "Object Layer"),
-    "polygon": ("hldplanning:02_polygon_layer", "Polygon Layer"),
-    "network": ("hldplanning:03_network_layer", "Network Layer"),
-    "trench":  ("hldplanning:04_trench_layer",  "Trench Layer"),
-    "cable":   ("hldplanning:06_cable_layer",   "Cable Layer"),
-    "duct":    ("hldplanning:05_duct_layer",    "Duct Layer"),
-}
-
-# Which ONECLICK_OUTPUTS entries belong to each pipeline step
-STEP_LAYER_MAP: Dict[str, List[str]] = {
-    "object":  ["objects"],
-    "polygon": ["polygons"],
-    "network": ["pdps", "mfg"],
-    "trench":  ["trenches"],
-    "cable":   ["feeder_cable", "distribution_cable"],
-    "duct":    ["feeder_ducts", "distribution_ducts"],
-}
-
-# Step dependency chain (which step must be completed before this one)
-STEP_DEPENDENCIES: Dict[str, Optional[str]] = {
-    "object":  None,
-    "polygon": "object",
-    "network": "polygon",
-    "trench":  "network",
-    "cable":   "trench",
-    "duct":    "trench",
-}
-
 ONECLICK_OUTPUTS: List[Tuple[str, str, str]] = [
     ("objects", "Objects.gpkg", "Objects.geojson"),
     ("polygons", "Polygons.gpkg", "Polygons.geojson"),
-    # Network layer outputs — each a separate public_layer for the frontend
     ("pdps", "PDPs.gpkg", "PDPs.geojson"),
     ("mfg", "MFG.gpkg", "MFG.geojson"),
-    # All trench types merged under "trenches" (single frontend toggle)
     ("trenches", "Feeder_Trench.gpkg", "Feeder_Trench.geojson"),
     ("trenches", "Distribution_Trench.gpkg", "Distribution_Trench.geojson"),
     ("trenches", "Garden_Trench.gpkg", "Garden_Trench.geojson"),
     ("trenches", "Drill_Trench.gpkg", "Drill_Trench.geojson"),
     ("trenches", "Final_Trenches.gpkg", "Final_Trenches.geojson"),
-    # Cable layers — individual names for frontend color mapping
     ("feeder_cable", "Feeder_Cable.gpkg", "Feeder_Cable.geojson"),
     ("distribution_cable", "Distribution_Cable.gpkg", "Distribution_Cable.geojson"),
-    # Duct layers — individual names for frontend color mapping
     ("feeder_ducts", "Feeder_Ducts.gpkg", "Feeder_Ducts.geojson"),
     ("distribution_ducts", "Distribution_Ducts.gpkg", "Distribution_Ducts.geojson"),
-    # Reports (non-vector, appear in downloads only)
     ("reports", "BOQ.xlsx", "BOQ.xlsx"),
     ("reports", "BOM.xlsx", "BOM.xlsx"),
 ]
@@ -262,152 +227,6 @@ def _convert_gpkg_to_geojson(gpkg_path: Path, geojson_path: Path) -> bool:
     return result.returncode == 0 and geojson_path.exists()
 
 
-# ---------------------------------------------------------------------------
-# Pipeline state helpers (server-side progress persistence)
-# ---------------------------------------------------------------------------
-
-
-def _init_pipeline_state(
-    project_id: str,
-    excel_filename: Optional[str] = None,
-    roads_filename: Optional[str] = None,
-) -> None:
-    """Initialise the pipeline_state JSONB in PostGIS for a fresh project."""
-    if postgis.is_available():
-        postgis.init_pipeline_state(
-            project_id, excel_filename=excel_filename, roads_filename=roads_filename
-        )
-
-
-def _update_step_progress(
-    project_id: str,
-    step: str,
-    status: str,
-    *,
-    progress: Optional[int] = None,
-    error: Optional[str] = None,
-    outputs: Optional[Dict[str, str]] = None,
-    params: Optional[Dict[str, Any]] = None,
-) -> None:
-    """Update a single step's state in PostGIS pipeline_state."""
-    if postgis.is_available():
-        postgis.update_step_progress(
-            project_id, step, status,
-            progress=progress, error=error, outputs=outputs, params=params,
-        )
-    # Also update in-memory task for polling
-    if error:
-        _append(project_id, "error", f"[{step}] {error}")
-    elif status == "completed":
-        _append(project_id, "success", f"[{step}] Completed")
-    elif status == "running":
-        _append(project_id, "info", f"[{step}] Running...")
-
-
-def _step_output_name(step: str) -> List[str]:
-    """Return the list of output GPKG filenames produced by a step."""
-    layer_map = {
-        "object":  ["Objects.gpkg"],
-        "polygon": ["Polygons.gpkg"],
-        "network": ["PDPs.gpkg", "MFG.gpkg", "Objects.gpkg"],  # network re-writes Objects.gpkg with PDP IDs
-        "trench":  ["Feeder_Trench.gpkg", "Distribution_Trench.gpkg",
-                     "Garden_Trench.gpkg", "Drill_Trench.gpkg", "Final_Trenches.gpkg"],
-        "cable":   ["Feeder_Cable.gpkg", "Distribution_Cable.gpkg"],
-        "duct":    ["Feeder_Ducts.gpkg", "Distribution_Ducts.gpkg"],
-    }
-    return layer_map.get(step, [])
-
-
-def _check_dependency(project_id: str, step: str) -> None:
-    """Check that the dependency step has been completed before this step."""
-    dep = STEP_DEPENDENCIES.get(step)
-    if dep is None:
-        return
-    if not postgis.is_available():
-        return  # Can't verify without PostGIS — let it proceed
-    state = postgis.get_pipeline_state(project_id)
-    if state is None:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Project has no pipeline state. Run '{dep}' step first.",
-        )
-    dep_status = (state.get("steps") or {}).get(dep, {}).get("status")
-    if dep_status != "completed":
-        raise HTTPException(
-            status_code=400,
-            detail=f"Cannot run '{step}' — dependency '{dep}' has status '{dep_status}'. Complete '{dep}' first.",
-        )
-
-
-# ---------------------------------------------------------------------------
-# Step-level qgis_process runners
-# ---------------------------------------------------------------------------
-
-
-def _build_qgis_step_cmd(
-    qgis: str,
-    step: str,
-    output_dir: Path,
-    step_params: Dict[str, str],
-) -> Union[List[str], str]:
-    """Build the qgis_process run command for an individual pipeline step."""
-    alg_id = PIPELINE_STEPS[step][0]
-    cmd_parts = [qgis, "run", alg_id, "--"]
-    for key, value in step_params.items():
-        cmd_parts.append(f"{key}={value}")
-    # When QGIS executable is a Windows batch script, convert to a single string
-    if os.name == "nt" and qgis.lower().endswith((".bat", ".cmd")):
-        return " ".join(_quote_cmd_arg(p) for p in cmd_parts)
-    return cmd_parts
-
-
-def _run_step(
-    project_id: str,
-    step: str,
-    output_dir: Path,
-    step_params: Dict[str, str],
-) -> None:
-    """Run a single pipeline step via qgis_process and update pipeline_state.
-
-    Args:
-        project_id: The project UUID.
-        step: Step name (object, polygon, network, trench, cable, duct).
-        output_dir: Directory storing inputs and receiving outputs.
-        step_params: KEY=VALUE parameters for the qgis_process algorithm.
-    """
-    # Validate step
-    if step not in PIPELINE_STEPS:
-        raise HTTPException(status_code=400, detail=f"Unknown step '{step}'.")
-
-    _update_step_progress(project_id, step, "running", progress=0)
-
-    qgis = _find_qgis_process()
-    if not qgis:
-        raise RuntimeError(
-            "qgis_process was not found. Set QGIS_EXECUTABLE or add QGIS bin to PATH."
-        )
-
-    cmd = _build_qgis_step_cmd(qgis, step, output_dir, step_params)
-    try:
-        _run_command(project_id, cmd, output_dir)
-    except Exception as exc:
-        _update_step_progress(project_id, step, "failed", error=str(exc))
-        raise
-
-    # Collect outputs — find which GPKGs were produced
-    outputs: Dict[str, str] = {}
-    for fname in _step_output_name(step):
-        gpkg = output_dir / fname
-        if gpkg.exists():
-            outputs[fname] = str(gpkg)
-
-    _update_step_progress(
-        project_id, step, "completed",
-        progress=100,
-        outputs=outputs if outputs else None,
-    )
-
-
 def _register_downloads(project_id: str, output_dir: Path) -> List[Dict[str, Any]]:
     downloads: List[Dict[str, Any]] = []
     for path in output_dir.rglob("*"):
@@ -475,8 +294,6 @@ def _run_pipeline(project_id: str, excel_path: Path, roads_path: Path, output_di
             roads_filename=roads_path.name,
             output_dir=str(output_dir),
         )
-        # Initialize pipeline_state and mark all steps as running (full pipeline)
-        _init_pipeline_state(project_id, excel_filename=excel_path.name, roads_filename=roads_path.name)
 
     try:
         qgis = _find_qgis_process()
@@ -499,19 +316,6 @@ def _run_pipeline(project_id: str, excel_path: Path, roads_path: Path, output_di
         _run_command(project_id, cmd, output_dir)
         layers = _ingest_outputs(project_id, output_dir)
         downloads = _register_downloads(project_id, output_dir)
-
-        # Mark all steps as completed in pipeline_state
-        for step_key in ("object", "polygon", "network", "trench", "cable", "duct"):
-            outputs = {}
-            for fname in _step_output_name(step_key):
-                gpkg = output_dir / fname
-                if gpkg.exists():
-                    outputs[fname] = str(gpkg)
-            _update_step_progress(
-                project_id, step_key, "completed",
-                progress=100,
-                outputs=outputs if outputs else None,
-            )
 
         task.update(
             {
@@ -570,6 +374,7 @@ def health() -> Dict[str, Any]:
             "GET /ftth/hld/download/{project_id}/{file_path}",
             "GET /tiles/{layer}/{z}/{x}/{y}.pbf?project_id={project_id}",
             "GET /ftth/projects",
+            "DELETE /ftth/hld/projects/{project_id}",
         ],
     }
 
@@ -679,6 +484,23 @@ def tiles(layer: str, z: int, x: int, y: int, project_id: str) -> Response:
     )
 
 
+@app.delete("/ftth/hld/projects/{project_id}", status_code=200)
+def delete_project(project_id: str) -> Dict[str, Any]:
+    """Delete a project and all its associated data (disk + PostGIS)."""
+    removed_task = tasks.pop(project_id, None)
+    output_dir = OUTPUT_DIR / project_id
+    if output_dir.exists() and output_dir.is_dir():
+        shutil.rmtree(str(output_dir), ignore_errors=True)
+    if postgis.is_available():
+        postgis.clear_project_layers(project_id)
+        postgis.delete_project(project_id)
+    return {
+        "deleted": True,
+        "project_id": project_id,
+        "had_in_memory_task": removed_task is not None,
+    }
+
+
 @app.get("/ftth/projects")
 def projects(limit: int = 50) -> List[Dict[str, Any]]:
     if postgis.is_available():
@@ -687,572 +509,6 @@ def projects(limit: int = 50) -> List[Dict[str, Any]]:
         _public_task(project_id)
         for project_id in sorted(tasks, key=lambda pid: tasks[pid].get("created_at", ""), reverse=True)
     ][:limit]
-
-
-# ---------------------------------------------------------------------------
-# Pre-Validation endpoint
-# ---------------------------------------------------------------------------
-
-
-@app.post("/ftth/hld/validate", status_code=200)
-async def validate_inputs(
-    excel: UploadFile = File(...),
-    roads: UploadFile = File(...),
-) -> Dict[str, Any]:
-    """
-    Pre-flight validation: checks that uploaded files are valid and that the
-    pipeline prerequisites are met, without running the full pipeline.
-
-    Checks performed:
-      1. qgis_process is available
-      2. HLDPlanning plugin is registered
-      3. Excel file is a valid .xlsx
-      4. Roads file has valid geometry
-      5. Bounding boxes overlap (approx)
-      6. Nominatim / PostGIS are reachable (if applicable)
-
-    Returns a list of check results with pass/fail status.
-    """
-    checks: List[Dict[str, Any]] = []
-
-    def _pass(check: str, detail: str = "") -> Dict[str, Any]:
-        return {"check": check, "status": "pass", "detail": detail}
-
-    def _fail(check: str, detail: str) -> Dict[str, Any]:
-        return {"check": check, "status": "fail", "detail": detail}
-
-    def _warn(check: str, detail: str) -> Dict[str, Any]:
-        return {"check": check, "status": "warn", "detail": detail}
-
-    # 1. QGIS process availability
-    qgis = _find_qgis_process()
-    if qgis:
-        checks.append(_pass("qgis_process", f"Found at {qgis}"))
-    else:
-        checks.append(_fail("qgis_process", "qgis_process not found in PATH. Set QGIS_EXECUTABLE."))
-
-    # 2. Plugin health (quick: list algorithms)
-    if qgis:
-        try:
-            result = subprocess.run(
-                [qgis, "plugins", "list", "--json"],
-                capture_output=True, text=True, timeout=30,
-                env={"QT_QPA_PLATFORM": "offscreen", "QGIS_PLUGINPATH": str(ROOT_DIR)},
-            )
-            if result.returncode == 0:
-                if "HLDPlanning" in result.stdout:
-                    checks.append(_pass("plugin_hldplanning", "HLDPlanning plugin is enabled."))
-                else:
-                    checks.append(_fail("plugin_hldplanning", "HLDPlanning plugin not found. Run: qgis_process plugins enable HLDPlanning"))
-            else:
-                checks.append(_warn("plugin_hldplanning", f"Plugin list command returned code {result.returncode}: {result.stderr[:200]}"))
-        except subprocess.TimeoutExpired:
-            checks.append(_warn("plugin_hldplanning", "Plugin check timed out (30s). Skipping."))
-        except Exception as exc:
-            checks.append(_warn("plugin_hldplanning", f"Plugin check error: {exc}"))
-
-    # 3. Excel file validation (magic bytes: first 8 bytes)
-    try:
-        excel_bytes = await excel.read(16)  # Only need first 16 bytes for magic check
-        await excel.seek(0)  # Reset for later upload
-        if excel_bytes[:8] in (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1",  # OLE2 (.xls)
-                               b"\x50\x4b\x03\x04"):  # PKZIP (.xlsx is ZIP)
-            checks.append(_pass("excel_format", "File header validates as Excel (.xls or .xlsx)"))
-        else:
-            checks.append(_fail("excel_format", f"Unexpected file header: {excel_bytes[:8].hex()}. Expected .xlsx (PK) or .xls (OLE2)"))
-    except Exception as exc:
-        checks.append(_fail("excel_format", f"Cannot read Excel file: {exc}"))
-
-    # 4. Roads file: geometry + extent check via ogr2ogr
-    roads_extent = None
-    try:
-        roads_bytes = await roads.read(16)
-        await roads.seek(0)
-        ogrinfo = shutil.which("ogrinfo")
-        roads_path = Path(roads.filename or "roads.gpkg")
-        roads_ext = roads_path.suffix.lower() if roads.filename else ".gpkg"
-
-        if ogrinfo:
-            # Write a temp file for ogrinfo to read
-            import tempfile
-            all_bytes = await roads.read()
-            await roads.seek(0)
-            with tempfile.NamedTemporaryFile(suffix=roads_ext, delete=False) as tmp:
-                tmp.write(all_bytes)
-                tmp_path = tmp.name
-            try:
-                # Get layer extent and feature count
-                result = subprocess.run(
-                    [ogrinfo, "-so", "-al", tmp_path],
-                    capture_output=True, text=True, timeout=30,
-                )
-                if result.returncode == 0:
-                    output = result.stdout
-                    fc = 0
-                    extent = None
-                    for line in output.splitlines():
-                        if "Feature Count" in line:
-                            fc = int(line.split("=")[-1].strip())
-                        if "Extent" in line and "(" in line:
-                            extent = line.strip()
-                    if fc > 0:
-                        checks.append(_pass("roads_geometry", f"Valid vector file: {fc} feature(s). Extent: {extent or 'unknown'}"))
-                        roads_extent = extent
-                    else:
-                        checks.append(_fail("roads_geometry", "Roads file contains zero features. Add road data before running."))
-                else:
-                    checks.append(_warn("roads_geometry", f"ogrinfo could not read file: {result.stderr[:200]}"))
-            finally:
-                try:
-                    os.unlink(tmp_path)
-                except Exception:
-                    pass
-        elif roads_ext in (".geojson", ".json"):
-            # Fallback: try quick JSON parse of first chunk
-            all_bytes = await roads.read()
-            await roads.seek(0)
-            try:
-                snippet = all_bytes[:4096].decode("utf-8").strip()
-                if snippet.startswith("{") and "\"type\"" in snippet:
-                    checks.append(_warn("roads_geometry", "GeoJSON detected (ogrinfo not available for deeper validation)"))
-                else:
-                    checks.append(_fail("roads_geometry", "GeoJSON format invalid — file does not start with valid JSON"))
-            except UnicodeDecodeError:
-                checks.append(_fail("roads_geometry", "GeoJSON must be UTF-8 encoded"))
-        else:
-            checks.append(_warn("roads_geometry", f"{roads_ext.upper()} file detected — ogrinfo not available for geometry validation"))
-    except Exception as exc:
-        checks.append(_fail("roads_geometry", f"Cannot read Roads file: {exc}"))
-
-    # 5. Bounding-box overlap check (requires openpyxl for Excel + ogrinfo extent)
-    try:
-        if roads_extent is not None:
-            import openpyxl
-            await excel.seek(0)
-            wb = openpyxl.load_workbook(excel.file, read_only=True, data_only=True)
-            ws = wb.active
-            if ws is not None:
-                # Look for LAT / LON columns in header row
-                lat_col = None
-                lon_col = None
-                for row in ws.iter_rows(min_row=1, max_row=1, values_only=True):
-                    for idx, cell in enumerate(row):
-                        cell_str = str(cell or "").strip().upper()
-                        if cell_str in ("LAT", "LATITUDE", "Y", "Y_COORD", "YCOORD"):
-                            lat_col = idx
-                        if cell_str in ("LON", "LNG", "LONG", "LONGITUDE", "X", "X_COORD", "XCOORD"):
-                            lon_col = idx
-                    break  # only header row
-                if lat_col is not None and lon_col is not None:
-                    # Read a sample of coordinates
-                    lats = []
-                    lons = []
-                    for row in ws.iter_rows(min_row=2, max_row=min(ws.max_row or 100, 100), values_only=True):
-                        try:
-                            lat_val = float(row[lat_col]) if row[lat_col] is not None else None
-                            lon_val = float(row[lon_col]) if row[lon_col] is not None else None
-                            if lat_val is not None and lon_val is not None \
-                               and -90 <= lat_val <= 90 and -180 <= lon_val <= 180:
-                                lats.append(lat_val)
-                                lons.append(lon_val)
-                        except (ValueError, TypeError, IndexError):
-                            continue
-                    if lats and lons:
-                        addr_bbox = (min(lons), min(lats), max(lons), max(lats))
-                        checks.append(_pass("bounding_box",
-                            f"Addresses span ({addr_bbox[0]:.4f}, {addr_bbox[1]:.4f}) to ({addr_bbox[2]:.4f}, {addr_bbox[3]:.4f}). "
-                            f"Roads extent: {roads_extent}"))
-                    else:
-                        checks.append(_warn("bounding_box",
-                            "Could not parse LAT/LON coordinates from Excel. Bounding box check skipped."))
-                else:
-                    checks.append(_warn("bounding_box",
-                        "Excel has no LAT/LON columns. Addresses will be geocoded via Nominatim. "
-                        "Bounding box check deferred to pipeline."))
-            wb.close()
-        else:
-            checks.append(_warn("bounding_box",
-                "Roads extent unknown. Cannot check bounding box overlap."))
-    except ImportError:
-        checks.append(_warn("bounding_box", "openpyxl not available. Bounding box check skipped."))
-    except Exception as exc:
-        checks.append(_warn("bounding_box", f"Bounding box check error: {exc}"))
-
-    # 6. PostGIS availability
-    if postgis.is_available():
-        checks.append(_pass("postgis", "PostGIS connection OK"))
-    else:
-        checks.append(_warn("postgis", "PostGIS not available. Pipeline will run without database storage."))
-
-    # 7. Overall summary
-    failures = [c for c in checks if c["status"] == "fail"]
-    warnings = [c for c in checks if c["status"] == "warn"]
-
-    return {
-        "valid": len(failures) == 0,
-        "pass_count": len([c for c in checks if c["status"] == "pass"]),
-        "warn_count": len(warnings),
-        "fail_count": len(failures),
-        "checks": checks,
-        "summary": (
-            "All checks passed." if not failures and not warnings else
-            f"{len(failures)} check(s) failed, {len(warnings)} warning(s)." if failures else
-            f"{len(warnings)} warning(s) — pipeline should still work."
-        ),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Individual step endpoints & progress/resume API
-# ---------------------------------------------------------------------------
-
-
-@app.get("/ftth/hld/progress/{project_id}")
-def get_progress(project_id: str) -> Dict[str, Any]:
-    """
-    Get the current pipeline_state for a project — shows which steps are
-    completed, pending, or failed, along with output files and parameters.
-    Useful for resuming a partially-complete pipeline.
-    """
-    if postgis.is_available():
-        state = postgis.get_pipeline_state(project_id)
-        if state is not None:
-            project = postgis.get_project(project_id)
-            return {
-                "project_id": project_id,
-                "status": (project or {}).get("status", "unknown"),
-                "pipeline_state": state,
-            }
-    # Fallback to in-memory task
-    task = tasks.get(project_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Project not found")
-    # Build a basic state from the in-memory task
-    steps = {}
-    for step_key in ("object", "polygon", "network", "trench", "cable", "duct"):
-        step_status = "pending"
-        if task.get("status") == "completed":
-            step_status = "completed"
-        elif task.get("status") == "failed":
-            step_status = "failed"
-        steps[step_key] = {
-            "status": step_status,
-            "outputs": {},
-            "params": {},
-            "error": task.get("error") if step_status == "failed" else None,
-            "started_at": task.get("created_at"),
-            "completed_at": task.get("updated_at") if step_status in ("completed", "failed") else None,
-        }
-    return {
-        "project_id": project_id,
-        "status": task.get("status", "unknown"),
-        "pipeline_state": {
-            "steps": steps,
-            "inputs": {
-                "excel_filename": task.get("roads_filename"),
-                "roads_filename": task.get("roads_filename"),
-            },
-        },
-    }
-
-
-@app.post("/ftth/hld/run/step/object", status_code=202)
-async def run_step_object(
-    background_tasks: BackgroundTasks,
-    project_id: str = Form(...),
-    excel: UploadFile = File(...),
-    sheet: Optional[str] = Form(None),
-    email: Optional[str] = Form("you@example.com"),
-    out_crs: Optional[str] = Form("EPSG:25833"),
-    thin: bool = Form(False),
-) -> Dict[str, Any]:
-    """Run the Object Layer step individually. Produces Objects.gpkg."""
-    output_dir = OUTPUT_DIR / project_id
-    upload_dir = output_dir / "inputs"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Initialize project if new
-    _task(project_id)
-    if postgis.is_available():
-        postgis.init_schema()
-        postgis.upsert_project(project_id, status="queued", output_dir=str(output_dir))
-        _init_pipeline_state(project_id, excel_filename=excel.filename)
-        postgis.update_inputs_state(project_id, excel_filename=excel.filename)
-
-    excel_path = _save_upload(excel, upload_dir, "addresses.xlsx")
-    out_gpkg = str(output_dir / "Objects.gpkg")
-
-    step_params = {
-        "EXCEL": str(excel_path),
-        "SHEET": sheet or "",
-        "EMAIL": email or "you@example.com",
-        "OUT_CRS": out_crs or "EPSG:25833",
-        "OUT_GPKG": out_gpkg,
-        "THIN_EXPORT": "1" if thin else "0",
-    }
-
-    def _run() -> None:
-        try:
-            _run_step(project_id, "object", output_dir, step_params)
-            _append(project_id, "info", "Object Layer step complete.")
-        except Exception as exc:
-            _append(project_id, "error", f"Object Layer failed: {exc}")
-
-    background_tasks.add_task(_run)
-
-    task = _task(project_id)
-    task.update({"status": "queued", "stage": "Object Layer", "output_dir": str(output_dir), "updated_at": _now()})
-    return _public_task(project_id)
-
-
-@app.post("/ftth/hld/run/step/polygon", status_code=202)
-async def run_step_polygon(
-    background_tasks: BackgroundTasks,
-    project_id: str = Form(...),
-    input_objects: UploadFile = File(...),
-    method: int = Form(3),
-    planning_first: bool = Form(False),
-    min_hh: int = Form(32),
-    max_hh: int = Form(128),
-    neighbor_dist: float = Form(150.0),
-    service_radius: float = Form(300.0),
-    road_access_dist: float = Form(100.0),
-    buffer: float = Form(0.0),
-    barrier_roads: Optional[UploadFile] = File(None),
-    barrier_classes: Optional[str] = Form("motorway,trunk,primary,secondary"),
-) -> Dict[str, Any]:
-    """Run the Polygon Layer step individually. Requires Objects.gpkg."""
-    _check_dependency(project_id, "polygon")
-    output_dir = OUTPUT_DIR / project_id
-    upload_dir = output_dir / "inputs"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    _task(project_id)
-    objects_path = _save_upload(input_objects, upload_dir, "Objects.gpkg")
-    out_gpkg = str(output_dir / "Polygons.gpkg")
-
-    step_params: Dict[str, str] = {
-        "INPUT": str(objects_path),
-        "METHOD": str(method),
-        "PLANNING_FIRST": "1" if planning_first else "0",
-        "MIN_HH_PER_POLYGON": str(min_hh),
-        "MAX_HH_PER_POLYGON": str(max_hh),
-        "NEIGHBOR_DIST": str(neighbor_dist),
-        "SERVICE_RADIUS": str(service_radius),
-        "ROAD_ACCESS_DIST": str(road_access_dist),
-        "BUFFER": str(buffer),
-        "THIN_EXPORT": "0",
-        "OUT": out_gpkg,
-    }
-    if barrier_classes:
-        step_params["BARRIER_MAIN_CLASSES"] = barrier_classes
-
-    def _run() -> None:
-        try:
-            _run_step(project_id, "polygon", output_dir, step_params)
-            _append(project_id, "info", "Polygon Layer step complete.")
-        except Exception as exc:
-            _append(project_id, "error", f"Polygon Layer failed: {exc}")
-
-    background_tasks.add_task(_run)
-
-    task = _task(project_id)
-    task.update({"status": "queued", "stage": "Polygon Layer", "output_dir": str(output_dir), "updated_at": _now()})
-    return _public_task(project_id)
-
-
-@app.post("/ftth/hld/run/step/network", status_code=202)
-async def run_step_network(
-    background_tasks: BackgroundTasks,
-    project_id: str = Form(...),
-    input_polygons: UploadFile = File(...),
-    input_objects: UploadFile = File(...),
-    roads: UploadFile = File(...),
-    mfg_override: Optional[UploadFile] = File(None),
-) -> Dict[str, Any]:
-    """Run the Network Layer step individually. Produces PDPs.gpkg and MFG.gpkg."""
-    _check_dependency(project_id, "network")
-    output_dir = OUTPUT_DIR / project_id
-    upload_dir = output_dir / "inputs"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    _task(project_id)
-    polys_path = _save_upload(input_polygons, upload_dir, "Polygons.gpkg")
-    objs_path = _save_upload(input_objects, upload_dir, "Objects.gpkg")
-    roads_path = _save_upload(roads, upload_dir, "roads.gpkg")
-
-    step_params: Dict[str, str] = {
-        "INPUT_POLY": str(polys_path),
-        "INPUT_OBJECTS": str(objs_path),
-        "INPUT_ROADS": str(roads_path),
-        "OUT_EDGES": "TEMPORARY_OUTPUT",
-        "OUT_CAND": "TEMPORARY_OUTPUT",
-        "OUT_REMOVED": "TEMPORARY_OUTPUT",
-        "OUT_CLEAN": "TEMPORARY_OUTPUT",
-        "OUT_ASSIGNED": str(output_dir / "PDPs.gpkg"),
-        "OUT_MFG_POINT": str(output_dir / "MFG.gpkg"),
-        "OUT_FINAL_OBJECTS": str(objs_path),  # updates objects with PDP IDs
-    }
-
-    # If user provided an MFG point override, save it and pass to the algorithm.
-    # The network layer uses INPUT_MFG to skip MFG generation and use this point.
-    mfg_override_path: Optional[Path] = None
-    if mfg_override is not None:
-        mfg_override_path = _save_upload(mfg_override, upload_dir, "MFG_override.gpkg")
-        step_params["INPUT_MFG"] = str(mfg_override_path)
-
-    def _run() -> None:
-        try:
-            _run_step(project_id, "network", output_dir, step_params)
-            _append(project_id, "info", "Network Layer step complete.")
-        except Exception as exc:
-            _append(project_id, "error", f"Network Layer failed: {exc}")
-
-    background_tasks.add_task(_run)
-
-    task = _task(project_id)
-    task.update({"status": "queued", "stage": "Network Layer", "output_dir": str(output_dir), "updated_at": _now()})
-    return _public_task(project_id)
-
-
-@app.post("/ftth/hld/run/step/trench", status_code=202)
-async def run_step_trench(
-    background_tasks: BackgroundTasks,
-    project_id: str = Form(...),
-    input_polygons: UploadFile = File(...),
-    input_roads: UploadFile = File(...),
-    input_pdp: UploadFile = File(...),
-    input_objects: UploadFile = File(...),
-    input_mfg: UploadFile = File(...),
-    buildings: Optional[UploadFile] = File(None),
-) -> Dict[str, Any]:
-    """Run the Trench Layer step individually. Produces all trench GPKGs."""
-    _check_dependency(project_id, "trench")
-    output_dir = OUTPUT_DIR / project_id
-    upload_dir = output_dir / "inputs"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    _task(project_id)
-    polys_path = _save_upload(input_polygons, upload_dir, "Polygons.gpkg")
-    roads_path = _save_upload(input_roads, upload_dir, "roads.gpkg")
-    pdp_path = _save_upload(input_pdp, upload_dir, "PDPs.gpkg")
-    objs_path = _save_upload(input_objects, upload_dir, "Objects.gpkg")
-    mfg_path = _save_upload(input_mfg, upload_dir, "MFG.gpkg")
-
-    step_params: Dict[str, str] = {
-        "INPUT_POLY": str(polys_path),
-        "INPUT_ROADS": str(roads_path),
-        "INPUT_PDP": str(pdp_path),
-        "INPUT_HOUSEHOLDS": str(objs_path),
-        "INPUT_MFG": str(mfg_path),
-        "OUT_FINAL_TRENCHES": str(output_dir / "Final_Trenches.gpkg"),
-        "OUT_SIDEWALK_LEFT": "TEMPORARY_OUTPUT",
-        "OUT_SIDEWALK_RIGHT": "TEMPORARY_OUTPUT",
-        "OUT_MERGED_PDP": "TEMPORARY_OUTPUT",
-        "OUT_FEEDER_FINAL": "TEMPORARY_OUTPUT",
-        "OUT_GARDEN_TRENCHES": "TEMPORARY_OUTPUT",
-        "OUT_DISTRIBUTION_LINES": "TEMPORARY_OUTPUT",
-        "OUT_DISTRIBUTION_DISS": "TEMPORARY_OUTPUT",
-        "OUT_FINAL_TANGENT_TRENCHES": "TEMPORARY_OUTPUT",
-    }
-
-    def _run() -> None:
-        try:
-            _run_step(project_id, "trench", output_dir, step_params)
-            _append(project_id, "info", "Trench Layer step complete.")
-        except Exception as exc:
-            _append(project_id, "error", f"Trench Layer failed: {exc}")
-
-    background_tasks.add_task(_run)
-
-    task = _task(project_id)
-    task.update({"status": "queued", "stage": "Trench Layer", "output_dir": str(output_dir), "updated_at": _now()})
-    return _public_task(project_id)
-
-
-@app.post("/ftth/hld/run/step/cable", status_code=202)
-async def run_step_cable(
-    background_tasks: BackgroundTasks,
-    project_id: str = Form(...),
-    feeder_trench: UploadFile = File(...),
-    garden_trench: UploadFile = File(...),
-    distribution_trench: UploadFile = File(...),
-) -> Dict[str, Any]:
-    """Run the Cable Layer step individually. Produces Feeder_Cable and Distribution_Cable."""
-    _check_dependency(project_id, "cable")
-    output_dir = OUTPUT_DIR / project_id
-    upload_dir = output_dir / "inputs"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    _task(project_id)
-    feeder_path = _save_upload(feeder_trench, upload_dir, "Feeder_Trench.gpkg")
-    garden_path = _save_upload(garden_trench, upload_dir, "Garden_Trench.gpkg")
-    dist_path = _save_upload(distribution_trench, upload_dir, "Distribution_Trench.gpkg")
-
-    step_params: Dict[str, str] = {
-        "FEEDER_TRENCH": str(feeder_path),
-        "GARDEN_TRENCHES": str(garden_path),
-        "DISTR_TRENCHES": str(dist_path),
-        "OUT_FEEDER_CABLE": str(output_dir / "Feeder_Cable.gpkg"),
-        "OUT_DISTRIBUTION_CABLE": str(output_dir / "Distribution_Cable.gpkg"),
-    }
-
-    def _run() -> None:
-        try:
-            _run_step(project_id, "cable", output_dir, step_params)
-            _append(project_id, "info", "Cable Layer step complete.")
-        except Exception as exc:
-            _append(project_id, "error", f"Cable Layer failed: {exc}")
-
-    background_tasks.add_task(_run)
-
-    task = _task(project_id)
-    task.update({"status": "queued", "stage": "Cable Layer", "output_dir": str(output_dir), "updated_at": _now()})
-    return _public_task(project_id)
-
-
-@app.post("/ftth/hld/run/step/duct", status_code=202)
-async def run_step_duct(
-    background_tasks: BackgroundTasks,
-    project_id: str = Form(...),
-    network_lines: UploadFile = File(...),
-    mfg_points: UploadFile = File(...),
-    pdp_points: UploadFile = File(...),
-    object_points: UploadFile = File(...),
-) -> Dict[str, Any]:
-    """Run the Duct Layer step individually. Produces Feeder_Ducts and Distribution_Ducts."""
-    _check_dependency(project_id, "duct")
-    output_dir = OUTPUT_DIR / project_id
-    upload_dir = output_dir / "inputs"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    _task(project_id)
-    nl_path = _save_upload(network_lines, upload_dir, "Final_Trenches.gpkg")
-    mfg_path = _save_upload(mfg_points, upload_dir, "MFG.gpkg")
-    pdp_path = _save_upload(pdp_points, upload_dir, "PDPs.gpkg")
-    obj_path = _save_upload(object_points, upload_dir, "Objects.gpkg")
-
-    step_params: Dict[str, str] = {
-        "NETWORK_LINES": str(nl_path),
-        "MFG_POINTS": str(mfg_path),
-        "PDP_POINTS": str(pdp_path),
-        "OBJECT_POINTS": str(obj_path),
-        "OUT_FEEDER_DUCTS": str(output_dir / "Feeder_Ducts.gpkg"),
-        "OUT_DISTRIBUTION_DUCTS": str(output_dir / "Distribution_Ducts.gpkg"),
-    }
-
-    def _run() -> None:
-        try:
-            _run_step(project_id, "duct", output_dir, step_params)
-            _append(project_id, "info", "Duct Layer step complete.")
-        except Exception as exc:
-            _append(project_id, "error", f"Duct Layer failed: {exc}")
-
-    background_tasks.add_task(_run)
-
-    task = _task(project_id)
-    task.update({"status": "queued", "stage": "Duct Layer", "output_dir": str(output_dir), "updated_at": _now()})
-    return _public_task(project_id)
 
 
 # Compatibility aliases
