@@ -11,10 +11,8 @@ import json
 import os
 import shutil
 import subprocess
-import threading
 import time
 import uuid
-import zipfile
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,47 +23,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 
 import postgis
-
-
-def _extract_roads_if_needed(roads_path: Path, upload_dir: Path) -> Path:
-    """If the uploaded roads file is a ZIP archive, extract it and return
-    the path to the first usable vector file found within. Otherwise return
-    the original path unchanged."""
-    if roads_path.suffix.lower() != ".zip":
-        return roads_path
-
-    extract_dir = upload_dir / "roads_extracted"
-    extract_dir.mkdir(parents=True, exist_ok=True)
-
-    try:
-        with zipfile.ZipFile(str(roads_path), "r") as zf:
-            zf.extractall(str(extract_dir))
-    except zipfile.BadZipFile:
-        # Not a valid ZIP — return the original path and let QGIS try
-        return roads_path
-
-    # Walk extracted files looking for the best vector dataset.
-    # Priority: .gpkg (single-file, no companion files needed) →
-    # .shp containing "road" in the name (identifies the roads layer
-    # in Geofabrik bundles that also include waterways, railways etc.)
-    # → any .shp → .geojson / .json.
-    best = None
-    for root, _dirs, files in os.walk(str(extract_dir)):
-        for fname in files:
-            ext = os.path.splitext(fname)[1].lower()
-            fn_lower = fname.lower()
-            if ext == ".gpkg":
-                return Path(os.path.join(root, fname))
-            elif ext == ".shp":
-                if "road" in fn_lower:
-                    return Path(os.path.join(root, fname))
-                if best is None:
-                    best = Path(os.path.join(root, fname))
-            elif ext in (".geojson", ".json"):
-                if best is None:
-                    best = Path(os.path.join(root, fname))
-
-    return best if best is not None else roads_path
 
 
 APP_STARTED_AT = datetime.now(timezone.utc)
@@ -89,14 +46,24 @@ PIPELINE_STAGES = [
 ONECLICK_OUTPUTS: List[Tuple[str, str, str]] = [
     ("objects", "Objects.gpkg", "Objects.geojson"),
     ("polygons", "Polygons.gpkg", "Polygons.geojson"),
-    ("network", "Network.gpkg", "Network.geojson"),
-    ("network", "PDPs.gpkg", "PDPs.geojson"),
-    ("network", "MFG.gpkg", "MFG.geojson"),
+    # Network layer outputs — each a separate public_layer for the frontend
+    ("pdps", "PDPs.gpkg", "PDPs.geojson"),
+    ("mfg", "MFG.gpkg", "MFG.geojson"),
+    # All trench types merged under "trenches" (single frontend toggle)
+    ("trenches", "Feeder_Trench.gpkg", "Feeder_Trench.geojson"),
+    ("trenches", "Distribution_Trench.gpkg", "Distribution_Trench.geojson"),
+    ("trenches", "Garden_Trench.gpkg", "Garden_Trench.geojson"),
+    ("trenches", "Drill_Trench.gpkg", "Drill_Trench.geojson"),
     ("trenches", "Final_Trenches.gpkg", "Final_Trenches.geojson"),
-    ("cables", "Feeder_Cable.gpkg", "Feeder_Cable.geojson"),
-    ("cables", "Distribution_Cable.gpkg", "Distribution_Cable.geojson"),
-    ("ducts", "Feeder_Ducts.gpkg", "Feeder_Ducts.geojson"),
-    ("ducts", "Distribution_Ducts.gpkg", "Distribution_Ducts.geojson"),
+    # Cable layers — individual names for frontend color mapping
+    ("feeder_cable", "Feeder_Cable.gpkg", "Feeder_Cable.geojson"),
+    ("distribution_cable", "Distribution_Cable.gpkg", "Distribution_Cable.geojson"),
+    # Duct layers — individual names for frontend color mapping
+    ("feeder_ducts", "Feeder_Ducts.gpkg", "Feeder_Ducts.geojson"),
+    ("distribution_ducts", "Distribution_Ducts.gpkg", "Distribution_Ducts.geojson"),
+    # Reports (non-vector, appear in downloads only)
+    ("reports", "BOQ.xlsx", "BOQ.xlsx"),
+    ("reports", "BOM.xlsx", "BOM.xlsx"),
 ]
 
 DOWNLOAD_EXTS = {".gpkg", ".xlsx", ".csv", ".json", ".geojson", ".txt"}
@@ -191,36 +158,6 @@ def _quote_cmd_arg(arg: str) -> str:
     return '"' + arg.replace('"', r'\"') + '"'
 
 
-def _process_line(project_id: str, line: str) -> None:
-    """Process a single stdout line: append as message and update stage/progress."""
-    text = line.strip()
-    if not text:
-        return
-    _append(project_id, "info", text)
-    for idx, stage in enumerate(PIPELINE_STAGES):
-        if stage.lower() in text.lower():
-            task = _task(project_id)
-            task["stage"] = stage
-            task["stage_index"] = idx
-            task["progress"] = int((idx / len(PIPELINE_STAGES)) * 100)
-
-
-def _stream_reader(stream, project_id: str) -> None:
-    """Read lines from a stream and process them in real-time.
-    Runs in a daemon thread so it won't block shutdown."""
-    try:
-        for line in iter(stream.readline, ""):
-            _process_line(project_id, line)
-    except (BrokenPipeError, OSError, ValueError):
-        # Stream closed while reading; expected on timeout or kill.
-        pass
-    finally:
-        try:
-            stream.close()
-        except Exception:
-            pass
-
-
 def _run_command(project_id: str, cmd: Union[List[str], str], output_dir: Path) -> None:
     env = os.environ.copy()
     env.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -240,23 +177,10 @@ def _run_command(project_id: str, cmd: Union[List[str], str], output_dir: Path) 
         shell=isinstance(cmd, str),
         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
     )
-
-    # Start a daemon reader thread so every stdout line is appended to
-    # the task's messages in real-time (not batched until exit).
-    reader = threading.Thread(
-        target=_stream_reader,
-        args=(process.stdout, project_id),
-        daemon=True,
-    )
-    reader.start()
-
     timeout = int(os.environ.get("QGIS_PROCESS_TIMEOUT", "10800"))
     try:
-        # wait() with timeout so we can raise on timeout without needing
-        # the full stdout (the reader thread already consumed it).
-        rc = process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        # Kill the process tree.
+        stdout, _ = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
         if os.name == "nt":
             subprocess.run(
                 ["taskkill", "/PID", str(process.pid), "/T", "/F"],
@@ -265,13 +189,27 @@ def _run_command(project_id: str, cmd: Union[List[str], str], output_dir: Path) 
             )
         else:
             process.kill()
-        # Reader thread will exit when the pipe closes.
-        reader.join(timeout=5)
-        raise RuntimeError(f"qgis_process timed out after {timeout} seconds")
+        try:
+            stdout, _ = process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            stdout = ""
+        for line in (stdout or "").splitlines()[-80:]:
+            _append(project_id, "info", line)
+        raise RuntimeError(f"qgis_process timed out after {timeout} seconds") from exc
 
-    # Wait for the reader thread to finish processing any buffered lines.
-    reader.join(timeout=10)
+    for line in (stdout or "").splitlines():
+        text = line.strip()
+        if not text:
+            continue
+        _append(project_id, "info", text)
+        for idx, stage in enumerate(PIPELINE_STAGES):
+            if stage.lower() in text.lower():
+                task = _task(project_id)
+                task["stage"] = stage
+                task["stage_index"] = idx
+                task["progress"] = int((idx / len(PIPELINE_STAGES)) * 100)
 
+    rc = process.returncode
     if rc != 0:
         raise RuntimeError(f"qgis_process exited with code {rc}")
     _append(project_id, "info", f"qgis_process finished; outputs in {output_dir}")
@@ -292,116 +230,6 @@ def _convert_gpkg_to_geojson(gpkg_path: Path, geojson_path: Path) -> bool:
         timeout=600,
     )
     return result.returncode == 0 and geojson_path.exists()
-
-
-def _reproject_gpkgs_to_wgs84(project_id: str, output_dir: Path) -> int:
-    """Generate EPSG:4326 (WGS84) sibling .gpkg files for every canonical
-    EPSG:25833 GPKG on disk, using `ogr2ogr` as an OUT-OF-PROCESS subprocess.
-
-    This belongs in the FastAPI backend, not the QGIS plugin, because:
-
-      * ogr2ogr is pure GDAL — no QGIS engine, no WSL2 .vhdx pressure
-        race, no containerd metadata.db write contention. Runs after
-        `qgis_process` has fully exited so the WSL2 engine is at rest.
-      * No nested `processing.run("native:reprojectlayer")` and no
-        read-back into QGIS memory — both were the sources of the
-        disk-pressure hang that previously bricked the engine.
-      * Per-file failure isolation: if ogr2ogr chokes on one GPKG, the
-        canonical layers and the other 8 siblings are unaffected.
-      * Toggle-default OFF: headless / qgis_process CLI runs and
-        back-to-back automation just don't ask for it, so there is zero
-        overhead in the common case.
-
-    Naming pattern matches the project's earlier convention: for every
-    `<stem>.gpkg` on disk, a `<stem>_wgs84.gpkg` is produced. The internal
-    layer table inside the WGS84 GPKG is also renamed to `<stem>_wgs84`
-    via the `-nln` flag, so dragging both files into the same QGIS
-    project does not collide on layer names. Files already ending in
-    `_wgs84.gpkg` are skipped so re-runs are safe.
-
-    WGS84 siblings stay on disk only; the PostGIS DB receives the
-    canonical EPSG:25833 layers via `ONECLICK_OUTPUTS` (which excludes
-    `*_wgs84.gpkg`). The DB schema is unchanged — this stage never
-    touches `postgis.load_geojson_file` and never populates any WGS84
-    rows.
-
-    Returns the number of WGS84 sibling files successfully written.
-    """
-    ogr2ogr = shutil.which("ogr2ogr")
-    if not ogr2ogr:
-        _append(
-            project_id, "warning",
-            "ogr2ogr not found in PATH; WGS84 sibling files will NOT be generated.",
-        )
-        return 0
-
-    written = 0
-    failed = 0
-    skipped_wgs = 0
-    t_started = time.time()
-    for gpkg in sorted(output_dir.glob("*.gpkg")):
-        # Skip our own previous outputs to avoid reprocessing.
-        if gpkg.stem.endswith("_wgs84"):
-            skipped_wgs += 1
-            continue
-        # Defensive: skip zero-byte inputs that often appear mid-pipeline.
-        try:
-            if gpkg.stat().st_size == 0:
-                _append(project_id, "warning",
-                        f"WGS84: skipping empty GPKG {gpkg.name}.")
-                continue
-        except OSError:
-            continue
-
-        wgs84_path = gpkg.with_name(f"{gpkg.stem}_wgs84.gpkg")
-        cmd = [
-            ogr2ogr,
-            "-f", "GPKG",
-            "-overwrite",
-            "-t_srs", "EPSG:4326",
-            "-s_srs", "EPSG:25833",
-            "-nln", f"{gpkg.stem}_wgs84",
-            str(wgs84_path),
-            str(gpkg),
-        ]
-        try:
-            res = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=300,
-            )
-            if res.returncode == 0 and wgs84_path.exists():
-                written += 1
-                _append(
-                    project_id, "info",
-                    f"WGS84 sibling created: {wgs84_path.name} "
-                    f"({gpkg.stat().st_size // 1024} KB → "
-                    f"{wgs84_path.stat().st_size // 1024} KB)",
-                )
-            else:
-                failed += 1
-                err_msg = (res.stderr or res.stdout or "unknown ogr2ogr error").strip()
-                _append(
-                    project_id, "warning",
-                    f"WGS84 sibling failed for {gpkg.name}: {err_msg[:300]}",
-                )
-        except subprocess.TimeoutExpired:
-            failed += 1
-            _append(
-                project_id, "warning",
-                f"WGS84 sibling timed out for {gpkg.name} (300 s cap).",
-            )
-        except Exception as exc:
-            failed += 1
-            _append(
-                project_id, "warning",
-                f"WGS84 sibling exception for {gpkg.name}: {exc}",
-            )
-
-    _append(
-        project_id, "info",
-        f"WGS84 stage done in {time.time() - t_started:.2f}s — "
-        f"written={written} failed={failed} skipped_existing={skipped_wgs}.",
-    )
-    return written
 
 
 def _register_downloads(project_id: str, output_dir: Path) -> List[Dict[str, Any]]:
@@ -430,6 +258,11 @@ def _ingest_outputs(project_id: str, output_dir: Path) -> List[Dict[str, Any]]:
     for public_layer, gpkg_name, geojson_name in ONECLICK_OUTPUTS:
         gpkg_path = output_dir / gpkg_name
         geojson_path = output_dir / geojson_name
+        # Handle report files (.xlsx) that aren't vector layers
+        if gpkg_name.lower().endswith(".xlsx"):
+            if gpkg_path.exists():
+                layer_files.setdefault(public_layer, []).append(str(gpkg_path))
+            continue
         if not geojson_path.exists():
             _convert_gpkg_to_geojson(gpkg_path, geojson_path)
         if geojson_path.exists():
@@ -455,32 +288,15 @@ def _ingest_outputs(project_id: str, output_dir: Path) -> List[Dict[str, Any]]:
     ]
 
 
-def _run_pipeline(
-    project_id: str,
-    excel_path: Path,
-    roads_path: Path,
-    output_dir: Path,
-    poly_method: int = 3,
-    wgs84: bool = False,
-) -> None:
+def _run_pipeline(project_id: str, excel_path: Path, roads_path: Path, output_dir: Path) -> None:
     task = _task(project_id)
     task.update({"status": "running", "stage": PIPELINE_STAGES[0], "updated_at": _now()})
-
-    # If the uploaded roads file is a ZIP archive, extract it so QGIS can
-    # open the vector file directly (QGIS/GDAL cannot reliably open ZIPs
-    # that contain shapefiles in subdirectories, e.g. Geofabrik bundles).
-    upload_dir = roads_path.parent
-    resolved_roads = _extract_roads_if_needed(roads_path, upload_dir)
-    if resolved_roads != roads_path:
-        _append(project_id, "info",
-                f"Extracted roads ZIP → {resolved_roads.name}")
-
     if postgis.is_available():
         postgis.init_schema()
         postgis.upsert_project(
             project_id,
             status="running",
-            roads_filename=resolved_roads.name,
+            roads_filename=roads_path.name,
             output_dir=str(output_dir),
         )
 
@@ -496,9 +312,8 @@ def _run_pipeline(
             "hldplanning:end_to_end_pipeline",
             "--",
             f"EXCEL={excel_path}",
-            f"ROADS={resolved_roads}",
+            f"ROADS={roads_path}",
             f"OUTPUT_DIR={output_dir}",
-            f"POLY_METHOD={poly_method}",
         ]
         if os.name == "nt" and qgis.lower().endswith((".bat", ".cmd")):
             cmd = " ".join(_quote_cmd_arg(part) for part in cmd)
@@ -506,29 +321,6 @@ def _run_pipeline(
         _run_command(project_id, cmd, output_dir)
         layers = _ingest_outputs(project_id, output_dir)
         downloads = _register_downloads(project_id, output_dir)
-
-        # Optional WGS84 sibling generation: ENTIRELY OUT of the QGIS
-        # plugin, runs after qgis_process has exited, on the canonical
-        # GPKGs that the plugin already wrote. Pure ogr2ogr subprocesses —
-        # no nested processing.run, no QGIS engine touching, no QGIS
-        # read-back. Per-file failures don't affect the canonical
-        # pipeline. Toggle via the `wgs84` form field on POST /ftth/hld/run.
-        if wgs84:
-            # Surface the WGS84 stage in the polling UI so 9 × ogr2ogr
-            # subprocesses show as activity instead of a static "complete".
-            task.update({"stage": "WGS84 Reprojection", "progress": 99})
-            _append(
-                project_id, "info",
-                "Generating WGS84 sibling files via out-of-process ogr2ogr...",
-            )
-            n_wgs = _reproject_gpkgs_to_wgs84(project_id, output_dir)
-            _append(
-                project_id, "info",
-                f"WGS84 stage complete — {n_wgs} companion file(s) written.",
-            )
-            # Refresh downloads so the new WGS84 GPKGs appear in the
-            # download manifest after the pipeline completes.
-            downloads = _register_downloads(project_id, output_dir)
 
         task.update(
             {
@@ -597,12 +389,8 @@ async def run_hld(
     excel: UploadFile = File(...),
     roads: UploadFile = File(...),
     project_id: Optional[str] = Form(None),
-    poly_method: int = Form(3),
-    wgs84: bool = Form(False),
 ) -> Dict[str, Any]:
     project_id = project_id or uuid.uuid4().hex
-    if poly_method not in (0, 1, 2, 3):
-        raise HTTPException(status_code=422, detail="poly_method must be one of 0, 1, 2, or 3")
     output_dir = OUTPUT_DIR / project_id
     upload_dir = output_dir / "inputs"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -628,7 +416,7 @@ async def run_hld(
             output_dir=str(output_dir),
         )
 
-    background_tasks.add_task(_run_pipeline, project_id, excel_path, roads_path, output_dir, poly_method, wgs84)
+    background_tasks.add_task(_run_pipeline, project_id, excel_path, roads_path, output_dir)
     return _public_task(project_id)
 
 
@@ -717,10 +505,8 @@ async def run_hld_compat(
     excel: UploadFile = File(...),
     roads: UploadFile = File(...),
     project_id: Optional[str] = Form(None),
-    poly_method: int = Form(3),
-    wgs84: bool = Form(False),
 ) -> Dict[str, Any]:
-    return await run_hld(background_tasks, excel, roads, project_id, poly_method, wgs84)
+    return await run_hld(background_tasks, excel, roads, project_id)
 
 
 @app.get("/status/{project_id}")

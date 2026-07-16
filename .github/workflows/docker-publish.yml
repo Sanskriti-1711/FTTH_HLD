@@ -1,0 +1,69 @@
+name: Build and Push ftth-engine to Docker Hub
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: sanskriti17/ftth_planning
+
+# Avoid racing rebuilds against Docker Hub rate limits and GHA cache thrash.
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-push:
+    name: Build & push ftth-engine
+    runs-on: ubuntu-latest
+    # qgis/qgis:3.44 (~1.5 GB) base pull + source-compiled shapely can be slow
+    # on a cold cache. 60 min leaves headroom.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Tag scheme:
+      #   * Release tag v1.2.3        -> :1.2.3, :1.2, :latest
+      #   * Prerelease tag v1.2.3-rc1 -> :1.2.3-rc1, :1.2 (no :latest)
+      #   * Manual workflow_dispatch  -> :dev
+      #
+      # Note: only Jinja template syntax (`{{ }}`) inside the tags block. Mixing
+      # `${{ }}` here is fragile across metadata-action majors.
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=dev,enable={{event == 'workflow_dispatch'}}
+          flavor: |
+            latest=auto
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./web/backend/Dockerfile
+          # qgis/qgis:3.44 only publishes linux/amd64; multi-arch would fail.
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope={{ github.ref_name }}
+          cache-to: type=gha,mode=max,scope={{ github.ref_name }}

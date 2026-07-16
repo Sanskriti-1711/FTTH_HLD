@@ -25,6 +25,7 @@ from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsVectorFileWriter,
     QgsMapLayer,
+    QgsProcessingOutputFile,
     Qgis,
 )
 from qgis import processing
@@ -147,6 +148,11 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
     OUT_MFG = "OUT_MFG"
     
     OUT_TRENCHES = "OUT_TRENCHES"
+    OUT_FEEDER_TRENCH = "OUT_FEEDER_TRENCH"
+    OUT_DIST_TRENCH = "OUT_DIST_TRENCH"
+    OUT_GARDEN_TRENCH = "OUT_GARDEN_TRENCH"
+    OUT_DRILL_TRENCH = "OUT_DRILL_TRENCH"
+
     OUT_FEEDER_CABLE = "OUT_FEEDER_CABLE"
     OUT_DIST_CABLE = "OUT_DIST_CABLE"
     OUT_FEEDER_DUCTS = "OUT_FEEDER_DUCTS"
@@ -157,6 +163,10 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         OUT_POLYGONS: "Polygons.gpkg",
         OUT_PDP: "PDPs.gpkg",
         OUT_MFG: "MFG.gpkg",
+        OUT_FEEDER_TRENCH: "Feeder_Trench.gpkg",
+        OUT_DIST_TRENCH: "Distribution_Trench.gpkg",
+        OUT_GARDEN_TRENCH: "Garden_Trench.gpkg",
+        OUT_DRILL_TRENCH: "Drill_Trench.gpkg",
         OUT_TRENCHES: "Final_Trenches.gpkg",
         OUT_FEEDER_CABLE: "Feeder_Cable.gpkg",
         OUT_DIST_CABLE: "Distribution_Cable.gpkg",
@@ -402,40 +412,63 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         ))
 
         self.addParameter(QgsProcessingParameterFeatureSink(
-            self.OUT_OBJECTS, self.tr("Final Object Layer"),
+            self.OUT_OBJECTS, self.tr("Object Layer"),
             QgsProcessing.TypeVectorPoint, optional=True, createByDefault=True
         ))
         self.addParameter(QgsProcessingParameterFeatureSink(
-            self.OUT_POLYGONS, self.tr("Polygons"),
+            self.OUT_POLYGONS, self.tr("Polygon Layer"),
             QgsProcessing.TypeVectorPolygon, optional=True, createByDefault=True
         ))
         self.addParameter(QgsProcessingParameterFeatureSink(
-            self.OUT_PDP, self.tr("PDPs (per polygon)"),
+            self.OUT_PDP, self.tr("Network - PDPs"),
             QgsProcessing.TypeVectorPoint, optional=True, createByDefault=True
         ))
         self.addParameter(QgsProcessingParameterFeatureSink(
-            self.OUT_MFG, self.tr("MFG point"),
+            self.OUT_MFG, self.tr("Network - MFG"),
             QgsProcessing.TypeVectorPoint, optional=True, createByDefault=True
         ))
         self.addParameter(QgsProcessingParameterFeatureSink(
-            self.OUT_TRENCHES, self.tr("Final Trenches"),
+            self.OUT_FEEDER_TRENCH,            self.tr("Trenches - Feeder"),
             QgsProcessing.TypeVectorLine, optional=True, createByDefault=True
         ))
         self.addParameter(QgsProcessingParameterFeatureSink(
-            self.OUT_FEEDER_CABLE, self.tr("Feeder Cable"),
+            self.OUT_DIST_TRENCH,            self.tr("Trenches - Distribution"),
             QgsProcessing.TypeVectorLine, optional=True, createByDefault=True
         ))
         self.addParameter(QgsProcessingParameterFeatureSink(
-            self.OUT_DIST_CABLE, self.tr("Distribution Cable"),
+            self.OUT_GARDEN_TRENCH,            self.tr("Trenches - Garden (HH->Footway)"),
             QgsProcessing.TypeVectorLine, optional=True, createByDefault=True
         ))
         self.addParameter(QgsProcessingParameterFeatureSink(
-            self.OUT_FEEDER_DUCTS, self.tr("Feeder Ducts"),
+            self.OUT_DRILL_TRENCH,            self.tr("Trenches - Drill Crossings"),
             QgsProcessing.TypeVectorLine, optional=True, createByDefault=True
         ))
         self.addParameter(QgsProcessingParameterFeatureSink(
-            self.OUT_DIST_DUCTS, self.tr("Distribution Ducts"),
+            self.OUT_TRENCHES, self.tr("Final Trenches (combined)"),
             QgsProcessing.TypeVectorLine, optional=True, createByDefault=True
+        ))
+        self.addParameter(QgsProcessingParameterFeatureSink(
+            self.OUT_FEEDER_CABLE,            self.tr("Cables - Feeder"),
+            QgsProcessing.TypeVectorLine, optional=True, createByDefault=True
+        ))
+        self.addParameter(QgsProcessingParameterFeatureSink(
+            self.OUT_DIST_CABLE,            self.tr("Cables - Distribution"),
+            QgsProcessing.TypeVectorLine, optional=True, createByDefault=True
+        ))
+        self.addParameter(QgsProcessingParameterFeatureSink(
+            self.OUT_FEEDER_DUCTS,            self.tr("Ducts - Feeder"),
+            QgsProcessing.TypeVectorLine, optional=True, createByDefault=True
+        ))
+        self.addParameter(QgsProcessingParameterFeatureSink(
+            self.OUT_DIST_DUCTS,            self.tr("Ducts - Distribution"),
+            QgsProcessing.TypeVectorLine, optional=True, createByDefault=True
+        ))
+
+        self.addOutput(QgsProcessingOutputFile(
+            "BOQ", self.tr("BOQ - Bill of Quantities")
+        ))
+        self.addOutput(QgsProcessingOutputFile(
+            "BOM", self.tr("BOM - Bill of Materials")
         ))
 
     def _output_dir(self, parameters, context):
@@ -1053,8 +1086,17 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             or tr.get(self._TR_DIST_DISS)
             or tr.get(self._TR_MERGED_PDP)
         )
+        results["drill"] = tr.get(self._TR_FINAL_TAN)
         results["trenches"] = self._save_layer_to_gpkg(
             results["trenches"], "Final_Trenches.gpkg", out_dir, context, feedback)
+        results["feeder"] = self._save_layer_to_gpkg(
+            results["feeder"], "Feeder_Trench.gpkg", out_dir, context, feedback)
+        results["distribution"] = self._save_layer_to_gpkg(
+            results["distribution"], "Distribution_Trench.gpkg", out_dir, context, feedback)
+        results["garden"] = self._save_layer_to_gpkg(
+            results["garden"], "Garden_Trench.gpkg", out_dir, context, feedback)
+        results["drill"] = self._save_layer_to_gpkg(
+            results["drill"], "Drill_Trench.gpkg", out_dir, context, feedback)
 
         if feedback.isCanceled():
             return {}
@@ -1151,6 +1193,10 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         put(self.OUT_POLYGONS, results.get("polygons"))
         put(self.OUT_PDP, results.get("pdp"))
         put(self.OUT_MFG, results.get("mfg"))
+        put(self.OUT_FEEDER_TRENCH, results.get("feeder"))
+        put(self.OUT_DIST_TRENCH, results.get("distribution"))
+        put(self.OUT_GARDEN_TRENCH, results.get("garden"))
+        put(self.OUT_DRILL_TRENCH, results.get("drill"))
         put(self.OUT_TRENCHES, results.get("trenches"))
         put(self.OUT_FEEDER_CABLE, cables.get(self._CB_OUT_FEEDER))
         put(self.OUT_DIST_CABLE, cables.get(self._CB_OUT_DIST))
@@ -1260,6 +1306,152 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         except Exception:
             pass
 
+    def postProcess(self, results, context, feedback):
+        """
+        Organise output layers into a hierarchical QGIS layer tree with groups:
+          Object Layer
+          Polygon Layer
+          Network (PDPs, MFG)
+          Trenches (Feeder, Distribution, Garden, Drill, Final)
+          Cables (Feeder, Distribution)
+          Ducts (Feeder, Distribution)
+          BOQ / BOM (file outputs, shown at root)
+
+        Runs after processAlgorithm() returns. Headless-mode calls are silently
+        skipped because QgsProject is not available.
+        """
+        try:
+            from qgis.core import (
+                QgsProject, QgsVectorLayer, QgsProcessingUtils, QgsMapLayer,
+            )
+        except Exception:
+            return  # Not running inside a QGIS environment
+
+        project = QgsProject.instance()
+        if project is None:
+            return  # Headless mode (qgis_process)
+
+        # ---- group layout ---------------------------------------------------
+        # Maps output-key -> (group_name, display_name, order_within_group)
+        LAYOUT = {
+            self.OUT_OBJECTS:    (None, "Object Layer", 0),        # root
+            self.OUT_POLYGONS:   (None, "Polygon Layer", 0),       # root
+            self.OUT_PDP:        ("Network", "PDPs", 0),
+            self.OUT_MFG:        ("Network", "MFG", 1),
+            self.OUT_FEEDER_TRENCH:  ("Trenches", "Feeder", 0),
+            self.OUT_DIST_TRENCH:    ("Trenches", "Distribution", 1),
+            self.OUT_GARDEN_TRENCH:  ("Trenches", "Garden", 2),
+            self.OUT_DRILL_TRENCH:   ("Trenches", "Drill Crossings", 3),
+            self.OUT_TRENCHES:       ("Trenches", "Final Trenches", 4),
+            self.OUT_FEEDER_CABLE: ("Cables", "Feeder", 0),
+            self.OUT_DIST_CABLE:   ("Cables", "Distribution", 1),
+            self.OUT_FEEDER_DUCTS: ("Ducts", "Feeder", 0),
+            self.OUT_DIST_DUCTS:   ("Ducts", "Distribution", 1),
+        }
+
+        # Ordered group list (top-to-bottom in the legend)
+        GROUP_ORDER = ("Network", "Trenches", "Cables", "Ducts")
+
+        # ---- helpers --------------------------------------------------------
+        def _resolve(key, val):
+            """Resolve a QgsMapLayer from the output value."""
+            if val is None or (isinstance(val, str) and not val.strip()):
+                return None
+            if isinstance(val, QgsMapLayer):
+                return val
+            if not isinstance(val, str):
+                return None
+            # Temporary layer store (memory layers from child algorithms)
+            try:
+                store = context.temporaryLayerStore()
+                if store:
+                    lyr = store.mapLayer(val)
+                    if lyr is not None:
+                        return lyr
+            except Exception:
+                pass
+            # Standard context lookup (resolves layer IDs and file URIs)
+            try:
+                return QgsProcessingUtils.mapLayerFromString(val, context)
+            except Exception:
+                pass
+            # Bare file path fallback
+            try:
+                name = LAYOUT.get(key, (None, key, 0))[1]
+                lyr = QgsVectorLayer(val, name, "ogr")
+                if lyr.isValid():
+                    return lyr
+            except Exception:
+                pass
+            return None
+
+        def _remove_existing(source_uri):
+            """Remove any layer already in the project with the same source URI
+            so re-runs replace layers instead of duplicating them."""
+            if not source_uri or not isinstance(source_uri, str):
+                return
+            for existing in list(project.mapLayers().values()):
+                try:
+                    if existing.source() == source_uri:
+                        project.removeMapLayer(existing)
+                except Exception:
+                    pass
+
+        # ---- build groups (insert at top, reversed order for correct stacking) ---
+        root = project.layerTreeRoot()
+        groups = {}
+        for grp_name in reversed(GROUP_ORDER):
+            existing = root.findGroup(grp_name)
+            if existing is not None:
+                # Clear stale child layers from previous runs
+                for child in list(existing.children()):
+                    existing.removeChildNode(child)
+                # Move group to top of legend
+                root.removeChildNode(existing)
+                root.insertChildNode(0, existing)
+                groups[grp_name] = existing
+            else:
+                groups[grp_name] = root.insertGroup(0, grp_name)
+
+        # ---- add each output to its group (or root) -------------------------
+        for key, val in results.items():
+            if key not in LAYOUT:
+                continue
+            lyr = _resolve(key, val)
+            if lyr is None:
+                continue
+
+            grp_name, display_name, _ = LAYOUT[key]
+
+            # Set a friendly layer name
+            try:
+                lyr.setName(display_name)
+            except Exception:
+                pass
+
+            # Remove any previous project layer with the same source
+            try:
+                _remove_existing(lyr.source())
+            except Exception:
+                pass
+
+            if grp_name is None:
+                # Root level — add normally
+                project.addMapLayer(lyr)
+                # Move to top
+                tl = root.findLayer(lyr.id())
+                if tl:
+                    c = tl.clone()
+                    root.insertChildNode(0, c)
+                    root.removeChildNode(tl)
+            else:
+                grp = groups.get(grp_name)
+                if grp is None:
+                    project.addMapLayer(lyr)
+                else:
+                    project.addMapLayer(lyr, False)
+                    grp.addLayer(lyr)
+
     def processAlgorithm(self, parameters, context, feedback):
         log_feedback, log_path = self._setup_logging(
             parameters, context, feedback)
@@ -1267,6 +1459,15 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             self._validate_inputs(parameters, context, log_feedback)
             out = self.execute_pipeline(parameters, context, log_feedback)
             self._copy_hardcoded_reports(parameters, context, log_feedback)
+            # Include BOQ/BOM file paths in output if they exist
+            out_dir = self._output_dir(parameters, context)
+            if out_dir:
+                boq_path = os.path.join(out_dir, "BOQ.xlsx")
+                bom_path = os.path.join(out_dir, "BOM.xlsx")
+                if os.path.isfile(boq_path):
+                    out["BOQ"] = boq_path
+                if os.path.isfile(bom_path):
+                    out["BOM"] = bom_path
             self._finalize_logging(log_path, log_feedback, out)
             return out
         except Exception as exc:

@@ -39,8 +39,9 @@ node_modules/
 package.json
 package-lock.json
 
-# GitHub templates / actions (auto-generated)
-.github/
+# GitHub auto-generated templates (workflow files are tracked intentionally)
+.github/ISSUE_TEMPLATE/
+.github/PULL_REQUEST_TEMPLATE.md
 
 # Token / credential stores
 .tokensave/
