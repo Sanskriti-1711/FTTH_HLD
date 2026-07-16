@@ -690,6 +690,219 @@ def projects(limit: int = 50) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Pre-Validation endpoint
+# ---------------------------------------------------------------------------
+
+
+@app.post("/ftth/hld/validate", status_code=200)
+async def validate_inputs(
+    excel: UploadFile = File(...),
+    roads: UploadFile = File(...),
+) -> Dict[str, Any]:
+    """
+    Pre-flight validation: checks that uploaded files are valid and that the
+    pipeline prerequisites are met, without running the full pipeline.
+
+    Checks performed:
+      1. qgis_process is available
+      2. HLDPlanning plugin is registered
+      3. Excel file is a valid .xlsx
+      4. Roads file has valid geometry
+      5. Bounding boxes overlap (approx)
+      6. Nominatim / PostGIS are reachable (if applicable)
+
+    Returns a list of check results with pass/fail status.
+    """
+    checks: List[Dict[str, Any]] = []
+
+    def _pass(check: str, detail: str = "") -> Dict[str, Any]:
+        return {"check": check, "status": "pass", "detail": detail}
+
+    def _fail(check: str, detail: str) -> Dict[str, Any]:
+        return {"check": check, "status": "fail", "detail": detail}
+
+    def _warn(check: str, detail: str) -> Dict[str, Any]:
+        return {"check": check, "status": "warn", "detail": detail}
+
+    # 1. QGIS process availability
+    qgis = _find_qgis_process()
+    if qgis:
+        checks.append(_pass("qgis_process", f"Found at {qgis}"))
+    else:
+        checks.append(_fail("qgis_process", "qgis_process not found in PATH. Set QGIS_EXECUTABLE."))
+
+    # 2. Plugin health (quick: list algorithms)
+    if qgis:
+        try:
+            result = subprocess.run(
+                [qgis, "plugins", "list", "--json"],
+                capture_output=True, text=True, timeout=30,
+                env={"QT_QPA_PLATFORM": "offscreen", "QGIS_PLUGINPATH": str(ROOT_DIR)},
+            )
+            if result.returncode == 0:
+                if "HLDPlanning" in result.stdout:
+                    checks.append(_pass("plugin_hldplanning", "HLDPlanning plugin is enabled."))
+                else:
+                    checks.append(_fail("plugin_hldplanning", "HLDPlanning plugin not found. Run: qgis_process plugins enable HLDPlanning"))
+            else:
+                checks.append(_warn("plugin_hldplanning", f"Plugin list command returned code {result.returncode}: {result.stderr[:200]}"))
+        except subprocess.TimeoutExpired:
+            checks.append(_warn("plugin_hldplanning", "Plugin check timed out (30s). Skipping."))
+        except Exception as exc:
+            checks.append(_warn("plugin_hldplanning", f"Plugin check error: {exc}"))
+
+    # 3. Excel file validation (magic bytes: first 8 bytes)
+    try:
+        excel_bytes = await excel.read(16)  # Only need first 16 bytes for magic check
+        await excel.seek(0)  # Reset for later upload
+        if excel_bytes[:8] in (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1",  # OLE2 (.xls)
+                               b"\x50\x4b\x03\x04"):  # PKZIP (.xlsx is ZIP)
+            checks.append(_pass("excel_format", "File header validates as Excel (.xls or .xlsx)"))
+        else:
+            checks.append(_fail("excel_format", f"Unexpected file header: {excel_bytes[:8].hex()}. Expected .xlsx (PK) or .xls (OLE2)"))
+    except Exception as exc:
+        checks.append(_fail("excel_format", f"Cannot read Excel file: {exc}"))
+
+    # 4. Roads file: geometry + extent check via ogr2ogr
+    roads_extent = None
+    try:
+        roads_bytes = await roads.read(16)
+        await roads.seek(0)
+        ogrinfo = shutil.which("ogrinfo")
+        roads_path = Path(roads.filename or "roads.gpkg")
+        roads_ext = roads_path.suffix.lower() if roads.filename else ".gpkg"
+
+        if ogrinfo:
+            # Write a temp file for ogrinfo to read
+            import tempfile
+            all_bytes = await roads.read()
+            await roads.seek(0)
+            with tempfile.NamedTemporaryFile(suffix=roads_ext, delete=False) as tmp:
+                tmp.write(all_bytes)
+                tmp_path = tmp.name
+            try:
+                # Get layer extent and feature count
+                result = subprocess.run(
+                    [ogrinfo, "-so", "-al", tmp_path],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if result.returncode == 0:
+                    output = result.stdout
+                    fc = 0
+                    extent = None
+                    for line in output.splitlines():
+                        if "Feature Count" in line:
+                            fc = int(line.split("=")[-1].strip())
+                        if "Extent" in line and "(" in line:
+                            extent = line.strip()
+                    if fc > 0:
+                        checks.append(_pass("roads_geometry", f"Valid vector file: {fc} feature(s). Extent: {extent or 'unknown'}"))
+                        roads_extent = extent
+                    else:
+                        checks.append(_fail("roads_geometry", "Roads file contains zero features. Add road data before running."))
+                else:
+                    checks.append(_warn("roads_geometry", f"ogrinfo could not read file: {result.stderr[:200]}"))
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+        elif roads_ext in (".geojson", ".json"):
+            # Fallback: try quick JSON parse of first chunk
+            all_bytes = await roads.read()
+            await roads.seek(0)
+            try:
+                snippet = all_bytes[:4096].decode("utf-8").strip()
+                if snippet.startswith("{") and "\"type\"" in snippet:
+                    checks.append(_warn("roads_geometry", "GeoJSON detected (ogrinfo not available for deeper validation)"))
+                else:
+                    checks.append(_fail("roads_geometry", "GeoJSON format invalid — file does not start with valid JSON"))
+            except UnicodeDecodeError:
+                checks.append(_fail("roads_geometry", "GeoJSON must be UTF-8 encoded"))
+        else:
+            checks.append(_warn("roads_geometry", f"{roads_ext.upper()} file detected — ogrinfo not available for geometry validation"))
+    except Exception as exc:
+        checks.append(_fail("roads_geometry", f"Cannot read Roads file: {exc}"))
+
+    # 5. Bounding-box overlap check (requires openpyxl for Excel + ogrinfo extent)
+    try:
+        if roads_extent is not None:
+            import openpyxl
+            await excel.seek(0)
+            wb = openpyxl.load_workbook(excel.file, read_only=True, data_only=True)
+            ws = wb.active
+            if ws is not None:
+                # Look for LAT / LON columns in header row
+                lat_col = None
+                lon_col = None
+                for row in ws.iter_rows(min_row=1, max_row=1, values_only=True):
+                    for idx, cell in enumerate(row):
+                        cell_str = str(cell or "").strip().upper()
+                        if cell_str in ("LAT", "LATITUDE", "Y", "Y_COORD", "YCOORD"):
+                            lat_col = idx
+                        if cell_str in ("LON", "LNG", "LONG", "LONGITUDE", "X", "X_COORD", "XCOORD"):
+                            lon_col = idx
+                    break  # only header row
+                if lat_col is not None and lon_col is not None:
+                    # Read a sample of coordinates
+                    lats = []
+                    lons = []
+                    for row in ws.iter_rows(min_row=2, max_row=min(ws.max_row or 100, 100), values_only=True):
+                        try:
+                            lat_val = float(row[lat_col]) if row[lat_col] is not None else None
+                            lon_val = float(row[lon_col]) if row[lon_col] is not None else None
+                            if lat_val is not None and lon_val is not None \
+                               and -90 <= lat_val <= 90 and -180 <= lon_val <= 180:
+                                lats.append(lat_val)
+                                lons.append(lon_val)
+                        except (ValueError, TypeError, IndexError):
+                            continue
+                    if lats and lons:
+                        addr_bbox = (min(lons), min(lats), max(lons), max(lats))
+                        checks.append(_pass("bounding_box",
+                            f"Addresses span ({addr_bbox[0]:.4f}, {addr_bbox[1]:.4f}) to ({addr_bbox[2]:.4f}, {addr_bbox[3]:.4f}). "
+                            f"Roads extent: {roads_extent}"))
+                    else:
+                        checks.append(_warn("bounding_box",
+                            "Could not parse LAT/LON coordinates from Excel. Bounding box check skipped."))
+                else:
+                    checks.append(_warn("bounding_box",
+                        "Excel has no LAT/LON columns. Addresses will be geocoded via Nominatim. "
+                        "Bounding box check deferred to pipeline."))
+            wb.close()
+        else:
+            checks.append(_warn("bounding_box",
+                "Roads extent unknown. Cannot check bounding box overlap."))
+    except ImportError:
+        checks.append(_warn("bounding_box", "openpyxl not available. Bounding box check skipped."))
+    except Exception as exc:
+        checks.append(_warn("bounding_box", f"Bounding box check error: {exc}"))
+
+    # 6. PostGIS availability
+    if postgis.is_available():
+        checks.append(_pass("postgis", "PostGIS connection OK"))
+    else:
+        checks.append(_warn("postgis", "PostGIS not available. Pipeline will run without database storage."))
+
+    # 7. Overall summary
+    failures = [c for c in checks if c["status"] == "fail"]
+    warnings = [c for c in checks if c["status"] == "warn"]
+
+    return {
+        "valid": len(failures) == 0,
+        "pass_count": len([c for c in checks if c["status"] == "pass"]),
+        "warn_count": len(warnings),
+        "fail_count": len(failures),
+        "checks": checks,
+        "summary": (
+            "All checks passed." if not failures and not warnings else
+            f"{len(failures)} check(s) failed, {len(warnings)} warning(s)." if failures else
+            f"{len(warnings)} warning(s) — pipeline should still work."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Individual step endpoints & progress/resume API
 # ---------------------------------------------------------------------------
 

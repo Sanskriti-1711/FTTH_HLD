@@ -4,6 +4,10 @@ The backend keeps one physical table per canonical FTTH layer so QGIS,
 MapLibre tile generation, pgRouting, and downloads can address stable names:
 object_layer, polygon_layer, network_layer, trench_layer, duct_layer,
 cable_layer.
+
+Schema layout (unified PostgreSQL with Django):
+  gis schema      — PostGIS spatial layer tables
+  business schema — project metadata, pipeline state (shared with Django)
 """
 
 from __future__ import annotations
@@ -25,9 +29,13 @@ except ImportError:  # pragma: no cover - handled by API diagnostics
     sql = None  # type: ignore
 
 
+# Schema names shared with Django (settings.py search_path=business,public)
+GIS_SCHEMA = "gis"
+BUSINESS_SCHEMA = "business"
+
 CANONICAL_COLUMNS = ("POLYGON_ID", "PDP_ID", "MFG_ID", "SRC_ID", "STAGE")
 
-# Maps public API layer names → PostGIS physical table names.
+# Maps public API layer names -> PostGIS physical table names (without schema).
 # Individual sub-layers (pdps, mfg, feeder_cable, etc.) each get their own
 # table so the frontend can address them independently by name.
 LAYER_TABLES: Dict[str, str] = {
@@ -58,6 +66,7 @@ LAYER_TABLES: Dict[str, str] = {
     "cable_layer": "cable_layer",
 }
 
+# Maps internal table name (no schema) -> public API name
 TABLE_TO_PUBLIC_NAME = {
     "object_layer": "objects",
     "polygon_layer": "polygons",
@@ -75,6 +84,26 @@ TABLE_TO_PUBLIC_NAME = {
 
 _TABLES = tuple(TABLE_TO_PUBLIC_NAME.keys())
 _tl = threading.local()
+
+
+# ---------------------------------------------------------------------------
+# Schema-qualified identifier helpers
+# ---------------------------------------------------------------------------
+
+
+def _gis_ident(table: str) -> sql.Composable:
+    """Return a psycopg2 sql.Identifier qualified with the GIS schema."""
+    return sql.Identifier(GIS_SCHEMA, table)
+
+
+def _biz_ident(table: str) -> sql.Composable:
+    """Return a psycopg2 sql.Identifier qualified with the business schema."""
+    return sql.Identifier(BUSINESS_SCHEMA, table)
+
+
+# ---------------------------------------------------------------------------
+# Connection management
+# ---------------------------------------------------------------------------
 
 
 def normalize_layer_name(layer: str) -> str:
@@ -135,44 +164,64 @@ def is_available() -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# Schema initialisation
+# ---------------------------------------------------------------------------
+
+
 def init_schema() -> None:
     conn = get_conn()
     with conn.cursor() as cur:
         cur.execute("CREATE EXTENSION IF NOT EXISTS postgis")
+        # Create schemas (idempotent)
+        cur.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {schema}").format(
+            schema=sql.Identifier(GIS_SCHEMA)
+        ))
+        cur.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {schema}").format(
+            schema=sql.Identifier(BUSINESS_SCHEMA)
+        ))
+
+        # Business schema: project metadata table
         cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS ftth_projects (
-                project_id TEXT PRIMARY KEY,
-                status TEXT NOT NULL DEFAULT 'queued',
-                runner TEXT,
-                qgis_version TEXT,
-                roads_filename TEXT,
-                error TEXT,
-                output_dir TEXT,
-                downloads JSONB NOT NULL DEFAULT '[]'::jsonb,
-                pipeline_state JSONB,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            )
-            """
+            sql.SQL(
+                """
+                CREATE TABLE IF NOT EXISTS {projects} (
+                    project_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    runner TEXT,
+                    qgis_version TEXT,
+                    roads_filename TEXT,
+                    error TEXT,
+                    output_dir TEXT,
+                    downloads JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    pipeline_state JSONB,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            ).format(projects=_biz_ident("ftth_projects"))
         )
         # Add pipeline_state column if upgrading from older schema
         try:
             cur.execute(
-                """
-                ALTER TABLE ftth_projects
-                ADD COLUMN IF NOT EXISTS pipeline_state JSONB
-                """
+                sql.SQL(
+                    """
+                    ALTER TABLE {projects}
+                    ADD COLUMN IF NOT EXISTS pipeline_state JSONB
+                    """
+                ).format(projects=_biz_ident("ftth_projects"))
             )
         except Exception:
-            pass  # Column already exists or table doesn't exist yet (race-safe)
+            pass  # Race-safe
+
+        # GIS schema: spatial layer tables
         for table in _TABLES:
             cur.execute(
                 sql.SQL(
                     """
                     CREATE TABLE IF NOT EXISTS {table} (
                         id BIGSERIAL PRIMARY KEY,
-                        project_id TEXT NOT NULL REFERENCES ftth_projects(project_id) ON DELETE CASCADE,
+                        project_id TEXT NOT NULL REFERENCES {projects}(project_id) ON DELETE CASCADE,
                         fid INTEGER,
                         geom GEOMETRY(Geometry, 4326),
                         "POLYGON_ID" TEXT,
@@ -184,20 +233,32 @@ def init_schema() -> None:
                         created_at TIMESTAMPTZ NOT NULL DEFAULT now()
                     )
                     """
-                ).format(table=sql.Identifier(table))
+                ).format(
+                    table=_gis_ident(table),
+                    projects=_biz_ident("ftth_projects"),
+                )
             )
             cur.execute(
-                sql.SQL("CREATE INDEX IF NOT EXISTS {idx} ON {table} (project_id)").format(
+                sql.SQL(
+                    "CREATE INDEX IF NOT EXISTS {idx} ON {table} (project_id)"
+                ).format(
                     idx=sql.Identifier(f"idx_{table}_project"),
-                    table=sql.Identifier(table),
+                    table=_gis_ident(table),
                 )
             )
             cur.execute(
-                sql.SQL("CREATE INDEX IF NOT EXISTS {idx} ON {table} USING GIST (geom)").format(
+                sql.SQL(
+                    "CREATE INDEX IF NOT EXISTS {idx} ON {table} USING GIST (geom)"
+                ).format(
                     idx=sql.Identifier(f"idx_{table}_geom"),
-                    table=sql.Identifier(table),
+                    table=_gis_ident(table),
                 )
             )
+
+
+# ---------------------------------------------------------------------------
+# Project CRUD
+# ---------------------------------------------------------------------------
 
 
 def upsert_project(
@@ -214,22 +275,32 @@ def upsert_project(
     conn = get_conn()
     with conn.cursor() as cur:
         cur.execute(
-            """
-            INSERT INTO ftth_projects (
-                project_id, status, roads_filename, runner, qgis_version,
-                error, output_dir, downloads, created_at, updated_at
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now(), now())
-            ON CONFLICT (project_id) DO UPDATE SET
-                status = EXCLUDED.status,
-                roads_filename = COALESCE(EXCLUDED.roads_filename, ftth_projects.roads_filename),
-                runner = COALESCE(EXCLUDED.runner, ftth_projects.runner),
-                qgis_version = COALESCE(EXCLUDED.qgis_version, ftth_projects.qgis_version),
-                error = EXCLUDED.error,
-                output_dir = COALESCE(EXCLUDED.output_dir, ftth_projects.output_dir),
-                downloads = COALESCE(EXCLUDED.downloads, ftth_projects.downloads),
-                updated_at = now()
-            """,
+            sql.SQL(
+                """
+                INSERT INTO {projects} (
+                    project_id, status, roads_filename, runner, qgis_version,
+                    error, output_dir, downloads, created_at, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now(), now())
+                ON CONFLICT (project_id) DO UPDATE SET
+                    status = EXCLUDED.status,
+                    roads_filename = COALESCE(
+                        EXCLUDED.roads_filename, {projects}.roads_filename
+                    ),
+                    runner = COALESCE(EXCLUDED.runner, {projects}.runner),
+                    qgis_version = COALESCE(
+                        EXCLUDED.qgis_version, {projects}.qgis_version
+                    ),
+                    error = EXCLUDED.error,
+                    output_dir = COALESCE(
+                        EXCLUDED.output_dir, {projects}.output_dir
+                    ),
+                    downloads = COALESCE(
+                        EXCLUDED.downloads, {projects}.downloads
+                    ),
+                    updated_at = now()
+                """
+            ).format(projects=_biz_ident("ftth_projects")),
             (
                 project_id,
                 status,
@@ -246,36 +317,49 @@ def upsert_project(
 def get_project(project_id: str) -> Optional[Dict[str, Any]]:
     conn = get_conn()
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("SELECT * FROM ftth_projects WHERE project_id = %s", (project_id,))
+        cur.execute(
+            sql.SQL("SELECT * FROM {projects} WHERE project_id = %s").format(
+                projects=_biz_ident("ftth_projects")
+            ),
+            (project_id,),
+        )
         row = cur.fetchone()
     return dict(row) if row else None
-
 
 
 def list_projects(limit: int = 50) -> List[Dict[str, Any]]:
     conn = get_conn()
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
-            """
-            SELECT * FROM ftth_projects
-            ORDER BY created_at DESC
-            LIMIT %s
-            """,
+            sql.SQL(
+                """
+                SELECT * FROM {projects}
+                ORDER BY created_at DESC
+                LIMIT %s
+                """
+            ).format(projects=_biz_ident("ftth_projects")),
             (limit,),
         )
         return [dict(row) for row in cur.fetchall()]
 
 
-def clear_project_layers(project_id: str, tables: Optional[Iterable[str]] = None) -> None:
+def clear_project_layers(
+    project_id: str, tables: Optional[Iterable[str]] = None
+) -> None:
     conn = get_conn()
     with conn.cursor() as cur:
         for table in tables or _TABLES:
             cur.execute(
                 sql.SQL("DELETE FROM {table} WHERE project_id = %s").format(
-                    table=sql.Identifier(table)
+                    table=_gis_ident(table)
                 ),
                 (project_id,),
             )
+
+
+# ---------------------------------------------------------------------------
+# GeoJSON ingestion
+# ---------------------------------------------------------------------------
 
 
 def _pick_prop(props: Dict[str, Any], name: str) -> Optional[str]:
@@ -325,7 +409,7 @@ def load_geojson(
         if replace:
             cur.execute(
                 sql.SQL("DELETE FROM {table} WHERE project_id = %s").format(
-                    table=sql.Identifier(table)
+                    table=_gis_ident(table)
                 ),
                 (project_id,),
             )
@@ -367,7 +451,7 @@ def load_geojson(
                     %s, %s, %s, %s, %s, %s
                 )
                 """
-            ).format(table=sql.Identifier(table)),
+            ).format(table=_gis_ident(table)),
             [
                 (
                     project_id,
@@ -411,7 +495,14 @@ def load_geojson_file(
         return load_geojson(project_id, layer, json.load(f), replace=replace)
 
 
-def get_layer_geojson(project_id: str, layer: str) -> Optional[Dict[str, Any]]:
+# ---------------------------------------------------------------------------
+# Layer querying
+# ---------------------------------------------------------------------------
+
+
+def get_layer_geojson(
+    project_id: str, layer: str
+) -> Optional[Dict[str, Any]]:
     table = normalize_layer_name(layer)
     conn = get_conn()
     with conn.cursor() as cur:
@@ -430,7 +521,7 @@ def get_layer_geojson(project_id: str, layer: str) -> Optional[Dict[str, Any]]:
                 FROM {table}
                 WHERE project_id = %s
                 """
-            ).format(table=sql.Identifier(table)),
+            ).format(table=_gis_ident(table)),
             (project_id,),
         )
         row = cur.fetchone()
@@ -452,7 +543,7 @@ def list_project_layers(project_id: str) -> List[Dict[str, Any]]:
                     FROM {table}
                     WHERE project_id = %s
                     """
-                ).format(table=sql.Identifier(table)),
+                ).format(table=_gis_ident(table)),
                 (project_id,),
             )
             row = dict(cur.fetchone() or {})
@@ -460,7 +551,7 @@ def list_project_layers(project_id: str) -> List[Dict[str, Any]]:
                 out.append(
                     {
                         "name": public_name,
-                        "table": table,
+                        "table": f"{GIS_SCHEMA}.{table}",
                         "feature_count": int(row["feature_count"]),
                         "geometry_type": row.get("geometry_type"),
                     }
@@ -468,7 +559,9 @@ def list_project_layers(project_id: str) -> List[Dict[str, Any]]:
     return out
 
 
-def get_vector_tile(project_id: str, layer: str, z: int, x: int, y: int) -> bytes:
+def get_vector_tile(
+    project_id: str, layer: str, z: int, x: int, y: int
+) -> bytes:
     table = normalize_layer_name(layer)
     conn = get_conn()
     with conn.cursor() as cur:
@@ -502,7 +595,7 @@ def get_vector_tile(project_id: str, layer: str, z: int, x: int, y: int) -> byte
                 )
                 SELECT ST_AsMVT(mvtgeom, %s, 4096, 'geom') FROM mvtgeom
                 """
-            ).format(table=sql.Identifier(table)),
+            ).format(table=_gis_ident(table)),
             (z, x, y, project_id, TABLE_TO_PUBLIC_NAME[table]),
         )
         row = cur.fetchone()
@@ -554,11 +647,13 @@ def init_pipeline_state(
     conn = get_conn()
     with conn.cursor() as cur:
         cur.execute(
-            """
-            UPDATE ftth_projects
-            SET pipeline_state = %s::jsonb, updated_at = now()
-            WHERE project_id = %s
-            """,
+            sql.SQL(
+                """
+                UPDATE {projects}
+                SET pipeline_state = %s::jsonb, updated_at = now()
+                WHERE project_id = %s
+                """
+            ).format(projects=_biz_ident("ftth_projects")),
             (Json(state), project_id),
         )
 
@@ -568,7 +663,11 @@ def get_pipeline_state(project_id: str) -> Optional[Dict[str, Any]]:
     conn = get_conn()
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
-            "SELECT pipeline_state FROM ftth_projects WHERE project_id = %s",
+            sql.SQL(
+                """
+                SELECT pipeline_state FROM {projects} WHERE project_id = %s
+                """
+            ).format(projects=_biz_ident("ftth_projects")),
             (project_id,),
         )
         row = cur.fetchone()
@@ -608,7 +707,9 @@ def update_step_progress(
     if params is not None:
         patch["params"] = params
 
-    now_ts = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+    now_ts = datetime.datetime.now(datetime.timezone.utc).isoformat(
+        timespec="seconds"
+    )
     if status == "running":
         patch["started_at"] = now_ts
     if status in ("completed", "failed"):
@@ -616,24 +717,26 @@ def update_step_progress(
 
     conn = get_conn()
     with conn.cursor() as cur:
-        # Use jsonb_set to merge the step update into the existing state
         cur.execute(
-            """
-            UPDATE ftth_projects
-            SET pipeline_state = jsonb_set(
-                COALESCE(pipeline_state, '{}'::jsonb),
-                %s,
-                %s::jsonb,
-                true
-            ),
-            status = CASE
-                WHEN %s IN ('completed', 'failed') AND %s IN ('completed', 'failed')
-                THEN %s  -- propagate terminal status to top-level
-                ELSE ftth_projects.status
-            END,
-            updated_at = now()
-            WHERE project_id = %s
-            """,
+            sql.SQL(
+                """
+                UPDATE {projects}
+                SET pipeline_state = jsonb_set(
+                    COALESCE(pipeline_state, '{{}}'::jsonb),
+                    %s,
+                    %s::jsonb,
+                    true
+                ),
+                status = CASE
+                    WHEN %s IN ('completed', 'failed')
+                     AND %s IN ('completed', 'failed')
+                    THEN %s  -- propagate terminal status to top-level
+                    ELSE {projects}.status
+                END,
+                updated_at = now()
+                WHERE project_id = %s
+                """
+            ).format(projects=_biz_ident("ftth_projects")),
             (
                 "{steps," + step + "}",  # JSONB path: {steps,object}
                 Json(patch),
@@ -666,17 +769,19 @@ def update_inputs_state(
     conn = get_conn()
     with conn.cursor() as cur:
         cur.execute(
-            """
-            UPDATE ftth_projects
-            SET pipeline_state = jsonb_set(
-                COALESCE(pipeline_state, '{}'::jsonb),
-                '{inputs}',
-                pipeline_state->'inputs' || %s::jsonb,
-                true
-            ),
-            updated_at = now()
-            WHERE project_id = %s
-            """,
+            sql.SQL(
+                """
+                UPDATE {projects}
+                SET pipeline_state = jsonb_set(
+                    COALESCE(pipeline_state, '{{}}'::jsonb),
+                    '{{inputs}}',
+                    (pipeline_state->'inputs') || %s::jsonb,
+                    true
+                ),
+                updated_at = now()
+                WHERE project_id = %s
+                """
+            ).format(projects=_biz_ident("ftth_projects")),
             (Json(patch), project_id),
         )
 
@@ -688,6 +793,9 @@ def db_info() -> Dict[str, Any]:
         with get_conn().cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT postgis_full_version() AS version")
             row = cur.fetchone()
-        return {"available": True, "postgis_version": row["version"] if row else None}
+        return {
+            "available": True,
+            "postgis_version": row["version"] if row else None,
+        }
     except Exception as exc:
         return {"available": False, "error": str(exc)}
