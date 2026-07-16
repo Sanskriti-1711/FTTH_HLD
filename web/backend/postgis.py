@@ -8,6 +8,7 @@ cable_layer.
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import threading
@@ -26,16 +27,27 @@ except ImportError:  # pragma: no cover - handled by API diagnostics
 
 CANONICAL_COLUMNS = ("POLYGON_ID", "PDP_ID", "MFG_ID", "SRC_ID", "STAGE")
 
+# Maps public API layer names → PostGIS physical table names.
+# Individual sub-layers (pdps, mfg, feeder_cable, etc.) each get their own
+# table so the frontend can address them independently by name.
 LAYER_TABLES: Dict[str, str] = {
+    # Canonical names (from ONECLICK_OUTPUTS)
     "objects": "object_layer",
+    "polygons": "polygon_layer",
+    "pdps": "pdps",
+    "mfg": "mfg",
+    "feeder_cable": "feeder_cable",
+    "distribution_cable": "distribution_cable",
+    "feeder_ducts": "feeder_ducts",
+    "distribution_ducts": "distribution_ducts",
+    "trenches": "trench_layer",
+    # Backward-compatible aliases
     "object": "object_layer",
     "object_layer": "object_layer",
-    "polygons": "polygon_layer",
     "polygon": "polygon_layer",
     "polygon_layer": "polygon_layer",
     "network": "network_layer",
     "network_layer": "network_layer",
-    "trenches": "trench_layer",
     "trench": "trench_layer",
     "trench_layer": "trench_layer",
     "ducts": "duct_layer",
@@ -49,8 +61,14 @@ LAYER_TABLES: Dict[str, str] = {
 TABLE_TO_PUBLIC_NAME = {
     "object_layer": "objects",
     "polygon_layer": "polygons",
-    "network_layer": "network",
+    "pdps": "pdps",
+    "mfg": "mfg",
+    "feeder_cable": "feeder_cable",
+    "distribution_cable": "distribution_cable",
+    "feeder_ducts": "feeder_ducts",
+    "distribution_ducts": "distribution_ducts",
     "trench_layer": "trenches",
+    "network_layer": "network",
     "duct_layer": "ducts",
     "cable_layer": "cables",
 }
@@ -132,11 +150,22 @@ def init_schema() -> None:
                 error TEXT,
                 output_dir TEXT,
                 downloads JSONB NOT NULL DEFAULT '[]'::jsonb,
+                pipeline_state JSONB,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )
             """
         )
+        # Add pipeline_state column if upgrading from older schema
+        try:
+            cur.execute(
+                """
+                ALTER TABLE ftth_projects
+                ADD COLUMN IF NOT EXISTS pipeline_state JSONB
+                """
+            )
+        except Exception:
+            pass  # Column already exists or table doesn't exist yet (race-safe)
         for table in _TABLES:
             cur.execute(
                 sql.SQL(
@@ -478,6 +507,178 @@ def get_vector_tile(project_id: str, layer: str, z: int, x: int, y: int) -> byte
         )
         row = cur.fetchone()
     return bytes(row[0]) if row and row[0] is not None else b""
+
+
+# ---------------------------------------------------------------------------
+# Pipeline state (step-by-step progress persistence for resume capability)
+# ---------------------------------------------------------------------------
+
+
+def _make_pipeline_state() -> Dict[str, Any]:
+    """Return the default pipeline_state for a fresh project."""
+    return {
+        "steps": {
+            step: {
+                "status": "pending",
+                "outputs": {},
+                "params": {},
+                "error": None,
+                "started_at": None,
+                "completed_at": None,
+                "progress": 0,
+            }
+            for step in ("object", "polygon", "network", "trench", "cable", "duct")
+        },
+        "inputs": {
+            "excel_filename": None,
+            "roads_filename": None,
+            "excel_uploaded": False,
+            "roads_uploaded": False,
+        },
+    }
+
+
+def init_pipeline_state(
+    project_id: str,
+    excel_filename: Optional[str] = None,
+    roads_filename: Optional[str] = None,
+) -> None:
+    """Set the initial pipeline_state for a new project."""
+    state = _make_pipeline_state()
+    if excel_filename:
+        state["inputs"]["excel_filename"] = excel_filename
+        state["inputs"]["excel_uploaded"] = True
+    if roads_filename:
+        state["inputs"]["roads_filename"] = roads_filename
+        state["inputs"]["roads_uploaded"] = True
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE ftth_projects
+            SET pipeline_state = %s::jsonb, updated_at = now()
+            WHERE project_id = %s
+            """,
+            (Json(state), project_id),
+        )
+
+
+def get_pipeline_state(project_id: str) -> Optional[Dict[str, Any]]:
+    """Get the current pipeline_state for a project, or None if not set."""
+    conn = get_conn()
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "SELECT pipeline_state FROM ftth_projects WHERE project_id = %s",
+            (project_id,),
+        )
+        row = cur.fetchone()
+    if row is None or row.get("pipeline_state") is None:
+        return None
+    return row["pipeline_state"]
+
+
+def update_step_progress(
+    project_id: str,
+    step: str,
+    status: str,
+    *,
+    progress: Optional[int] = None,
+    error: Optional[str] = None,
+    outputs: Optional[Dict[str, str]] = None,
+    params: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Update a single step's state within the pipeline_state JSONB column.
+
+    Uses PostGIS JSONB merge so concurrent partial updates don't clobber.
+    """
+    valid_steps = {"object", "polygon", "network", "trench", "cable", "duct"}
+    if step not in valid_steps:
+        raise ValueError(f"Unknown pipeline step '{step}'. Valid: {valid_steps}")
+
+    # Build the partial update JSON
+    patch: Dict[str, Any] = {
+        "status": status,
+    }
+    if progress is not None:
+        patch["progress"] = progress
+    if error is not None:
+        patch["error"] = error
+    if outputs is not None:
+        patch["outputs"] = outputs
+    if params is not None:
+        patch["params"] = params
+
+    now_ts = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+    if status == "running":
+        patch["started_at"] = now_ts
+    if status in ("completed", "failed"):
+        patch["completed_at"] = now_ts
+
+    conn = get_conn()
+    with conn.cursor() as cur:
+        # Use jsonb_set to merge the step update into the existing state
+        cur.execute(
+            """
+            UPDATE ftth_projects
+            SET pipeline_state = jsonb_set(
+                COALESCE(pipeline_state, '{}'::jsonb),
+                %s,
+                %s::jsonb,
+                true
+            ),
+            status = CASE
+                WHEN %s IN ('completed', 'failed') AND %s IN ('completed', 'failed')
+                THEN %s  -- propagate terminal status to top-level
+                ELSE ftth_projects.status
+            END,
+            updated_at = now()
+            WHERE project_id = %s
+            """,
+            (
+                "{steps," + step + "}",  # JSONB path: {steps,object}
+                Json(patch),
+                status,
+                status,
+                status,
+                project_id,
+            ),
+        )
+
+
+def update_inputs_state(
+    project_id: str,
+    *,
+    excel_filename: Optional[str] = None,
+    roads_filename: Optional[str] = None,
+) -> None:
+    """Update the inputs section of pipeline_state."""
+    patch: Dict[str, Any] = {}
+    if excel_filename is not None:
+        patch["excel_filename"] = excel_filename
+        patch["excel_uploaded"] = True
+    if roads_filename is not None:
+        patch["roads_filename"] = roads_filename
+        patch["roads_uploaded"] = True
+
+    if not patch:
+        return
+
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE ftth_projects
+            SET pipeline_state = jsonb_set(
+                COALESCE(pipeline_state, '{}'::jsonb),
+                '{inputs}',
+                pipeline_state->'inputs' || %s::jsonb,
+                true
+            ),
+            updated_at = now()
+            WHERE project_id = %s
+            """,
+            (Json(patch), project_id),
+        )
 
 
 def db_info() -> Dict[str, Any]:
