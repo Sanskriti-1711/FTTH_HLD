@@ -51,7 +51,6 @@ ONECLICK_OUTPUTS: List[Tuple[str, str, str]] = [
     ("trenches", "Feeder_Trench.gpkg", "Feeder_Trench.geojson"),
     ("trenches", "Distribution_Trench.gpkg", "Distribution_Trench.geojson"),
     ("trenches", "Garden_Trench.gpkg", "Garden_Trench.geojson"),
-    ("trenches", "Drill_Trench.gpkg", "Drill_Trench.geojson"),
     ("trenches", "Final_Trenches.gpkg", "Final_Trenches.geojson"),
     ("feeder_cable", "Feeder_Cable.gpkg", "Feeder_Cable.geojson"),
     ("distribution_cable", "Distribution_Cable.gpkg", "Distribution_Cable.geojson"),
@@ -157,6 +156,9 @@ def _run_command(project_id: str, cmd: Union[List[str], str], output_dir: Path) 
     env = os.environ.copy()
     env.setdefault("QT_QPA_PLATFORM", "offscreen")
     env.setdefault("QGIS_PLUGINPATH", str(ROOT_DIR))
+    # Line-buffer stdout so plugin progress reaches the API logger
+    # instead of waiting for the kernel buffer to fill or process exit.
+    env.setdefault("PYTHONUNBUFFERED", "1")
 
     _append(project_id, "info", "$ " + (cmd if isinstance(cmd, str) else " ".join(cmd)))
     process = subprocess.Popen(
@@ -172,27 +174,10 @@ def _run_command(project_id: str, cmd: Union[List[str], str], output_dir: Path) 
         shell=isinstance(cmd, str),
         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
     )
-    timeout = int(os.environ.get("QGIS_PROCESS_TIMEOUT", "10800"))
-    try:
-        stdout, _ = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        if os.name == "nt":
-            subprocess.run(
-                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                capture_output=True,
-                text=True,
-            )
-        else:
-            process.kill()
-        try:
-            stdout, _ = process.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            stdout = ""
-        for line in (stdout or "").splitlines()[-80:]:
-            _append(project_id, "info", line)
-        raise RuntimeError(f"qgis_process timed out after {timeout} seconds") from exc
-
-    for line in (stdout or "").splitlines():
+    # Stream stdout line-by-line so log messages appear in real-time
+    # (Nominatim geocoding takes 1.2s per address — without streaming,
+    # the frontend sees 0% until the entire pipeline finishes.)
+    for line in iter(process.stdout.readline, ""):
         text = line.strip()
         if not text:
             continue
@@ -204,10 +189,23 @@ def _run_command(project_id: str, cmd: Union[List[str], str], output_dir: Path) 
                 task["stage_index"] = idx
                 task["progress"] = int((idx / len(PIPELINE_STAGES)) * 100)
 
-    rc = process.returncode
-    if rc != 0:
-        raise RuntimeError(f"qgis_process exited with code {rc}")
-    _append(project_id, "info", f"qgis_process finished; outputs in {output_dir}")
+    process.stdout.close()
+    timeout = int(os.environ.get("QGIS_PROCESS_TIMEOUT", "10800"))
+    try:
+        rc = process.wait(timeout=timeout)
+        if rc != 0:
+            raise RuntimeError(f"qgis_process exited with code {rc}")
+        _append(project_id, "info", f"qgis_process finished; outputs in {output_dir}")
+    except subprocess.TimeoutExpired:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                capture_output=True,
+                text=True,
+            )
+        else:
+            process.kill()
+        raise RuntimeError(f"qgis_process timed out after {timeout} seconds")
 
 
 def _convert_gpkg_to_geojson(gpkg_path: Path, geojson_path: Path) -> bool:

@@ -151,8 +151,6 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
     OUT_FEEDER_TRENCH = "OUT_FEEDER_TRENCH"
     OUT_DIST_TRENCH = "OUT_DIST_TRENCH"
     OUT_GARDEN_TRENCH = "OUT_GARDEN_TRENCH"
-    OUT_DRILL_TRENCH = "OUT_DRILL_TRENCH"
-
     OUT_FEEDER_CABLE = "OUT_FEEDER_CABLE"
     OUT_DIST_CABLE = "OUT_DIST_CABLE"
     OUT_FEEDER_DUCTS = "OUT_FEEDER_DUCTS"
@@ -166,7 +164,6 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         OUT_FEEDER_TRENCH: "Feeder_Trench.gpkg",
         OUT_DIST_TRENCH: "Distribution_Trench.gpkg",
         OUT_GARDEN_TRENCH: "Garden_Trench.gpkg",
-        OUT_DRILL_TRENCH: "Drill_Trench.gpkg",
         OUT_TRENCHES: "Final_Trenches.gpkg",
         OUT_FEEDER_CABLE: "Feeder_Cable.gpkg",
         OUT_DIST_CABLE: "Distribution_Cable.gpkg",
@@ -437,10 +434,6 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         ))
         self.addParameter(QgsProcessingParameterFeatureSink(
             self.OUT_GARDEN_TRENCH,            self.tr("Trenches - Garden (HH->Footway)"),
-            QgsProcessing.TypeVectorLine, optional=True, createByDefault=True
-        ))
-        self.addParameter(QgsProcessingParameterFeatureSink(
-            self.OUT_DRILL_TRENCH,            self.tr("Trenches - Drill Crossings"),
             QgsProcessing.TypeVectorLine, optional=True, createByDefault=True
         ))
         self.addParameter(QgsProcessingParameterFeatureSink(
@@ -1086,7 +1079,6 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             or tr.get(self._TR_DIST_DISS)
             or tr.get(self._TR_MERGED_PDP)
         )
-        results["drill"] = tr.get(self._TR_FINAL_TAN)
         results["trenches"] = self._save_layer_to_gpkg(
             results["trenches"], "Final_Trenches.gpkg", out_dir, context, feedback)
         results["feeder"] = self._save_layer_to_gpkg(
@@ -1095,8 +1087,6 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             results["distribution"], "Distribution_Trench.gpkg", out_dir, context, feedback)
         results["garden"] = self._save_layer_to_gpkg(
             results["garden"], "Garden_Trench.gpkg", out_dir, context, feedback)
-        results["drill"] = self._save_layer_to_gpkg(
-            results["drill"], "Drill_Trench.gpkg", out_dir, context, feedback)
 
         if feedback.isCanceled():
             return {}
@@ -1196,7 +1186,6 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         put(self.OUT_FEEDER_TRENCH, results.get("feeder"))
         put(self.OUT_DIST_TRENCH, results.get("distribution"))
         put(self.OUT_GARDEN_TRENCH, results.get("garden"))
-        put(self.OUT_DRILL_TRENCH, results.get("drill"))
         put(self.OUT_TRENCHES, results.get("trenches"))
         put(self.OUT_FEEDER_CABLE, cables.get(self._CB_OUT_FEEDER))
         put(self.OUT_DIST_CABLE, cables.get(self._CB_OUT_DIST))
@@ -1341,8 +1330,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             self.OUT_FEEDER_TRENCH:  ("Trenches", "Feeder", 0),
             self.OUT_DIST_TRENCH:    ("Trenches", "Distribution", 1),
             self.OUT_GARDEN_TRENCH:  ("Trenches", "Garden", 2),
-            self.OUT_DRILL_TRENCH:   ("Trenches", "Drill Crossings", 3),
-            self.OUT_TRENCHES:       ("Trenches", "Final Trenches", 4),
+            self.OUT_TRENCHES:       ("Trenches", "Final Trenches", 3),
             self.OUT_FEEDER_CABLE: ("Cables", "Feeder", 0),
             self.OUT_DIST_CABLE:   ("Cables", "Distribution", 1),
             self.OUT_FEEDER_DUCTS: ("Ducts", "Feeder", 0),
