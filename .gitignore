@@ -46,15 +46,9 @@ package-lock.json
 # Token / credential stores
 .tokensave/
 
-# Scratch / debug directories
-# Throwaway bits only — test scripts under tmp/ stay visible so they can be
-# `git add`'d later if you decide to commit them.
+# Scratch / debug / temp directories and files (entirely ignored)
+tmp/
 tmp-*/
-tmp/hld-test/screenshots/
-tmp/hld-test/uvicorn*.log
-tmp/hld-test/static.log
-tmp/hld-test/vite-stack.log
-tmp/patch_main_recovery_v*.py
 
 # Runtime pipeline output scratch (UUID-keyed task dirs the API writes)
 web/backend/outputs/
@@ -67,6 +61,10 @@ env/
 
 # Windows / CMD redirection artifact (accidental `> nul`)
 nul
+
+# Root-level overlap test data (duplicates of web/uploads/)
+/overlap_*.xlsx
+/overlap_*.geojson
 
 # Runtime logs
 *.log
