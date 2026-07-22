@@ -35,5 +35,24 @@ services:
     volumes:
       - ./web/backend/outputs:/app/web/backend/outputs
 
+  survey-api:
+    build:
+      context: .
+      dockerfile: survey-backend/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://ftth:ftth@postgis:5432/ftth
+      SURVEY_JWT_SECRET: change-this-to-a-secure-random-secret
+      SURVEY_JWT_EXPIRE_MINUTES: 1440
+    depends_on:
+      postgis:
+        condition: service_healthy
+    # Note: host port 8000 may be held by a Docker Desktop ghost socket.
+    # Using 8001 instead. Access API at http://localhost:8001
+    ports:
+      - "8001:8000"
+    volumes:
+      - survey_uploads:/app/uploads
+
 volumes:
   postgis_data:
+  survey_uploads:

@@ -1,0 +1,8 @@
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9
+psycopg2-binary>=2.9.9
+pydantic>=2.7.0
+pyjwt>=2.8.0
+passlib[bcrypt]>=1.7.4
+bcrypt<4.1.0  # passlib compatibility (4.1+ removed __about__)

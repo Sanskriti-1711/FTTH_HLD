@@ -4,6 +4,8 @@
 web/backend/venv
 web/backend/outputs
 web/backend/logs
+survey-backend/venv
+survey-backend/uploads
 tmp
 HLDPlanning/logs
 HLDPlanning/output
