@@ -51,6 +51,7 @@ ONECLICK_OUTPUTS: List[Tuple[str, str, str]] = [
     ("trenches", "Feeder_Trench.gpkg", "Feeder_Trench.geojson"),
     ("trenches", "Distribution_Trench.gpkg", "Distribution_Trench.geojson"),
     ("trenches", "Garden_Trench.gpkg", "Garden_Trench.geojson"),
+    ("trenches", "Drill_Trench.gpkg", "Drill_Trench.geojson"),
     ("trenches", "Final_Trenches.gpkg", "Final_Trenches.geojson"),
     ("feeder_cable", "Feeder_Cable.gpkg", "Feeder_Cable.geojson"),
     ("distribution_cable", "Distribution_Cable.gpkg", "Distribution_Cable.geojson"),
@@ -507,6 +508,7 @@ def projects(limit: int = 50) -> List[Dict[str, Any]]:
         _public_task(project_id)
         for project_id in sorted(tasks, key=lambda pid: tasks[pid].get("created_at", ""), reverse=True)
     ][:limit]
+
 
 
 # Compatibility aliases
