@@ -1111,6 +1111,10 @@ class DuctLayer(QgsProcessingAlgorithm):
             f_side = first_field_case_insensitive(garden_lyr, ["sidewalk", "side"])
             # For snapping the object end back to the building when garden
             # trenches were trimmed against a building buffer.
+            # NOTE: ADDR_ID is NOT guaranteed unique (two premises can share an
+            # address). Index ALL objects per address and pick the one closest
+            # to this garden line's start so we never snap a duct to a far-away
+            # building that happens to share the same address.
             obj_by_addr = {}
             o_addr = None
             if obj_lyr is not None:
@@ -1121,8 +1125,8 @@ class DuctLayer(QgsProcessingAlgorithm):
                         if v is None:
                             continue
                         k = str(v).strip().lower()
-                        if k and k not in obj_by_addr:
-                            obj_by_addr[k] = of
+                        if k:
+                            obj_by_addr.setdefault(k, []).append(of)
             for gf in garden_lyr.getFeatures():
                 g = gf.geometry()
                 # If the garden line was trimmed (start no longer touches the
@@ -1131,8 +1135,24 @@ class DuctLayer(QgsProcessingAlgorithm):
                 if obj_by_addr and f_addr:
                     v = gf.attribute(f_addr)
                     key = str(v).strip().lower() if v is not None else None
-                    of = obj_by_addr.get(key) if key else None
-                    if of is not None:
+                    cands = obj_by_addr.get(key) if key else None
+                    if cands:
+                        of = cands[0]
+                        if len(cands) > 1 and g and not g.isEmpty():
+                            ln = g.asMultiPolyline()[0] if g.isMultipart() else g.asPolyline()
+                            if ln:
+                                g_start = QgsPointXY(ln[0])
+                                gs_geom = QgsGeometry.fromPointXY(g_start)
+                                def _dist_obj(o2):
+                                    og2 = o2.geometry()
+                                    if og2 is None or og2.isEmpty():
+                                        return float("inf")
+                                    if QgsWkbTypes.geometryType(og2.wkbType()) == QgsWkbTypes.PointGeometry:
+                                        p2 = og2.asPoint()
+                                    else:
+                                        p2 = og2.centroid().asPoint()
+                                    return gs_geom.distance(QgsGeometry.fromPointXY(QgsPointXY(p2)))
+                                of = min(cands, key=_dist_obj)
                         og = of.geometry()
                         if og and not og.isEmpty() and g and not g.isEmpty():
                             if QgsWkbTypes.geometryType(og.wkbType()) == QgsWkbTypes.PointGeometry:
@@ -1162,28 +1182,47 @@ class DuctLayer(QgsProcessingAlgorithm):
             o_poly = first_field_case_insensitive(obj_lyr, ["POLYGON_ID", "polygon_id"])
             o_mfg  = first_field_case_insensitive(obj_lyr, ["MFG_ID", "mfg_id"])
             if p_addr and o_addr:
+                # ADDR_ID may be duplicated; index ALL pseudo points per address
+                # and pick the one nearest this object (no far-away cross-pairs).
                 pseudo_by_addr = {}
                 for pf in pseudo_lyr.getFeatures():
                     v = pf.attribute(p_addr)
                     if v is None:
                         continue
                     k = str(v).strip().lower()
-                    if k and k not in pseudo_by_addr:
-                        pseudo_by_addr[k] = pf
+                    if k:
+                        pseudo_by_addr.setdefault(k, []).append(pf)
                 for of in obj_lyr.getFeatures():
                     v = of.attribute(o_addr)
                     if v is None:
                         continue
-                    pf = pseudo_by_addr.get(str(v).strip().lower())
-                    if pf is None:
+                    pf_list = pseudo_by_addr.get(str(v).strip().lower())
+                    if not pf_list:
                         continue
-                    og = of.geometry(); pg = pf.geometry()
-                    if not og or og.isEmpty() or not pg or pg.isEmpty():
+                    og = of.geometry()
+                    if not og or og.isEmpty():
                         continue
                     if QgsWkbTypes.geometryType(og.wkbType()) == QgsWkbTypes.PointGeometry:
                         hpt = og.asPoint()
                     else:
                         hpt = og.centroid().asPoint()
+                    if len(pf_list) > 1:
+                        hg = QgsGeometry.fromPointXY(QgsPointXY(hpt))
+                        def _dist_p(p2):
+                            pg2 = p2.geometry()
+                            if pg2 is None or pg2.isEmpty():
+                                return float("inf")
+                            if QgsWkbTypes.geometryType(pg2.wkbType()) == QgsWkbTypes.PointGeometry:
+                                pt2 = pg2.asPoint()
+                            else:
+                                pt2 = pg2.centroid().asPoint()
+                            return hg.distance(QgsGeometry.fromPointXY(QgsPointXY(pt2)))
+                        pf = min(pf_list, key=_dist_p)
+                    else:
+                        pf = pf_list[0]
+                    pg = pf.geometry()
+                    if not pg or pg.isEmpty():
+                        continue
                     if QgsWkbTypes.geometryType(pg.wkbType()) == QgsWkbTypes.PointGeometry:
                         ppt = pg.asPoint()
                     else:

@@ -226,10 +226,34 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
             dfeats = distr_by_addr.get(key, [])
             if not dfeats:
                 continue  # no PDP→footway segment for this object; skip
-            df = dfeats[0]
-            dg = df.geometry()
             gg = gf.geometry()
-            if not dg or dg.isEmpty() or not gg or gg.isEmpty():
+            if not gg or gg.isEmpty():
+                continue
+            # ADDR_ID is NOT guaranteed unique (two premises can share an
+            # address). Among the distribution segments with the same addr,
+            # pick the one whose footway endpoint is nearest THIS garden's
+            # footway endpoint (garden runs object → footway, so its last
+            # point is the shared footway point).
+            g_pts = _polyline_of(gg)
+            g_end = g_pts[-1] if g_pts else None
+            df = dfeats[0]
+            if len(dfeats) > 1 and g_end is not None:
+                best_df, best_d = None, None
+                for cand in dfeats:
+                    cg = cand.geometry()
+                    if not cg or cg.isEmpty():
+                        continue
+                    c_pts = _polyline_of(cg)
+                    if not c_pts:
+                        continue
+                    c_end = c_pts[-1]
+                    d = (c_end.x() - g_end.x()) ** 2 + (c_end.y() - g_end.y()) ** 2
+                    if best_d is None or d < best_d:
+                        best_d, best_df = d, cand
+                if best_df is not None:
+                    df = best_df
+            dg = df.geometry()
+            if not dg or dg.isEmpty():
                 continue
 
             # PDP_ID: prefer the PDP id carried on the distribution segment; fall back to the garden's.
