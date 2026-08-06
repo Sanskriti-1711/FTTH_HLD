@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Cable Builder — Feeder Cable (copy/style) + Distribution Cable (merge by PDP)
+Cable Builder — Feeder Cable (copy/style) + Distribution Cable (per object)
 • Copies Feeder Trench to Feeder Cable.
-• Merges Garden + Distribution Trenches by PDP into Distribution Cable, with snap/merge/dedupe.
+• Builds ONE Distribution Cable per object (HH): joins the object's
+  Distribution Trench segment (PDP → footway point) with its Garden Trench
+  segment (object → footway point) into a single PDP → object cable, tagged
+  with the object's addr_id and household count (hhs).
 
 Parameter surface slimmed 2026-07-03: only the three trench layers remain.
 PDP fields are auto-detected (PDP_ID/pdp_id), CRS is the pipeline standard
@@ -18,8 +21,8 @@ from qgis.core import (
     QgsProcessingParameterVectorLayer,
     QgsProcessingParameterFeatureSink, QgsProcessingException,
     QgsFeatureSink, QgsFields, QgsField, QgsWkbTypes,
-    QgsFeature, QgsProcessingUtils, QgsSymbol,
-    QgsCoordinateReferenceSystem,
+    QgsFeature, QgsProcessingUtils, QgsSymbol, QgsGeometry,
+    QgsCoordinateReferenceSystem, QgsPointXY,
 )
 from qgis import processing
 
@@ -35,11 +38,73 @@ from ..utils.layer_ops import (
     find_first_alg,
 )
 
+
+def _polyline_of(geom: QgsGeometry):
+    """Return the first polyline (list of QgsPointXY) of a line geometry."""
+    if geom is None or geom.isEmpty():
+        return None
+    if QgsWkbTypes.geometryType(geom.wkbType()) != QgsWkbTypes.LineGeometry:
+        return None
+    if QgsWkbTypes.isMultiType(geom.wkbType()):
+        parts = geom.asMultiPolyline()
+        return parts[0] if parts else None
+    pts = geom.asPolyline()
+    return pts or None
+
+
+def _pts_close(a, b, tol=0.01):
+    return abs(a.x() - b.x()) < tol and abs(a.y() - b.y()) < tol
+
+
+def _concat_polylines(*polys, tol=0.01):
+    """Concatenate polylines (lists of QgsPointXY), dropping shared endpoints."""
+    out = []
+    for pts in polys:
+        if not pts:
+            continue
+        if out and _pts_close(pts[0], out[-1], tol):
+            pts = pts[1:]
+        if pts:
+            out.extend(pts)
+    return out
+
+
+def _join_object_cable(dist_geom: QgsGeometry, garden_geom: QgsGeometry, proj_geom=None):
+    """
+    Build one continuous PDP → object cable.
+
+    ``dist_geom`` runs pseudo-PDP → footway point (Distribution Trench);
+    ``garden_geom`` runs object → footway point (Garden Trench). They share
+    the footway endpoint, so the joined polyline is
+    ``dist_points + reversed(garden_points)[1:]``.
+
+    When the PDP sits back from the street, ``proj_geom`` is the PDP →
+    pseudo-PDP projection line and is prepended (PDP → pseudo-PDP → footway
+    → object).
+    """
+    dpts = _polyline_of(dist_geom)
+    gpts = _polyline_of(garden_geom)
+    if not dpts or not gpts:
+        return None
+    # The garden runs object → footway; reverse it to footway → object.
+    g_rev = list(reversed(gpts))
+    parts = [dpts, g_rev]
+    if proj_geom is not None:
+        ppts = _polyline_of(proj_geom)
+        if ppts:
+            parts.insert(0, ppts)  # PDP → pseudo-PDP
+    joined = _concat_polylines(*parts)
+    if len(joined) < 2:
+        return None
+    return QgsGeometry.fromPolylineXY(joined)
+
+
 class AlgCableBuilderAll(QgsProcessingAlgorithm):
     # --- Inputs ---
     FEEDER_SRC   = "FEEDER_TRENCH"
     GARDEN_L     = "GARDEN_TRENCHES"
     DISTR_L      = "DISTR_TRENCHES"
+    PDP_PROJ     = "PDP_PROJECTIONS"   # optional: PDP→footway/Service lines
 
     # --- Outputs ---
     O_FEEDER     = "OUT_FEEDER_CABLE"
@@ -64,12 +129,16 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
         self.addParameter(QgsProcessingParameterVectorLayer(
             self.DISTR_L, "Distribution Trenches (lines; PDP_ID auto-detected)", [QgsProcessing.TypeVectorLine]
         ))
+        self.addParameter(QgsProcessingParameterVectorLayer(
+            self.PDP_PROJ, "PDP→Footway projections (optional)", [QgsProcessing.TypeVectorLine],
+            optional=True,
+        ))
 
         self.addParameter(QgsProcessingParameterFeatureSink(
             self.O_FEEDER, "Feeder Cable"
         ))
         self.addParameter(QgsProcessingParameterFeatureSink(
-            self.O_DIST, "Distribution Cable (by PDP)", QgsProcessing.TypeVectorLine
+            self.O_DIST, "Distribution Cable (per object)", QgsProcessing.TypeVectorLine
         ))
 
     # ------------------------ run -------------------------
@@ -90,57 +159,105 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
             copied += 1
         feedback.pushInfo(f"Feeder: copied {copied} features.")
 
-        # --- Distribution build ---
+        # --- Distribution build: one cable per object (PDP → object) ---
         garden = self.parameterAsVectorLayer(p, self.GARDEN_L, context)
         distr = self.parameterAsVectorLayer(p, self.DISTR_L, context)
 
-        # Auto-detect the PDP linkage fields (pickers removed from the UI)
-        fld_g = first_field_case_insensitive(garden, ["PDP_ID", "pdp_id", "pdp_pol_id", "pDp_POL_ID"])
-        fld_d = first_field_case_insensitive(distr, ["PDP_ID", "pdp_id", "pdp_pol_id", "pDp_POL_ID"])
-        if not fld_g or not fld_d:
+        # Auto-detect the object linkage fields (pickers removed from the UI).
+        # The Garden Trench runs object → footway point; the Distribution Trench
+        # runs PDP → the SAME footway point. Both carry the object's addr_id.
+        fld_g_addr = first_field_case_insensitive(garden, ["addr_id", "ADDR_ID", "hh_id", "object_id", "OBJ_ID"])
+        fld_d_addr = first_field_case_insensitive(distr, ["addr_id", "ADDR_ID", "obj_id", "object_id"])
+        fld_g_hhs = first_field_case_insensitive(garden, ["hhs", "hh", "HH", "households", "HOUSEHOLDS"])
+        fld_g_pdp = first_field_case_insensitive(garden, ["PDP_ID", "pdp_id", "pdp_pol_id", "pDp_POL_ID"])
+        fld_g_poly = first_field_case_insensitive(garden, ["POLYGON_ID", "polygon_id"])
+        fld_g_mfg = first_field_case_insensitive(garden, ["MFG_ID", "mfg_id"])
+        fld_d_pdp = first_field_case_insensitive(distr, ["PDP_ID", "pdp_id", "pdp_pol_id", "pDp_POL_ID"])
+        if not fld_g_addr or not fld_d_addr:
             raise QgsProcessingException(
-                "Garden/Distribution trenches need a PDP_ID (or pdp_id) field — run stage 04 first."
+                "Garden/Distribution trenches need an addr_id (or obj_id) field to build per-object cables — run stage 04 first."
             )
-        feedback.pushInfo(f"Auto-detected PDP fields → Garden: '{fld_g}', Distribution: '{fld_d}'")
+        feedback.pushInfo(
+            f"Auto-detected fields → Garden addr: '{fld_g_addr}', Distribution addr: '{fld_d_addr}', HH: '{fld_g_hhs or '-'}'"
+        )
 
         crs_t = QgsCoordinateReferenceSystem(self.DEFAULT_CRS_AUTHID)
-        snap_m = self.DEFAULT_SNAP_M
-        do_merge = self.DEFAULT_DO_MERGE
-        do_dedupe = self.DEFAULT_DO_DEDUPE
 
         garden_t = reproject_if_needed(fix_geometries(garden, context, feedback), crs_t, context, feedback)
         distr_t = reproject_if_needed(fix_geometries(distr, context, feedback), crs_t, context, feedback)
 
-        out_fields = QgsFields(); out_fields.append(QgsField("pdp_id", QMetaType.Type.QString))
+        # NOTE: GeoPackage field names are case-insensitive, so we cannot have
+        # both 'pdp_id' and 'PDP_ID' — keep only the uppercase PDP_ID used by
+        # the rest of the pipeline.
+        out_fields = QgsFields()
+        out_fields.append(QgsField("addr_id",    QMetaType.Type.QString))
+        out_fields.append(QgsField("hhs",        QMetaType.Type.QString))
+        out_fields.append(QgsField("length_m",   QMetaType.Type.Double))
+        out_fields.append(QgsField("POLYGON_ID", QMetaType.Type.QString))
+        out_fields.append(QgsField("PDP_ID",     QMetaType.Type.QString))
+        out_fields.append(QgsField("MFG_ID",     QMetaType.Type.QString))
         sinkD, outDistId = self.parameterAsSink(p, self.O_DIST, context, out_fields, QgsWkbTypes.MultiLineString, crs_t)
 
-        id_keys = set()
-        for f in garden_t.getFeatures(): id_keys.add(normalize_key(f[fld_g]))
-        for f in distr_t.getFeatures(): id_keys.add(normalize_key(f[fld_d]))
-        id_keys.discard("")
+        # Index distribution segments by normalized addr_id
+        distr_by_addr = {}
+        for f in distr_t.getFeatures():
+            key = normalize_key(f[fld_d_addr])
+            if key:
+                distr_by_addr.setdefault(key, []).append(f)
 
-        total_groups, made = len(id_keys), 0
-        for i, key in enumerate(sorted(id_keys), 1):
-            g_sub = subset_by_id(garden_t, fld_g, key, normalize_key)
-            d_sub = subset_by_id(distr_t, fld_d, key, normalize_key)
-            grp = processing.run("native:mergevectorlayers", {"LAYERS": [g_sub, d_sub], "CRS": crs_t, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT}, context=context, feedback=feedback)["OUTPUT"]
-            snapped = snap_layer(grp, grp, snap_m, context, feedback)
-            cleaned = fix_geometries(snapped, context, feedback)
-            if do_merge:
-                cleaned = linemerge_layer(cleaned, context, feedback)
-            if do_dedupe:
-                dd_alg = find_first_alg("native:deleteduplicategeometries", "qgis:deleteduplicategeometries")
-                if dd_alg:
-                    cleaned = processing.run(dd_alg, {"INPUT": cleaned, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT}, context=context, feedback=feedback)["OUTPUT"]
+        # Optional PDP→footway projection lines, indexed by normalized PDP id.
+        proj_layer = self.parameterAsVectorLayer(p, self.PDP_PROJ, context)
+        proj_by_pdp = {}
+        if proj_layer is not None:
+            fld_proj_pdp = first_field_case_insensitive(
+                proj_layer, ["pdp_id", "PDP_ID", "pdp_pol_id", "pDp_POL_ID"])
+            proj_t = reproject_if_needed(
+                fix_geometries(proj_layer, context, feedback), crs_t, context, feedback)
+            for f in proj_t.getFeatures():
+                pid = normalize_key(f[fld_proj_pdp]) if fld_proj_pdp else None
+                if pid:
+                    proj_by_pdp.setdefault(pid, []).append(f.geometry())
 
-            for f in cleaned.getFeatures():
-                of = QgsFeature(out_fields)
-                of.setGeometry(f.geometry())
-                of["pdp_id"] = key
-                sinkD.addFeature(of, QgsFeatureSink.FastInsert)
-                made += 1
+        made = 0
+        for gf in garden_t.getFeatures():
+            key = normalize_key(gf[fld_g_addr])
+            if not key:
+                continue
+            dfeats = distr_by_addr.get(key, [])
+            if not dfeats:
+                continue  # no PDP→footway segment for this object; skip
+            df = dfeats[0]
+            dg = df.geometry()
+            gg = gf.geometry()
+            if not dg or dg.isEmpty() or not gg or gg.isEmpty():
+                continue
 
-            feedback.setProgress(100.0 * i / total_groups)
+            # PDP_ID: prefer the PDP id carried on the distribution segment; fall back to the garden's.
+            pid = normalize_key(df[fld_d_pdp]) if fld_d_pdp else ""
+            if not pid and fld_g_pdp:
+                pid = normalize_key(gf[fld_g_pdp])
+
+            # Concatenate: [projection (PDP → pseudo-PDP)] + distribution
+            # polyline (pseudo-PDP → footway) + reversed garden polyline
+            # (footway → object). Shared endpoints are dropped once.
+            proj_geom = None
+            if proj_by_pdp and pid and pid in proj_by_pdp and proj_by_pdp[pid]:
+                proj_geom = proj_by_pdp[pid][0]
+            cable = _join_object_cable(dg, gg, proj_geom)
+            if cable is None or cable.isEmpty():
+                continue
+
+            of = QgsFeature(out_fields)
+            of.setGeometry(cable)
+            of["addr_id"]    = str(gf[fld_g_addr])
+            hhs = gf[fld_g_hhs] if fld_g_hhs else None
+            of["hhs"]        = str(hhs) if hhs is not None else None
+            of["length_m"]   = round(cable.length(), 2)
+            of["POLYGON_ID"] = str(gf[fld_g_poly]) if fld_g_poly else None
+            of["PDP_ID"]     = pid or None
+            of["MFG_ID"]     = str(gf[fld_g_mfg]) if fld_g_mfg else None
+            sinkD.addFeature(of, QgsFeatureSink.FastInsert)
+            made += 1
 
         # Style output
         out_layer = QgsProcessingUtils.mapLayerFromString(outDistId, context)
@@ -151,7 +268,7 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
             except Exception: pass
             out_layer.renderer().setSymbol(sym)
 
-        feedback.pushInfo(f"Distribution: PDP groups={total_groups}, parts={made}")
+        feedback.pushInfo(f"Distribution: per-object cables={made}")
         return {
             self.O_FEEDER: outFeederId,
             self.O_DIST: outDistId,

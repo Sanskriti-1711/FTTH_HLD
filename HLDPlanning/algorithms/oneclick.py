@@ -248,6 +248,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
     _CB_FEEDER, _CB_GARDEN, _CB_DISTR = (
         "FEEDER_TRENCH", "GARDEN_TRENCHES", "DISTR_TRENCHES",
     )
+    _CB_PROJ = "PDP_PROJECTIONS"
     _CB_OUT_FEEDER, _CB_OUT_DIST = "OUT_FEEDER_CABLE", "OUT_DISTRIBUTION_CABLE"
 
     _DU_NETWORK, _DU_MFG, _DU_PDP, _DU_OBJECTS = (
@@ -890,6 +891,8 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             self._CB_OUT_FEEDER: self._dest(parameters, self.OUT_FEEDER_CABLE, context),
             self._CB_OUT_DIST: self._dest(parameters, self.OUT_DIST_CABLE, context),
         }
+        if results.get("pdp_proj"):
+            params[self._CB_PROJ] = results["pdp_proj"]
         return processing.run(ALG.CABLE, params, context=context, feedback=feedback,
                               is_child_algorithm=True)
 
@@ -1288,6 +1291,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         feedback.pushInfo(self.tr("  [timing] Trench Layer: {}{:.3f}s".format(fc_str, elapsed)))
         results["garden"] = tr.get(self._TR_GARDEN)
         results["pseudo_hh"] = tr.get("OUT_PSEUDO_HH")
+        results["pdp_proj"] = tr.get("OUT_PDP_TO_SIDE")
         results["tangents_used"] = tr.get(self._TR_TAN_USED)
         results["distribution"] = (
             tr.get(self._TR_DIST_LINES)
