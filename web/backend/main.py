@@ -462,10 +462,30 @@ def get_layer(project_id: str, layer: str) -> Dict[str, Any]:
 
     task = tasks.get(project_id)
     if task:
-        for file_path in (task.get("files") or {}).get(layer, []):
-            if file_path.lower().endswith((".geojson", ".json")) and os.path.isfile(file_path):
-                with open(file_path, "r", encoding="utf-8") as f:
-                    return json.load(f)
+        files = (task.get("files") or {}).get(layer, [])
+        geojson_files = [
+            fp for fp in files
+            if fp.lower().endswith((".geojson", ".json")) and os.path.isfile(fp)
+        ]
+        if not geojson_files:
+            raise HTTPException(status_code=404, detail="Layer not found")
+        if len(geojson_files) == 1:
+            with open(geojson_files[0], "r", encoding="utf-8") as f:
+                return json.load(f)
+        # Group with multiple sub-layers (e.g. ducts: feeder + distribution + drop):
+        # merge them into one FeatureCollection and tag each feature with its
+        # originating sub-layer so the frontend can style them differently.
+        merged: Dict[str, Any] = {"type": "FeatureCollection", "features": []}
+        for fp in geojson_files:
+            with open(fp, "r", encoding="utf-8") as f:
+                sub = json.load(f)
+            sub_name = os.path.splitext(os.path.basename(fp))[0]
+            for feat in sub.get("features", []):
+                props = dict(feat.get("properties") or {})
+                props.setdefault("sublayer", sub_name)
+                feat["properties"] = props
+                merged["features"].append(feat)
+        return merged
     raise HTTPException(status_code=404, detail="Layer not found")
 
 
