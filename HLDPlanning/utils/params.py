@@ -21,12 +21,15 @@ class FIELD:
     GEOCODE_Q = "GEOCODE_Q"
 
 class ALG:
+    BROWNFIELD = "hldplanning:00_brownfield_layer"
     OBJECT = "hldplanning:01_object_layer"
     POLYGON = "hldplanning:02_polygon_layer"
     NETWORK = "hldplanning:03_network_layer"
     TRENCH  = "hldplanning:04_trench_layer"
     DUCT    = "hldplanning:05_duct_layer"
     CABLE   = "hldplanning:06_cable_layer"
+    CHAMBER = "hldplanning:07_chamber_layer"
+    POLE    = "hldplanning:08_pole_layer"
 
 # Vendor/customer profile keys that can be overridden per deployment
 class PROFILE_KEYS:

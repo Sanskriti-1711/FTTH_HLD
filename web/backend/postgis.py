@@ -44,10 +44,12 @@ LAYER_TABLES: Dict[str, str] = {
     "polygons": "polygon_layer",
     "pdps": "pdps",
     "mfg": "mfg",
-    "feeder_cable": "feeder_cable",
-    "distribution_cable": "distribution_cable",
-    "feeder_ducts": "feeder_ducts",
-    "distribution_ducts": "distribution_ducts",
+    # Feeder/Distribution sub-layers share the canonical merged table so the
+    # frontend sees one "cables"/"ducts" layer (distinguishable by STAGE).
+    "feeder_cable": "cable_layer",
+    "distribution_cable": "cable_layer",
+    "feeder_ducts": "duct_layer",
+    "distribution_ducts": "duct_layer",
     "trenches": "trench_layer",
     # Backward-compatible aliases
     "object": "object_layer",
@@ -72,17 +74,23 @@ TABLE_TO_PUBLIC_NAME = {
     "polygon_layer": "polygons",
     "pdps": "pdps",
     "mfg": "mfg",
-    "feeder_cable": "feeder_cable",
-    "distribution_cable": "distribution_cable",
-    "feeder_ducts": "feeder_ducts",
-    "distribution_ducts": "distribution_ducts",
+    "cable_layer": "cables",
+    "duct_layer": "ducts",
     "trench_layer": "trenches",
     "network_layer": "network",
-    "duct_layer": "ducts",
-    "cable_layer": "cables",
 }
 
 _TABLES = tuple(TABLE_TO_PUBLIC_NAME.keys())
+
+# Tables created before cables/ducts were unified (kept only for clearing
+# stale rows on re-runs against an upgraded database).
+LEGACY_TABLES = (
+    "feeder_cable",
+    "distribution_cable",
+    "feeder_ducts",
+    "distribution_ducts",
+)
+
 _tl = threading.local()
 
 
@@ -348,7 +356,18 @@ def clear_project_layers(
 ) -> None:
     conn = get_conn()
     with conn.cursor() as cur:
-        for table in tables or _TABLES:
+        # Legacy tables may not exist on fresh databases — drop rows only if
+        # the table is present (older databases from before the cable/duct
+        # unification still hold rows there).
+        for table in tables or (_TABLES + LEGACY_TABLES):
+            cur.execute(
+                sql.SQL(
+                    "SELECT to_regclass(%s)"
+                ),
+                (f"{GIS_SCHEMA}.{table}",),
+            )
+            if cur.fetchone()[0] is None:
+                continue
             cur.execute(
                 sql.SQL("DELETE FROM {table} WHERE project_id = %s").format(
                     table=_gis_ident(table)

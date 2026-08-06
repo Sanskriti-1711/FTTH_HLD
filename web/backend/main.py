@@ -53,10 +53,11 @@ ONECLICK_OUTPUTS: List[Tuple[str, str, str]] = [
     ("trenches", "Garden_Trench.gpkg", "Garden_Trench.geojson"),
     ("trenches", "Drill_Trench.gpkg", "Drill_Trench.geojson"),
     ("trenches", "Final_Trenches.gpkg", "Final_Trenches.geojson"),
-    ("feeder_cable", "Feeder_Cable.gpkg", "Feeder_Cable.geojson"),
-    ("distribution_cable", "Distribution_Cable.gpkg", "Distribution_Cable.geojson"),
-    ("feeder_ducts", "Feeder_Ducts.gpkg", "Feeder_Ducts.geojson"),
-    ("distribution_ducts", "Distribution_Ducts.gpkg", "Distribution_Ducts.geojson"),
+    ("cables", "Feeder_Cable.gpkg", "Feeder_Cable.geojson"),
+    ("cables", "Distribution_Cable.gpkg", "Distribution_Cable.geojson"),
+    ("ducts", "Feeder_Ducts.gpkg", "Feeder_Ducts.geojson"),
+    ("ducts", "Distribution_Ducts.gpkg", "Distribution_Ducts.geojson"),
+    ("ducts", "Drop_Ducts.gpkg", "Drop_Ducts.geojson"),
     ("reports", "BOQ.xlsx", "BOQ.xlsx"),
     ("reports", "BOM.xlsx", "BOM.xlsx"),
 ]
@@ -282,7 +283,13 @@ def _ingest_outputs(project_id: str, output_dir: Path) -> List[Dict[str, Any]]:
     ]
 
 
-def _run_pipeline(project_id: str, excel_path: Path, roads_path: Path, output_dir: Path) -> None:
+def _run_pipeline(
+    project_id: str,
+    excel_path: Path,
+    roads_path: Path,
+    output_dir: Path,
+    poly_method: int = 3,
+) -> None:
     task = _task(project_id)
     task.update({"status": "running", "stage": PIPELINE_STAGES[0], "updated_at": _now()})
     if postgis.is_available():
@@ -308,6 +315,7 @@ def _run_pipeline(project_id: str, excel_path: Path, roads_path: Path, output_di
             f"EXCEL={excel_path}",
             f"ROADS={roads_path}",
             f"OUTPUT_DIR={output_dir}",
+            f"POLY_METHOD={int(poly_method or 3)}",
         ]
         if os.name == "nt" and qgis.lower().endswith((".bat", ".cmd")):
             cmd = " ".join(_quote_cmd_arg(part) for part in cmd)
@@ -384,6 +392,8 @@ async def run_hld(
     excel: UploadFile = File(...),
     roads: UploadFile = File(...),
     project_id: Optional[str] = Form(None),
+    name: Optional[str] = Form(None),
+    poly_method: Optional[int] = Form(3),
 ) -> Dict[str, Any]:
     project_id = project_id or uuid.uuid4().hex
     output_dir = OUTPUT_DIR / project_id
@@ -397,6 +407,8 @@ async def run_hld(
     task.update(
         {
             "status": "queued",
+            "project_name": name or "",
+            "poly_method": poly_method,
             "roads_filename": roads_path.name,
             "output_dir": str(output_dir),
             "updated_at": _now(),
@@ -411,7 +423,9 @@ async def run_hld(
             output_dir=str(output_dir),
         )
 
-    background_tasks.add_task(_run_pipeline, project_id, excel_path, roads_path, output_dir)
+    background_tasks.add_task(
+        _run_pipeline, project_id, excel_path, roads_path, output_dir, poly_method
+    )
     return _public_task(project_id)
 
 

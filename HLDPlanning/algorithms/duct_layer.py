@@ -1013,8 +1013,11 @@ class DuctLayer(QgsProcessingAlgorithm):
     P_SIDE_R  = "SIDEWALK_RIGHT"
     P_FINAL   = "FINAL_TANGENT_TRENCHES"
     P_CRS     = "TARGET_CRS"
+    P_PSEUDO  = "PSEUDO_OBJECT_POINTS"
+    P_GARDEN  = "GARDEN_TRENCHES"
     O_FEEDER  = "OUT_FEEDER_DUCTS"
     O_DISTR   = "OUT_DISTRIBUTION_DUCTS"
+    O_DROP    = "OUT_DROP_DUCTS"
 
     def createInstance(self): return DuctLayer()
     def name(self): return "05_duct_layer"
@@ -1036,13 +1039,175 @@ class DuctLayer(QgsProcessingAlgorithm):
         self.addParameter(QgsProcessingParameterVectorLayer(self.P_SIDE_L, "Sidewalk Left (lines)", [QgsProcessing.TypeVectorLine], optional=True))
         self.addParameter(QgsProcessingParameterVectorLayer(self.P_SIDE_R, "Sidewalk Right (lines)", [QgsProcessing.TypeVectorLine], optional=True))
         self.addParameter(QgsProcessingParameterVectorLayer(self.P_FINAL, "Final Tangent Trenches (optional)", [QgsProcessing.TypeVectorLine], optional=True))
+        self.addParameter(QgsProcessingParameterVectorLayer(self.P_PSEUDO, "Pseudo Object/HH Points on Footway (optional; distribution duct ends)", [QgsProcessing.TypeVectorPoint], optional=True))
+        self.addParameter(QgsProcessingParameterVectorLayer(self.P_GARDEN, "Garden Trenches (optional; drop-duct source)", [QgsProcessing.TypeVectorLine], optional=True))
         self.addParameter(QgsProcessingParameterVectorDestination(self.O_FEEDER, "Feeder_Ducts"))
         self.addParameter(QgsProcessingParameterVectorDestination(self.O_DISTR, "Distribution_Ducts"))
+        self.addParameter(QgsProcessingParameterVectorDestination(self.O_DROP, "Drop_Ducts (small; pseudo → object)"))
+
+    def _build_drop_ducts(self, p, context, feedback, out_spec,
+                          garden_lyr, pseudo_lyr, obj_lyr, crs):
+        """Small 'drop' ducts that connect each pseudo object/HH point on the
+        footway to the object/building itself.
+
+        Primary source: the garden trenches (they already span object → footway
+        and carry PDP_ID / ADDR_ID / POLYGON_ID / MFG_ID).  Fallback: straight
+        lines between pseudo point and object joined by address id.  Emits an
+        empty layer when nothing is available so downstream stages stay stable.
+        Returns the output layer id (or None).
+        """
+        if not out_spec:
+            return None
+
+        fields = QgsFields()
+        for nm, t in (
+            ("PDP_ID", QMetaType.Type.QString),
+            ("ADDR_ID", QMetaType.Type.QString),
+            ("HH_ID", QMetaType.Type.QString),
+            ("POLYGON_ID", QMetaType.Type.QString),
+            ("MFG_ID", QMetaType.Type.QString),
+            ("DUCT_TYPE", QMetaType.Type.QString),
+            ("LENGTH_M", QMetaType.Type.Double),
+            ("SIDE", QMetaType.Type.QString),
+            ("DUCT_UID", QMetaType.Type.Int),
+        ):
+            fields.append(QgsField(nm, t))
+
+        sink, out_id = QgsProcessingUtils.createFeatureSink(
+            out_spec, context, fields, QgsWkbTypes.LineString, crs)
+        if sink is None:
+            return None
+
+        uid = 0
+        made = 0
+
+        def _add(pdp, addr, hh, poly, mfg, geom, side):
+            nonlocal uid, made
+            if not geom or geom.isEmpty():
+                return
+            f = QgsFeature(fields)
+            f.setGeometry(geom)
+            f["PDP_ID"] = pdp
+            f["ADDR_ID"] = addr
+            f["HH_ID"] = hh
+            f["POLYGON_ID"] = poly
+            f["MFG_ID"] = mfg
+            f["DUCT_TYPE"] = "Drop"
+            f["LENGTH_M"] = round(float(geom.length()), 2)
+            f["SIDE"] = side
+            f["DUCT_UID"] = uid
+            sink.addFeature(f, QgsFeatureSink.FastInsert)
+            uid += 1
+            made += 1
+
+        # 1) Preferred: garden trenches (object → footway) carry the exact
+        #    connection geometry plus the needed linkage attributes.
+        if garden_lyr is not None and garden_lyr.featureCount() > 0:
+            f_pdp  = first_field_case_insensitive(garden_lyr, ["PDP_ID", "pdp_id"])
+            f_addr = first_field_case_insensitive(garden_lyr, ["addr_id", "ADDR_ID", "address_id"])
+            f_hh   = first_field_case_insensitive(garden_lyr, ["hhs", "hh", "hh_id"])
+            f_poly = first_field_case_insensitive(garden_lyr, ["POLYGON_ID", "polygon_id"])
+            f_mfg  = first_field_case_insensitive(garden_lyr, ["MFG_ID", "mfg_id"])
+            f_side = first_field_case_insensitive(garden_lyr, ["sidewalk", "side"])
+            # For snapping the object end back to the building when garden
+            # trenches were trimmed against a building buffer.
+            obj_by_addr = {}
+            o_addr = None
+            if obj_lyr is not None:
+                o_addr = first_field_case_insensitive(obj_lyr, ["ADDR_ID", "addr_id", "id"])
+                if o_addr:
+                    for of in obj_lyr.getFeatures():
+                        v = of.attribute(o_addr)
+                        if v is None:
+                            continue
+                        k = str(v).strip().lower()
+                        if k and k not in obj_by_addr:
+                            obj_by_addr[k] = of
+            for gf in garden_lyr.getFeatures():
+                g = gf.geometry()
+                # If the garden line was trimmed (start no longer touches the
+                # building), rebuild it from the real object point to keep the
+                # drop duct spanning pseudo → object.
+                if obj_by_addr and f_addr:
+                    v = gf.attribute(f_addr)
+                    key = str(v).strip().lower() if v is not None else None
+                    of = obj_by_addr.get(key) if key else None
+                    if of is not None:
+                        og = of.geometry()
+                        if og and not og.isEmpty() and g and not g.isEmpty():
+                            if QgsWkbTypes.geometryType(og.wkbType()) == QgsWkbTypes.PointGeometry:
+                                hpt = og.asPoint()
+                            else:
+                                hpt = og.centroid().asPoint()
+                            ln = g.asMultiPolyline()[0] if g.isMultipart() else g.asPolyline()
+                            if ln:
+                                end_pt = QgsPointXY(ln[-1])
+                                hg = QgsGeometry.fromPointXY(QgsPointXY(hpt))
+                                if hg.distance(g) > 1.0:
+                                    g = QgsGeometry.fromPolylineXY([QgsPointXY(hpt), end_pt])
+                _add(
+                    str(gf[f_pdp]) if f_pdp else None,
+                    str(gf[f_addr]) if f_addr else None,
+                    str(gf[f_hh]) if f_hh else None,
+                    str(gf[f_poly]) if f_poly else None,
+                    str(gf[f_mfg]) if f_mfg else None,
+                    g,
+                    str(gf[f_side]) if f_side else None,
+                )
+        # 2) Fallback: straight object → pseudo lines joined by address id.
+        elif pseudo_lyr is not None and obj_lyr is not None:
+            p_addr = first_field_case_insensitive(pseudo_lyr, ["addr_id", "ADDR_ID", "hh_id"])
+            o_addr = first_field_case_insensitive(obj_lyr, ["ADDR_ID", "addr_id", "id"])
+            o_pdp  = first_field_case_insensitive(obj_lyr, ["PDP_ID", "pdp_id"])
+            o_poly = first_field_case_insensitive(obj_lyr, ["POLYGON_ID", "polygon_id"])
+            o_mfg  = first_field_case_insensitive(obj_lyr, ["MFG_ID", "mfg_id"])
+            if p_addr and o_addr:
+                pseudo_by_addr = {}
+                for pf in pseudo_lyr.getFeatures():
+                    v = pf.attribute(p_addr)
+                    if v is None:
+                        continue
+                    k = str(v).strip().lower()
+                    if k and k not in pseudo_by_addr:
+                        pseudo_by_addr[k] = pf
+                for of in obj_lyr.getFeatures():
+                    v = of.attribute(o_addr)
+                    if v is None:
+                        continue
+                    pf = pseudo_by_addr.get(str(v).strip().lower())
+                    if pf is None:
+                        continue
+                    og = of.geometry(); pg = pf.geometry()
+                    if not og or og.isEmpty() or not pg or pg.isEmpty():
+                        continue
+                    if QgsWkbTypes.geometryType(og.wkbType()) == QgsWkbTypes.PointGeometry:
+                        hpt = og.asPoint()
+                    else:
+                        hpt = og.centroid().asPoint()
+                    if QgsWkbTypes.geometryType(pg.wkbType()) == QgsWkbTypes.PointGeometry:
+                        ppt = pg.asPoint()
+                    else:
+                        ppt = pg.centroid().asPoint()
+                    _add(
+                        str(of.attribute(o_pdp)) if o_pdp else None,
+                        str(of.attribute(o_addr)),
+                        None,
+                        str(of.attribute(o_poly)) if o_poly else None,
+                        str(of.attribute(o_mfg)) if o_mfg else None,
+                        QgsGeometry.fromPolylineXY([QgsPointXY(hpt), QgsPointXY(ppt)]),
+                        None,
+                    )
+
+        feedback.pushInfo(f"✅ Drop (small) ducts created: {made}")
+        if sink:
+            del sink
+        return out_id
 
     def processAlgorithm(self, p, context, feedback):
         # Resolve parent output URIs up front
         out_feeder_uri = self.parameterAsOutputLayer(p, self.O_FEEDER, context)
         out_distr_uri  = self.parameterAsOutputLayer(p, self.O_DISTR,  context)
+        out_drop_uri   = self.parameterAsOutputLayer(p, self.O_DROP,   context)
 
         # >>> ADD THE HELPER RIGHT HERE <<<
         from qgis.core import QgsVectorLayer, QgsProject, QgsProcessingUtils
@@ -1161,7 +1326,23 @@ class DuctLayer(QgsProcessingAlgorithm):
             feeder.MAX_K:     4,
         }
         feeder.processAlgorithm(feeder_params, context, feedback)
-        
+
+        # --- DROP DUCTS (small connections: pseudo object point → object) ---
+        feedback.pushInfo("⚙️ Building small drop ducts (pseudo → object) …")
+        pseudo_lyr = _as_layer_any(self.P_PSEUDO)
+        garden_lyr = _as_layer_any(self.P_GARDEN)
+        obj_lyr = self.parameterAsVectorLayer(p, self.P_OBJECTS, context) or self.parameterAsSource(p, self.P_OBJECTS, context)
+        try:
+            out_drop_id = self._build_drop_ducts(
+                p, context, feedback, out_drop_uri,
+                garden_lyr, pseudo_lyr, obj_lyr, net_lyr.crs())
+        except Exception as e:
+            try:
+                feedback.reportError(f"Drop ducts failed: {e}")
+            except Exception:
+                pass
+            out_drop_id = None
+
         # --- DISTRIBUTION ---
         feedback.pushInfo("⚙️ Running embedded Distribution algorithm …")
 
@@ -1176,11 +1357,22 @@ class DuctLayer(QgsProcessingAlgorithm):
 
         # ---- Preflight diagnostics (so you see EXACTLY what's missing) ----
         pdp_lyr = self.parameterAsVectorLayer(p, self.P_PDP, context) or self.parameterAsSource(p, self.P_PDP, context)
-        obj_lyr = self.parameterAsVectorLayer(p, self.P_OBJECTS, context) or self.parameterAsSource(p, self.P_OBJECTS, context)
+        # obj_lyr was already resolved above (drop-duct build).
+        # Prefer pseudo object/HH points (on the footway) as distribution duct
+        # endpoints so ducts stop at the property line; the small drop ducts
+        # (from garden trenches) then connect pseudo → object.
+        # NOTE: with pseudo endpoints the distribution duct's hh_ids field
+        # carries the pseudo feature ids — the real address linkage lives in
+        # the Drop_Ducts layer (ADDR_ID / HH_ID).
+        dist_objs = pseudo_lyr if (pseudo_lyr is not None and pseudo_lyr.featureCount() > 0) else obj_lyr
+        if dist_objs is pseudo_lyr:
+            feedback.pushInfo("Distribution duct endpoints → pseudo object points (ducts stop at the footway).")
+        else:
+            feedback.pushInfo("Distribution duct endpoints → object points (no pseudo layer provided; ducts run to the objects).")
         # Auto-detect canonical fields on the resolved layers
-        hh_fld   = first_field_case_insensitive(obj_lyr, ["ADDR_ID", "addr_id", "HH_ID", "hh_id", "address_id", "id"]) or "" if obj_lyr else ""
+        hh_fld   = first_field_case_insensitive(dist_objs, ["ADDR_ID", "addr_id", "HH_ID", "hh_id", "address_id", "id"]) or "" if dist_objs else ""
         pdp_on_p = first_field_case_insensitive(pdp_lyr, ["PDP_ID", "pdp_id", "pdp"]) or "" if pdp_lyr else ""
-        pdp_on_h = first_field_case_insensitive(obj_lyr, ["PDP_ID", "pdp_id"]) or "" if obj_lyr else ""
+        pdp_on_h = first_field_case_insensitive(dist_objs, ["PDP_ID", "pdp_id"]) or "" if dist_objs else ""
         feedback.pushInfo(f"Distribution auto-detected fields → HH id: '{hh_fld}', PDP id on PDPs: '{pdp_on_p}', PDP id on HH: '{pdp_on_h}'")
 
         # --- replace the whole validation block with this ---
@@ -1189,7 +1381,7 @@ class DuctLayer(QgsProcessingAlgorithm):
 
         errs = []
         if pdp_lyr is None:  errs.append("Distribution: PDP_POINTS layer is NULL (check the input).")
-        if obj_lyr is None:  errs.append("Distribution: OBJECT_POINTS layer is NULL (check the input).")
+        if dist_objs is None:  errs.append("Distribution: endpoint points layer (pseudo or objects) is NULL (check the input).")
         if side_l is None or side_r is None:
             try:
                 feedback.pushWarning("Distribution: Sidewalk L/R not provided — will build graph from tangent/feeder only and default side labels.")
@@ -1197,15 +1389,15 @@ class DuctLayer(QgsProcessingAlgorithm):
                 pass
             
         if not pdp_on_p:     errs.append("Distribution: PDP ID field on PDPs is empty.")
-        if not pdp_on_h:     errs.append("Distribution: PDP ID field on HH/Objects is empty.")
-        if not hh_fld:       errs.append("Distribution: HH ID field on HH/Objects is empty.")
+        if not pdp_on_h:     errs.append("Distribution: PDP ID field on endpoint points (pseudo/objects) is empty.")
+        if not hh_fld:       errs.append("Distribution: HH ID field on endpoint points (pseudo/objects) is empty.")
 
         if pdp_lyr and not _field_exists(pdp_lyr, pdp_on_p):
             errs.append(f"Distribution: PDP_POINTS is missing field '{pdp_on_p}'.")
-        if obj_lyr and not _field_exists(obj_lyr, pdp_on_h):
-            errs.append(f"Distribution: OBJECT_POINTS is missing field '{pdp_on_h}'.")
-        if obj_lyr and not _field_exists(obj_lyr, hh_fld):
-            errs.append(f"Distribution: OBJECT_POINTS is missing field '{hh_fld}'.")
+        if dist_objs and not _field_exists(dist_objs, pdp_on_h):
+            errs.append(f"Distribution: endpoint points (pseudo/objects) is missing field '{pdp_on_h}'.")
+        if dist_objs and not _field_exists(dist_objs, hh_fld):
+            errs.append(f"Distribution: endpoint points (pseudo/objects) is missing field '{hh_fld}'.")
 
         if errs:
             # Warn instead of raising, then skip this stage safely.
@@ -1223,14 +1415,15 @@ class DuctLayer(QgsProcessingAlgorithm):
             # Return empty outputs so upstream steps and the demo can continue
             return {
                 self.O_FEEDER: out_feeder_uri,
-                self.O_DISTR:  None
+                self.O_DISTR:  None,
+                self.O_DROP:   out_drop_id,
             }
 
 
         # ---- Now run child algorithm writing DIRECTLY to parent output ----
         distr_params = {
             distr.L_PDP:        pdp_lyr,
-            distr.L_HH:         obj_lyr,
+            distr.L_HH:         dist_objs,
             distr.L_LEFT:       side_l,
             distr.L_RIGHT:      side_r,
             distr.L_TAN:        final_tan,
@@ -1244,7 +1437,7 @@ class DuctLayer(QgsProcessingAlgorithm):
         
         # Guard: required inputs present?
         _missing = [k for k, v in {
-            "PDP": pdp_lyr, "HH": obj_lyr, "LEFT": side_l, "RIGHT": side_r, "TAN": final_tan
+            "PDP": pdp_lyr, "HH": dist_objs, "LEFT": side_l, "RIGHT": side_r, "TAN": final_tan
         }.items() if v is None]
         if _missing:
             for m in _missing:
@@ -1255,6 +1448,7 @@ class DuctLayer(QgsProcessingAlgorithm):
             return {
                 self.O_FEEDER: locals().get("out_feeder_uri", None),
                 self.O_DISTR:  None,
+                self.O_DROP:   locals().get("out_drop_id", None),
             }
         
         # Safe run
@@ -1268,6 +1462,7 @@ class DuctLayer(QgsProcessingAlgorithm):
             return {
                 self.O_FEEDER: locals().get("out_feeder_uri", None),
                 self.O_DISTR:  None,
+                self.O_DROP:   locals().get("out_drop_id", None),
             }
         except Exception as e:
             try:
@@ -1277,12 +1472,14 @@ class DuctLayer(QgsProcessingAlgorithm):
             return {
                 self.O_FEEDER: locals().get("out_feeder_uri", None),
                 self.O_DISTR:  None,
+                self.O_DROP:   locals().get("out_drop_id", None),
             }
         
         # Success: return URIs so Processing auto-loads the layer(s)
         return {
             self.O_FEEDER: out_feeder_uri,
             self.O_DISTR:  out_distr_uri,
+            self.O_DROP:   out_drop_id,
         }
 
 
@@ -1321,8 +1518,11 @@ try:
         P_SIDE_R  = DuctLayer.P_SIDE_R
         P_FINAL   = DuctLayer.P_FINAL
         P_CRS     = DuctLayer.P_CRS
+        P_PSEUDO  = DuctLayer.P_PSEUDO
+        P_GARDEN  = DuctLayer.P_GARDEN
         O_FEEDER  = DuctLayer.O_FEEDER
         O_DISTR   = DuctLayer.O_DISTR
+        O_DROP    = DuctLayer.O_DROP
 except Exception:
     # If DuctLayer wasn't defined for some reason, avoid crashing module import
     pass

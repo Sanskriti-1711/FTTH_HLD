@@ -996,6 +996,15 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
 
         poly_count = polys_valid.featureCount()
         pidx = 0
+
+        # Brownfield: load the existing-asset registry once for PDP reuse below.
+        bf_pdp_reg = None
+        try:
+            from ..utils.brownfield import BrownfieldRegistry
+            bf_pdp_reg = BrownfieldRegistry.load_from_project()
+        except Exception:
+            bf_pdp_reg = None
+
         for poly in polys_valid.getFeatures():
             if feedback.isCanceled():
                 raise QgsProcessingException("Canceled by user")
@@ -1084,6 +1093,26 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
                     )
                     final_pdp_geom = snapped_geom if snapped_geom else chosen.geometry()
                     _src_id = str(chosen.id())
+
+                    # ── Brownfield: reuse an existing chamber/PDP within 10 m ──
+                    if bf_pdp_reg is not None and bf_pdp_reg.asset_count:
+                        try:
+                            new_geom, bf_aid = bf_pdp_reg.try_snap_pdp_to_chamber(
+                                final_pdp_geom, max_dist=10.0
+                            )
+                            if bf_aid:
+                                moved_m = final_pdp_geom.distance(new_geom)
+                                final_pdp_geom = new_geom
+                                _src_id = bf_aid
+                                feedback.pushInfo(
+                                    f"Polygon {pid_val}: PDP reused existing point asset "
+                                    f"'{bf_aid}' ({moved_m:.1f}m away)."
+                                )
+                        except Exception as e:
+                            # Best-effort: a failure here must never break PDP placement.
+                            feedback.pushWarning(
+                                f"Polygon {pid_val}: brownfield PDP snap skipped ({e!r})."
+                            )
                 else:
                     # Guarantee a PDP for EVERY polygon: when no candidate point is
                     # available, place the PDP at the polygon's point-on-surface

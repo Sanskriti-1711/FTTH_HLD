@@ -28,10 +28,14 @@ def _register(module_name: str, class_name: str) -> None:
 
 _register("object_layer", "BuildObjectLayer")
 _register("polygon_layer", "PolygonLayerAlgorithm")
+_register("brownfield_layer", "BrownfieldLayerAlgorithm")
 _register("oneclick", "EndToEndPipelineAlgorithm")
+_register("brownfield_oneclick", "BrownfieldOneClickAlgorithm")
 _register("network_layer", "NetworkLayerAlgorithm")
 _register("trench_layer", "TrenchLayerAlgorithm")
 _register("duct_layer", "DuctLayer")
 _register("cable_layer", "AlgCableBuilderAll")
+_register("chamber_layer", "ChamberLayerAlgorithm")
+_register("pole_layer", "PoleLayerAlgorithm")
 
 __all__ = ["ALL_ALGORITHMS", "IMPORT_ERRORS"]

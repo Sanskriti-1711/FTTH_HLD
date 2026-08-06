@@ -1,0 +1,395 @@
+{
+  "type": "FeatureCollection",
+  "crs": {
+    "type": "name",
+    "properties": {
+      "name": "EPSG:25833"
+    }
+  },
+  "features": [
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          389745.8073165493,
+          5812096.711109271
+        ]
+      },
+      "properties": {
+        "SRC_ID": "BF_CH_000",
+        "STAGE": "brownfield",
+        "ASSET_TYPE": "chamber",
+        "INFRA_STATUS": "Existing",
+        "VERIFY_STATUS": "Verified",
+        "CAPACITY_USED": 0,
+        "CAPACITY_TOTAL": 1,
+        "POLYGON_ID": "POLY00001",
+        "PDP_ID": "",
+        "REUSE_SOURCE": "",
+        "NODE_TYPE": "chamber",
+        "CHAMBER_TYPE": "MH"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          389767.847671076,
+          5811939.528079812
+        ]
+      },
+      "properties": {
+        "SRC_ID": "BF_CH_001",
+        "STAGE": "brownfield",
+        "ASSET_TYPE": "chamber",
+        "INFRA_STATUS": "Existing",
+        "VERIFY_STATUS": "Verified",
+        "CAPACITY_USED": 0,
+        "CAPACITY_TOTAL": 1,
+        "POLYGON_ID": "POLY00003",
+        "PDP_ID": "",
+        "REUSE_SOURCE": "",
+        "NODE_TYPE": "chamber",
+        "CHAMBER_TYPE": "MH"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          389563.7447730492,
+          5811837.575185644
+        ]
+      },
+      "properties": {
+        "SRC_ID": "BF_CH_002",
+        "STAGE": "brownfield",
+        "ASSET_TYPE": "chamber",
+        "INFRA_STATUS": "Existing",
+        "VERIFY_STATUS": "Verified",
+        "CAPACITY_USED": 0,
+        "CAPACITY_TOTAL": 1,
+        "POLYGON_ID": "POLY00005",
+        "PDP_ID": "",
+        "REUSE_SOURCE": "",
+        "NODE_TYPE": "chamber",
+        "CHAMBER_TYPE": "HH"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          389365.03982338175,
+          5811875.889122785
+        ]
+      },
+      "properties": {
+        "SRC_ID": "BF_CH_003",
+        "STAGE": "brownfield",
+        "ASSET_TYPE": "chamber",
+        "INFRA_STATUS": "Existing",
+        "VERIFY_STATUS": "Verified",
+        "CAPACITY_USED": 0,
+        "CAPACITY_TOTAL": 1,
+        "POLYGON_ID": "POLY00007",
+        "PDP_ID": "",
+        "REUSE_SOURCE": "",
+        "NODE_TYPE": "chamber",
+        "CHAMBER_TYPE": "MH"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          389544.1906701934,
+          5811965.726079585
+        ]
+      },
+      "properties": {
+        "SRC_ID": "BF_CH_004",
+        "STAGE": "brownfield",
+        "ASSET_TYPE": "chamber",
+        "INFRA_STATUS": "Existing",
+        "VERIFY_STATUS": "Survey Required",
+        "CAPACITY_USED": 0,
+        "CAPACITY_TOTAL": 1,
+        "POLYGON_ID": "POLY00009",
+        "PDP_ID": "",
+        "REUSE_SOURCE": "",
+        "NODE_TYPE": "chamber",
+        "CHAMBER_TYPE": "HH"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          389334.8517467677,
+          5812052.968647503
+        ]
+      },
+      "properties": {
+        "SRC_ID": "BF_CH_005",
+        "STAGE": "brownfield",
+        "ASSET_TYPE": "chamber",
+        "INFRA_STATUS": "Existing",
+        "VERIFY_STATUS": "Verified",
+        "CAPACITY_USED": 0,
+        "CAPACITY_TOTAL": 1,
+        "POLYGON_ID": "POLY00011",
+        "PDP_ID": "",
+        "REUSE_SOURCE": "",
+        "NODE_TYPE": "chamber",
+        "CHAMBER_TYPE": "MH"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          389365.62115845055,
+          5812184.267988673
+        ]
+      },
+      "properties": {
+        "SRC_ID": "BF_CH_006",
+        "STAGE": "brownfield",
+        "ASSET_TYPE": "chamber",
+        "INFRA_STATUS": "Existing",
+        "VERIFY_STATUS": "Verified",
+        "CAPACITY_USED": 0,
+        "CAPACITY_TOTAL": 1,
+        "POLYGON_ID": "POLY00013",
+        "PDP_ID": "",
+        "REUSE_SOURCE": "",
+        "NODE_TYPE": "chamber",
+        "CHAMBER_TYPE": "MH"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          389415.2734786671,
+          5812055.67963739
+        ]
+      },
+      "properties": {
+        "SRC_ID": "BF_CH_007",
+        "STAGE": "brownfield",
+        "ASSET_TYPE": "chamber",
+        "INFRA_STATUS": "Existing",
+        "VERIFY_STATUS": "Verified",
+        "CAPACITY_USED": 0,
+        "CAPACITY_TOTAL": 1,
+        "POLYGON_ID": "POLY00015",
+        "PDP_ID": "",
+        "REUSE_SOURCE": "",
+        "NODE_TYPE": "chamber",
+        "CHAMBER_TYPE": "MH"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          389809.5511877897,
+          5812485.690734571
+        ]
+      },
+      "properties": {
+        "SRC_ID": "BF_CH_008",
+        "STAGE": "brownfield",
+        "ASSET_TYPE": "chamber",
+        "INFRA_STATUS": "Existing",
+        "VERIFY_STATUS": "Verified",
+        "CAPACITY_USED": 0,
+        "CAPACITY_TOTAL": 1,
+        "POLYGON_ID": "POLY00017",
+        "PDP_ID": "",
+        "REUSE_SOURCE": "",
+        "NODE_TYPE": "chamber",
+        "CHAMBER_TYPE": "HH"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          389796.4356373395,
+          5812318.795544571
+        ]
+      },
+      "properties": {
+        "SRC_ID": "BF_CH_009",
+        "STAGE": "brownfield",
+        "ASSET_TYPE": "chamber",
+        "INFRA_STATUS": "Existing",
+        "VERIFY_STATUS": "Verified",
+        "CAPACITY_USED": 0,
+        "CAPACITY_TOTAL": 1,
+        "POLYGON_ID": "POLY00019",
+        "PDP_ID": "",
+        "REUSE_SOURCE": "",
+        "NODE_TYPE": "chamber",
+        "CHAMBER_TYPE": "HH"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          389177.7534834841,
+          5811945.145684223
+        ]
+      },
+      "properties": {
+        "SRC_ID": "BF_CH_010",
+        "STAGE": "brownfield",
+        "ASSET_TYPE": "chamber",
+        "INFRA_STATUS": "Existing",
+        "VERIFY_STATUS": "Survey Required",
+        "CAPACITY_USED": 0,
+        "CAPACITY_TOTAL": 1,
+        "POLYGON_ID": "POLY00021",
+        "PDP_ID": "",
+        "REUSE_SOURCE": "",
+        "NODE_TYPE": "chamber",
+        "CHAMBER_TYPE": "MH"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          389672.3453498942,
+          5812014.956807584
+        ]
+      },
+      "properties": {
+        "SRC_ID": "BF_CH_011",
+        "STAGE": "brownfield",
+        "ASSET_TYPE": "chamber",
+        "INFRA_STATUS": "Existing",
+        "VERIFY_STATUS": "Verified",
+        "CAPACITY_USED": 0,
+        "CAPACITY_TOTAL": 1,
+        "POLYGON_ID": "POLY00023",
+        "PDP_ID": "",
+        "REUSE_SOURCE": "",
+        "NODE_TYPE": "chamber",
+        "CHAMBER_TYPE": "MH"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          389672.4359888143,
+          5811928.1310080895
+        ]
+      },
+      "properties": {
+        "SRC_ID": "BF_CH_012",
+        "STAGE": "brownfield",
+        "ASSET_TYPE": "chamber",
+        "INFRA_STATUS": "Existing",
+        "VERIFY_STATUS": "Survey Required",
+        "CAPACITY_USED": 0,
+        "CAPACITY_TOTAL": 1,
+        "POLYGON_ID": "POLY00025",
+        "PDP_ID": "",
+        "REUSE_SOURCE": "",
+        "NODE_TYPE": "chamber",
+        "CHAMBER_TYPE": "MH"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          389811.0180080361,
+          5812011.349357834
+        ]
+      },
+      "properties": {
+        "SRC_ID": "BF_CH_013",
+        "STAGE": "brownfield",
+        "ASSET_TYPE": "chamber",
+        "INFRA_STATUS": "Existing",
+        "VERIFY_STATUS": "Verified",
+        "CAPACITY_USED": 0,
+        "CAPACITY_TOTAL": 1,
+        "POLYGON_ID": "POLY00027",
+        "PDP_ID": "",
+        "REUSE_SOURCE": "",
+        "NODE_TYPE": "chamber",
+        "CHAMBER_TYPE": "MH"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          389571.4426411122,
+          5811984.853594541
+        ]
+      },
+      "properties": {
+        "SRC_ID": "BF_CH_014",
+        "STAGE": "brownfield",
+        "ASSET_TYPE": "chamber",
+        "INFRA_STATUS": "Existing",
+        "VERIFY_STATUS": "Verified",
+        "CAPACITY_USED": 0,
+        "CAPACITY_TOTAL": 1,
+        "POLYGON_ID": "POLY00029",
+        "PDP_ID": "",
+        "REUSE_SOURCE": "",
+        "NODE_TYPE": "chamber",
+        "CHAMBER_TYPE": "MH"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          389479.86409327126,
+          5812082.512968059
+        ]
+      },
+      "properties": {
+        "SRC_ID": "BF_CH_015",
+        "STAGE": "brownfield",
+        "ASSET_TYPE": "chamber",
+        "INFRA_STATUS": "Existing",
+        "VERIFY_STATUS": "Verified",
+        "CAPACITY_USED": 0,
+        "CAPACITY_TOTAL": 1,
+        "POLYGON_ID": "POLY00031",
+        "PDP_ID": "",
+        "REUSE_SOURCE": "",
+        "NODE_TYPE": "chamber",
+        "CHAMBER_TYPE": "MH"
+      }
+    }
+  ]
+}

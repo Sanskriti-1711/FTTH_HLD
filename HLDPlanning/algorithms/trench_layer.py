@@ -52,7 +52,7 @@ from ..utils.expressions import swap_canonical_field, expr_ci_in, expr_area_not_
 from ..utils.sinks import copy_to_sink
 from ..utils.intersections import build_intersection_buffers
 from ..utils.nearest import nearest_point_on_lines
-from ..utils.graph_ops import add_lines_to_graph as _add_lines_to_graph, snap_to_nodes as _snap_to_nodes
+from ..utils.graph_ops import add_lines_to_graph as _add_lines_to_graph, snap_to_nodes as _snap_to_nodes, add_brownfield_edges_to_graph as _add_brownfield_edges_to_graph
 from ..utils.geom_ops import nearest_point_and_distance as _nearest_point_and_distance
 from ..utils.graph_nodes import build_node_index_from_graph as _build_node_index_from_graph, nearest_node as _nearest_node
 from ..utils.projection_utils import reproject_to
@@ -527,6 +527,8 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
         final_snap = 0.20  # final snap (m)
         cross_step = 25.0  # mid-block drill spacing (m)
         cross_len  = 60.0  # mid-block drill total length (m)
+        bf_connect = 5.0   # brownfield→graph connection tolerance (m): bridges
+                           # slightly-offset existing corridors into the graph
 
         # Small epsilon used in later graph steps (keep tiny but > 0)
         eps = min(0.05, max(0.001, dens / 5.0))
@@ -1388,6 +1390,26 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
             _add_lines_to_graph(G, right_sw, dens, eps, _qkey)
             if tan_tmp:
                 _add_lines_to_graph(G, tan_tmp, dens, eps, _qkey)
+
+            # ── Brownfield: inject existing duct/trench edges (weight=0.1 vs 1.0 for new) ──
+            # ── Brownfield: inject existing duct/trench edges into routing graph ──
+            bf_edges_added = 0
+            try:
+                from ..utils.brownfield import BrownfieldRegistry
+                bf_reg = BrownfieldRegistry.load_from_project()
+                if bf_reg is not None:
+                    bf_edges_added = bf_reg.inject_edges_into_graph(
+                        G, dens, eps, _qkey, base_weight=0.1,
+                        connect_tol=bf_connect
+                    )
+                    if bf_edges_added > 0:
+                        feedback.pushInfo(
+                            f"Brownfield: {bf_edges_added} existing duct/trench edges "
+                            f"added to routing graph (weight=0.1x, "
+                            f"connect ≤ {bf_connect:g} m)."
+                        )
+            except Exception as exc:
+                feedback.pushWarning(f"Brownfield graph injection skipped: {exc}")
 
 
             _add_lr_bridges(G, left_sw, right_sw, heal, eps)
@@ -2379,6 +2401,10 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                         ext_fields.append(QgsField(field.name(), field.type(), field.typeName(), field.length(), field.precision()))
                 ext_fields.append(QgsField("POLYGON_ID", QMetaType.Type.QString))
                 ext_fields.append(QgsField("PDP_ID", QMetaType.Type.QString))
+                # Brownfield classification fields
+                ext_fields.append(QgsField("INFRA_STATUS", QMetaType.Type.QString))
+                ext_fields.append(QgsField("VERIFY_STATUS", QMetaType.Type.QString))
+                ext_fields.append(QgsField("REUSE_SOURCE", QMetaType.Type.QString))
 
                 sinkFinal, final_id = self.parameterAsSink(
                     p, self.O_FINAL, context,
@@ -2401,6 +2427,43 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                         return s if s and s.upper() != "NULL" else None
 
                     written = 0
+                    bf_tagged = 0
+                    # ── Brownfield classification: spatial overlap pass ──
+                    # Build the brownfield line-asset index ONCE, then tag each
+                    # feature INLINE as it is copied into the final sink.
+                    # Tagging inline (instead of a post-hoc dataProvider update
+                    # keyed on source fids) fixes the fid-mismatch bug where
+                    # changeAttributeValues never matched the newly added rows.
+                    bf_reg = None
+                    bf_idx = None
+                    bf_geoms = {}
+                    TOL_M = 2.0  # 2m tolerance for "following same route"
+                    try:
+                        # Use the shared (toggle-aware) loader so turning the
+                        # USE_BROWNFIELD toggle off disables classification too.
+                        from ..utils.brownfield import BrownfieldRegistry
+                        bf_reg = BrownfieldRegistry.load_from_project()
+                        if bf_reg is not None and bf_reg.has_assets():
+                            # NOTE: QgsSpatialIndex is imported at module level;
+                            # a local import here would shadow it for the whole
+                            # function and break earlier uses (UnboundLocalError).
+                            bf_idx = QgsSpatialIndex()
+                            _fid = 0
+                            for aid in bf_reg.asset_ids():
+                                a = bf_reg.get_asset(aid)
+                                if a and a["asset_type"] in ("duct", "trench", "fibre"):
+                                    g = a["geom"]
+                                    if g and not g.isEmpty():
+                                        bf_geoms[_fid] = (aid, a, g)
+                                        _f = QgsFeature(_fid)
+                                        _f.setGeometry(g)
+                                        bf_idx.addFeature(_f)
+                                        _fid += 1
+                    except Exception as exc:
+                        feedback.pushWarning(f"Brownfield classification index build skipped: {exc}")
+                        bf_idx = None
+                        bf_geoms = {}
+
                     for f in merged_final.getFeatures():
                         nf = QgsFeature(ext_fields)
                         nf.setGeometry(f.geometry())
@@ -2419,9 +2482,51 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                                 pdp_val = lu[1] or pdp_val
                         nf["POLYGON_ID"] = poly_val
                         nf["PDP_ID"] = pdp_val
+                        # Brownfield classification (inline, before adding to the
+                        # sink) — if this trench part follows an existing
+                        # duct/trench/fibre corridor within tolerance, mark it
+                        # Reused and consume capacity from the matched asset.
+                        # Non-matching (or brownfield-less) features default to
+                        # 'Proposed' so INFRA_STATUS is fully populated per the
+                        # schema enum (Existing | Reused | Proposed | Removed).
+                        bf_matched = False
+                        if bf_idx is not None and bf_geoms:
+                            fg = f.geometry()
+                            if fg and not fg.isEmpty():
+                                try:
+                                    bb = fg.buffer(TOL_M, 8).boundingBox()
+                                    for bf_fid in bf_idx.intersects(bb):
+                                        aid, a, bg = bf_geoms[bf_fid]
+                                        if fg.distance(bg) <= TOL_M:
+                                            nf["INFRA_STATUS"] = "Reused"
+                                            nf["VERIFY_STATUS"] = a["verify_status"]
+                                            nf["REUSE_SOURCE"] = aid
+                                            try:
+                                                bf_reg.consume_capacity(aid)
+                                            except Exception:
+                                                pass
+                                            bf_tagged += 1
+                                            bf_matched = True
+                                            break  # one classification per feature
+                                except Exception:
+                                    pass  # classification must never block output
+                        if not bf_matched:
+                            nf["INFRA_STATUS"] = "Proposed"
                         sinkFinal.addFeature(nf)
                         written += 1
                     feedback.pushInfo(f"✅ Final_Trenches layer written with {written} features (incl. POLYGON_ID/PDP_ID).")
+                    if bf_tagged > 0:
+                        feedback.pushInfo(
+                            f"Brownfield: {bf_tagged} trench features classified as 'Reused' "
+                            f"(overlapping existing ducts/trenches within {TOL_M}m); "
+                            f"capacity consumed from matched assets."
+                        )
+                    elif bf_idx is not None and bf_geoms:
+                        feedback.pushInfo(
+                            "Brownfield: no trench features overlapped existing "
+                            f"duct/trench/fibre assets within {TOL_M}m."
+                        )
+
                 else:
                     feedback.reportError("Could not allocate sink for Final_Trenches.")
             else:

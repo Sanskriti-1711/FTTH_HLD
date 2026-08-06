@@ -147,16 +147,24 @@ docker exec hld_planning_01-ftth-engine-1 qgis_process run \
 
 ## 2. Pipeline Overview
 
-The HLD pipeline runs **6 sequential stages** inside `qgis_process` via the `hldplanning:end_to_end_pipeline` algorithm:
+The HLD pipeline runs **sequential stages** inside `qgis_process` via the `hldplanning:end_to_end_pipeline` algorithm:
 
 | # | Stage | Algorithm | Output Files |
 |---|-------|-----------|-------------|
 | 0 | **Object Layer** | `01_object_layer` | `Objects.gpkg` |
 | 1 | **Polygon Layer** | `02_polygon_layer` | `Polygons.gpkg` |
 | 2 | **Network Layer** | `03_network_layer` | `PDPs.gpkg`, `MFG.gpkg`, `Network.gpkg` |
-| 3 | **Trench Layer** | `04_trench_layer` | `Final_Trenches.gpkg` |
+| 3 | **Trench Layer** | `04_trench_layer` | `Feeder_Trench.gpkg`, `Distribution_Trench.gpkg`, `Garden_Trench.gpkg`, `Final_Trenches.gpkg` |
 | 4 | **Cable Layer** | `05_cable_layer` | `Feeder_Cable.gpkg`, `Distribution_Cable.gpkg` |
 | 5 | **Duct Layer** | `06_duct_layer` | `Feeder_Ducts.gpkg`, `Distribution_Ducts.gpkg` |
+| 6 | **Chamber Layer** | `07_chamber_layer` | `Chambers.gpkg` |
+| 7 | **Pole Layer** | `08_pole_layer` | `Poles.gpkg` |
+
+> **Note:** The brownfield (existing-infrastructure) workflow — including the
+> standalone `00_brownfield_layer` algorithm — is handled inside the QGIS
+> plugin via the **Brownfield – One-Click HLD Pipeline**. The web API runs the
+> standard `hldplanning:end_to_end_pipeline` and does not accept brownfield
+> inputs, so no brownfield stage appears in the pipeline or its outputs.
 
 ### Inputs
 
@@ -397,9 +405,11 @@ GET /layers/{project_id}/{layer}        ← compatibility alias
 | `objects` | `object_layer` | Point | Premises / address points |
 | `polygons` | `polygon_layer` | Polygon | Service-area polygons (FDP/PDP zones) |
 | `network` | `network_layer` | Line | Road network with PDP/MFG assignments |
-| `trenches` | `trench_layer` | Line | Trench routes |
-| `cables` | `cable_layer` | Line | Feeder & distribution cables |
-| `ducts` | `duct_layer` | Line | Feeder & distribution duct routes |
+| `trenches` | `trench_layer` | Line | All trench routes (Feeder, Distribution, Garden, Final) |
+| `cables` | `cable_layer` | Line | Feeder & distribution cables (one layer, STAGE distinguishes) |
+| `ducts` | `duct_layer` | Line | Feeder & distribution duct routes (one layer, STAGE distinguishes) |
+| `pdps` | `pdps` | Point | Network PDPs |
+| `mfg` | `mfg` | Point | MFG point |
 
 **Response:** GeoJSON FeatureCollection
 ```json

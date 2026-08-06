@@ -22,6 +22,7 @@ from qgis.core import (
     QgsProcessingParameterFeatureSink,
     QgsProcessingFeedback,
     QgsProcessingUtils,
+    QgsWkbTypes,
     QgsCoordinateReferenceSystem,
     QgsVectorFileWriter,
     QgsMapLayer,
@@ -31,6 +32,8 @@ from qgis.core import (
 from qgis import processing
 
 from ..utils.params import ALG, LAYERNAMES
+from ..utils import attr_enrich
+from ..utils.style_utils import apply_simple_line_style
 
 
 class PipelineStageError(QgsProcessingException):
@@ -138,6 +141,19 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
 
     P_OSM_PBF = "OSM_PBF"
 
+    # Brownfield (existing infrastructure) — optional inputs
+    P_BF_DUCTS = "BF_DUCTS"
+    P_BF_CHAMBERS = "BF_CHAMBERS"
+    P_BF_POLES = "BF_POLES"
+    P_BF_FIBRE = "BF_FIBRE"
+    P_BF_CABINETS = "BF_CABINETS"
+    P_BF_TRENCHES = "BF_TRENCHES"
+    P_BF_FEEDER_TRENCH = "BF_FEEDER_TRENCH"
+    P_BF_DIST_TRENCH = "BF_DIST_TRENCH"
+    P_BF_EXISTING_PDP = "BF_EXISTING_PDP"
+    P_BF_EXISTING_MFG = "BF_EXISTING_MFG"
+    P_USE_BROWNFIELD = "USE_BROWNFIELD"
+
     P_TR_ROADS = "TRENCH_ROADS"
     P_BUILDINGS = "BUILDINGS"
     P_TR_MFG = "TRENCH_MFG"
@@ -147,6 +163,8 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
     OUT_PDP = "OUT_PDP"
     OUT_MFG = "OUT_MFG"
     
+    OUT_BROWNFIELD = "OUT_BROWNFIELD"
+    OUT_BROWNFIELD_POINTS = "OUT_BROWNFIELD_POINTS"
     OUT_TRENCHES = "OUT_TRENCHES"
     OUT_FEEDER_TRENCH = "OUT_FEEDER_TRENCH"
     OUT_DIST_TRENCH = "OUT_DIST_TRENCH"
@@ -155,8 +173,15 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
     OUT_DIST_CABLE = "OUT_DIST_CABLE"
     OUT_FEEDER_DUCTS = "OUT_FEEDER_DUCTS"
     OUT_DIST_DUCTS = "OUT_DIST_DUCTS"
+    OUT_DROP_DUCTS = "OUT_DROP_DUCTS"
+
+    # HLD_attr civil layers
+    P_AERIAL_ZONES = "AERIAL_ZONES"
+    OUT_CHAMBERS = "OUT_CHAMBERS"
+    OUT_POLES = "OUT_POLES"
 
     _DEFAULT_OUTPUT_FILES = {
+        OUT_BROWNFIELD: "Existing_Infrastructure.gpkg",
         OUT_OBJECTS: "Objects.gpkg",
         OUT_POLYGONS: "Polygons.gpkg",
         OUT_PDP: "PDPs.gpkg",
@@ -169,6 +194,9 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         OUT_DIST_CABLE: "Distribution_Cable.gpkg",
         OUT_FEEDER_DUCTS: "Feeder_Ducts.gpkg",
         OUT_DIST_DUCTS: "Distribution_Ducts.gpkg",
+        OUT_DROP_DUCTS: "Drop_Ducts.gpkg",
+        OUT_CHAMBERS: "Chambers.gpkg",
+        OUT_POLES: "Poles.gpkg",
     }
 
     _OBJ_EXCEL, _OBJ_SHEET, _OBJ_EMAIL = "EXCEL", "SHEET", "EMAIL"
@@ -198,6 +226,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
 
     _TR_POLY, _TR_ROADS_KEY, _TR_PDP = "INPUT_POLY", "INPUT_ROADS", "INPUT_PDP"
     _TR_HH, _TR_BLDG, _TR_MFG_KEY = "INPUT_HOUSEHOLDS", "INPUT_BUILDINGS", "INPUT_MFG"
+    _TR_TAN_USED = "OUT_TANGENT_TRENCHES_USED"
     _TR_SIDE_L, _TR_SIDE_R = "OUT_SIDEWALK_LEFT", "OUT_SIDEWALK_RIGHT"
     _TR_MERGED_PDP, _TR_FEEDER_FINAL = "OUT_MERGED_PDP", "OUT_FEEDER_FINAL"
     _TR_GARDEN, _TR_FINAL, _TR_FINAL_TAN = (
@@ -227,7 +256,10 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
     _DU_SIDE_L, _DU_SIDE_R, _DU_FINAL_TAN = (
         "SIDEWALK_LEFT", "SIDEWALK_RIGHT", "FINAL_TANGENT_TRENCHES",
     )
-    _DU_OUT_FEEDER, _DU_OUT_DIST = "OUT_FEEDER_DUCTS", "OUT_DISTRIBUTION_DUCTS"
+    _DU_PSEUDO, _DU_GARDEN = "PSEUDO_OBJECT_POINTS", "GARDEN_TRENCHES"
+    _DU_OUT_FEEDER, _DU_OUT_DIST, _DU_OUT_DROP = (
+        "OUT_FEEDER_DUCTS", "OUT_DISTRIBUTION_DUCTS", "OUT_DROP_DUCTS",
+    )
 
     _METHOD_OPTIONS = [
         "Convex Hull (optional inset)",
@@ -291,6 +323,53 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             self.P_ROADS,
             self.tr("Roads (OSM lines; fclass/highway field strongly recommended)"),
             [QgsProcessing.TypeVectorLine]
+        ))
+
+        # ── 00 Brownfield (Existing Infrastructure) ──────────────────
+        self.addParameter(QgsProcessingParameterBoolean(
+            self.P_USE_BROWNFIELD,
+            self.tr("00 Brownfield — Enable existing infrastructure reuse"),
+            defaultValue=False
+        ))
+        self.addParameter(QgsProcessingParameterVectorLayer(
+            self.P_BF_DUCTS, self.tr("00 Brownfield — Existing Ducts [lines]"),
+            [QgsProcessing.TypeVectorLine], optional=True
+        ))
+        self.addParameter(QgsProcessingParameterVectorLayer(
+            self.P_BF_CHAMBERS, self.tr("00 Brownfield — Existing Chambers [points]"),
+            [QgsProcessing.TypeVectorPoint], optional=True
+        ))
+        self.addParameter(QgsProcessingParameterVectorLayer(
+            self.P_BF_POLES, self.tr("00 Brownfield — Existing Poles [points]"),
+            [QgsProcessing.TypeVectorPoint], optional=True
+        ))
+        self.addParameter(QgsProcessingParameterVectorLayer(
+            self.P_BF_FIBRE, self.tr("00 Brownfield — Existing Fibre [lines]"),
+            [QgsProcessing.TypeVectorLine], optional=True
+        ))
+        self.addParameter(QgsProcessingParameterVectorLayer(
+            self.P_BF_CABINETS, self.tr("00 Brownfield — Existing Cabinets [points]"),
+            [QgsProcessing.TypeVectorPoint], optional=True
+        ))
+        self.addParameter(QgsProcessingParameterVectorLayer(
+            self.P_BF_TRENCHES, self.tr("00 Brownfield — Existing Trenches [lines] (legacy/merged)"),
+            [QgsProcessing.TypeVectorLine], optional=True
+        ))
+        self.addParameter(QgsProcessingParameterVectorLayer(
+            self.P_BF_FEEDER_TRENCH, self.tr("00 Brownfield — Existing Feeder Trenches [lines]"),
+            [QgsProcessing.TypeVectorLine], optional=True
+        ))
+        self.addParameter(QgsProcessingParameterVectorLayer(
+            self.P_BF_DIST_TRENCH, self.tr("00 Brownfield — Existing Distribution Trenches [lines]"),
+            [QgsProcessing.TypeVectorLine], optional=True
+        ))
+        self.addParameter(QgsProcessingParameterVectorLayer(
+            self.P_BF_EXISTING_PDP, self.tr("00 Brownfield — Existing PDPs [points]"),
+            [QgsProcessing.TypeVectorPoint], optional=True
+        ))
+        self.addParameter(QgsProcessingParameterVectorLayer(
+            self.P_BF_EXISTING_MFG, self.tr("00 Brownfield — Existing MFGs [points]"),
+            [QgsProcessing.TypeVectorPoint], optional=True
         ))
 
         self.addParameter(QgsProcessingParameterString(
@@ -407,6 +486,11 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             self.tr("04 Trench — Existing MFG point override (blank = MFG from Network stage)"),
             [QgsProcessing.TypeVectorPoint], optional=True
         ))
+        self.addParameter(QgsProcessingParameterVectorLayer(
+            self.P_AERIAL_ZONES,
+            self.tr("07 Civil — Aerial Zones [polygons] (blank = no poles planned)"),
+            [QgsProcessing.TypeVectorPolygon], optional=True
+        ))
 
         self.addParameter(QgsProcessingParameterFeatureSink(
             self.OUT_OBJECTS, self.tr("Object Layer"),
@@ -455,6 +539,18 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(QgsProcessingParameterFeatureSink(
             self.OUT_DIST_DUCTS,            self.tr("Ducts - Distribution"),
             QgsProcessing.TypeVectorLine, optional=True, createByDefault=True
+        ))
+        self.addParameter(QgsProcessingParameterFeatureSink(
+            self.OUT_DROP_DUCTS,            self.tr("Ducts - Drop (pseudo → object)"),
+            QgsProcessing.TypeVectorLine, optional=True, createByDefault=True
+        ))
+        self.addParameter(QgsProcessingParameterFeatureSink(
+            self.OUT_CHAMBERS,            self.tr("Civil - Chambers (planned)"),
+            QgsProcessing.TypeVectorPoint, optional=True, createByDefault=True
+        ))
+        self.addParameter(QgsProcessingParameterFeatureSink(
+            self.OUT_POLES,            self.tr("Civil - Poles (aerial zones)"),
+            QgsProcessing.TypeVectorPoint, optional=True, createByDefault=True
         ))
 
         self.addOutput(QgsProcessingOutputFile(
@@ -668,6 +764,31 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             return False
         return any(c in names for c in candidates)
 
+    def run_brownfield_layer(self, parameters, context, feedback):
+        """Stage 0: Load brownfield (existing) infrastructure into the registry."""
+        params = {
+            "INPUT_DUCTS": self.parameterAsVectorLayer(parameters, self.P_BF_DUCTS, context),
+            "INPUT_CHAMBERS": self.parameterAsVectorLayer(parameters, self.P_BF_CHAMBERS, context),
+            "INPUT_POLES": self.parameterAsVectorLayer(parameters, self.P_BF_POLES, context),
+            "INPUT_FIBRE": self.parameterAsVectorLayer(parameters, self.P_BF_FIBRE, context),
+            "INPUT_CABINETS": self.parameterAsVectorLayer(parameters, self.P_BF_CABINETS, context),
+            "INPUT_TRENCHES": self.parameterAsVectorLayer(parameters, self.P_BF_TRENCHES, context),
+            "INPUT_FEEDER_TRENCH": self.parameterAsVectorLayer(parameters, self.P_BF_FEEDER_TRENCH, context),
+            "INPUT_DIST_TRENCH": self.parameterAsVectorLayer(parameters, self.P_BF_DIST_TRENCH, context),
+            "INPUT_EXISTING_PDP": self.parameterAsVectorLayer(parameters, self.P_BF_EXISTING_PDP, context),
+            "INPUT_EXISTING_MFG": self.parameterAsVectorLayer(parameters, self.P_BF_EXISTING_MFG, context),
+            "OUT_EXISTING_INFRA": QgsProcessing.TEMPORARY_OUTPUT,
+            # Points (chambers, PDPs, MFG) go to their own sink so point assets
+            # are exported too — otherwise they are silently dropped.
+            "OUT_EXISTING_POINTS": QgsProcessing.TEMPORARY_OUTPUT,
+        }
+        # Only run if at least one brownfield layer provided
+        has_any = any(v is not None for k, v in params.items() if k.startswith("INPUT_"))
+        if not has_any:
+            return {"OUT_EXISTING_INFRA": None, "OUT_EXISTING_POINTS": None}
+        return processing.run(ALG.BROWNFIELD, params, context=context, feedback=feedback,
+                              is_child_algorithm=True)
+
     def run_object_layer(self, parameters, context, feedback):
         params = {
             self._OBJ_EXCEL: self.parameterAsFile(parameters, self.P_EXCEL, context),
@@ -780,12 +901,49 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             self._DU_OBJECTS: results.get("objects"),
             self._DU_OUT_FEEDER: self._dest(parameters, self.OUT_FEEDER_DUCTS, context),
             self._DU_OUT_DIST: self._dest(parameters, self.OUT_DIST_DUCTS, context),
+            self._DU_OUT_DROP: self._dest(parameters, self.OUT_DROP_DUCTS, context),
         }
+        if results.get("pseudo_hh"):
+            params[self._DU_PSEUDO] = results["pseudo_hh"]
+        if results.get("garden"):
+            params[self._DU_GARDEN] = results["garden"]
         if results.get("sidewalk_l"):
             params[self._DU_SIDE_L] = results["sidewalk_l"]
         if results.get("sidewalk_r"):
             params[self._DU_SIDE_R] = results["sidewalk_r"]
         return processing.run(ALG.DUCT, params, context=context, feedback=feedback,
+                              is_child_algorithm=True)
+
+    def run_chamber_layer(self, parameters, results, context, feedback):
+        """Stage 7: plan civil chambers from duct junctions + PDPs."""
+        ducts = results.get("ducts") or {}
+        # Resolve the trench stage's temporary tangent-crossing layer to a
+        # concrete layer object (or None).  Passing an unresolved temp-id
+        # string into a child algorithm has caused native crashes in headless
+        # runs, so we never hand the raw id downstream.
+        tangents = self._fast_resolve(results.get("tangents_used"), context)
+        params = {
+            "INPUT_FEEDER_DUCTS": ducts.get(self._DU_OUT_FEEDER),
+            "INPUT_DIST_DUCTS": ducts.get(self._DU_OUT_DIST),
+            "INPUT_PDP": results.get("pdp"),
+            "INPUT_TANGENT_CROSSINGS": tangents,
+            "INPUT_TRENCHES": results.get("trenches"),
+            "OUT_CHAMBERS": self._dest(parameters, self.OUT_CHAMBERS, context),
+        }
+        return processing.run(ALG.CHAMBER, params, context=context, feedback=feedback,
+                              is_child_algorithm=True)
+
+    def run_pole_layer(self, parameters, results, context, feedback):
+        """Stage 8: plan aerial poles inside user-supplied aerial zones."""
+        zones = self.parameterAsVectorLayer(parameters, self.P_AERIAL_ZONES, context)
+        params = {
+            "INPUT_GARDEN_TRENCHES": results.get("garden"),
+            "INPUT_AERIAL_ZONES": zones,
+            "INPUT_FEEDER_TRENCHES": results.get("feeder"),
+            "INPUT_PDP": results.get("pdp"),
+            "OUT_POLES": self._dest(parameters, self.OUT_POLES, context),
+        }
+        return processing.run(ALG.POLE, params, context=context, feedback=feedback,
                               is_child_algorithm=True)
 
     def _preflight_cable(self, results, context, feedback):
@@ -887,6 +1045,11 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
                 "Duct Layer",
                 self.tr("MFG and PDP layers are required but missing.")
             ))
+        if results.get("pseudo_hh") is None:
+            feedback.pushWarning(self.tr(
+                "No pseudo object points available — distribution ducts will "
+                "route to the objects instead of stopping at the footway."
+            ))
         objects_lyr = self._fast_resolve(results.get("objects"), context)
         problems = []
         if not self._has_field(objects_lyr, self._PDP_ID_FIELDS):
@@ -959,16 +1122,66 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             feedback.pushInfo(f"  [timing] {fname}: write exception in {time.time() - t0:.3f}s")
         return val
 
+    def _run_stage_brownfield(self, parameters, context, steps, feedback, results, out_dir):
+        """Stage 0: Load brownfield (existing) infrastructure.
+
+        Override in brownfield subclass to always execute when inputs are
+        provided, regardless of the P_USE_BROWNFIELD toggle.
+        """
+        if feedback.isCanceled():
+            return
+        steps.setCurrentStep(0)
+        feedback.pushInfo(self.tr("[0%] Loading Brownfield (Existing) Infrastructure"))
+        t0 = time.time()
+        use_bf = self.parameterAsBoolean(parameters, self.P_USE_BROWNFIELD, context)
+        if use_bf:
+            bf_result = self._run("Brownfield", self.run_brownfield_layer,
+                                  parameters, context, steps, feedback)
+            results["brownfield_output"] = bf_result.get("OUT_EXISTING_INFRA") if bf_result else None
+            results["brownfield_points"] = bf_result.get("OUT_EXISTING_POINTS") if bf_result else None
+            elapsed = time.time() - t0
+            has_lines = results.get("brownfield_output")
+            has_points = results.get("brownfield_points")
+            if has_lines or has_points:
+                parts = []
+                if has_lines:
+                    parts.append("lines")
+                if has_points:
+                    parts.append("points")
+                feedback.pushInfo(self.tr(
+                    f"  [timing] Brownfield: {elapsed:.3f}s ({', '.join(parts)})"))
+            else:
+                feedback.pushInfo(self.tr(
+                    f"  [timing] Brownfield: skipped (no assets provided) in {elapsed:.3f}s"))
+        else:
+            results["brownfield_output"] = None
+            results["brownfield_points"] = None
+            feedback.pushInfo(self.tr(
+                f"  [timing] Brownfield: disabled (toggle off) in {time.time() - t0:.3f}s"))
+
+        # Save brownfield layers to output directory (if requested)
+        if results.get("brownfield_output"):
+            results["brownfield_output"] = self._save_layer_to_gpkg(
+                results["brownfield_output"], "Existing_Infrastructure.gpkg",
+                out_dir, context, feedback)
+        if results.get("brownfield_points"):
+            results["brownfield_points"] = self._save_layer_to_gpkg(
+                results["brownfield_points"], "Existing_Infrastructure_Points.gpkg",
+                out_dir, context, feedback)
+
     def execute_pipeline(self, parameters, context, feedback):
         t_pipeline = time.time()
         results = {}
-        steps = QgsProcessingMultiStepFeedback(6, feedback)
+        steps = QgsProcessingMultiStepFeedback(9, feedback)
         out_dir = self._output_dir(parameters, context)
+
+        # --- Stage 0: Brownfield (Existing Infrastructure) ---
+        self._run_stage_brownfield(parameters, context, steps, feedback, results, out_dir)
 
         if feedback.isCanceled():
             return {}
         # --- Object Layer ---
-        steps.setCurrentStep(0)
+        steps.setCurrentStep(1)
         feedback.pushInfo(self.tr("[5%] Running Object Layer"))
         t0 = time.time()
         obj = self._run("Object Layer", self.run_object_layer,
@@ -987,8 +1200,8 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         if feedback.isCanceled():
             return {}
         # --- Polygon Layer ---
-        steps.setCurrentStep(1)
-        feedback.pushInfo(self.tr("[20%] Running Polygon Layer"))
+        steps.setCurrentStep(2)
+        feedback.pushInfo(self.tr("[25%] Running Polygon Layer"))
         t0 = time.time()
         poly = self._run("Polygon Layer", self.run_polygon_layer,
                          parameters, context, steps, feedback, results=results)
@@ -1003,8 +1216,8 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         if feedback.isCanceled():
             return {}
         # --- Network Layer ---
-        steps.setCurrentStep(2)
-        feedback.pushInfo(self.tr("[35%] Running Network Layer"))
+        steps.setCurrentStep(3)
+        feedback.pushInfo(self.tr("[40%] Running Network Layer"))
         t0 = time.time()
         net = self._run("Network Layer", self.run_network_layer,
                         parameters, context, steps, feedback, results=results)
@@ -1060,8 +1273,8 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         if feedback.isCanceled():
             return {}
         # --- Trench Layer ---
-        steps.setCurrentStep(3)
-        feedback.pushInfo(self.tr("[55%] Running Trench Layer"))
+        steps.setCurrentStep(4)
+        feedback.pushInfo(self.tr("[60%] Running Trench Layer"))
         t0 = time.time()
         tr = self._run("Trench Layer", self.run_trench_layer,
                        parameters, context, steps, feedback, results=results)
@@ -1074,6 +1287,8 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         fc_str = "{} features, ".format(n_tr) if n_tr is not None else ""
         feedback.pushInfo(self.tr("  [timing] Trench Layer: {}{:.3f}s".format(fc_str, elapsed)))
         results["garden"] = tr.get(self._TR_GARDEN)
+        results["pseudo_hh"] = tr.get("OUT_PSEUDO_HH")
+        results["tangents_used"] = tr.get(self._TR_TAN_USED)
         results["distribution"] = (
             tr.get(self._TR_DIST_LINES)
             or tr.get(self._TR_DIST_DISS)
@@ -1087,12 +1302,14 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             results["distribution"], "Distribution_Trench.gpkg", out_dir, context, feedback)
         results["garden"] = self._save_layer_to_gpkg(
             results["garden"], "Garden_Trench.gpkg", out_dir, context, feedback)
+        results["pseudo_hh"] = self._save_layer_to_gpkg(
+            results["pseudo_hh"], "Pseudo_HH.gpkg", out_dir, context, feedback)
 
         if feedback.isCanceled():
             return {}
         # --- Cable Layer ---
-        steps.setCurrentStep(4)
-        feedback.pushInfo(self.tr("[75%] Running Cable Layer"))
+        steps.setCurrentStep(5)
+        feedback.pushInfo(self.tr("[80%] Running Cable Layer"))
         self._preflight_cable(results, context, feedback)
         t0 = time.time()
         cab = self._run("Cable Layer", self.run_cable_layer,
@@ -1120,8 +1337,8 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         if feedback.isCanceled():
             return {}
         # --- Duct Layer ---
-        steps.setCurrentStep(5)
-        feedback.pushInfo(self.tr("[90%] Running Duct Layer"))
+        steps.setCurrentStep(6)
+        feedback.pushInfo(self.tr("[95%] Running Duct Layer"))
         self._preflight_duct(results, context, feedback)
         t0 = time.time()
         duct = self._run("Duct Layer", self.run_duct_layer,
@@ -1130,11 +1347,14 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         elapsed = time.time() - t0
         n_fd = self._fast_count(duct.get(self._DU_OUT_FEEDER), context)
         n_dd = self._fast_count(duct.get(self._DU_OUT_DIST), context)
+        n_dr = self._fast_count(duct.get(self._DU_OUT_DROP), context)
         parts = []
         if n_fd is not None:
             parts.append("Feeder: {}".format(n_fd))
         if n_dd is not None:
             parts.append("Dist: {}".format(n_dd))
+        if n_dr is not None:
+            parts.append("Drop: {}".format(n_dr))
         fc_str = ("{} features, ".format(", ".join(parts))) if parts else ""
         feedback.pushInfo(self.tr("  [timing] Duct Layer: {}{:.3f}s".format(fc_str, elapsed)))
         fd = results["ducts"].get(self._DU_OUT_FEEDER)
@@ -1145,6 +1365,52 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         if dd:
             results["ducts"][self._DU_OUT_DIST] = self._save_layer_to_gpkg(
                 dd, "Distribution_Ducts.gpkg", out_dir, context, feedback)
+        dr = results["ducts"].get(self._DU_OUT_DROP)
+        if dr:
+            results["ducts"][self._DU_OUT_DROP] = self._save_layer_to_gpkg(
+                dr, "Drop_Ducts.gpkg", out_dir, context, feedback)
+
+        if feedback.isCanceled():
+            return {}
+        # --- Chamber Layer (civil structures) ---
+        steps.setCurrentStep(7)
+        feedback.pushInfo(self.tr("[97%] Running Chamber Layer"))
+        t0 = time.time()
+        chambers = self._run("Chamber Layer", self.run_chamber_layer,
+                             parameters, context, steps, feedback, results=results)
+        results["chambers"] = chambers.get("OUT_CHAMBERS") if chambers else None
+        elapsed = time.time() - t0
+        n_ch = self._fast_count(results.get("chambers"), context)
+        fc_str = "{} features, ".format(n_ch) if n_ch is not None else ""
+        feedback.pushInfo(self.tr("  [timing] Chamber Layer: {}{:.3f}s".format(fc_str, elapsed)))
+        if results.get("chambers"):
+            results["chambers"] = self._save_layer_to_gpkg(
+                results["chambers"], "Chambers.gpkg", out_dir, context, feedback)
+
+        if feedback.isCanceled():
+            return {}
+        # --- Pole Layer (aerial zones only) ---
+        steps.setCurrentStep(8)
+        feedback.pushInfo(self.tr("[99%] Running Pole Layer"))
+        t0 = time.time()
+        poles = self._run("Pole Layer", self.run_pole_layer,
+                          parameters, context, steps, feedback, results=results)
+        results["poles"] = poles.get("OUT_POLES") if poles else None
+        elapsed = time.time() - t0
+        n_po = self._fast_count(results.get("poles"), context)
+        fc_str = "{} features, ".format(n_po) if n_po is not None else ""
+        feedback.pushInfo(self.tr("  [timing] Pole Layer: {}{:.3f}s".format(fc_str, elapsed)))
+        if results.get("poles"):
+            results["poles"] = self._save_layer_to_gpkg(
+                results["poles"], "Poles.gpkg", out_dir, context, feedback)
+
+        # --- HLD_attr catalogue enrichment (in place on the saved GPKGs) ---
+        if out_dir:
+            try:
+                attr_enrich.enrich_all(out_dir, feedback)
+            except Exception as exc:
+                feedback.pushWarning(
+                    self.tr("Catalogue enrichment failed: %s") % exc)
 
         feedback.pushInfo(self.tr(
             "[timing] Total pipeline: {:.3f}s".format(time.time() - t_pipeline)
@@ -1179,6 +1445,8 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         cables = results.get("cables") or {}
         ducts = results.get("ducts") or {}
 
+        put(self.OUT_BROWNFIELD, results.get("brownfield_output"))
+        put(self.OUT_BROWNFIELD_POINTS, results.get("brownfield_points"))
         put(self.OUT_OBJECTS, results.get("objects"))
         put(self.OUT_POLYGONS, results.get("polygons"))
         put(self.OUT_PDP, results.get("pdp"))
@@ -1191,6 +1459,9 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         put(self.OUT_DIST_CABLE, cables.get(self._CB_OUT_DIST))
         put(self.OUT_FEEDER_DUCTS, ducts.get(self._DU_OUT_FEEDER))
         put(self.OUT_DIST_DUCTS, ducts.get(self._DU_OUT_DIST))
+        put(self.OUT_DROP_DUCTS, ducts.get(self._DU_OUT_DROP))
+        put(self.OUT_CHAMBERS, results.get("chambers"))
+        put(self.OUT_POLES, results.get("poles"))
 
         return out
 
@@ -1295,20 +1566,45 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         except Exception:
             pass
 
+    def postProcessAlgorithm(self, context, feedback):
+        """
+        QGIS 3.38+ post-processing hook — called on the main thread after
+        runPrepared() finishes, exactly once per run.
+
+        Organises output layers into a hierarchical QGIS layer tree with groups:
+          Object Layer / Polygon Layer (root)
+          Brownfield, Network, Trenches, Cables, Ducts, Civil (groups)
+
+        NOTE: this hook does NOT receive the results map, so processAlgorithm()
+        stashes it in self._last_results. Returns an empty map so the results
+        returned by processAlgorithm() are kept unchanged.
+
+        Headless-mode calls (qgis_process) are silently skipped because
+        QgsProject is not available.
+        """
+        results = getattr(self, "_last_results", None) or {}
+        try:
+            self._build_layer_tree(results, context)
+        except Exception as exc:
+            # Never let the post-run hook break an otherwise successful run.
+            try:
+                feedback.pushWarning(self.tr(
+                    "Layer-tree grouping failed (outputs still valid): %s") % exc)
+            except Exception:
+                pass
+        return {}
+
     def postProcess(self, results, context, feedback):
         """
-        Organise output layers into a hierarchical QGIS layer tree with groups:
-          Object Layer
-          Polygon Layer
-          Network (PDPs, MFG)
-          Trenches (Feeder, Distribution, Garden, Drill, Final)
-          Cables (Feeder, Distribution)
-          Ducts (Feeder, Distribution)
-          BOQ / BOM (file outputs, shown at root)
-
-        Runs after processAlgorithm() returns. Headless-mode calls are silently
-        skipped because QgsProject is not available.
+        Legacy hook (QGIS < 3.38) — kept so older QGIS installs still populate
+        the layer tree. Newer QGIS releases dispatch to postProcessAlgorithm()
+        instead of this method.
         """
+        self._build_layer_tree(results, context)
+
+    def _build_layer_tree(self, results, context):
+        """Shared implementation of the hierarchical layer-tree grouping used
+        by both postProcessAlgorithm() (QGIS 3.38+) and postProcess() (legacy)."""
         try:
             from qgis.core import (
                 QgsProject, QgsVectorLayer, QgsProcessingUtils, QgsMapLayer,
@@ -1323,7 +1619,9 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         # ---- group layout ---------------------------------------------------
         # Maps output-key -> (group_name, display_name, order_within_group)
         LAYOUT = {
-            self.OUT_OBJECTS:    (None, "Object Layer", 0),        # root
+            self.OUT_BROWNFIELD:       ("Brownfield", "Existing Infrastructure", 0),
+            self.OUT_BROWNFIELD_POINTS: ("Brownfield", "Existing Points", 1),
+            self.OUT_OBJECTS:          (None, "Object Layer", 0),    # root
             self.OUT_POLYGONS:   (None, "Polygon Layer", 0),       # root
             self.OUT_PDP:        ("Network", "PDPs", 0),
             self.OUT_MFG:        ("Network", "MFG", 1),
@@ -1335,10 +1633,32 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             self.OUT_DIST_CABLE:   ("Cables", "Distribution", 1),
             self.OUT_FEEDER_DUCTS: ("Ducts", "Feeder", 0),
             self.OUT_DIST_DUCTS:   ("Ducts", "Distribution", 1),
+            self.OUT_DROP_DUCTS:   ("Ducts", "Drop", 2),
+            self.OUT_CHAMBERS:     ("Civil", "Chambers", 0),
+            self.OUT_POLES:        ("Civil", "Poles", 1),
         }
 
         # Ordered group list (top-to-bottom in the legend)
-        GROUP_ORDER = ("Network", "Trenches", "Cables", "Ducts")
+        GROUP_ORDER = ("Brownfield", "Network", "Trenches", "Cables", "Ducts", "Civil")
+
+        # Distinct colour per sublayer so the members of a group are easy to
+        # tell apart in the legend (and in QField): feeder blue, distribution
+        # green, garden orange, final purple, etc.
+        LAYER_COLORS = {
+            self.OUT_BROWNFIELD:        "#808080",  # grey
+            self.OUT_BROWNFIELD_POINTS: "#9e9e9e",  # light grey
+            self.OUT_FEEDER_TRENCH:     "#1e88e5",  # blue
+            self.OUT_DIST_TRENCH:    "#43a047",  # green
+            self.OUT_GARDEN_TRENCH:  "#fb8c00",  # orange
+            self.OUT_TRENCHES:       "#8e24aa",  # purple
+            self.OUT_FEEDER_CABLE:   "#d81b60",  # pink/red
+            self.OUT_DIST_CABLE:     "#00897b",  # teal
+            self.OUT_FEEDER_DUCTS:   "#5e35b1",  # violet
+            self.OUT_DIST_DUCTS:     "#fdd835",  # yellow
+            self.OUT_DROP_DUCTS:     "#00838f",  # dark cyan
+            self.OUT_CHAMBERS:       "#757575",  # grey
+            self.OUT_POLES:          "#795548",  # brown
+        }
 
         # ---- helpers --------------------------------------------------------
         def _resolve(key, val):
@@ -1417,6 +1737,23 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             except Exception:
                 pass
 
+            # Give each sublayer a distinct colour so group members are
+            # distinguishable (feeder vs distribution vs garden, ...).
+            # Both helpers already guard against invalid layers / geometry.
+            hexcol = LAYER_COLORS.get(key)
+            if hexcol:
+                try:
+                    if lyr.geometryType() == QgsWkbTypes.PointGeometry:
+                        from qgis.core import QgsMarkerSymbol, QgsSingleSymbolRenderer
+                        m = QgsMarkerSymbol.createSimple(
+                            {"color": hexcol, "outline_color": "0,0,0,255",
+                             "size": "2.2", "size_unit": "MM"})
+                        lyr.setRenderer(QgsSingleSymbolRenderer(m))
+                    else:
+                        apply_simple_line_style(lyr, hexcol, 1.0)
+                except Exception:
+                    pass
+
             # Remove any previous project layer with the same source
             try:
                 _remove_existing(lyr.source())
@@ -1440,6 +1777,16 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
                     project.addMapLayer(lyr, False)
                     grp.addLayer(lyr)
 
+        # Every output we care about is now in the project tree. Clear the
+        # context's pending-load list so the Processing GUI does not load
+        # (and duplicate) the same layers again — in particular the
+        # intermediate layers registered by the child algorithm runs during
+        # the pipeline.
+        try:
+            context.setLayersToLoadOnCompletion({})
+        except Exception:
+            pass
+
     def processAlgorithm(self, parameters, context, feedback):
         log_feedback, log_path = self._setup_logging(
             parameters, context, feedback)
@@ -1456,6 +1803,10 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
                     out["BOQ"] = boq_path
                 if os.path.isfile(bom_path):
                     out["BOM"] = bom_path
+            # Stash the exact results so the QGIS 3.38+ postProcessAlgorithm()
+            # hook (which does not receive the results map) can populate the
+            # layer tree with the same values returned to the GUI.
+            self._last_results = out
             self._finalize_logging(log_path, log_feedback, out)
             return out
         except Exception as exc:
