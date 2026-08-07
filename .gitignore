@@ -39,6 +39,12 @@ node_modules/
 package.json
 package-lock.json
 
+# Local dev server scripts, logs & generated outputs
+_start_*.cmd
+_*.log
+output/
+symbology-style.db
+
 # GitHub auto-generated templates (workflow files are tracked intentionally)
 .github/ISSUE_TEMPLATE/
 .github/PULL_REQUEST_TEMPLATE.md

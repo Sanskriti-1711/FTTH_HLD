@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import time
 import uuid
+import zipfile
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -58,8 +59,12 @@ ONECLICK_OUTPUTS: List[Tuple[str, str, str]] = [
     ("ducts", "Feeder_Ducts.gpkg", "Feeder_Ducts.geojson"),
     ("ducts", "Distribution_Ducts.gpkg", "Distribution_Ducts.geojson"),
     ("ducts", "Drop_Ducts.gpkg", "Drop_Ducts.geojson"),
-    ("reports", "BOQ.xlsx", "BOQ.xlsx"),
-    ("reports", "BOM.xlsx", "BOM.xlsx"),
+    ("chambers", "Chambers.gpkg", "Chambers.geojson"),
+    ("poles", "Poles.gpkg", "Poles.geojson"),
+    ("brownfield", "Existing_Infrastructure.gpkg", "Existing_Infrastructure.geojson"),
+    ("brownfield", "Existing_Infrastructure_Points.gpkg", "Existing_Infrastructure_Points.geojson"),
+    # NOTE: BOQ.xlsx / BOM.xlsx are intentionally NOT listed here as layers —
+    # they surface in the Downloads section via _register_downloads() instead.
 ]
 
 DOWNLOAD_EXTS = {".gpkg", ".xlsx", ".csv", ".json", ".geojson", ".txt"}
@@ -218,8 +223,11 @@ def _convert_gpkg_to_geojson(gpkg_path: Path, geojson_path: Path) -> bool:
     ogr2ogr = shutil.which("ogr2ogr")
     if not ogr2ogr:
         return False
+    # Reproject to WGS84 (EPSG:4326): MapLibre/Leaflet render GeoJSON as
+    # lon/lat, so serving projected (e.g. EPSG:25833) coordinates puts every
+    # feature off the map. The PostGIS path already transforms on ingest.
     result = subprocess.run(
-        [ogr2ogr, "-f", "GeoJSON", str(geojson_path), str(gpkg_path)],
+        [ogr2ogr, "-f", "GeoJSON", "-t_srs", "EPSG:4326", str(geojson_path), str(gpkg_path)],
         capture_output=True,
         text=True,
         timeout=600,
@@ -241,6 +249,59 @@ def _register_downloads(project_id: str, output_dir: Path) -> List[Dict[str, Any
             }
         )
     return sorted(downloads, key=lambda item: item["name"])
+
+
+def _restore_task_from_disk(project_id: str) -> Optional[Dict[str, Any]]:
+    """Rebuild an in-memory task from output files already on disk.
+
+    The task registry is memory-only, so an engine restart loses every run.
+    PostGIS reloads them when available; this is the disk fallback for local
+    dev / deployments without a database. Returns the restored task or None
+    when no outputs exist for the project.
+    """
+    output_dir = OUTPUT_DIR / project_id
+    if not output_dir.is_dir():
+        return None
+
+    layer_files: Dict[str, List[str]] = {}
+    for public_layer, gpkg_name, geojson_name in ONECLICK_OUTPUTS:
+        if gpkg_name.lower().endswith(".xlsx"):
+            path = output_dir / gpkg_name
+            if path.is_file():
+                layer_files.setdefault(public_layer, []).append(str(path))
+            continue
+        geojson_path = output_dir / geojson_name
+        gpkg_path = output_dir / gpkg_name
+        if not geojson_path.exists() and gpkg_path.exists():
+            _convert_gpkg_to_geojson(gpkg_path, geojson_path)
+        if geojson_path.exists():
+            layer_files.setdefault(public_layer, []).append(str(geojson_path))
+        elif gpkg_path.exists():
+            layer_files.setdefault(public_layer, []).append(str(gpkg_path))
+
+    if not layer_files:
+        return None
+
+    task = _task(project_id)
+    task.update(
+        {
+            "status": "completed",
+            "stage": "Complete",
+            "stage_index": len(PIPELINE_STAGES),
+            "stage_count": len(PIPELINE_STAGES),
+            "progress": 100,
+            "files": layer_files,
+            "layers": [
+                {"name": layer, "feature_count": None, "geometry_type": None, "files": files}
+                for layer, files in sorted(layer_files.items())
+            ],
+            "downloads": _register_downloads(project_id, output_dir),
+            "output_dir": str(output_dir),
+            "restored_from_disk": True,
+            "updated_at": _now(),
+        }
+    )
+    return task
 
 
 def _ingest_outputs(project_id: str, output_dir: Path) -> List[Dict[str, Any]]:
@@ -283,12 +344,89 @@ def _ingest_outputs(project_id: str, output_dir: Path) -> List[Dict[str, Any]]:
     ]
 
 
+_BF_VECTOR_EXTS = {".geojson", ".gpkg", ".shp", ".json"}
+
+
+def _match_brownfield_param(filename: str) -> Optional[str]:
+    """Map an uploaded brownfield file to its plugin BF_* parameter by name.
+
+    Specific patterns are matched first so e.g. ``bf_feeder_trench.geojson``
+    hits BF_FEEDER_TRENCH and not the generic BF_TRENCHES.
+    """
+    lower = filename.lower()
+    if "duct" in lower:
+        return "BF_DUCTS"
+    if "chamber" in lower:
+        return "BF_CHAMBERS"
+    if "pole" in lower:
+        return "BF_POLES"
+    if "fibre" in lower or "fiber" in lower:
+        return "BF_FIBRE"
+    if "cabinet" in lower:
+        return "BF_CABINETS"
+    if "feeder" in lower and "trench" in lower:
+        return "BF_FEEDER_TRENCH"
+    if "dist" in lower and "trench" in lower:
+        return "BF_DIST_TRENCH"
+    if "pdp" in lower:
+        return "BF_EXISTING_PDP"
+    if "mfg" in lower:
+        return "BF_EXISTING_MFG"
+    if "trench" in lower:
+        return "BF_TRENCHES"
+    return None
+
+
+def _brownfield_args(brownfield_path: Optional[Path], output_dir: Path) -> List[str]:
+    """Unzip an uploaded brownfield archive and build the plugin BF_* params.
+
+    Returns qgis_process ``--`` style args (e.g. ``USE_BROWNFIELD=true``,
+    ``BF_DUCTS=<path>``) or an empty list when no archive was supplied.
+    """
+    if not brownfield_path or not brownfield_path.exists():
+        return []
+    bf_dir = output_dir / "brownfield"
+    bf_dir.mkdir(parents=True, exist_ok=True)
+    if zipfile.is_zipfile(brownfield_path):
+        with zipfile.ZipFile(brownfield_path) as zf:
+            base = str(bf_dir.resolve())
+            for member in zf.namelist():
+                dest = (bf_dir / member).resolve()
+                if not str(dest).startswith(base):
+                    continue  # skip path-traversal entries
+                zf.extract(member, bf_dir)
+    else:
+        shutil.copy2(brownfield_path, bf_dir / brownfield_path.name)
+
+    matches: Dict[str, str] = {}
+    # Prefer GeoJSON > GPKG > JSON > SHP when a zip ships the same asset
+    # in several formats.
+    priority = {".geojson": 3, ".gpkg": 2, ".json": 1, ".shp": 0}
+    for fp in bf_dir.rglob("*"):
+        if not fp.is_file() or fp.suffix.lower() not in _BF_VECTOR_EXTS:
+            continue
+        param = _match_brownfield_param(fp.name)
+        if not param:
+            continue
+        prev = matches.get(param)
+        if prev is None or priority[fp.suffix.lower()] > priority[Path(prev).suffix.lower()]:
+            matches[param] = str(fp)
+
+    args: List[str] = []
+    if matches:
+        args.append("USE_BROWNFIELD=true")
+        for param in sorted(matches):
+            args.append(f"{param}={matches[param]}")
+    return args
+
+
 def _run_pipeline(
     project_id: str,
     excel_path: Path,
     roads_path: Path,
     output_dir: Path,
     poly_method: int = 3,
+    brownfield_path: Optional[Path] = None,
 ) -> None:
     task = _task(project_id)
     task.update({"status": "running", "stage": PIPELINE_STAGES[0], "updated_at": _now()})
@@ -317,6 +455,10 @@ def _run_pipeline(
             f"OUTPUT_DIR={output_dir}",
             f"POLY_METHOD={int(poly_method or 3)}",
         ]
+        bf_args = _brownfield_args(brownfield_path, output_dir)
+        if bf_args:
+            cmd.extend(bf_args)
+            _append(project_id, "info", "Brownfield upload detected; enabling reuse.")
         if os.name == "nt" and qgis.lower().endswith((".bat", ".cmd")):
             cmd = " ".join(_quote_cmd_arg(part) for part in cmd)
 
@@ -391,6 +533,7 @@ async def run_hld(
     background_tasks: BackgroundTasks,
     excel: UploadFile = File(...),
     roads: UploadFile = File(...),
+    brownfield: Optional[UploadFile] = File(None),
     project_id: Optional[str] = Form(None),
     name: Optional[str] = Form(None),
     poly_method: Optional[int] = Form(3),
@@ -402,6 +545,9 @@ async def run_hld(
 
     excel_path = _save_upload(excel, upload_dir, "addresses.xlsx")
     roads_path = _save_upload(roads, upload_dir, "roads.gpkg")
+    brownfield_path: Optional[Path] = None
+    if brownfield and brownfield.filename:
+        brownfield_path = _save_upload(brownfield, upload_dir, "brownfield.zip")
 
     task = _task(project_id)
     task.update(
@@ -424,7 +570,13 @@ async def run_hld(
         )
 
     background_tasks.add_task(
-        _run_pipeline, project_id, excel_path, roads_path, output_dir, poly_method
+        _run_pipeline,
+        project_id,
+        excel_path,
+        roads_path,
+        output_dir,
+        poly_method,
+        brownfield_path,
     )
     return _public_task(project_id)
 
@@ -446,6 +598,8 @@ def get_results(project_id: str) -> Dict[str, Any]:
                 }
             )
     if project_id not in tasks:
+        _restore_task_from_disk(project_id)
+    if project_id not in tasks:
         raise HTTPException(status_code=404, detail="Project not found")
     return _public_task(project_id)
 
@@ -461,6 +615,8 @@ def get_layer(project_id: str, layer: str) -> Dict[str, Any]:
             return data
 
     task = tasks.get(project_id)
+    if task is None:
+        task = _restore_task_from_disk(project_id)
     if task:
         files = (task.get("files") or {}).get(layer, [])
         geojson_files = [
@@ -553,7 +709,9 @@ async def run_hld_compat(
     roads: UploadFile = File(...),
     project_id: Optional[str] = Form(None),
 ) -> Dict[str, Any]:
-    return await run_hld(background_tasks, excel, roads, project_id)
+    # NOTE: brownfield (4th positional) is intentionally None here — pass
+    # project_id by keyword so it does not land in the brownfield slot.
+    return await run_hld(background_tasks, excel, roads, None, project_id)
 
 
 @app.get("/status/{project_id}")
