@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 
@@ -698,6 +698,346 @@ def projects(limit: int = 50) -> List[Dict[str, Any]]:
         _public_task(project_id)
         for project_id in sorted(tasks, key=lambda pid: tasks[pid].get("created_at", ""), reverse=True)
     ][:limit]
+
+
+# ======================================================================
+# LLD — apply approved survey changes to the HLD output, validate the
+# network (path continuity + attribute consistency), and emit the final
+# LLD layers + a downloadable zip.
+# ======================================================================
+
+LLD_LAYER_ORDER = [
+    "objects", "polygons", "pdps", "mfg",
+    "final_trenches", "feeder_trench", "distribution_trench",
+    "garden_trench", "drill_trench",
+    "feeder_cable", "distribution_cable",
+    "feeder_ducts", "distribution_ducts", "drop_ducts",
+    "chambers", "poles",
+    "existing_infrastructure", "existing_infrastructure_points",
+    "brownfield",
+]
+
+lld_tasks: Dict[str, Dict[str, Any]] = {}
+
+
+def _lld_key(project_id: str, lld_version: str) -> str:
+    return f"{project_id}:{lld_version}"
+
+
+def _lld_task(project_id: str, lld_version: str) -> Dict[str, Any]:
+    key = _lld_key(project_id, lld_version)
+    return lld_tasks.setdefault(
+        key,
+        {
+            "project_id": project_id,
+            "lld_version": lld_version,
+            "status": "queued",
+            "stage": None,
+            "progress": 0,
+            "layers": [],
+            "downloads": [],
+            "messages": deque(maxlen=MAX_MESSAGES),
+            "created_at": _now(),
+            "updated_at": _now(),
+        },
+    )
+
+
+def _lld_public_task(project_id: str, lld_version: str) -> Dict[str, Any]:
+    task = dict(_lld_task(project_id, lld_version))
+    messages = task.get("messages")
+    task["messages"] = list(messages) if isinstance(messages, deque) else []
+    task["results_url"] = f"/ftth/lld/results/{project_id}/{lld_version}"
+    return task
+
+
+def _lld_append(project_id: str, lld_version: str, level: str, text: str) -> None:
+    task = _lld_task(project_id, lld_version)
+    task["messages"].append({"ts": _now(), "level": level, "text": text})
+    task["updated_at"] = _now()
+
+
+def _geom_type(feats: List[Dict[str, Any]]) -> Optional[str]:
+    for f in feats:
+        g = f.get("geometry")
+        if g and g.get("type"):
+            return g["type"]
+    return None
+
+
+def _line_strings(g: Optional[Dict[str, Any]]) -> List[Any]:
+    if not g:
+        return []
+    t = g.get("type")
+    c = g.get("coordinates") or []
+    if t == "LineString":
+        return [c]
+    if t == "MultiLineString":
+        return c
+    return []
+
+
+def _points(g: Optional[Dict[str, Any]]) -> List[Any]:
+    if not g:
+        return []
+    t = g.get("type")
+    c = g.get("coordinates") or []
+    if t == "Point":
+        return [c]
+    if t == "MultiPoint":
+        return c
+    return []
+
+
+def _near_point_counter(points: List[Any], tol: float):
+    """Grid-hashed near-neighbour counter (pure Python, no shapely needed)."""
+    cell = max(tol, 1e-9)
+    index: Dict[Tuple[int, int], List[Any]] = {}
+    for p in points:
+        key = (int(p[0] / cell), int(p[1] / cell))
+        index.setdefault(key, []).append(p)
+
+    def count_near(p: Any) -> int:
+        kx, ky = int(p[0] / cell), int(p[1] / cell)
+        n = 0
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for q in index.get((kx + dx, ky + dy), []):
+                    if abs(q[0] - p[0]) < tol and abs(q[1] - p[1]) < tol:
+                        n += 1
+        return n
+
+    return count_near
+
+
+def _validate_network(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+    """Path-continuity + attribute-consistency validation.
+
+    Reports issues (does not modify the dataset) so the reviewer can see where
+    the approved survey edits left gaps or mismatched attributes.
+    """
+    tol = 0.0005  # ~50m in degrees — connectivity tolerance
+    line_layers: List[str] = []
+    node_points: List[Any] = []
+    line_endpoints: List[Any] = []
+
+    for layer, feats in by_layer.items():
+        t = _geom_type(feats)
+        if t in ("LineString", "MultiLineString"):
+            line_layers.append(layer)
+            for f in feats:
+                for ln in _line_strings(f.get("geometry")):
+                    if len(ln) >= 2:
+                        line_endpoints.append(ln[0])
+                        line_endpoints.append(ln[-1])
+        elif t in ("Point", "MultiPoint"):
+            for f in feats:
+                node_points.extend(_points(f.get("geometry")))
+
+    count_near = _near_point_counter(node_points + line_endpoints, tol)
+    issues: List[Dict[str, Any]] = []
+
+    for layer in line_layers:
+        for f in by_layer[layer]:
+            fid = (f.get("properties") or {}).get("feature_id")
+            for ln in _line_strings(f.get("geometry")):
+                if len(ln) < 2:
+                    continue
+                for ep in (ln[0], ln[-1]):
+                    if count_near(ep) <= 1:
+                        issues.append({
+                            "type": "continuity",
+                            "layer": layer,
+                            "feature_id": fid,
+                            "message": "Disconnected endpoint at (%.5f, %.5f)" % (ep[0], ep[1]),
+                        })
+
+    attr_issues = 0
+    for layer, feats in by_layer.items():
+        for f in feats:
+            props = f.get("properties") or {}
+            if not props.get("feature_id"):
+                issues.append({
+                    "type": "attribute",
+                    "layer": layer,
+                    "message": "Missing feature_id",
+                })
+                attr_issues += 1
+
+    return {
+        "issues": issues,
+        "summary": {
+            "layers": len(by_layer),
+            "total_features": sum(len(v) for v in by_layer.values()),
+            "continuity_issues": sum(1 for i in issues if i["type"] == "continuity"),
+            "attribute_issues": attr_issues,
+        },
+    }
+
+
+def _run_lld(
+    project_id: str,
+    lld_version: str,
+    dataset: Dict[str, Any],
+) -> None:
+    task = _lld_task(project_id, lld_version)
+    task.update({"status": "running", "stage": "Grouping layers", "updated_at": _now()})
+    try:
+        # ── 1. Group the approved dataset (HLD + approved survey changes) by
+        #       its `layer` property, preserving the HLD layer structure. ────
+        by_layer: Dict[str, List[Dict[str, Any]]] = {}
+        for feat in dataset.get("features") or []:
+            props = feat.get("properties") or {}
+            layer = props.get("layer") or "unknown"
+            by_layer.setdefault(layer, []).append(feat)
+
+        if not by_layer:
+            raise RuntimeError("Approved dataset contains no features")
+
+        task.update({"stage": "Validating network", "progress": 30, "updated_at": _now()})
+        validation = _validate_network(by_layer)
+        _lld_append(
+            project_id, lld_version, "info",
+            "Validation: %d layers, %d features, %d continuity issue(s), %d attribute issue(s)."
+            % (
+                validation["summary"]["layers"],
+                validation["summary"]["total_features"],
+                validation["summary"]["continuity_issues"],
+                validation["summary"]["attribute_issues"],
+            ),
+        )
+
+        # ── 2. Write one GeoJSON file per layer. ────────────────────────────
+        task.update({"stage": "Writing layers", "progress": 60, "updated_at": _now()})
+        output_dir = OUTPUT_DIR / project_id / "lld" / lld_version
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        layer_files: Dict[str, List[str]] = {}
+        order = {name: i for i, name in enumerate(LLD_LAYER_ORDER)}
+        for layer in sorted(by_layer.keys(), key=lambda n: (order.get(n, 999), n)):
+            fc = {"type": "FeatureCollection", "features": by_layer[layer]}
+            geojson_path = output_dir / f"{layer}.geojson"
+            geojson_path.write_text(json.dumps(fc), encoding="utf-8")
+            layer_files[layer] = [str(geojson_path)]
+
+        # ── 3. Build the downloadable LLD zip (all layers, like HLD). ──────
+        task.update({"stage": "Packaging", "progress": 85, "updated_at": _now()})
+        zip_name = f"{project_id}_{lld_version}_lld.zip"
+        zip_path = output_dir / zip_name
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for layer, files in layer_files.items():
+                for fp in files:
+                    zf.write(fp, arcname=f"{layer}.geojson")
+
+        downloads = [
+            {
+                "name": zip_name,
+                "url": f"/ftth/lld/download/{project_id}/{lld_version}",
+                "size_bytes": zip_path.stat().st_size,
+            }
+        ]
+        for layer, files in layer_files.items():
+            for fp in files:
+                p = Path(fp)
+                downloads.append({
+                    "name": f"{layer}.geojson",
+                    "url": f"/ftth/lld/results/{project_id}/{lld_version}/layers/{layer}",
+                    "size_bytes": p.stat().st_size,
+                })
+
+        task.update(
+            {
+                "status": "completed",
+                "stage": "Complete",
+                "progress": 100,
+                "files": layer_files,
+                "layers": [
+                    {"name": layer, "feature_count": len(by_layer[layer]), "files": files}
+                    for layer, files in layer_files.items()
+                ],
+                "downloads": downloads,
+                "validation": validation,
+                "output_dir": str(output_dir),
+                "updated_at": _now(),
+            }
+        )
+    except Exception as exc:
+        task.update({"status": "failed", "error": str(exc), "updated_at": _now()})
+        _lld_append(project_id, lld_version, "error", str(exc))
+
+
+@app.post("/ftth/lld/run", status_code=202)
+async def run_lld(
+    background_tasks: BackgroundTasks,
+    request: Request,
+) -> Dict[str, Any]:
+    """Start an LLD run: apply approved survey changes to the HLD output,
+    validate the network, and emit final LLD layers + a zip.
+
+    Body (JSON):
+        {
+          "project_id": "<hld-project-id>",
+          "lld_version": "LLD-V01",
+          "dataset": {"type": "FeatureCollection", "features": [...]}
+        }
+    """
+    body = None
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    project_id = (body or {}).get("project_id") or ""
+    lld_version = (body or {}).get("lld_version") or ""
+    dataset = (body or {}).get("dataset") or {}
+
+    if not project_id or not lld_version:
+        raise HTTPException(status_code=400, detail="project_id and lld_version are required")
+    if not isinstance(dataset.get("features"), list):
+        raise HTTPException(status_code=400, detail="dataset.features must be a list")
+
+    task = _lld_task(project_id, lld_version)
+    task.update({
+        "status": "queued",
+        "stage": "Queued",
+        "progress": 0,
+        "updated_at": _now(),
+    })
+    background_tasks.add_task(_run_lld, project_id, lld_version, dataset)
+    return _lld_public_task(project_id, lld_version)
+
+
+@app.get("/ftth/lld/results/{project_id}/{lld_version}")
+def get_lld_results(project_id: str, lld_version: str) -> Dict[str, Any]:
+    if _lld_key(project_id, lld_version) not in lld_tasks:
+        raise HTTPException(status_code=404, detail="LLD run not found")
+    return _lld_public_task(project_id, lld_version)
+
+
+@app.get("/ftth/lld/results/{project_id}/{lld_version}/layers/{layer}")
+def get_lld_layer(project_id: str, lld_version: str, layer: str) -> Dict[str, Any]:
+    if _lld_key(project_id, lld_version) not in lld_tasks:
+        raise HTTPException(status_code=404, detail="LLD run not found")
+    task = _lld_task(project_id, lld_version)
+    files = (task.get("files") or {}).get(layer) or []
+    for fp in files:
+        if fp.lower().endswith((".geojson", ".json")) and os.path.isfile(fp):
+            with open(fp, "r", encoding="utf-8") as f:
+                return json.load(f)
+    raise HTTPException(status_code=404, detail="Layer not found")
+
+
+@app.get("/ftth/lld/download/{project_id}/{lld_version}")
+def download_lld(project_id: str, lld_version: str) -> FileResponse:
+    if _lld_key(project_id, lld_version) not in lld_tasks:
+        raise HTTPException(status_code=404, detail="LLD run not found")
+    task = _lld_task(project_id, lld_version)
+    output_dir = Path(task.get("output_dir")) if task.get("output_dir") else OUTPUT_DIR / project_id / "lld" / lld_version
+    zip_name = f"{project_id}_{lld_version}_lld.zip"
+    candidate = output_dir / zip_name
+    if not candidate.is_file():
+        raise HTTPException(status_code=404, detail="LLD zip not found")
+    return FileResponse(str(candidate), filename=candidate.name)
 
 
 
