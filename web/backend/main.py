@@ -810,6 +810,187 @@ def _near_point_counter(points: List[Any], tol: float):
     return count_near
 
 
+# ---------------------------------------------------------------------------
+# Cross-layer support propagation — approved survey changes in one layer must
+# be reflected in the layers that depend on it:
+#
+#   * a cable can only be laid where a trench AND a duct already exist, so
+#     every cable path must be covered by final_trenches + a duct;
+#   * a duct can only be laid where a trench exists, so every duct path must
+#     be covered by final_trenches.
+#
+# Where the approved dataset lacks the supporting layer on the cable/duct
+# path (e.g. the engineer added a cable in survey without drawing a trench),
+# the engine creates the missing supporting feature along that path and tags
+# it ``lld_created`` so reviewers can see exactly what was auto-generated.
+# ---------------------------------------------------------------------------
+
+TRENCH_LAYERS = {"final_trenches"}
+CABLE_LAYERS = {"feeder_cable", "distribution_cable"}
+DUCT_LAYERS = {"feeder_ducts", "distribution_ducts", "drop_ducts"}
+# A cable must ride on the duct of the same tier (feeder cable → feeder ducts,
+# distribution cable → distribution ducts). Drop ducts serve premises only.
+CABLE_TO_DUCT = {"feeder_cable": "feeder_ducts", "distribution_cable": "distribution_ducts"}
+
+# Coverage / creation tolerance in degrees (~50 m). Must stay consistent with
+# the network-connectivity tolerance used by _validate_network().
+LLD_COVERAGE_TOL = 0.0005
+
+
+def _seg_point_dist(p: Any, a: Any, b: Any) -> float:
+    """Euclidean distance from point p to segment [a, b] (degrees)."""
+    px, py = p[0], p[1]
+    ax, ay = a[0], a[1]
+    bx, by = b[0], b[1]
+    dx, dy = bx - ax, by - ay
+    if dx == 0 and dy == 0:
+        return ((px - ax) ** 2 + (py - ay) ** 2) ** 0.5
+    t = ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)
+    t = max(0.0, min(1.0, t))
+    cx, cy = ax + t * dx, ay + t * dy
+    return ((px - cx) ** 2 + (py - cy) ** 2) ** 0.5
+
+
+def _sample_polyline(line: Any, step: float) -> List[Any]:
+    """Sample points along a polyline every ``step`` degrees (incl. joints)."""
+    pts: List[Any] = []
+    for a, b in zip(line, line[1:]):
+        d = ((b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2) ** 0.5
+        n = max(1, int(d / step)) if step > 0 else 1
+        for i in range(n + 1):
+            t = i / n
+            pts.append((a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t))
+    return pts
+
+
+def _build_segment_index(lines: List[Any], tol: float) -> Tuple[Dict[Tuple[int, int], List[Any]], float]:
+    """Grid-hashed index of line segments for fast point-coverage queries."""
+    cell = max(tol, 1e-9)
+    index: Dict[Tuple[int, int], List[Any]] = {}
+    for line in lines:
+        for a, b in zip(line, line[1:]):
+            xmin, xmax = sorted((a[0], b[0]))
+            ymin, ymax = sorted((a[1], b[1]))
+            for cx in range(int(xmin / cell) - 1, int(xmax / cell) + 2):
+                for cy in range(int(ymin / cell) - 1, int(ymax / cell) + 2):
+                    index.setdefault((cx, cy), []).append((a, b))
+    return index, cell
+
+
+def _uncovered_points(line: Any, index: Dict[Tuple[int, int], List[Any]], cell: float, tol: float) -> List[Any]:
+    """Sample points of ``line`` not covered by any indexed segment."""
+    uncovered: List[Any] = []
+    step = max(tol * 0.5, 1e-6)
+    for p in _sample_polyline(line, step):
+        kx, ky = int(p[0] / cell), int(p[1] / cell)
+        found = False
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for a, b in index.get((kx + dx, ky + dy), []):
+                    if _seg_point_dist(p, a, b) <= tol:
+                        found = True
+                        break
+                if found:
+                    break
+            if found:
+                break
+        if not found:
+            uncovered.append(p)
+    return uncovered
+
+
+def _runs(points: List[Any]) -> List[List[Any]]:
+    """Group consecutive sample points into contiguous runs (min 2 points)."""
+    if not points:
+        return []
+    runs: List[List[Any]] = []
+    cur = [points[0]]
+    for p in points[1:]:
+        d = ((p[0] - cur[-1][0]) ** 2 + (p[1] - cur[-1][1]) ** 2) ** 0.5
+        if d <= LLD_COVERAGE_TOL * 2.0:
+            cur.append(p)
+        else:
+            if len(cur) >= 2:
+                runs.append(cur)
+            cur = [p]
+    if len(cur) >= 2:
+        runs.append(cur)
+    return runs
+
+
+def _propagate_support_layers(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, int]:
+    """Ensure every cable lies on a trench + duct and every duct lies on a
+    trench. Creates missing supporting features along the cable/duct path.
+
+    The coverage checks make this a no-op wherever the HLD (or an approved
+    survey change) already provided the supporting layer — so unchanged HLD
+    networks are never duplicated. Created features carry ``lld_created``.
+
+    Returns a count of created features per layer.
+    """
+    created: Dict[str, int] = {layer: 0 for layer in (*TRENCH_LAYERS, *DUCT_LAYERS)}
+    tol = LLD_COVERAGE_TOL
+
+    def all_lines(layers: set) -> List[Any]:
+        out: List[Any] = []
+        for layer in layers:
+            for f in by_layer.get(layer, []):
+                for ln in _line_strings(f.get("geometry")):
+                    if len(ln) >= 2:
+                        out.append(ln)
+        return out
+
+    def add_feature(layer: str, geometry: Dict[str, Any], source: Dict[str, Any], kind: str) -> None:
+        props = dict(source.get("properties") or {})
+        props["feature_id"] = "LLD-%s-%s" % (layer, uuid.uuid4().hex[:10])
+        props["layer"] = layer
+        props["lld_created"] = True
+        props["lld_source_layer"] = (source.get("properties") or {}).get("layer") or "unknown"
+        props["lld_source_feature_id"] = (source.get("properties") or {}).get("feature_id") or ""
+        props["lld_reason"] = kind
+        by_layer.setdefault(layer, []).append({
+            "type": "Feature",
+            "geometry": geometry,
+            "properties": props,
+        })
+        created[layer] = created.get(layer, 0) + 1
+
+    # ── 1. Trench coverage: every cable and duct must lie on final_trenches. ──
+    trench_index, cell = _build_segment_index(all_lines(TRENCH_LAYERS), tol)
+    for layer in (*CABLE_LAYERS, *DUCT_LAYERS):
+        for f in by_layer.get(layer, []):
+            for ln in _line_strings(f.get("geometry")):
+                if len(ln) < 2:
+                    continue
+                uncovered = _uncovered_points(ln, trench_index, cell, tol)
+                for run in _runs(uncovered):
+                    add_feature(
+                        "final_trenches",
+                        {"type": "LineString", "coordinates": run},
+                        f,
+                        "auto-created trench along approved %s change (cable/duct must lie on a trench)" % layer,
+                    )
+
+    # ── 2. Duct coverage: every cable must lie on a duct of its tier. ──
+    duct_index, dcell = _build_segment_index(all_lines(DUCT_LAYERS), tol)
+    for layer in CABLE_LAYERS:
+        duct_layer = CABLE_TO_DUCT[layer]
+        for f in by_layer.get(layer, []):
+            for ln in _line_strings(f.get("geometry")):
+                if len(ln) < 2:
+                    continue
+                uncovered = _uncovered_points(ln, duct_index, dcell, tol)
+                for run in _runs(uncovered):
+                    add_feature(
+                        duct_layer,
+                        {"type": "LineString", "coordinates": run},
+                        f,
+                        "auto-created %s along approved %s change (cable must lie on a duct)" % (duct_layer, layer),
+                    )
+
+    return created
+
+
 def _validate_network(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
     """Path-continuity + attribute-consistency validation.
 
@@ -893,6 +1074,23 @@ def _run_lld(
 
         if not by_layer:
             raise RuntimeError("Approved dataset contains no features")
+
+        # ── 1b. Cross-layer propagation: every cable must lie on a trench + duct,
+        #       every duct must lie on a trench. Missing supporting features are
+        #       auto-created along the changed path (tagged ``lld_created``). ────
+        task.update({"stage": "Propagating approved changes across layers", "progress": 20, "updated_at": _now()})
+        created = _propagate_support_layers(by_layer)
+        created_summary = ", ".join("%s=%d" % (k, v) for k, v in created.items() if v)
+        if created_summary:
+            _lld_append(
+                project_id, lld_version, "info",
+                "Cross-layer propagation created missing supporting features: %s." % created_summary,
+            )
+        else:
+            _lld_append(
+                project_id, lld_version, "info",
+                "Cross-layer propagation: all cables lie on a trench + duct and all ducts lie on a trench — no supporting features needed.",
+            )
 
         task.update({"stage": "Validating network", "progress": 30, "updated_at": _now()})
         validation = _validate_network(by_layer)
