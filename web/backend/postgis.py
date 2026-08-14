@@ -624,6 +624,12 @@ def get_layer_geojson(
         row = cur.fetchone()
     if not row or row[0] is None:
         return None
+    # A table that exists but holds no rows for this project produces an
+    # empty FeatureCollection here. Treat it as "no data" so callers fall
+    # through to the on-disk outputs — returning an empty collection made
+    # clients cache a permanently-empty layer mid-run.
+    if not (row[0].get("features") or []):
+        return None
     return row[0]
 
 
