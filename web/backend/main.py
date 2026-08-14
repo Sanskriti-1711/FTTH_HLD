@@ -752,13 +752,19 @@ def projects(limit: int = 50) -> List[Dict[str, Any]]:
 LLD_LAYER_ORDER = [
     "objects", "polygons", "pdps", "mfg",
     "final_trenches", "feeder_trench", "distribution_trench",
-    "garden_trench", "drill_trench",
+    "drill_trench",
     "feeder_cable", "distribution_cable",
     "feeder_ducts", "distribution_ducts", "drop_ducts",
     "chambers", "poles",
     "existing_infrastructure", "existing_infrastructure_points",
     "brownfield",
 ]
+
+# Layer names the LLD engine should NOT emit as standalone outputs. Garden
+# trenches are mirrored into final_trenches (trench_type=Garden) like the HLD
+# pipeline does, so a separate garden_trench layer would be redundant and
+# confusing in the LLD results window.
+LLD_EXCLUDED_LAYERS = {"garden_trench"}
 
 lld_tasks: Dict[str, Dict[str, Any]] = {}
 
@@ -1135,16 +1141,21 @@ def _approx_meters(pts: List[Any]) -> float:
 def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, int]:
     """Ensure every premise (object) has a serving drop connection.
 
-    Returns per-layer counts of created features (garden_trench / drop_ducts
-    / distribution_cable / final_trenches). Idempotent per run: an object is
+    Returns per-layer counts of created features (drop_ducts /
+    distribution_cable / final_trenches). Idempotent per run: an object is
     only touched when something is genuinely missing — a serving drop duct
-    (with its garden trench, mirrored into final_trenches like the HLD does)
-    and/or a serving distribution cable. Already-served objects are skipped,
-    and everything created is tagged ``lld_created`` so downstream validation
-    and the design package can distinguish it from HLD-derived features.
+    (its garden trench is mirrored into final_trenches like the HLD does)
+    and/or a serving distribution cable.
+
+    Key invariant: the distribution cable flows THROUGH the drop duct — both
+    must share the exact same geometry. When the survey engineer already drew
+    a cable into the premise, the duct is routed along that cable's final
+    segment; when a drop duct already exists, the missing cable is built along
+    the duct's exact path. Everything created is tagged ``lld_created`` so
+    downstream validation and the design package can distinguish it from
+    HLD-derived features.
     """
     created: Dict[str, int] = {
-        "garden_trench": 0,
         "drop_ducts": 0,
         "distribution_cable": 0,
         "final_trenches": 0,
@@ -1231,6 +1242,23 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
             for e in ends
         )
 
+    def serving_feature(layer: str, o: Any) -> Optional[Dict[str, Any]]:
+        """Return the feature in `layer` that has an endpoint AT the premise."""
+        for f in by_layer.get(layer) or []:
+            for ln in _line_strings(f.get("geometry")):
+                if len(ln) >= 2 and (
+                    ((ln[0][0] - o[0]) ** 2 + (ln[0][1] - o[1]) ** 2) ** 0.5 <= DROP_CONNECT_TOL
+                    or ((ln[-1][0] - o[0]) ** 2 + (ln[-1][1] - o[1]) ** 2) ** 0.5 <= DROP_CONNECT_TOL
+                ):
+                    return f
+        return None
+
+    def path_ending_at(ln: List[Any], o: Any) -> List[Any]:
+        """Return a path along `ln` that ENDS at the premise."""
+        if len(ln) >= 2 and ((ln[0][0] - o[0]) ** 2 + (ln[0][1] - o[1]) ** 2) ** 0.5 <= DROP_CONNECT_TOL:
+            return [ln[1], ln[0]]
+        return ln
+
     for obj in objects:
         pts = _points(obj.get("geometry"))
         if not pts:
@@ -1261,21 +1289,41 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
                 pdp_id = best_p.get("PDP_ID") or best_p.get("SRC_ID")
                 mfg_id = mfg_id or best_p.get("MFG_ID")
 
-        # 2. Tap point on the distribution-duct network (footway side).
-        best_seg, best_d = None, float("inf")
-        for a, b in dist_segs:
-            d = _seg_point_dist(o, a, b)
-            if d < best_d:
-                best_d, best_seg = d, (a, b)
-        if best_seg is not None:
-            tap = _project_point_on_segment(o, best_seg[0], best_seg[1])
+        # 2. Determine the serving path. The distribution cable must flow
+        #    THROUGH the drop duct, so cable and duct share one geometry:
+        #      a) cable already drawn by the survey engineer → route the new
+        #         drop duct along the cable's final segment into the premise
+        #      b) drop duct already exists → build the missing cable along the
+        #         duct's exact path
+        #      c) neither → route from the nearest distribution-network point
+        serving_cable = serving_feature("distribution_cable", o)
+        serving_duct = serving_feature("drop_ducts", o)
+        path: List[Any] = []
+        if not has_drop and has_cable and serving_cable is not None:
+            ln = path_ending_at(
+                _line_strings(serving_cable.get("geometry"))[0], o
+            )
+            path = ln[-2:] if len(ln) >= 2 else ln
+        elif not has_cable and has_drop and serving_duct is not None:
+            path = path_ending_at(_line_strings(serving_duct.get("geometry"))[0], o)
         else:
-            tap = o  # no distribution network — validation will flag
+            # Both missing — route from the nearest distribution-duct network
+            # point (footway side).
+            best_seg, best_d = None, float("inf")
+            for a, b in dist_segs:
+                d = _seg_point_dist(o, a, b)
+                if d < best_d:
+                    best_d, best_seg = d, (a, b)
+            if best_seg is not None:
+                tap = _project_point_on_segment(o, best_seg[0], best_seg[1])
+            else:
+                tap = o  # no distribution network — validation will flag
+            if (tap[0] - o[0]) ** 2 + (tap[1] - o[1]) ** 2 < 1e-14:
+                continue  # degenerate zero-length connection
+            path = [tap, o]
 
-        if (tap[0] - o[0]) ** 2 + (tap[1] - o[1]) ** 2 < 1e-14:
-            continue  # degenerate zero-length connection
-
-        path = [tap, o]
+        if len(path) < 2:
+            continue
         length_m = _approx_meters(path)
         max_uid += 1
         common = {
@@ -1289,15 +1337,11 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
         addr = str(props.get("ADDR_ID") or props.get("addr_id") or props.get("SRC_ID") or "")
 
         if not has_drop:
-            # 3a. Garden trench — mirrored into final_trenches exactly like the
-            #     HLD pipeline does (trench_type=Garden, micro trench specs), so
-            #     the construction plan + BOQ include the garden digging.
-            make_feature(
-                "garden_trench",
-                {"type": "LineString", "coordinates": path},
-                {**common, "length_m": length_m, "SIDE": "left"},
-                "auto-created garden trench to serve approved new premise %s" % obj_ref,
-            )
+            # 3a. Drop duct + its garden trench. The garden trench is mirrored
+            #     into final_trenches exactly like the HLD pipeline does
+            #     (trench_type=Garden, micro trench specs) so the construction
+            #     plan + BOQ include the garden digging — the standalone
+            #     garden_trench layer is NOT emitted in the LLD output.
             make_feature(
                 "final_trenches",
                 {"type": "LineString", "coordinates": path},
@@ -1338,6 +1382,7 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
         if not has_cable:
             # 3b. Serving distribution cable (only when one does not already
             #     end at the premise — avoids duplicating survey-drawn cables).
+            #     Same geometry as the drop duct: the cable flows THROUGH it.
             make_feature(
                 "distribution_cable",
                 {"type": "LineString", "coordinates": path},
@@ -1531,6 +1576,8 @@ def _run_lld(
         layer_files: Dict[str, List[str]] = {}
         order = {name: i for i, name in enumerate(LLD_LAYER_ORDER)}
         for layer in sorted(by_layer.keys(), key=lambda n: (order.get(n, 999), n)):
+            if layer in LLD_EXCLUDED_LAYERS:
+                continue  # e.g. garden_trench — mirrored into final_trenches
             fc = {"type": "FeatureCollection", "features": by_layer[layer]}
             geojson_path = output_dir / f"{layer}.geojson"
             geojson_path.write_text(json.dumps(fc), encoding="utf-8")
