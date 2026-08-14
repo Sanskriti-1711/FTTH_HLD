@@ -1136,12 +1136,19 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
     """Ensure every premise (object) has a serving drop connection.
 
     Returns per-layer counts of created features (garden_trench / drop_ducts
-    / distribution_cable). Idempotent per run: objects already served by an
-    existing drop-duct endpoint are skipped, and new premises are tagged with
-    ``lld_created`` so downstream validation and the design package can
-    distinguish them from HLD-derived features.
+    / distribution_cable / final_trenches). Idempotent per run: an object is
+    only touched when something is genuinely missing — a serving drop duct
+    (with its garden trench, mirrored into final_trenches like the HLD does)
+    and/or a serving distribution cable. Already-served objects are skipped,
+    and everything created is tagged ``lld_created`` so downstream validation
+    and the design package can distinguish it from HLD-derived features.
     """
-    created: Dict[str, int] = {"garden_trench": 0, "drop_ducts": 0, "distribution_cable": 0}
+    created: Dict[str, int] = {
+        "garden_trench": 0,
+        "drop_ducts": 0,
+        "distribution_cable": 0,
+        "final_trenches": 0,
+    }
     objects = by_layer.get("objects") or []
     if not objects:
         return created
@@ -1153,6 +1160,16 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
             if len(ln) >= 2:
                 drop_ends.append(ln[0])
                 drop_ends.append(ln[-1])
+
+    # Existing distribution-cable endpoints — a serving cable ends AT its
+    # premise too. Checking these (in addition to drop ducts) stops the
+    # planner from duplicating a cable the survey engineer already drew.
+    cable_ends: List[Any] = []
+    for f in by_layer.get("distribution_cable") or []:
+        for ln in _line_strings(f.get("geometry")):
+            if len(ln) >= 2:
+                cable_ends.append(ln[0])
+                cable_ends.append(ln[-1])
 
     # Distribution-duct network segments — the tap point for the drop.
     dist_segs: List[Tuple[Any, Any]] = []
@@ -1208,17 +1225,21 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
         except (TypeError, ValueError):
             pass
 
+    def served_by(ends: List[Any], o: Any) -> bool:
+        return any(
+            ((o[0] - e[0]) ** 2 + (o[1] - e[1]) ** 2) ** 0.5 <= DROP_CONNECT_TOL
+            for e in ends
+        )
+
     for obj in objects:
         pts = _points(obj.get("geometry"))
         if not pts:
             continue
         o = pts[0]
-        # Already served by an existing drop duct? (endpoint at the object)
-        if any(
-            ((o[0] - e[0]) ** 2 + (o[1] - e[1]) ** 2) ** 0.5 <= DROP_CONNECT_TOL
-            for e in drop_ends
-        ):
-            continue
+        has_drop = served_by(drop_ends, o)
+        has_cable = served_by(cable_ends, o)
+        if has_drop and has_cable:
+            continue  # fully served — nothing to do
         props = obj.get("properties") or {}
         obj_ref = props.get("feature_id") or ("%s,%s" % (round(o[0], 6), round(o[1], 6)))
 
@@ -1265,46 +1286,74 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
             "INFRA_STATUS": "Proposed",
         }
         hh = str(props.get("HH") or props.get("hhs") or "1")
+        addr = str(props.get("ADDR_ID") or props.get("addr_id") or props.get("SRC_ID") or "")
 
-        make_feature(
-            "garden_trench",
-            {"type": "LineString", "coordinates": path},
-            {**common, "length_m": length_m, "SIDE": "left"},
-            "auto-created garden trench to serve approved new premise %s" % obj_ref,
-        )
-        make_feature(
-            "drop_ducts",
-            {"type": "LineString", "coordinates": path},
-            {
-                **common,
-                "DUCT_TYPE": "1-Way HDPE",
-                "DIAMETER_MM": 32,
-                "WAYS": 1,
-                "SIDE": "left",
-                "DUCT_UID": max_uid,
-                "HH_ID": hh,
-                "LENGTH_M": length_m,
-                "SPARE_PCT": 0.0,
-                "OCCUPANCY_PCT": 100.0,
-            },
-            "auto-created drop duct to serve approved new premise %s" % obj_ref,
-        )
-        make_feature(
-            "distribution_cable",
-            {"type": "LineString", "coordinates": path},
-            {
-                **common,
-                "CABLE_TYPE": "Distribution",
-                "FIBER_COUNT": 8,
-                "UTIL_PCT": 100.0,
-                "SOURCE_NODE": str(pdp_id or ""),
-                "hhs": hh,
-                "length_m": length_m,
-            },
-            "auto-created serving distribution cable for approved new premise %s" % obj_ref,
-        )
+        if not has_drop:
+            # 3a. Garden trench — mirrored into final_trenches exactly like the
+            #     HLD pipeline does (trench_type=Garden, micro trench specs), so
+            #     the construction plan + BOQ include the garden digging.
+            make_feature(
+                "garden_trench",
+                {"type": "LineString", "coordinates": path},
+                {**common, "length_m": length_m, "SIDE": "left"},
+                "auto-created garden trench to serve approved new premise %s" % obj_ref,
+            )
+            make_feature(
+                "final_trenches",
+                {"type": "LineString", "coordinates": path},
+                {
+                    **common,
+                    "trench_type": "Garden",
+                    "USAGE_TYPE": "Garden",
+                    "SURFACE": "Footpath",
+                    "CONSTRUCT": "Micro Trench",
+                    "REINSTATE": "Sidewalk",
+                    "DEPTH_MM": 450,
+                    "WIDTH_MM": 150,
+                    "obj_id": addr,
+                    "addr_id": addr,
+                    "hhs": hh,
+                    "length_m": length_m,
+                },
+                "auto-created garden trench (mirrored into final_trenches) for %s" % obj_ref,
+            )
+            make_feature(
+                "drop_ducts",
+                {"type": "LineString", "coordinates": path},
+                {
+                    **common,
+                    "DUCT_TYPE": "1-Way HDPE",
+                    "DIAMETER_MM": 32,
+                    "WAYS": 1,
+                    "SIDE": "left",
+                    "DUCT_UID": max_uid,
+                    "HH_ID": hh,
+                    "LENGTH_M": length_m,
+                    "SPARE_PCT": 0.0,
+                    "OCCUPANCY_PCT": 100.0,
+                },
+                "auto-created drop duct to serve approved new premise %s" % obj_ref,
+            )
 
-        # 3. Link the premise itself to its serving polygon / PDP / MFG.
+        if not has_cable:
+            # 3b. Serving distribution cable (only when one does not already
+            #     end at the premise — avoids duplicating survey-drawn cables).
+            make_feature(
+                "distribution_cable",
+                {"type": "LineString", "coordinates": path},
+                {
+                    **common,
+                    "CABLE_TYPE": "Distribution",
+                    "FIBER_COUNT": 8,
+                    "UTIL_PCT": 100.0,
+                    "SOURCE_NODE": str(pdp_id or ""),
+                    "hhs": hh,
+                    "length_m": length_m,
+                },
+                "auto-created serving distribution cable for approved new premise %s" % obj_ref,
+            )
+
+        # 4. Link the premise itself to its serving polygon / PDP / MFG.
         if poly_id:
             props["POLYGON_ID"] = str(poly_id).upper()
         if pdp_id:
@@ -1313,6 +1362,7 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
             props["MFG_ID"] = mfg_id
 
         drop_ends.append(o)
+        cable_ends.append(o)
 
     return created
 
