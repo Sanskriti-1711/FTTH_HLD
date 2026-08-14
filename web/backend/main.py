@@ -8,7 +8,9 @@ tiles for MapLibre or any other client.
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -1038,6 +1040,283 @@ def _propagate_support_layers(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict
     return created
 
 
+# ---------------------------------------------------------------------------
+# LLD — drop-connection planning for new/moved premises (Phase 1)
+#
+# Approved survey changes that ADD a premise (object) only copy the point
+# into the objects layer — the LLD then emits it with no serving drop duct,
+# no garden trench and no distribution cable, so the premise is never
+# connected to the network. This stage gives every orphan premise a proper
+# layout: polygon/PDP assignment, a garden trench + drop duct routed from
+# the nearest distribution-duct network point to the object, and the
+# serving distribution cable along the same path. Created features carry
+# ``lld_created`` + a human-readable reason so the run is auditable.
+# ---------------------------------------------------------------------------
+
+# A premise is considered unserved when its nearest drop-duct endpoint is
+# farther than this (~10 m at survey latitudes; a real drop ends AT the
+# object, so existing premises sit at ~0).
+DROP_CONNECT_TOL = 0.0001
+
+
+def _project_point_on_segment(p: Any, a: Any, b: Any) -> List[float]:
+    """Foot of the perpendicular from p onto segment [a, b] (nearest endpoint
+    when the projection falls outside the segment)."""
+    ax, ay = a[0], a[1]
+    bx, by = b[0], b[1]
+    dx, dy = bx - ax, by - ay
+    denom = dx * dx + dy * dy
+    if denom == 0:
+        return [ax, ay]
+    t = ((p[0] - ax) * dx + (p[1] - ay) * dy) / denom
+    t = max(0.0, min(1.0, t))
+    return [ax + t * dx, ay + t * dy]
+
+
+def _point_in_ring(p: Any, ring: List[Any]) -> bool:
+    """Ray-casting point-in-polygon test for a single ring."""
+    x, y = p[0], p[1]
+    inside = False
+    n = len(ring)
+    j = n - 1
+    for i in range(n):
+        xi, yi = ring[i]
+        xj, yj = ring[j]
+        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _point_in_polygon(p: Any, geom: Optional[Dict[str, Any]]) -> bool:
+    """True if point lies inside a Polygon / MultiPolygon GeoJSON geometry.
+    Only the outer ring of each polygon is tested (premises never sit in
+    holes for the purpose of serving-polygon assignment)."""
+    if not geom:
+        return False
+    coords = geom.get("coordinates") or []
+    polys = coords if geom.get("type") == "MultiPolygon" else [coords]
+    for poly in polys:
+        if not poly:
+            continue
+        ring = poly[0]
+        if ring and len(ring) >= 3 and _point_in_ring(p, ring):
+            return True
+    return False
+
+
+def _polygon_centroid(geom: Optional[Dict[str, Any]]) -> Optional[List[float]]:
+    """Average of the outer-ring vertices (fallback for polygon assignment
+    when the premise sits just outside the polygon boundary)."""
+    if not geom:
+        return None
+    coords = geom.get("coordinates") or []
+    polys = coords if geom.get("type") == "MultiPolygon" else [coords]
+    for poly in polys:
+        ring = poly[0] if poly else None
+        if not ring:
+            continue
+        xs = sum(v[0] for v in ring) / len(ring)
+        ys = sum(v[1] for v in ring) / len(ring)
+        return [xs, ys]
+    return None
+
+
+def _approx_meters(pts: List[Any]) -> float:
+    """Approximate length in metres of a polyline of lon/lat points."""
+    total = 0.0
+    for a, b in zip(pts, pts[1:]):
+        dy = (b[1] - a[1]) * 111_320.0
+        dx = (b[0] - a[0]) * 111_320.0 * max(0.1, math.cos(math.radians((a[1] + b[1]) / 2)))
+        total += (dx * dx + dy * dy) ** 0.5
+    return round(total, 1)
+
+
+def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, int]:
+    """Ensure every premise (object) has a serving drop connection.
+
+    Returns per-layer counts of created features (garden_trench / drop_ducts
+    / distribution_cable). Idempotent per run: objects already served by an
+    existing drop-duct endpoint are skipped, and new premises are tagged with
+    ``lld_created`` so downstream validation and the design package can
+    distinguish them from HLD-derived features.
+    """
+    created: Dict[str, int] = {"garden_trench": 0, "drop_ducts": 0, "distribution_cable": 0}
+    objects = by_layer.get("objects") or []
+    if not objects:
+        return created
+
+    # Existing drop-duct endpoints — a drop duct ends AT its premise.
+    drop_ends: List[Any] = []
+    for f in by_layer.get("drop_ducts") or []:
+        for ln in _line_strings(f.get("geometry")):
+            if len(ln) >= 2:
+                drop_ends.append(ln[0])
+                drop_ends.append(ln[-1])
+
+    # Distribution-duct network segments — the tap point for the drop.
+    dist_segs: List[Tuple[Any, Any]] = []
+    for f in by_layer.get("distribution_ducts") or []:
+        for ln in _line_strings(f.get("geometry")):
+            for a, b in zip(ln, ln[1:]):
+                dist_segs.append((a, b))
+
+    polygons = by_layer.get("polygons") or []
+    pdps = by_layer.get("pdps") or []
+
+    # Map polygon id -> PDP properties. PDPs are named after their serving
+    # polygon (label 'Network_POLY00001' -> PDP00001).
+    pdp_by_poly: Dict[str, Dict[str, Any]] = {}
+    for p in pdps:
+        props = p.get("properties") or {}
+        label = str(props.get("label") or props.get("SRC_ID") or "")
+        m = re.search(r"(POLY\d+)", label, re.IGNORECASE)
+        if m:
+            pdp_by_poly.setdefault(m.group(1).upper(), props)
+
+    def nearest_polygon(p: Any) -> Optional[Dict[str, Any]]:
+        best: Optional[Dict[str, Any]] = None
+        best_d = float("inf")
+        for poly in polygons:
+            geom = poly.get("geometry")
+            props = poly.get("properties") or {}
+            if _point_in_polygon(p, geom):
+                return props
+            c = _polygon_centroid(geom)
+            if c:
+                d = ((p[0] - c[0]) ** 2 + (p[1] - c[1]) ** 2) ** 0.5
+                if d < best_d:
+                    best_d = d
+                    best = props
+        return best
+
+    def make_feature(layer: str, geom: Dict[str, Any], props: Dict[str, Any], kind: str) -> None:
+        props = dict(props)
+        props["feature_id"] = "LLD-%s-%s" % (layer, uuid.uuid4().hex[:10])
+        props["layer"] = layer
+        props["lld_created"] = True
+        props["lld_reason"] = kind
+        by_layer.setdefault(layer, []).append(
+            {"type": "Feature", "geometry": geom, "properties": props}
+        )
+        created[layer] = created.get(layer, 0) + 1
+
+    max_uid = 0
+    for f in by_layer.get("drop_ducts") or []:
+        try:
+            max_uid = max(max_uid, int((f.get("properties") or {}).get("DUCT_UID") or 0))
+        except (TypeError, ValueError):
+            pass
+
+    for obj in objects:
+        pts = _points(obj.get("geometry"))
+        if not pts:
+            continue
+        o = pts[0]
+        # Already served by an existing drop duct? (endpoint at the object)
+        if any(
+            ((o[0] - e[0]) ** 2 + (o[1] - e[1]) ** 2) ** 0.5 <= DROP_CONNECT_TOL
+            for e in drop_ends
+        ):
+            continue
+        props = obj.get("properties") or {}
+        obj_ref = props.get("feature_id") or ("%s,%s" % (round(o[0], 6), round(o[1], 6)))
+
+        # 1. Assign serving polygon + PDP/MFG.
+        poly_props = nearest_polygon(o)
+        poly_id = (poly_props or {}).get("SRC_ID") or props.get("POLYGON_ID")
+        pdp = pdp_by_poly.get(str(poly_id).upper()) if poly_id else None
+        pdp_id = (pdp or {}).get("PDP_ID") or props.get("PDP_ID")
+        mfg_id = (pdp or {}).get("MFG_ID") or props.get("MFG_ID")
+        if not pdp_id:
+            # Fallback: nearest PDP point.
+            best_d, best_p = float("inf"), None
+            for pdp_f in pdps:
+                for pp in _points(pdp_f.get("geometry")):
+                    d = ((o[0] - pp[0]) ** 2 + (o[1] - pp[1]) ** 2) ** 0.5
+                    if d < best_d:
+                        best_d, best_p = d, pdp_f.get("properties") or {}
+            if best_p:
+                pdp_id = best_p.get("PDP_ID") or best_p.get("SRC_ID")
+                mfg_id = mfg_id or best_p.get("MFG_ID")
+
+        # 2. Tap point on the distribution-duct network (footway side).
+        best_seg, best_d = None, float("inf")
+        for a, b in dist_segs:
+            d = _seg_point_dist(o, a, b)
+            if d < best_d:
+                best_d, best_seg = d, (a, b)
+        if best_seg is not None:
+            tap = _project_point_on_segment(o, best_seg[0], best_seg[1])
+        else:
+            tap = o  # no distribution network — validation will flag
+
+        if (tap[0] - o[0]) ** 2 + (tap[1] - o[1]) ** 2 < 1e-14:
+            continue  # degenerate zero-length connection
+
+        path = [tap, o]
+        length_m = _approx_meters(path)
+        max_uid += 1
+        common = {
+            "PDP_ID": str(pdp_id or ""),
+            "POLYGON_ID": str(poly_id).upper() if poly_id else "",
+            "MFG_ID": str(mfg_id or ""),
+            "ADDR_ID": str(props.get("ADDR_ID") or props.get("addr_id") or ""),
+            "INFRA_STATUS": "Proposed",
+        }
+        hh = str(props.get("HH") or props.get("hhs") or "1")
+
+        make_feature(
+            "garden_trench",
+            {"type": "LineString", "coordinates": path},
+            {**common, "length_m": length_m, "SIDE": "left"},
+            "auto-created garden trench to serve approved new premise %s" % obj_ref,
+        )
+        make_feature(
+            "drop_ducts",
+            {"type": "LineString", "coordinates": path},
+            {
+                **common,
+                "DUCT_TYPE": "1-Way HDPE",
+                "DIAMETER_MM": 32,
+                "WAYS": 1,
+                "SIDE": "left",
+                "DUCT_UID": max_uid,
+                "HH_ID": hh,
+                "LENGTH_M": length_m,
+                "SPARE_PCT": 0.0,
+                "OCCUPANCY_PCT": 100.0,
+            },
+            "auto-created drop duct to serve approved new premise %s" % obj_ref,
+        )
+        make_feature(
+            "distribution_cable",
+            {"type": "LineString", "coordinates": path},
+            {
+                **common,
+                "CABLE_TYPE": "Distribution",
+                "FIBER_COUNT": 8,
+                "UTIL_PCT": 100.0,
+                "SOURCE_NODE": str(pdp_id or ""),
+                "hhs": hh,
+                "length_m": length_m,
+            },
+            "auto-created serving distribution cable for approved new premise %s" % obj_ref,
+        )
+
+        # 3. Link the premise itself to its serving polygon / PDP / MFG.
+        if poly_id:
+            props["POLYGON_ID"] = str(poly_id).upper()
+        if pdp_id:
+            props["PDP_ID"] = pdp_id
+        if mfg_id:
+            props["MFG_ID"] = mfg_id
+
+        drop_ends.append(o)
+
+    return created
+
+
 def _validate_network(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
     """Path-continuity + attribute-consistency validation.
 
@@ -1092,6 +1371,28 @@ def _validate_network(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, An
                 })
                 attr_issues += 1
 
+    # Drop connectivity: every premise must have a drop duct ending at it.
+    drop_ends = []
+    for f in by_layer.get("drop_ducts") or []:
+        for ln in _line_strings(f.get("geometry")):
+            if len(ln) >= 2:
+                drop_ends.append(ln[0])
+                drop_ends.append(ln[-1])
+    drop_issues = 0
+    for f in by_layer.get("objects") or []:
+        for o in _points(f.get("geometry")):
+            if not any(
+                ((o[0] - e[0]) ** 2 + (o[1] - e[1]) ** 2) ** 0.5 <= DROP_CONNECT_TOL
+                for e in drop_ends
+            ):
+                drop_issues += 1
+                issues.append({
+                    "type": "drop",
+                    "layer": "objects",
+                    "feature_id": (f.get("properties") or {}).get("feature_id"),
+                    "message": "Premise has no serving drop duct",
+                })
+
     return {
         "issues": issues,
         "summary": {
@@ -1099,6 +1400,7 @@ def _validate_network(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, An
             "total_features": sum(len(v) for v in by_layer.values()),
             "continuity_issues": sum(1 for i in issues if i["type"] == "continuity"),
             "attribute_issues": attr_issues,
+            "drop_issues": drop_issues,
         },
     }
 
@@ -1139,16 +1441,35 @@ def _run_lld(
                 "Cross-layer propagation: all cables lie on a trench + duct and all ducts lie on a trench — no supporting features needed.",
             )
 
+        # ── 1c. Drop-connection planning: new/moved premises added by the
+        #       approved survey get a polygon/PDP assignment plus a garden
+        #       trench + drop duct + serving distribution cable, so the whole
+        #       layout (not just the point) reflects the change. ────────────
+        task.update({"stage": "Planning drop connections", "progress": 25, "updated_at": _now()})
+        drops = _plan_drop_connections(by_layer)
+        drop_summary = ", ".join("%s=%d" % (k, v) for k, v in drops.items() if v)
+        if drop_summary:
+            _lld_append(
+                project_id, lld_version, "info",
+                "Drop-connection planning created: %s." % drop_summary,
+            )
+        else:
+            _lld_append(
+                project_id, lld_version, "info",
+                "Drop-connection planning: all premises already served by a drop duct.",
+            )
+
         task.update({"stage": "Validating network", "progress": 30, "updated_at": _now()})
         validation = _validate_network(by_layer)
         _lld_append(
             project_id, lld_version, "info",
-            "Validation: %d layers, %d features, %d continuity issue(s), %d attribute issue(s)."
+            "Validation: %d layers, %d features, %d continuity issue(s), %d attribute issue(s), %d drop issue(s)."
             % (
                 validation["summary"]["layers"],
                 validation["summary"]["total_features"],
                 validation["summary"]["continuity_issues"],
                 validation["summary"]["attribute_issues"],
+                validation["summary"].get("drop_issues", 0),
             ),
         )
 
