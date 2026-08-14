@@ -221,18 +221,60 @@ def init_schema() -> None:
                 """
             ).format(projects=_biz_ident("ftth_projects"))
         )
-        # Add pipeline_state column if upgrading from older schema
-        try:
-            cur.execute(
-                sql.SQL(
-                    """
-                    ALTER TABLE {projects}
-                    ADD COLUMN IF NOT EXISTS pipeline_state JSONB
-                    """
-                ).format(projects=_biz_ident("ftth_projects"))
-            )
-        except Exception:
-            pass  # Race-safe
+        # Ensure every column the engine writes exists, even when the table
+        # was first created by Django migrations (which only know the Django
+        # fields — runner/qgis_version/error/output_dir/downloads are engine
+        # extras). Without this, upsert_project 500s with UndefinedColumn and
+        # every new run leaves a queued orphan row behind.
+        _engine_extras = [
+            ("runner", "TEXT"),
+            ("qgis_version", "TEXT"),
+            ("error", "TEXT"),
+            ("output_dir", "TEXT"),
+            ("downloads", "JSONB NOT NULL DEFAULT '[]'::jsonb"),
+            ("pipeline_state", "JSONB"),
+        ]
+        for col, ddl in _engine_extras:
+            try:
+                cur.execute(
+                    sql.SQL("ALTER TABLE {projects} ADD COLUMN IF NOT EXISTS {col} {ddl}").format(
+                        projects=_biz_ident("ftth_projects"),
+                        col=sql.Identifier(col),
+                        ddl=sql.SQL(ddl),
+                    )
+                )
+            except Exception:
+                pass  # Race-safe
+
+        # Django declares these NOT NULL without a DB default; the engine's
+        # upsert doesn't supply them, so a row insert would violate the
+        # constraint. Give them the same defaults as the Django model fields
+        # (Django always passes explicit values, so this never changes its
+        # behaviour — it only lets the engine create rows in a shared table).
+        _django_defaults = [
+            ("name", "''"),
+            ("status", "'queued'"),
+            ("stage_name", "''"),
+            ("stage_index", "0"),
+            ("stage_count", "6"),
+            ("progress", "0"),
+            ("error_message", "''"),
+            ("excel_filename", "''"),
+            ("roads_filename", "''"),
+        ]
+        for col, default in _django_defaults:
+            try:
+                cur.execute(
+                    sql.SQL(
+                        "ALTER TABLE {projects} ALTER COLUMN {col} SET DEFAULT {default}"
+                    ).format(
+                        projects=_biz_ident("ftth_projects"),
+                        col=sql.Identifier(col),
+                        default=sql.SQL(default),
+                    )
+                )
+            except Exception:
+                pass  # Race-safe
 
         # GIS schema: spatial layer tables
         for table in _TABLES:
