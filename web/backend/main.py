@@ -599,12 +599,19 @@ def get_results(project_id: str) -> Dict[str, Any]:
             )
     if project_id not in tasks:
         _restore_task_from_disk(project_id)
-    elif not (tasks[project_id].get("layers") or []):
+    elif (
+        tasks[project_id].get("status") != "running"
+        and tasks[project_id].get("status") != "queued"
+        and not (tasks[project_id].get("layers") or [])
+    ):
         # The project row exists in PostGIS but no layer rows were ever
         # ingested (e.g. the run predates the GIS wiring, or PostGIS was
         # unavailable at run time). Fall back to the on-disk outputs so the
         # results stay fetchable; _restore_task_from_disk merges into the
         # existing task (keeps roads_filename/runner, adds layers/downloads).
+        # NEVER restore over an in-flight run — _restore_task_from_disk
+        # force-marks the task completed, which would make the UI report a
+        # running pipeline as done at 0 layers.
         _restore_task_from_disk(project_id)
     if project_id not in tasks:
         raise HTTPException(status_code=404, detail="Project not found")
