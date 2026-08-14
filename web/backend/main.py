@@ -599,8 +599,29 @@ def get_results(project_id: str) -> Dict[str, Any]:
             )
     if project_id not in tasks:
         _restore_task_from_disk(project_id)
+    elif not (tasks[project_id].get("layers") or []):
+        # The project row exists in PostGIS but no layer rows were ever
+        # ingested (e.g. the run predates the GIS wiring, or PostGIS was
+        # unavailable at run time). Fall back to the on-disk outputs so the
+        # results stay fetchable; _restore_task_from_disk merges into the
+        # existing task (keeps roads_filename/runner, adds layers/downloads).
+        _restore_task_from_disk(project_id)
     if project_id not in tasks:
         raise HTTPException(status_code=404, detail="Project not found")
+    task = tasks[project_id]
+    # Downloads may be empty in the DB row (older runs) even though the
+    # design package files exist on disk — surface them and persist back.
+    if not (task.get("downloads") or []):
+        output_dir = OUTPUT_DIR / project_id
+        if output_dir.is_dir():
+            downloads = _register_downloads(project_id, output_dir)
+            if downloads:
+                task["downloads"] = downloads
+                try:
+                    if postgis.is_available():
+                        postgis.update_project_downloads(project_id, downloads)
+                except Exception:
+                    pass
     return _public_task(project_id)
 
 
@@ -609,8 +630,11 @@ def get_layer(project_id: str, layer: str) -> Dict[str, Any]:
     if postgis.is_available():
         try:
             data = postgis.get_layer_geojson(project_id, layer)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except KeyError:
+            # Layer name isn't a PostGIS table (e.g. chambers/poles/brownfield
+            # on a DB created before those tables) — fall through to the disk
+            # outputs below instead of 404ing.
+            data = None
         if data is not None:
             return data
 

@@ -51,6 +51,9 @@ LAYER_TABLES: Dict[str, str] = {
     "feeder_ducts": "duct_layer",
     "distribution_ducts": "duct_layer",
     "trenches": "trench_layer",
+    "chambers": "chambers",
+    "poles": "poles",
+    "brownfield": "brownfield",
     # Backward-compatible aliases
     "object": "object_layer",
     "object_layer": "object_layer",
@@ -66,6 +69,12 @@ LAYER_TABLES: Dict[str, str] = {
     "cables": "cable_layer",
     "cable": "cable_layer",
     "cable_layer": "cable_layer",
+    "chamber": "chambers",
+    "pole": "poles",
+    "existing_infrastructure": "brownfield",
+    "existing_infrastructure_points": "brownfield",
+    "existing_infra": "brownfield",
+    "existing_infra_points": "brownfield",
 }
 
 # Maps internal table name (no schema) -> public API name
@@ -78,6 +87,9 @@ TABLE_TO_PUBLIC_NAME = {
     "duct_layer": "ducts",
     "trench_layer": "trenches",
     "network_layer": "network",
+    "chambers": "chambers",
+    "poles": "poles",
+    "brownfield": "brownfield",
 }
 
 _TABLES = tuple(TABLE_TO_PUBLIC_NAME.keys())
@@ -322,6 +334,24 @@ def upsert_project(
         )
 
 
+def update_project_downloads(
+    project_id: str, downloads: List[Dict[str, Any]]
+) -> None:
+    """Persist the on-disk download manifest for a project."""
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            sql.SQL(
+                """
+                UPDATE {projects}
+                SET downloads = %s, updated_at = now()
+                WHERE project_id = %s
+                """
+            ).format(projects=_biz_ident("ftth_projects")),
+            (Json(downloads), project_id),
+        )
+
+
 def get_project(project_id: str) -> Optional[Dict[str, Any]]:
     conn = get_conn()
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -525,6 +555,12 @@ def get_layer_geojson(
     table = normalize_layer_name(layer)
     conn = get_conn()
     with conn.cursor() as cur:
+        # Table may not exist on DBs created before a layer was added
+        # (e.g. chambers/poles/brownfield) — treat it as "no data" so the
+        # caller can fall back to on-disk outputs instead of 500ing.
+        cur.execute(sql.SQL("SELECT to_regclass(%s)"), (f"{GIS_SCHEMA}.{table}",))
+        if cur.fetchone()[0] is None:
+            return None
         cur.execute(
             sql.SQL(
                 """
@@ -554,6 +590,12 @@ def list_project_layers(project_id: str) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         for table, public_name in TABLE_TO_PUBLIC_NAME.items():
+            # Skip tables that don't exist yet (added after the schema was
+            # first created — e.g. chambers/poles/brownfield) so a stale DB
+            # never 500s the results endpoint.
+            cur.execute(sql.SQL("SELECT to_regclass(%s)"), (f"{GIS_SCHEMA}.{table}",))
+            if cur.fetchone()["to_regclass"] is None:
+                continue
             cur.execute(
                 sql.SQL(
                     """
@@ -584,6 +626,9 @@ def get_vector_tile(
     table = normalize_layer_name(layer)
     conn = get_conn()
     with conn.cursor() as cur:
+        cur.execute(sql.SQL("SELECT to_regclass(%s)"), (f"{GIS_SCHEMA}.{table}",))
+        if cur.fetchone()[0] is None:
+            raise KeyError(f"Layer '{layer}' has no GIS table")
         cur.execute(
             sql.SQL(
                 """
