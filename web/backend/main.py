@@ -111,6 +111,16 @@ def _public_task(project_id: str) -> Dict[str, Any]:
     task["messages"] = list(messages) if isinstance(messages, deque) else []
     task["results_url"] = f"/ftth/hld/results/{project_id}"
     task["tile_url_template"] = f"/tiles/{{layer}}/{{z}}/{{x}}/{{y}}.pbf?project_id={project_id}"
+    # A run is only 100% when it is actually completed.  Anything else
+    # (queued/running/failed/unknown, or a restored task) is capped at 99%
+    # so the UI progress bar can never show a finished bar for an in-flight
+    # pipeline — regardless of how the in-memory state was built.  Conversely
+    # a genuinely completed run always reports 100 (in-memory rebuilds from
+    # PostGIS don't carry the final progress value).
+    if task.get("status") == "completed":
+        task["progress"] = 100
+    else:
+        task["progress"] = min(int(task.get("progress") or 0), 99)
     return task
 
 
@@ -779,6 +789,12 @@ def _lld_public_task(project_id: str, lld_version: str) -> Dict[str, Any]:
     messages = task.get("messages")
     task["messages"] = list(messages) if isinstance(messages, deque) else []
     task["results_url"] = f"/ftth/lld/results/{project_id}/{lld_version}"
+    # Same guarantee as HLD: never advertise 100% while the run is not
+    # actually completed; always advertise 100% once it is.
+    if task.get("status") == "completed":
+        task["progress"] = 100
+    else:
+        task["progress"] = min(int(task.get("progress") or 0), 99)
     return task
 
 
