@@ -546,6 +546,13 @@ async def run_hld(
     excel: UploadFile = File(...),
     roads: UploadFile = File(...),
     brownfield: Optional[UploadFile] = File(None),
+    # Optional OSM reference layers — stored in inputs/ for future routing-
+    # constraint / permit use. NOT consumed by the design algorithm yet.
+    railways: Optional[UploadFile] = File(None),
+    waterways: Optional[UploadFile] = File(None),
+    water: Optional[UploadFile] = File(None),
+    landuse: Optional[UploadFile] = File(None),
+    natural: Optional[UploadFile] = File(None),
     project_id: Optional[str] = Form(None),
     name: Optional[str] = Form(None),
     poly_method: Optional[int] = Form(3),
@@ -561,6 +568,19 @@ async def run_hld(
     if brownfield and brownfield.filename:
         brownfield_path = _save_upload(brownfield, upload_dir, "brownfield.zip")
 
+    # Optional OSM reference layers: save each under inputs/osm/<key>/ so they
+    # travel with the project but never touch the pipeline parameters.
+    osm_inputs: Dict[str, Path] = {}
+    for key, upload in (
+        ("railways", railways),
+        ("waterways", waterways),
+        ("water", water),
+        ("landuse", landuse),
+        ("natural", natural),
+    ):
+        if upload and upload.filename:
+            osm_inputs[key] = _save_upload(upload, upload_dir / "osm" / key, f"{key}.zip")
+
     task = _task(project_id)
     task.update(
         {
@@ -569,6 +589,7 @@ async def run_hld(
             "poly_method": poly_method,
             "roads_filename": roads_path.name,
             "output_dir": str(output_dir),
+            "osm_inputs": {k: str(v) for k, v in osm_inputs.items()},
             "updated_at": _now(),
         }
     )
