@@ -1692,10 +1692,14 @@ def get_lld_layer(project_id: str, lld_version: str, layer: str) -> Dict[str, An
 
 @app.get("/ftth/lld/download/{project_id}/{lld_version}")
 def download_lld(project_id: str, lld_version: str) -> FileResponse:
-    if _lld_key(project_id, lld_version) not in lld_tasks:
-        raise HTTPException(status_code=404, detail="LLD run not found")
-    task = _lld_task(project_id, lld_version)
-    output_dir = Path(task.get("output_dir")) if task.get("output_dir") else OUTPUT_DIR / project_id / "lld" / lld_version
+    # The in-memory task registry is lost on engine restart, but the output
+    # zip persists on disk — fall back to the on-disk file so downloads keep
+    # working for runs completed in a previous engine process.
+    task = lld_tasks.get(_lld_key(project_id, lld_version))
+    if task and task.get("output_dir"):
+        output_dir = Path(task["output_dir"])
+    else:
+        output_dir = OUTPUT_DIR / project_id / "lld" / lld_version
     zip_name = f"{project_id}_{lld_version}_lld.zip"
     candidate = output_dir / zip_name
     if not candidate.is_file():
