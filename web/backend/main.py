@@ -1106,9 +1106,17 @@ def _propagate_support_layers(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict
 # garden (drop) riding that region follow; reroute a cable -> the trench and
 # ducts under it follow. Already-approved features are never re-laid (the
 # engineer's own re-draw wins).
+# Trench sub-layers are the components of final_trenches (final = feeder +
+# distribution + garden merged, each tagged with trench_type). They must
+# follow a survey reroute of the final trench exactly like ducts/cables do —
+# otherwise the results viewer shows the old generated sub-path next to the
+# new final trench (visible duplication) even though the final trench is
+# supposed to be the combination of the three.
+TRENCH_SUB_LAYERS = {"feeder_trench", "distribution_trench"}
+
 # ---------------------------------------------------------------------------
 CORRIDOR_LINE_LAYERS = sorted(
-    set(TRENCH_LAYERS) | set(DUCT_LAYERS) | set(CABLE_LAYERS)
+    set(TRENCH_LAYERS) | set(DUCT_LAYERS) | set(CABLE_LAYERS) | TRENCH_SUB_LAYERS
 )
 
 
@@ -1176,7 +1184,8 @@ def _relay_dependents(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, in
     # duct, duct rides in the trench).
     changed.sort(
         key=lambda c: (
-            0 if c[0] in TRENCH_LAYERS else (1 if c[0] in DUCT_LAYERS else 2),
+            0 if (c[0] in TRENCH_LAYERS or c[0] in TRENCH_SUB_LAYERS)
+            else (1 if c[0] in DUCT_LAYERS else 2),
             c[0],
         )
     )
@@ -1331,6 +1340,91 @@ def _purge_old_region(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, in
             props["lld_purge_reason"] = "old rerouted region no longer used (%d vertices snapped)" % moved_any
             purged[layer] = purged.get(layer, 0) + 1
     return purged
+
+
+def _nearest_same_layer_props(
+    features: List[Dict[str, Any]],
+    approved: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Inherit design attributes from the nearest NON-approved generated
+    feature of the same layer that rides the approved corridor (within relay
+    tolerance). Used when a fresh pipeline assigns new feature ids, so the
+    survey-authoritative feature is appended rather than matched: pipeline
+    fields (trench_type, USAGE_TYPE, lengths, INFRA_STATUS ...) survive
+    instead of being replaced by the survey attrs alone."""
+    ap = approved.get("properties") or {}
+    alines = _line_strings(approved.get("geometry"))
+    if not alines:
+        return {}
+    p = alines[0][0]
+    best: Dict[str, Any] = {}
+    best_d = float("inf")
+    for f in features:
+        props = f.get("properties") or {}
+        if props.get("approved") or props.get("lld_created"):
+            continue
+        for ln in _line_strings(f.get("geometry")):
+            q = _nearest_point_on_path(p, ln)
+            d = ((p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2) ** 0.5
+            if d < best_d:
+                best_d, best = d, props
+    if best_d > LLD_RELAY_TOL:
+        return {}
+    out = {k: v for k, v in best.items()}
+    out.pop("feature_id", None)  # the survey id stays authoritative
+    return out
+
+
+def _inherit_trench_sub_layer_attributes(by_layer: Dict[str, List[Dict[str, Any]]]) -> int:
+    """final_trenches is the combination of feeder + distribution (+ garden,
+    mirrored into it by the pipeline) — every final trench feature should
+    therefore carry the design attributes of its component layer. A survey-
+    appended authoritative feature may lack them (its props are the survey
+    attrs alone), so inherit trench_type / USAGE_TYPE / SURFACE / CONSTRUCT /
+    DEPTH_MM / WIDTH_MM / INFRA_STATUS from the nearest sub-layer feature
+    riding the same corridor. Returns the number of enriched features."""
+    finals = by_layer.get("final_trenches") or []
+    if not finals:
+        return 0
+    subs: List[Tuple[List[Any], Dict[str, Any]]] = []
+    for sub in sorted(TRENCH_SUB_LAYERS):
+        for f in by_layer.get(sub, []) or []:
+            lines = _line_strings(f.get("geometry"))
+            if lines:
+                subs.append((lines[0], f.get("properties") or {}))
+    if not subs:
+        return 0
+    inherited = 0
+    for tf in finals:
+        props = tf.setdefault("properties", {})
+        if props.get("trench_type"):
+            continue  # already carries the component attribute
+        lines = _line_strings(tf.get("geometry"))
+        if not lines:
+            continue
+        line = lines[0]
+        samples = [line[0], line[-1]]
+        if len(line) > 2:
+            samples.append(line[len(line) // 2])
+        best: Dict[str, Any] = {}
+        best_d = float("inf")
+        for slines, sprops in subs:
+            total = 0.0
+            for p in samples:
+                q = _nearest_point_on_path(p, slines)
+                total += ((p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2) ** 0.5
+            if total < best_d:
+                best_d, best = total, sprops
+        if best_d > LLD_RELAY_TOL:
+            continue
+        for key in ("trench_type", "USAGE_TYPE", "SURFACE", "CONSTRUCT",
+                    "REINSTATE", "DEPTH_MM", "WIDTH_MM", "INFRA_STATUS",
+                    "VERIFY_STATUS"):
+            if key not in props and best.get(key) is not None:
+                props[key] = best[key]
+        props["lld_attr_source"] = "inherited from sub-layer"
+        inherited += 1
+    return inherited
 
 
 # ---------------------------------------------------------------------------
@@ -1955,6 +2049,17 @@ def _run_lld(
                 "Old-path purge: snapped %s off the old rerouted region onto the new path." % purge_summary,
             )
 
+        # final_trenches is the combination of feeder + distribution (+ garden):
+        # inherit the component attributes (trench_type etc.) onto any final
+        # feature that lacks them.
+        inherited = _inherit_trench_sub_layer_attributes(by_layer)
+        if inherited:
+            _lld_append(
+                project_id, lld_version, "info",
+                "Final-trench attributes: %d feature(s) inherited trench_type/design attrs from feeder/distribution sub-layers."
+                % inherited,
+            )
+
         # ── 1b. Cross-layer propagation: every cable must lie on a trench + duct,
         #       every duct must lie on a trench. Missing supporting features are
         #       auto-created along the changed path (tagged ``lld_created``). ────
@@ -2459,11 +2564,17 @@ def _run_lld_replan(
                 )
                 if target is None:
                     # The fresh algorithm assigns new ids, so the approved
-                    # route is appended as the authoritative feature.
+                    # route is appended as the authoritative feature. Inherit
+                    # the pipeline's design attributes from the nearest
+                    # generated feature riding the corridor so the survey
+                    # overlay never blanks trench_type / lengths / INFRA_STATUS.
+                    base_props = _nearest_same_layer_props(by_layer.get(layer, []), approved)
+                    props = dict(base_props)
+                    props.update(aprop)
                     target = {
                         "type": "Feature",
                         "geometry": approved.get("geometry"),
-                        "properties": dict(aprop),
+                        "properties": props,
                     }
                     by_layer.setdefault(layer, []).append(target)
                 else:
@@ -2476,6 +2587,19 @@ def _run_lld_replan(
         purged = _purge_old_region(by_layer)
         relay_summary = ", ".join("%s=%d" % (k, v) for k, v in relayed.items() if v) or "none"
         purge_summary = ", ".join("%s=%d" % (k, v) for k, v in purged.items() if v) or "none"
+
+        # final_trenches is the combination of feeder + distribution (+ garden):
+        # any final feature missing the component attributes inherits them from
+        # the nearest sub-layer so the final trench always carries trench_type
+        # / USAGE_TYPE / SURFACE ... like the three component layers.
+        inherited = _inherit_trench_sub_layer_attributes(by_layer)
+        if inherited:
+            _lld_append(
+                project_id, lld_version, "info",
+                "Final-trench attributes: %d feature(s) inherited trench_type/design attrs from feeder/distribution sub-layers."
+                % inherited,
+            )
+
         _lld_append(
             project_id, lld_version, "info",
             "Survey route enforcement: %d approved route(s) authoritative; "
