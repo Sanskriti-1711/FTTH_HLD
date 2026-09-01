@@ -371,6 +371,13 @@ def enrich_equipment(pdp_path, mfg_path, feedback=None):
             ("LOCATION", ogr.OFTString, 24),
             ("EQUIP_CAPACITY", ogr.OFTInteger),
             ("SPLIT_RATIO", ogr.OFTString, 16),
+            ("PRIMARY_SPLIT_RATIO", ogr.OFTString, 16),
+            ("DISTRIBUTION_SPLIT_RATIO", ogr.OFTString, 16),
+            ("SPLITTER_MODULE_COUNT", ogr.OFTInteger),
+            ("SPLITTER_TOTAL_PORTS", ogr.OFTInteger),
+            ("SPLITTER_USED_PORTS", ogr.OFTInteger),
+            ("SPLITTER_SPARE_PORTS", ogr.OFTInteger),
+            ("SPLITTER_UTILIZATION_PCT", ogr.OFTReal),
             ("VENDOR", ogr.OFTString, 32),
             ("POWER_REQ", ogr.OFTString, 8),
             ("MAINT_ZONE", ogr.OFTString, 24),
@@ -382,8 +389,30 @@ def enrich_equipment(pdp_path, mfg_path, feedback=None):
             f.SetField("LOCATION", "Street Cabinet")
             cap = int(_num(lyr, f, PDP_SPARE_CAP, 0)) or 32
             f.SetField("EQUIP_CAPACITY", cap)
+
+            # Use the network-layer splitter plan when available.  Never derive
+            # a splitter ratio from cable FIBER_COUNT: a 48-fibre distribution
+            # cable is not a 1:48 splitter.
             split = str(_get(lyr, f, "SPLIT_SIZE") or _get(lyr, f, "SPLIT_RATIO") or "")
-            f.SetField("SPLIT_RATIO", split or "1:32")
+            split = split if split in {"1:8", "1:16", "1:32", "1:64"} else "1:32"
+            module_count = int(_num(lyr, f, "SPLIT_CNT", 0))
+            total_ports = int(_num(lyr, f, "SPL_PORTS", 0))
+            used_ports = int(_num(lyr, f, "HH", 0))
+            if total_ports <= 0:
+                total_ports = cap
+            if module_count <= 0:
+                module_count = 1
+            spare_ports = max(0, total_ports - used_ports)
+            util_pct = round((100.0 * used_ports / total_ports), 1) if total_ports else 0.0
+
+            f.SetField("SPLIT_RATIO", split)
+            f.SetField("PRIMARY_SPLIT_RATIO", "1:8")
+            f.SetField("DISTRIBUTION_SPLIT_RATIO", split)
+            f.SetField("SPLITTER_MODULE_COUNT", module_count)
+            f.SetField("SPLITTER_TOTAL_PORTS", total_ports)
+            f.SetField("SPLITTER_USED_PORTS", used_ports)
+            f.SetField("SPLITTER_SPARE_PORTS", spare_ports)
+            f.SetField("SPLITTER_UTILIZATION_PCT", util_pct)
             f.SetField("VENDOR", "")
             f.SetField("POWER_REQ", "Yes")
             f.SetField("MAINT_ZONE", "")
@@ -399,6 +428,13 @@ def enrich_equipment(pdp_path, mfg_path, feedback=None):
             ("LOCATION", ogr.OFTString, 24),
             ("EQUIP_CAPACITY", ogr.OFTInteger),
             ("SPLIT_RATIO", ogr.OFTString, 16),
+            ("PRIMARY_SPLIT_RATIO", ogr.OFTString, 16),
+            ("DISTRIBUTION_SPLIT_RATIO", ogr.OFTString, 16),
+            ("SPLITTER_MODULE_COUNT", ogr.OFTInteger),
+            ("SPLITTER_TOTAL_PORTS", ogr.OFTInteger),
+            ("SPLITTER_USED_PORTS", ogr.OFTInteger),
+            ("SPLITTER_SPARE_PORTS", ogr.OFTInteger),
+            ("SPLITTER_UTILIZATION_PCT", ogr.OFTReal),
             ("VENDOR", ogr.OFTString, 32),
             ("POWER_REQ", ogr.OFTString, 8),
             ("MAINT_ZONE", ogr.OFTString, 24),

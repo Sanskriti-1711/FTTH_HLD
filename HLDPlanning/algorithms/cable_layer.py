@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Cable Builder — Feeder Cable (copy/style) + Distribution Cable (per object)
+Cable Builder — Feeder Cable (copy/style) + grouped Distribution Cable branches
 • Copies Feeder Trench to Feeder Cable.
-• Builds ONE Distribution Cable per object (HH): joins the object's
+• Builds ONE grouped Distribution Cable per same-footway group: joins each object's
   Distribution Trench segment (PDP → footway point) with its Garden Trench
   segment (object → footway point) into a single PDP → object cable, tagged
   with the object's addr_id and household count (hhs).
@@ -117,6 +117,8 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
     DEFAULT_DO_DEDUPE  = True     # remove duplicate geometries
     DEFAULT_DIST_COLOR = "#0000ff"
     DEFAULT_DIST_WIDTH = 0.8
+    SAME_FOOTWAY_TOL_M = 0.5
+    RESERVED_SPARE_FIBERS = 2
 
     # ------------------------- UI -------------------------
     def initAlgorithm(self, config=None):
@@ -191,7 +193,13 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
         # the rest of the pipeline.
         out_fields = QgsFields()
         out_fields.append(QgsField("addr_id",    QMetaType.Type.QString))
+        out_fields.append(QgsField("ADDR_IDS",   QMetaType.Type.QString))
         out_fields.append(QgsField("hhs",        QMetaType.Type.QString))
+        out_fields.append(QgsField("HH_COUNT",   QMetaType.Type.Int))
+        out_fields.append(QgsField("FIBER_COUNT", QMetaType.Type.Int))
+        out_fields.append(QgsField("RESERVED_SPARE_FIBERS", QMetaType.Type.Int))
+        out_fields.append(QgsField("AVAILABLE_FIBERS", QMetaType.Type.Int))
+        out_fields.append(QgsField("CONNECTION_TYPE", QMetaType.Type.QString))
         out_fields.append(QgsField("length_m",   QMetaType.Type.Double))
         out_fields.append(QgsField("POLYGON_ID", QMetaType.Type.QString))
         out_fields.append(QgsField("PDP_ID",     QMetaType.Type.QString))
@@ -219,67 +227,100 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
                     proj_by_pdp.setdefault(pid, []).append(f.geometry())
 
         made = 0
+        grouped = {}
         for gf in garden_t.getFeatures():
-            key = normalize_key(gf[fld_g_addr])
-            if not key:
+            gpts = _polyline_of(gf.geometry())
+            if not gpts:
                 continue
-            dfeats = distr_by_addr.get(key, [])
-            if not dfeats:
-                continue  # no PDP→footway segment for this object; skip
-            gg = gf.geometry()
-            if not gg or gg.isEmpty():
-                continue
-            # ADDR_ID is NOT guaranteed unique (two premises can share an
-            # address). Among the distribution segments with the same addr,
-            # pick the one whose footway endpoint is nearest THIS garden's
-            # footway endpoint (garden runs object → footway, so its last
-            # point is the shared footway point).
-            g_pts = _polyline_of(gg)
-            g_end = g_pts[-1] if g_pts else None
-            df = dfeats[0]
-            if len(dfeats) > 1 and g_end is not None:
-                best_df, best_d = None, None
-                for cand in dfeats:
-                    cg = cand.geometry()
-                    if not cg or cg.isEmpty():
-                        continue
-                    c_pts = _polyline_of(cg)
-                    if not c_pts:
-                        continue
-                    c_end = c_pts[-1]
-                    d = (c_end.x() - g_end.x()) ** 2 + (c_end.y() - g_end.y()) ** 2
-                    if best_d is None or d < best_d:
-                        best_d, best_df = d, cand
-                if best_df is not None:
-                    df = best_df
-            dg = df.geometry()
-            if not dg or dg.isEmpty():
-                continue
+            key = (normalize_key(gf[fld_g_pdp]) if fld_g_pdp else "", normalize_key(gf[fld_g_poly]) if fld_g_poly else "", round(gpts[-1].x() / self.SAME_FOOTWAY_TOL_M), round(gpts[-1].y() / self.SAME_FOOTWAY_TOL_M))
+            grouped.setdefault(key, []).append(gf)
 
-            # PDP_ID: prefer the PDP id carried on the distribution segment; fall back to the garden's.
-            pid = normalize_key(df[fld_d_pdp]) if fld_d_pdp else ""
-            if not pid and fld_g_pdp:
-                pid = normalize_key(gf[fld_g_pdp])
+        for group in grouped.values():
+            # Resolve every house in this same-footway group. Each house keeps
+            # its own distribution and garden arm; the shared distribution
+            # corridor is emitted once as the MultiLineString trunk component.
+            resolved = []
+            for gf in group:
+                key = normalize_key(gf[fld_g_addr])
+                if not key:
+                    continue
+                dfeats = distr_by_addr.get(key, [])
+                if not dfeats:
+                    continue
+                gg = gf.geometry()
+                if not gg or gg.isEmpty():
+                    continue
+                g_pts = _polyline_of(gg)
+                g_end = g_pts[-1] if g_pts else None
+                df = dfeats[0]
+                if len(dfeats) > 1 and g_end is not None:
+                    best_df, best_d = None, None
+                    for cand in dfeats:
+                        c_pts = _polyline_of(cand.geometry())
+                        if not c_pts:
+                            continue
+                        c_end = c_pts[-1]
+                        dist2 = (c_end.x() - g_end.x()) ** 2 + (c_end.y() - g_end.y()) ** 2
+                        if best_d is None or dist2 < best_d:
+                            best_d, best_df = dist2, cand
+                    if best_df is not None:
+                        df = best_df
+                dg = df.geometry()
+                if not dg or dg.isEmpty():
+                    continue
+                pid = normalize_key(df[fld_d_pdp]) if fld_d_pdp else ""
+                if not pid and fld_g_pdp:
+                    pid = normalize_key(gf[fld_g_pdp])
+                proj_geom = proj_by_pdp.get(pid, [None])[0] if pid else None
+                arm = _join_object_cable(dg, gg, proj_geom)
+                if arm is not None and not arm.isEmpty():
+                    resolved.append((gf, df, arm, pid))
 
-            # Concatenate: [projection (PDP → pseudo-PDP)] + distribution
-            # polyline (pseudo-PDP → footway) + reversed garden polyline
-            # (footway → object). Shared endpoints are dropped once.
-            proj_geom = None
-            if proj_by_pdp and pid and pid in proj_by_pdp and proj_by_pdp[pid]:
-                proj_geom = proj_by_pdp[pid][0]
-            cable = _join_object_cable(dg, gg, proj_geom)
-            if cable is None or cable.isEmpty():
+            if not resolved:
                 continue
-
+            # A MultiLineString deliberately preserves the common trunk and
+            # each house arm as separate components, avoiding duplicate trunk
+            # geometry while retaining per-house traceability.
+            cable_parts = []
+            for item in resolved:
+                geom = item[2]
+                if geom.isNull() or geom.isEmpty():
+                    continue
+                if geom.isMultipart():
+                    cable_parts.extend(geom.asMultiPolyline())
+                else:
+                    cable_parts.append(geom.asPolyline())
+            coordinates = [
+                [[point.x(), point.y()] for point in part]
+                for part in cable_parts if len(part) >= 2
+            ]
+            if not coordinates:
+                continue
+            first_gf, first_df, _first_arm, first_pid = resolved[0]
             of = QgsFeature(out_fields)
-            of.setGeometry(cable)
-            of["addr_id"]    = str(gf[fld_g_addr])
-            hhs = gf[fld_g_hhs] if fld_g_hhs else None
-            of["hhs"]        = str(hhs) if hhs is not None else None
-            of["length_m"]   = round(cable.length(), 2)
-            of["POLYGON_ID"] = str(gf[fld_g_poly]) if fld_g_poly else None
-            of["PDP_ID"]     = pid or None
-            of["MFG_ID"]     = str(gf[fld_g_mfg]) if fld_g_mfg else None
+            of.setGeometry(QgsGeometry.fromMultiPolylineXY([
+                [QgsPointXY(x, y) for x, y in part] for part in coordinates
+            ]))
+            addr_ids = [str(item[0][fld_g_addr]) for item in resolved]
+            hh_values = []
+            for item, _df, _arm, _pid in resolved:
+                try:
+                    hh_values.append(float(item[fld_g_hhs]) if fld_g_hhs and item[fld_g_hhs] not in (None, "") else 1.0)
+                except Exception:
+                    hh_values.append(1.0)
+            hh_count = int(sum(hh_values))
+            of["addr_id"]    = addr_ids[0]
+            of["ADDR_IDS"]   = ",".join(addr_ids)
+            of["hhs"]        = str(hh_count)
+            of["HH_COUNT"]   = hh_count
+            of["FIBER_COUNT"] = max(48, hh_count + self.RESERVED_SPARE_FIBERS)
+            of["RESERVED_SPARE_FIBERS"] = self.RESERVED_SPARE_FIBERS
+            of["AVAILABLE_FIBERS"] = max(0, of["FIBER_COUNT"] - self.RESERVED_SPARE_FIBERS - hh_count)
+            of["CONNECTION_TYPE"] = "Shared trunk + branches" if len(group) > 1 else "Dedicated drop"
+            of["length_m"]   = round(of.geometry().length(), 2)
+            of["POLYGON_ID"] = str(first_gf[fld_g_poly]) if fld_g_poly else None
+            of["PDP_ID"]     = first_pid or None
+            of["MFG_ID"]     = str(first_gf[fld_g_mfg]) if fld_g_mfg else None
             sinkD.addFeature(of, QgsFeatureSink.FastInsert)
             made += 1
 
@@ -292,7 +333,7 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
             except Exception: pass
             out_layer.renderer().setSymbol(sym)
 
-        feedback.pushInfo(f"Distribution: per-object cables={made}")
+        feedback.pushInfo(f"Distribution: grouped branched cables={made} (same-footway groups, tolerance={self.SAME_FOOTWAY_TOL_M} m)")
         return {
             self.O_FEEDER: outFeederId,
             self.O_DIST: outDistId,

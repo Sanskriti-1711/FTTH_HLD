@@ -54,7 +54,9 @@ class BrownfieldLayerAlgorithm(QgsProcessingAlgorithm):
     P_EXISTING_MFG = "INPUT_EXISTING_MFG"
 
     P_DUCT_CAPACITY_FIELD = "DUCT_CAPACITY_FIELD"
+    P_DUCT_USED_FIELD = "DUCT_USED_FIELD"
     P_FIBRE_CAPACITY_FIELD = "FIBRE_CAPACITY_FIELD"
+    P_FIBRE_USED_FIELD = "FIBRE_USED_FIELD"
     P_CABINET_CAPACITY_FIELD = "CABINET_CAPACITY_FIELD"
     P_VERIFY_FIELD = "VERIFY_FIELD"
 
@@ -159,8 +161,18 @@ class BrownfieldLayerAlgorithm(QgsProcessingAlgorithm):
             optional=True, defaultValue="",
         ))
         self.addParameter(QgsProcessingParameterString(
+            self.P_DUCT_USED_FIELD,
+            self.tr("Duct already-used capacity field name (default: auto-detect)"),
+            optional=True, defaultValue="",
+        ))
+        self.addParameter(QgsProcessingParameterString(
             self.P_FIBRE_CAPACITY_FIELD,
             self.tr("Fibre capacity field name (default: auto-detect)"),
+            optional=True, defaultValue="",
+        ))
+        self.addParameter(QgsProcessingParameterString(
+            self.P_FIBRE_USED_FIELD,
+            self.tr("Fibre already-used capacity field name (default: auto-detect)"),
             optional=True, defaultValue="",
         ))
         self.addParameter(QgsProcessingParameterString(
@@ -244,7 +256,9 @@ class BrownfieldLayerAlgorithm(QgsProcessingAlgorithm):
 
         # ── Resolve field mappings ─────────────────────────────────────────
         duct_cap_field = self._param_str(params, self.P_DUCT_CAPACITY_FIELD, context)
+        duct_used_field = self._param_str(params, self.P_DUCT_USED_FIELD, context)
         fibre_cap_field = self._param_str(params, self.P_FIBRE_CAPACITY_FIELD, context)
+        fibre_used_field = self._param_str(params, self.P_FIBRE_USED_FIELD, context)
         cabinet_cap_field = self._param_str(params, self.P_CABINET_CAPACITY_FIELD, context)
         verify_field = self._param_str(params, self.P_VERIFY_FIELD, context)
 
@@ -252,9 +266,17 @@ class BrownfieldLayerAlgorithm(QgsProcessingAlgorithm):
             duct_cap_field = self._auto_detect_field(
                 ducts, ["capacity_total", "capacity", "subducts", "sub_ducts", "n_subducts", "cap"]
             )
+        if not duct_used_field:
+            duct_used_field = self._auto_detect_field(
+                ducts, ["capacity_used", "used", "occupied", "n_used", "used_ways"]
+            )
         if not fibre_cap_field:
             fibre_cap_field = self._auto_detect_field(
                 fibre, ["capacity_total", "capacity", "strands", "fibre_count", "n_strands", "cap"]
+            )
+        if not fibre_used_field:
+            fibre_used_field = self._auto_detect_field(
+                fibre, ["capacity_used", "used", "strands_used", "n_used", "used_strands"]
             )
         if not cabinet_cap_field:
             cabinet_cap_field = self._auto_detect_field(
@@ -269,7 +291,9 @@ class BrownfieldLayerAlgorithm(QgsProcessingAlgorithm):
 
         feedback.pushInfo(self.tr(
             f"Brownfield: duct_cap_field='{duct_cap_field or '(default)'}', "
+            f"duct_used_field='{duct_used_field or '(none)'}', "
             f"fibre_cap_field='{fibre_cap_field or '(default)'}', "
+            f"fibre_used_field='{fibre_used_field or '(none)'}', "
             f"cabinet_cap_field='{cabinet_cap_field or '(default)'}', "
             f"verify_field='{verify_field or '(default)'}'"
         ))
@@ -279,7 +303,9 @@ class BrownfieldLayerAlgorithm(QgsProcessingAlgorithm):
 
         loaded = 0
         loaded += registry.load_ducts(
-            ducts, capacity_field=duct_cap_field or None, verify_field=verify_field or None
+            ducts, capacity_field=duct_cap_field or None,
+            capacity_used_field=duct_used_field or None,
+            verify_field=verify_field or None,
         )
         loaded += registry.load_chambers(
             chambers, verify_field=verify_field or None
@@ -288,7 +314,9 @@ class BrownfieldLayerAlgorithm(QgsProcessingAlgorithm):
             poles, verify_field=verify_field or None
         )
         loaded += registry.load_fibre(
-            fibre, capacity_field=fibre_cap_field or None, verify_field=verify_field or None
+            fibre, capacity_field=fibre_cap_field or None,
+            capacity_used_field=fibre_used_field or None,
+            verify_field=verify_field or None,
         )
         loaded += registry.load_cabinets(
             cabinets, capacity_field=cabinet_cap_field or None, verify_field=verify_field or None

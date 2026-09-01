@@ -65,6 +65,20 @@ class COMMON_FIELDS:
     HEIGHT_M = "HEIGHT_M"
     CABLE_CNT = "CABLE_CNT"
 
+    # Aerial drop trench / cable
+    AERIAL_TRENCH_ID = "AERIAL_TRENCH_ID"  # AT-0001
+    AERIAL_REASON = "AERIAL_REASON"        # why aerial was chosen
+    FROM_POLE = "FROM_POLE"                # PL-0001
+    TO_PREMISE = "TO_PREMISE"              # ADDR_ID
+
+    # Trench catalogue (used by multiple algorithms)
+    TRENCH_TYPE = "TRENCH_TYPE"            # Feeder | Distribution | Garden | Aerial_Drop
+    CONSTRUCTION_METHOD = "CONSTRUCTION_METHOD"  # Open Cut | Micro Trench | HDD | Overhead
+    FIBER_COUNT = "FIBER_COUNT"
+    POLE_SPACING_M = "POLE_SPACING_M"
+    CROSSINGS = "CROSSINGS"
+    PERMIT_REQUIRED = "PERMIT_REQUIRED"
+
 
 # Thin profile by output role (keep only what is needed operationally).
 THIN_PROFILES = {

@@ -30,6 +30,7 @@ class ALG:
     CABLE   = "hldplanning:06_cable_layer"
     CHAMBER = "hldplanning:07_chamber_layer"
     POLE    = "hldplanning:08_pole_layer"
+    AERIAL  = "hldplanning:09_aerial_drop_layer"
 
 # Vendor/customer profile keys that can be overridden per deployment
 class PROFILE_KEYS:

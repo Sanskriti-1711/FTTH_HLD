@@ -140,6 +140,7 @@ class AlgFeederDuctsNoSplit(QgsProcessingAlgorithm):
     INC_TRUNK= "INCLUDE_TRUNK"
     MAX_K    = "MAX_PDPS_PER_DUCT"
     ADD_STYLE= "ADD_STYLED_TO_PROJECT"
+    DEFAULT_MAX_PDPS_PER_DUCT = 4
 
     # Output
     O_DUCTS  = "OUT_FEEDER_DUCTS"  # (optional) rename to "Feeder_Duct" if you want OneClick auto-pickup
@@ -183,7 +184,7 @@ class AlgFeederDuctsNoSplit(QgsProcessingAlgorithm):
         ))
         self.addParameter(QgsProcessingParameterNumber(
             self.MAX_K, "Max PDPs per duct", QgsProcessingParameterNumber.Integer,
-            defaultValue=4, minValue=2, maxValue=16
+            defaultValue=self.DEFAULT_MAX_PDPS_PER_DUCT, minValue=2, maxValue=16
         ))
         self.addParameter(QgsProcessingParameterBoolean(
             self.ADD_STYLE, "Add categorized style (by color) to project", defaultValue=True
@@ -247,6 +248,9 @@ class AlgFeederDuctsNoSplit(QgsProcessingAlgorithm):
         f_pdp = (self.parameterAsString(p, self.F_PDPID, context) or "").strip()
         f_mfg = (self.parameterAsString(p, self.F_MFGID, context) or "").strip()
 
+        t_duct_total = _math.time() if hasattr(_math, "time") else None
+        import time as _time
+        t_duct_total = _time.time()
         snap_tol = float(self.parameterAsDouble(p, self.SNAP_TOL, context))
         node_tol = float(self.parameterAsDouble(p, self.NODE_TOL, context))
         end_eps  = float(self.parameterAsDouble(p, self.END_EPS,  context))
@@ -264,13 +268,18 @@ class AlgFeederDuctsNoSplit(QgsProcessingAlgorithm):
 
         crs = net.crs()
 
+        t0 = _time.time()
         net_fix = processing.run("native:fixgeometries",
                                  {"INPUT": net, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
                                  context=context, feedback=feedback)["OUTPUT"]
+        feedback.pushInfo(f"  [timing] Duct geometry fix: {_time.time() - t0:.3f}s")
+        t0 = _time.time()
         net_single = processing.run("native:multiparttosingleparts",
                                     {"INPUT": net_fix, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
                                     context=context, feedback=feedback)["OUTPUT"]
 
+        feedback.pushInfo(f"  [timing] Duct multipart split: {_time.time() - t0:.3f}s")
+        t0 = _time.time()
         try:
             inter_pts = processing.run("native:lineintersections",
                 {"INPUT": net_single, "INTERSECT": net_single, "INPUT_FIELDS": [], "INTERSECT_FIELDS": [], "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
@@ -280,9 +289,13 @@ class AlgFeederDuctsNoSplit(QgsProcessingAlgorithm):
                 {"INPUT": net_single, "INTERSECT": net_single, "INPUT_FIELDS": [], "INTERSECT_FIELDS": [], "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
                 context=context, feedback=feedback)["OUTPUT"]
 
+        feedback.pushInfo(f"  [timing] Duct line intersections: {_time.time() - t0:.3f}s")
+        t0 = _time.time()
         inter_pts = processing.run("native:deleteduplicategeometries",
                                    {"INPUT": inter_pts, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
                                    context=context, feedback=feedback)["OUTPUT"]
+        feedback.pushInfo(f"  [timing] Duct duplicate intersections: {_time.time() - t0:.3f}s")
+        feedback.pushInfo("  [timing] Feeder duct graph preparation complete")
 
         seg_index = QgsSpatialIndex(net_single.getFeatures())
         fid_to_geom, fid_to_len = {}, {}
@@ -322,6 +335,8 @@ class AlgFeederDuctsNoSplit(QgsProcessingAlgorithm):
                     fid_breaks[fid].append(d)
                     fid_break_xy[fid][d] = (pt.x(), pt.y())
 
+        feedback.pushInfo(f"  [timing] Duct graph indexing: {_time.time() - t0:.3f}s")
+        t0 = _time.time()
         # Snap MFG/PDP and register mid-segment breaks
         mfg_nodes, mfg_label = {}, {}
         for fm in mfg.getFeatures():
@@ -348,6 +363,8 @@ class AlgFeederDuctsNoSplit(QgsProcessingAlgorithm):
         if not mfg_nodes or not pdp_nodes:
             raise QgsProcessingException("No valid snapped MFG / PDP points found on the network.")
 
+        feedback.pushInfo(f"  [timing] Duct MFG/PDP snapping: {_time.time() - t0:.3f}s")
+        t0 = _time.time()
         # Build graph from split edges
         adj = defaultdict(list)
         edge_geom, edge_len = {}, {}
@@ -378,6 +395,8 @@ class AlgFeederDuctsNoSplit(QgsProcessingAlgorithm):
                 sub = geom_substring(geom, d0, d1)
                 add_edge(adj, edge_geom, edge_len, u, v, sub)
 
+        feedback.pushInfo(f"  [timing] Duct graph construction: {_time.time() - t0:.3f}s")
+        t0 = _time.time()
         # Label nodes by nearest MFG (multi-source Dijkstra front)
         label_dist = {}
         heap = []
@@ -406,6 +425,9 @@ class AlgFeederDuctsNoSplit(QgsProcessingAlgorithm):
         fields.append(QgsField("mfg_id",    QMetaType.Type.QString))
         fields.append(QgsField("pdp_ids",   QMetaType.Type.QString))
         fields.append(QgsField("pdp_count", QMetaType.Type.Int))
+        fields.append(QgsField("capacity_total", QMetaType.Type.Int))
+        fields.append(QgsField("capacity_used", QMetaType.Type.Int))
+        fields.append(QgsField("capacity_spare", QMetaType.Type.Int))
         fields.append(QgsField("part",      QMetaType.Type.QString))
         fields.append(QgsField("color",     QMetaType.Type.QString))
         fields.append(QgsField("edge_cnt",  QMetaType.Type.Int))
@@ -453,6 +475,9 @@ class AlgFeederDuctsNoSplit(QgsProcessingAlgorithm):
                     ft["mfg_id"]    = str(mfg_fid)
                     ft["pdp_ids"]   = ""
                     ft["pdp_count"] = 0
+                    ft["capacity_total"] = max_k
+                    ft["capacity_used"] = 0
+                    ft["capacity_spare"] = max_k
                     ft["part"]      = "trunk"
                     ft["color"]     = TRUNK_COLOR
                     ft["edge_cnt"]  = int(k)
@@ -508,6 +533,9 @@ class AlgFeederDuctsNoSplit(QgsProcessingAlgorithm):
                     fb["mfg_id"]    = str(mfg_fid)
                     fb["pdp_ids"]   = ",".join(sorted(str(pid) for pid in group))
                     fb["pdp_count"] = int(len(group))
+                    fb["capacity_total"] = max_k
+                    fb["capacity_used"] = int(len(group))
+                    fb["capacity_spare"] = max(0, max_k - len(group))
                     fb["part"]      = f"branch{bi}_duct{duct_idx}"
                     fb["color"]     = branch_color
                     fb["edge_cnt"]  = int(len(far_suf))
@@ -517,6 +545,7 @@ class AlgFeederDuctsNoSplit(QgsProcessingAlgorithm):
                     made += 1
                     duct_idx += 1
 
+        feedback.pushInfo(f"  [timing] Feeder duct routing/grouping: {_time.time() - t0:.3f}s")
         feedback.pushInfo(f"✅ Feeder ducts created: {made}")
         feedback.pushDebugInfo(f"Edges: {len(edge_geom)} Nodes: {len(adj)} MFGs: {len(mfg_nodes)} PDPs: {len(pdp_nodes)}")
 

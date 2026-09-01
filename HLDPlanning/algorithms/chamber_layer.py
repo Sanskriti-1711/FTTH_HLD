@@ -39,7 +39,8 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
     OUT_CHAMBERS = "OUT_CHAMBERS"
 
     JUNCTION_RADIUS_M = 1.5     # how close two DISTINCT ducts must pass to count as a junction
-    JUNCTION_SPACING_M = 20.0   # min spacing between junction-derived Manholes/Handholes
+    JUNCTION_SPACING_M = 80.0   # min spacing between junction-derived Manholes/Handholes
+    HANDHOLE_SPACING_M = 100.0  # wider spacing for handholes (Distribution-level)
     CHAMBER_SPACING_M = 2.0     # collapse chamber candidates closer than this
     CONN_RADIUS_M = 3.0         # ducts within this radius count as 'connected'
     TRENCH_JOIN_M = 3.0         # parent trench join tolerance
@@ -197,7 +198,7 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
         spacing = {
             "Chamber": self.CHAMBER_SPACING_M,
             "Manhole": self.JUNCTION_SPACING_M,
-            "Handhole": self.JUNCTION_SPACING_M,
+            "Handhole": self.HANDHOLE_SPACING_M,
         }
         ordered = sorted(candidates, key=lambda c: (-c[2], -c[5]))
         kept = []
@@ -286,6 +287,9 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
                 candidates.append((pt.x(), pt.y(), 3, "Chamber", pid, 999))
 
         # Manhole at used drill crossings (feeder access)
+        # Filter: skip crossings within 100m of an already-placed candidate
+        DRILL_DEDUP_M = 100.0
+        seen_drill = []
         if tangents is not None:
             for f in tangents.getFeatures():
                 g = f.geometry()
@@ -295,15 +299,25 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
                     pt = g.asPoint()
                 except Exception:
                     continue
-                candidates.append((pt.x(), pt.y(), 2, "Manhole", "", 999))
+                px, py = pt.x(), pt.y()
+                too_close = False
+                for sx, sy in seen_drill:
+                    if ((px - sx) ** 2 + (py - sy) ** 2) ** 0.5 < DRILL_DEDUP_M:
+                        too_close = True
+                        break
+                if not too_close:
+                    candidates.append((px, py, 2, "Manhole", "", 999))
+                    seen_drill.append((px, py))
 
-        # Manhole at feeder-duct junctions (distinct-duct rule)
+        # Manhole at feeder-duct junctions (≥3 distinct ducts required)
         for x, y, w in self._junction_points(feeder, self.JUNCTION_RADIUS_M):
-            candidates.append((x, y, 2, "Manhole", "", w))
+            if w >= 3:
+                candidates.append((x, y, 2, "Manhole", "", w))
 
-        # Handhole at distribution-duct junctions (distinct-duct rule)
+        # Handhole at distribution-duct junctions (>= 3 distinct ducts required)
         for x, y, w in self._junction_points(dist, self.JUNCTION_RADIUS_M):
-            candidates.append((x, y, 1, "Handhole", "", w))
+            if w >= 3:
+                candidates.append((x, y, 1, "Handhole", "", w))
 
         # ── collapse duplicates (highest priority, densest first) ────────
         kept = self._place_structures(candidates)

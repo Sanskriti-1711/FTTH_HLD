@@ -116,13 +116,14 @@ class BrownfieldEdge:
     """Represents an existing line asset as a graph edge for routing."""
     u: Tuple[float, float]       # start point (x, y) as hashable tuple
     v: Tuple[float, float]       # end point (x, y)
-    weight: float                # edge weight (low = preferred)
+    weight: float                # edge weight (0 = mandatory survey, 0.1 = preferred brownfield)
     asset_id: str                # registry asset id
     infra_type: str              # duct / fibre / trench
     geom: QgsGeometry            # original geometry for output
     capacity_total: int          # total sub-ducts / fibre strands
     capacity_used: int = 0       # currently consumed
     verify_status: str = VerifyStatus.ASSUMED
+    use_mode: str = ""           # 'survey' = mandatory (weight=0); '' = regular brownfield
 
 
 # ── Main Registry ───────────────────────────────────────────────────────────
@@ -189,8 +190,10 @@ class BrownfieldRegistry:
     def _load_layer(self, layer: QgsVectorLayer, asset_type: str,
                     capacity_field: Optional[str] = None,
                     capacity_default: int = 1,
+                    capacity_used_field: Optional[str] = None,
                     verify_field: Optional[str] = None,
-                    id_field: Optional[str] = None) -> int:
+                    id_field: Optional[str] = None,
+                    use_mode_field: Optional[str] = None) -> int:
         """
         Load features from a vector layer into the registry.
 
@@ -199,6 +202,8 @@ class BrownfieldRegistry:
             asset_type: One of AssetType.*
             capacity_field: Optional field name for capacity (total sub-ducts etc.)
             capacity_default: Default capacity when no field or value invalid
+            capacity_used_field: Optional field name for already-consumed capacity
+                (survey spare-capacity / occupancy). Defaults to 0 when absent.
             verify_field: Optional field name for verification status
             id_field: Optional field name for a user-supplied asset ID
 
@@ -238,6 +243,10 @@ class BrownfieldRegistry:
         if capacity_field and capacity_field.lower() in fields:
             cap_idx = fields[capacity_field.lower()][1]
 
+        cap_used_idx = -1
+        if capacity_used_field and capacity_used_field.lower() in fields:
+            cap_used_idx = fields[capacity_used_field.lower()][1]
+
         verify_idx = -1
         if verify_field and verify_field.lower() in fields:
             verify_idx = fields[verify_field.lower()][1]
@@ -245,6 +254,13 @@ class BrownfieldRegistry:
         id_idx = -1
         if id_field and id_field.lower() in fields:
             id_idx = fields[id_field.lower()][1]
+
+        # USE_MODE field: 'survey' = mandatory path; absent = regular brownfield.
+        use_mode_idx = -1
+        for candidate in (use_mode_field or "", "use_mode", "USE_MODE"):
+            if candidate and candidate.lower() in fields:
+                use_mode_idx = fields[candidate.lower()][1]
+                break
 
         count = 0
         verify_counts: Dict[str, int] = {}
@@ -263,7 +279,9 @@ class BrownfieldRegistry:
             if asset_id is None or asset_id in self._assets:
                 asset_id = self._make_id(asset_type)
 
-            # Capacity
+            # Capacity (total) + already-consumed capacity (spare/occupancy
+            # recorded by the survey engineer). Without a used-field the asset
+            # starts empty (capacity_used=0) exactly as before.
             capacity = capacity_default
             if cap_idx >= 0:
                 try:
@@ -272,18 +290,32 @@ class BrownfieldRegistry:
                     capacity = capacity_default
             capacity = max(1, capacity)
 
+            capacity_used = 0
+            if cap_used_idx >= 0:
+                try:
+                    capacity_used = int(feat[cap_used_idx])
+                except (ValueError, TypeError):
+                    capacity_used = 0
+            capacity_used = max(0, min(capacity_used, capacity))
+
             # Verification status
             verify_raw = feat[verify_idx] if verify_idx >= 0 else None
             verify_status = VerifyStatus.normalize(verify_raw)
 
             verify_counts[verify_status] = verify_counts.get(verify_status, 0) + 1
 
+            # USE_MODE: 'survey' = mandatory path (weight=0, forced);
+            # anything else or absent = regular brownfield (weight=0.1, preferred).
+            use_mode_raw = feat[use_mode_idx] if use_mode_idx >= 0 else None
+            use_mode = str(use_mode_raw).strip().lower() if use_mode_raw else ""
+
             self._assets[asset_id] = {
                 "asset_type": asset_type,
                 "geom": QgsGeometry(geom),
                 "capacity_total": capacity,
-                "capacity_used": 0,
+                "capacity_used": capacity_used,
                 "verify_status": verify_status,
+                "use_mode": use_mode,
                 "reused": False,
             }
             self._add_to_index(asset_id, geom)
@@ -308,12 +340,13 @@ class BrownfieldRegistry:
     def load_ducts(self, layer: QgsVectorLayer,
                    capacity_field: Optional[str] = None,
                    capacity_default: int = 2,
+                   capacity_used_field: Optional[str] = None,
                    verify_field: Optional[str] = None,
                    id_field: Optional[str] = None) -> int:
         """Load existing duct lines."""
         return self._load_layer(layer, AssetType.DUCT,
                                 capacity_field, capacity_default,
-                                verify_field, id_field)
+                                capacity_used_field, verify_field, id_field)
 
     def load_chambers(self, layer: QgsVectorLayer,
                       verify_field: Optional[str] = None,
@@ -334,12 +367,13 @@ class BrownfieldRegistry:
     def load_fibre(self, layer: QgsVectorLayer,
                    capacity_field: Optional[str] = None,
                    capacity_default: int = 12,
+                   capacity_used_field: Optional[str] = None,
                    verify_field: Optional[str] = None,
                    id_field: Optional[str] = None) -> int:
         """Load existing fibre lines."""
         return self._load_layer(layer, AssetType.FIBRE,
                                 capacity_field, capacity_default,
-                                verify_field, id_field)
+                                capacity_used_field, verify_field, id_field)
 
     def load_cabinets(self, layer: QgsVectorLayer,
                       capacity_field: Optional[str] = None,
@@ -349,7 +383,7 @@ class BrownfieldRegistry:
         """Load existing cabinet points (including PDP cabinets)."""
         return self._load_layer(layer, AssetType.CABINET,
                                 capacity_field, capacity_default,
-                                verify_field, id_field)
+                                None, verify_field, id_field)
 
     def load_trenches(self, layer: QgsVectorLayer,
                       verify_field: Optional[str] = None,
@@ -496,9 +530,16 @@ class BrownfieldRegistry:
         Yield BrownfieldEdge objects for all line-type assets,
         densified by step_m for graph insertion.
 
+        Two-tier weight model:
+        - **use_mode='survey'** → weight=0 (mandatory: the engineer's approved
+          path is the field truth; the routing algorithm MUST follow it)
+        - **regular brownfield** → weight=base_weight (preferred: existing
+          infrastructure is available but the algorithm may find a better path)
+
         Args:
             step_m: Densification distance in meters
-            base_weight: Base edge weight (low = preferred; new construction = 1.0)
+            base_weight: Base edge weight for regular brownfield (0.1, preferred;
+                         new construction = 1.0)
         """
         for asset_id, a in self._assets.items():
             if not AssetType.is_line(a["asset_type"]):
@@ -516,12 +557,17 @@ class BrownfieldRegistry:
             except Exception:
                 continue
 
-            weight = base_weight
-            # Scale weight by capacity utilisation: fuller assets are slightly
-            # less attractive (but still preferred over new construction)
-            if a["capacity_total"] > 0:
-                util = a["capacity_used"] / a["capacity_total"]
-                weight = base_weight + util * 0.3  # range: 0.1 - 0.4 (still << 1.0)
+            # ── Two-tier weight: survey = mandatory (0), brownfield = preferred ──
+            is_survey = a.get("use_mode") == "survey"
+            if is_survey:
+                weight = 0.0  # forced: Dijkstra always picks this
+            else:
+                weight = base_weight
+                # Scale weight by capacity utilisation: fuller assets are slightly
+                # less attractive (but still preferred over new construction)
+                if a["capacity_total"] > 0:
+                    util = a["capacity_used"] / a["capacity_total"]
+                    weight = base_weight + util * 0.3  # range: 0.1 - 0.4 (still << 1.0)
 
             for ln in lines:
                 for i in range(len(ln) - 1):
@@ -536,7 +582,20 @@ class BrownfieldRegistry:
                         capacity_total=a["capacity_total"],
                         capacity_used=a["capacity_used"],
                         verify_status=a["verify_status"],
+                        use_mode=a.get("use_mode", ""),
                     )
+
+    @property
+    def survey_asset_count(self) -> int:
+        """Count of line assets marked as mandatory survey paths."""
+        return sum(1 for a in self._assets.values()
+                   if AssetType.is_line(a["asset_type"]) and a.get("use_mode") == "survey")
+
+    @property
+    def brownfield_asset_count(self) -> int:
+        """Count of line assets that are regular (preferred) brownfield."""
+        return sum(1 for a in self._assets.values()
+                   if AssetType.is_line(a["asset_type"]) and a.get("use_mode") != "survey")
 
     # ── Classification ───────────────────────────────────────────────────
 
@@ -624,6 +683,11 @@ class BrownfieldRegistry:
         nearest pre-existing graph node within that many metres, so corridors
         offset from the road network (survey GPS error, drawing offsets) are
         still reused during routing.
+
+        Two-tier model:
+        - survey (USE_MODE=survey): weight=0, mandatory — algorithm MUST follow
+        - brownfield (default): weight=0.1, preferred — algorithm may choose
+
         Returns number of edges added.
         """
         from ..utils.graph_ops import add_brownfield_edges_to_graph as _add_bf_edges
@@ -660,6 +724,8 @@ class BrownfieldRegistry:
         lines = [
             f"BrownfieldRegistry: {self.asset_count} assets "
             f"({self.line_asset_count} lines, {self.point_asset_count} points)",
+            f"  survey (mandatory, weight=0): {self.survey_asset_count} lines",
+            f"  brownfield (preferred, weight=0.1): {self.brownfield_asset_count} lines",
         ]
         for asset_type in [AssetType.DUCT, AssetType.TRENCH, AssetType.FIBRE,
                            AssetType.CHAMBER, AssetType.POLE, AssetType.CABINET,

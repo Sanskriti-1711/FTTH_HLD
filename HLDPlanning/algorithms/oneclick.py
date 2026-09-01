@@ -157,6 +157,8 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
     P_TR_ROADS = "TRENCH_ROADS"
     P_BUILDINGS = "BUILDINGS"
     P_TR_MFG = "TRENCH_MFG"
+    P_PREMISES = "PREMISES"
+    P_SPACING = "POLE_SPACING"
 
     OUT_OBJECTS = "OUT_OBJECTS"
     OUT_POLYGONS = "OUT_POLYGONS"
@@ -179,6 +181,8 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
     P_AERIAL_ZONES = "AERIAL_ZONES"
     OUT_CHAMBERS = "OUT_CHAMBERS"
     OUT_POLES = "OUT_POLES"
+    OUT_AERIAL_TRENCHES = "OUT_AERIAL_TRENCHES"
+    OUT_AERIAL_CABLE = "OUT_AERIAL_CABLE"
 
     _DEFAULT_OUTPUT_FILES = {
         OUT_BROWNFIELD: "Existing_Infrastructure.gpkg",
@@ -197,6 +201,8 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         OUT_DROP_DUCTS: "Drop_Ducts.gpkg",
         OUT_CHAMBERS: "Chambers.gpkg",
         OUT_POLES: "Poles.gpkg",
+        OUT_AERIAL_TRENCHES: "Aerial_Drop_Trenches.gpkg",
+        OUT_AERIAL_CABLE: "Aerial_Cable.gpkg",
     }
 
     _OBJ_EXCEL, _OBJ_SHEET, _OBJ_EMAIL = "EXCEL", "SHEET", "EMAIL"
@@ -492,6 +498,18 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             self.tr("07 Civil — Aerial Zones [polygons] (blank = no poles planned)"),
             [QgsProcessing.TypeVectorPolygon], optional=True
         ))
+        self.addParameter(QgsProcessingParameterVectorLayer(
+            self.P_PREMISES,
+            self.tr("08b Aerial — Premises with aerial_required flag [points]"),
+            [QgsProcessing.TypeVectorPoint], optional=True
+        ))
+        self.addParameter(QgsProcessingParameterNumber(
+            self.P_SPACING,
+            self.tr("08b Aerial — Pole spacing [m]"),
+            type=QgsProcessingParameterNumber.Double,
+            defaultValue=50.0,
+            minValue=10.0,
+        ))
 
         self.addParameter(QgsProcessingParameterFeatureSink(
             self.OUT_OBJECTS, self.tr("Object Layer"),
@@ -552,6 +570,14 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(QgsProcessingParameterFeatureSink(
             self.OUT_POLES,            self.tr("Civil - Poles (aerial zones)"),
             QgsProcessing.TypeVectorPoint, optional=True, createByDefault=True
+        ))
+        self.addParameter(QgsProcessingParameterFeatureSink(
+            self.OUT_AERIAL_TRENCHES,  self.tr("Civil - Aerial Drop Trenches"),
+            QgsProcessing.TypeVectorLine, optional=True, createByDefault=True
+        ))
+        self.addParameter(QgsProcessingParameterFeatureSink(
+            self.OUT_AERIAL_CABLE,     self.tr("Cables - Aerial Drop"),
+            QgsProcessing.TypeVectorLine, optional=True, createByDefault=True
         ))
 
         self.addOutput(QgsProcessingOutputFile(
@@ -895,8 +921,11 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
                               is_child_algorithm=True)
 
     def run_pole_layer(self, parameters, results, context, feedback):
-        """Stage 8: plan aerial poles inside user-supplied aerial zones."""
+        """Stage 8: plan aerial poles inside user-supplied aerial zones.
+        Opt-in: without valid aerial zones there is nothing to plan."""
         zones = self.parameterAsVectorLayer(parameters, self.P_AERIAL_ZONES, context)
+        if zones is None or not zones.isValid() or zones.featureCount() == 0:
+            return None
         params = {
             "INPUT_GARDEN_TRENCHES": results.get("garden"),
             "INPUT_AERIAL_ZONES": zones,
@@ -905,6 +934,29 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             "OUT_POLES": self._dest(parameters, self.OUT_POLES, context),
         }
         return processing.run(ALG.POLE, params, context=context, feedback=feedback,
+                              is_child_algorithm=True)
+
+    def run_aerial_drop_layer(self, parameters, results, context, feedback):
+        """Stage 8b: route aerial drop trenches from poles to flagged premises.
+        Opt-in: without aerial zones (or poles) there is nothing to route."""
+        premises = self.parameterAsVectorLayer(parameters, self.P_PREMISES, context)
+        poles = results.get("poles")
+        bf_poles = self.parameterAsVectorLayer(parameters, self.P_BF_POLES, context)
+        zones = self.parameterAsVectorLayer(parameters, self.P_AERIAL_ZONES, context)
+        roads = self.parameterAsVectorLayer(parameters, self.P_TR_ROADS, context)
+        if zones is None or not zones.isValid() or zones.featureCount() == 0:
+            return None
+        params = {
+            "INPUT_PREMISES": premises,
+            "INPUT_POLES": poles,
+            "INPUT_AERIAL_ZONES": zones,
+            "INPUT_ROADS": roads,
+            "INPUT_BF_POLES": bf_poles,
+            "POLE_SPACING_M": self.parameterAsDouble(parameters, self.P_SPACING, context),
+            "OUT_AERIAL_TRENCH": self._dest(parameters, self.OUT_AERIAL_TRENCHES, context),
+            "OUT_AERIAL_CABLE": self._dest(parameters, self.OUT_AERIAL_CABLE, context),
+        }
+        return processing.run(ALG.AERIAL, params, context=context, feedback=feedback,
                               is_child_algorithm=True)
 
     def _preflight_cable(self, results, context, feedback):
@@ -1135,6 +1187,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         results = {}
         steps = QgsProcessingMultiStepFeedback(9, feedback)
         out_dir = self._output_dir(parameters, context)
+        feedback.pushInfo(self.tr("[timing] Pipeline started (output_dir=%s)" % (out_dir or "memory")))
 
         # --- Stage 0: Brownfield (Existing Infrastructure) ---
         self._run_stage_brownfield(parameters, context, steps, feedback, results, out_dir)
@@ -1171,8 +1224,10 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         n_poly = self._fast_count(results["polygons"], context)
         fc_str = "{} features, ".format(n_poly) if n_poly is not None else ""
         feedback.pushInfo(self.tr("  [timing] Polygon Layer: {}{:.3f}s".format(fc_str, elapsed)))
+        t_save = time.time()
         results["polygons"] = self._save_layer_to_gpkg(
             results["polygons"], "Polygons.gpkg", out_dir, context, feedback)
+        feedback.pushInfo(self.tr("  [timing] Polygon output save: {:.3f}s".format(time.time() - t_save)))
 
         if feedback.isCanceled():
             return {}
@@ -1228,8 +1283,10 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
                     "MFG point override' or check the Network stage log."
                 )
             ))
+        t_save = time.time()
         results["mfg"] = self._save_layer_to_gpkg(
             results["mfg"], "MFG.gpkg", out_dir, context, feedback)
+        feedback.pushInfo(self.tr("  [timing] Network output saves: {:.3f}s".format(time.time() - t_save)))
 
         if feedback.isCanceled():
             return {}
@@ -1351,28 +1408,69 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
 
         if feedback.isCanceled():
             return {}
-        # --- Pole Layer (aerial zones only) ---
-        steps.setCurrentStep(8)
-        feedback.pushInfo(self.tr("[99%] Running Pole Layer"))
-        t0 = time.time()
-        poles = self._run("Pole Layer", self.run_pole_layer,
-                          parameters, context, steps, feedback, results=results)
-        results["poles"] = poles.get("OUT_POLES") if poles else None
-        elapsed = time.time() - t0
-        n_po = self._fast_count(results.get("poles"), context)
-        fc_str = "{} features, ".format(n_po) if n_po is not None else ""
-        feedback.pushInfo(self.tr("  [timing] Pole Layer: {}{:.3f}s".format(fc_str, elapsed)))
-        if results.get("poles"):
-            results["poles"] = self._save_layer_to_gpkg(
-                results["poles"], "Poles.gpkg", out_dir, context, feedback)
+        # --- Pole + Aerial Drop stages: OPT-IN (aerial zones requested) ---
+        # Aerial conversion is exception-based per the planning document and
+        # ONLY runs when the engineer/planner explicitly supplies aerial
+        # zones (or flags premises for aerial). Without zones the pipeline
+        # skips both stages and every drop stays buried UG — identical to
+        # the pre-aerial pipeline behaviour.
+        zones = self.parameterAsVectorLayer(parameters, self.P_AERIAL_ZONES, context)
+        aerial_requested = zones is not None and zones.isValid() and zones.featureCount() > 0
+        if not aerial_requested:
+            feedback.pushInfo(self.tr(
+                "  [info] Aerial zones not supplied — Pole/Aerial Drop stages skipped (all drops remain buried UG)."
+            ))
+            results["poles"] = None
+            results["aerial_trench"] = None
+            results["aerial_cable"] = None
+        else:
+            # --- Pole Layer (aerial zones only) ---
+            steps.setCurrentStep(8)
+            feedback.pushInfo(self.tr("[99%] Running Pole Layer"))
+            t0 = time.time()
+            poles = self._run("Pole Layer", self.run_pole_layer,
+                              parameters, context, steps, feedback, results=results)
+            results["poles"] = poles.get("OUT_POLES") if poles else None
+            elapsed = time.time() - t0
+            n_po = self._fast_count(results.get("poles"), context)
+            fc_str = "{} features, ".format(n_po) if n_po is not None else ""
+            feedback.pushInfo(self.tr("  [timing] Pole Layer: {}{:.3f}s".format(fc_str, elapsed)))
+            if results.get("poles"):
+                results["poles"] = self._save_layer_to_gpkg(
+                    results["poles"], "Poles.gpkg", out_dir, context, feedback)
+
+            # --- Aerial Drop Layer (pole-to-premise for flagged drops) ---
+            if feedback.isCanceled():
+                return {}
+            steps.setCurrentStep(9)
+            feedback.pushInfo(self.tr("[99.5%] Running Aerial Drop Layer"))
+            t0 = time.time()
+            aerial = self._run("Aerial Drop Layer", self.run_aerial_drop_layer,
+                               parameters, context, steps, feedback, results=results)
+            results["aerial_trench"] = aerial.get("OUT_AERIAL_TRENCH") if aerial else None
+            results["aerial_cable"] = aerial.get("OUT_AERIAL_CABLE") if aerial else None
+            elapsed = time.time() - t0
+            n_at = self._fast_count(results.get("aerial_trench"), context)
+            fc_str = "{} features, ".format(n_at) if n_at is not None else ""
+            feedback.pushInfo(self.tr("  [timing] Aerial Drop Layer: {}{:.3f}s".format(fc_str, elapsed)))
+            if results.get("aerial_trench"):
+                results["aerial_trench"] = self._save_layer_to_gpkg(
+                    results["aerial_trench"], "Aerial_Drop_Trenches.gpkg", out_dir, context, feedback)
+            if results.get("aerial_cable"):
+                results["aerial_cable"] = self._save_layer_to_gpkg(
+                    results["aerial_cable"], "Aerial_Cable.gpkg", out_dir, context, feedback)
 
         # --- HLD_attr catalogue enrichment (in place on the saved GPKGs) ---
         if out_dir:
+            t_enrich = time.time()
             try:
                 attr_enrich.enrich_all(out_dir, feedback)
             except Exception as exc:
                 feedback.pushWarning(
                     self.tr("Catalogue enrichment failed: %s") % exc)
+            feedback.pushInfo(self.tr(
+                "  [timing] Attribute enrichment: {:.3f}s".format(time.time() - t_enrich)
+            ))
 
         feedback.pushInfo(self.tr(
             "[timing] Total pipeline: {:.3f}s".format(time.time() - t_pipeline)
@@ -1424,6 +1522,8 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         put(self.OUT_DROP_DUCTS, ducts.get(self._DU_OUT_DROP))
         put(self.OUT_CHAMBERS, results.get("chambers"))
         put(self.OUT_POLES, results.get("poles"))
+        put(self.OUT_AERIAL_TRENCHES, results.get("aerial_trench"))
+        put(self.OUT_AERIAL_CABLE, results.get("aerial_cable"))
 
         return out
 
@@ -1598,6 +1698,8 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             self.OUT_DROP_DUCTS:   ("Ducts", "Drop", 2),
             self.OUT_CHAMBERS:     ("Civil", "Chambers", 0),
             self.OUT_POLES:        ("Civil", "Poles", 1),
+            self.OUT_AERIAL_TRENCHES: ("Civil", "Aerial Drops", 2),
+            self.OUT_AERIAL_CABLE:    ("Cables", "Aerial Drop", 2),
         }
 
         # Ordered group list (top-to-bottom in the legend)
@@ -1620,6 +1722,8 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             self.OUT_DROP_DUCTS:     "#00838f",  # dark cyan
             self.OUT_CHAMBERS:       "#757575",  # grey
             self.OUT_POLES:          "#795548",  # brown
+            self.OUT_AERIAL_TRENCHES: "#ad1457",  # deep pink
+            self.OUT_AERIAL_CABLE:    "#6a1b9a",  # purple
         }
 
         # ---- helpers --------------------------------------------------------

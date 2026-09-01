@@ -64,6 +64,87 @@ from ..utils.projection_utils import reproject_to
 def _tr(s: str) -> str:
     return QCoreApplication.translate("TrenchLayer", s)
 
+
+# ---- Aerial feasibility evaluation -----------------------------------------
+# Used inside the garden-trench loop to decide whether a premise's drop
+# connection should be built underground or flagged for aerial routing.
+# ---------------------------------------------------------------------------
+
+_AERIAL_BARRIER_CLASSES = {
+    "motorway", "trunk", "primary", "secondary",
+    "motorway_link", "trunk_link", "primary_link", "secondary_link",
+}
+
+_AERIAL_TERRAIN_TYPES = {
+    "rock", "rocky", "scree", "boulder",
+    "water", "wetland", "marsh", "swamp", "flood",
+    "canal", "ditch",
+}
+
+# Default max economical UG drop distance (metres).  Rural projects can
+# increase this via the algorithm parameter MAX_UG_DROP_M.
+_MAX_UG_DROP_M_DEFAULT = 300.0
+
+
+def _approx_meters(a, b):
+    """Equirectangular approximation in metres."""
+    dx = (b.x() - a.x()) * 111_320.0 * max(0.1, math.cos(math.radians((a.y() + b.y()) / 2)))
+    dy = (b.y() - a.y()) * 111_320.0
+    return (dx * dx + dy * dy) ** 0.5
+
+
+def _eval_drop_feasibility(
+    premise_pt: QgsPointXY,
+    network_geoms: List[QgsGeometry],
+    barrier_geoms: List[QgsGeometry],
+    road_class_at_pt: Optional[str],
+    terrain_at_pt: Optional[str],
+    has_spare_duct: bool,
+    max_ug_drop_m: float = _MAX_UG_DROP_M_DEFAULT,
+) -> Tuple[bool, str]:
+    """Evaluate whether a buried drop is feasible for a premise.
+
+    Returns (buried_ok, reason).  ``reason`` is one of:
+      - ``ug_default``                    — buried is fine
+      - ``spare_duct_available``          — spare brownfield duct exists
+      - ``distance_threshold``            — too far for economical UG
+      - ``prohibited_crossing``           — barrier / restricted road
+      - ``major_road_crossing``           — expensive restoration
+      - ``terrain_constraint``            — rocky / waterlogged / protected
+      - ``no_duct_no_pole_ug_required``   — no duct and no aerial option
+    """
+    # 1. Existing spare duct → buried preferred
+    if has_spare_duct:
+        return (True, "spare_duct_available")
+
+    # 2. Distance to nearest network point
+    if network_geoms:
+        best_d = min(
+            _approx_meters(premise_pt, g.nearestPoint(QgsGeometry.fromPointXY(premise_pt)).asPoint())
+            for g in network_geoms
+        )
+        if best_d > max_ug_drop_m:
+            return (False, "distance_threshold")
+
+    # 3. Barrier crossing check
+    if barrier_geoms:
+        for bg in barrier_geoms:
+            buf = bg.buffer(5.0, 5)
+            for ng in network_geoms:
+                if buf.intersects(ng):
+                    return (False, "prohibited_crossing")
+
+    # 4. Major road type → expensive restoration
+    if road_class_at_pt and road_class_at_pt.lower() in _AERIAL_BARRIER_CLASSES:
+        return (False, "major_road_crossing")
+
+    # 5. Terrain constraint
+    if terrain_at_pt and terrain_at_pt.lower() in _AERIAL_TERRAIN_TYPES:
+        return (False, "terrain_constraint")
+
+    return (True, "ug_default")
+
+
 # ---- trench-specific helpers (keep local here)
 def _dir_on_line_near_point(line_geom: QgsGeometry, pt: QgsPointXY):
     """Unit direction vector of nearest segment to point."""
@@ -151,6 +232,10 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
     # Field params
     P_PDP_ID = "PDP_ID_FIELD"
     P_HH_ID  = "HH_ID_FIELD"
+    # Aerial-drop integration (Stage 08b). Only consulted when the pipeline
+    # explicitly passes INPUT_AERIAL_ZONES; absent otherwise so existing runs
+    # keep burying long-drop garden trenches exactly as before.
+    P_AERIAL_ZONES = "INPUT_AERIAL_ZONES"
     P_HH_PDP = "HH_PDP_FIELD"       # Households: PDP ID field (optional, for strict Distribution)
     P_HH_HHS = "HH_HHS_FIELD"       # optional: household size/count
 
@@ -1403,9 +1488,12 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                         connect_tol=bf_connect
                     )
                     if bf_edges_added > 0:
+                        survey_n = bf_reg.survey_asset_count
+                        bf_n = bf_reg.brownfield_asset_count
                         feedback.pushInfo(
-                            f"Brownfield: {bf_edges_added} existing duct/trench edges "
-                            f"added to routing graph (weight=0.1x, "
+                            f"Brownfield: {bf_edges_added} edges added to routing graph "
+                            f"({survey_n} survey/mandatory weight=0, "
+                            f"{bf_n} brownfield/preferred weight=0.1x, "
                             f"connect ≤ {bf_connect:g} m)."
                         )
             except Exception as exc:
@@ -1830,6 +1918,29 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
 
                 if best_pt is None:
                     continue
+
+                # --- Aerial feasibility check (Stage 08b integration) ---
+                # Only active when the pipeline explicitly supplies aerial
+                # zones. Without them this block is a no-op, so existing
+                # HLD/LLD runs keep burying long-drop garden trenches exactly
+                # as before (no behavioral change).
+                if self.P_AERIAL_ZONES in p:
+                    aerial_zones = self.parameterAsVectorLayer(p, self.P_AERIAL_ZONES, context)
+                    if aerial_zones is not None and aerial_zones.isValid() and aerial_zones.featureCount() > 0:
+                        drop_dist_m = _approx_meters(hpt, best_pt)
+                        if drop_dist_m > _MAX_UG_DROP_M_DEFAULT:
+                            in_aerial_zone = False
+                            for zf in aerial_zones.getFeatures():
+                                zg = zf.geometry()
+                                if zg and not zg.isEmpty() and zg.contains(QgsGeometry.fromPointXY(hpt)):
+                                    in_aerial_zone = True
+                                    break
+                            if in_aerial_zone:
+                                feedback.pushInfo(
+                                    f"Premise {str(hf.id())}: drop distance {drop_dist_m:.0f}m "
+                                    f"exceeds {_MAX_UG_DROP_M_DEFAULT}m — flagged for aerial."
+                                )
+                                continue  # skip buried garden trench; Stage 08b will route aerial
 
                 addr_val = str(hf[addr_field]) if addr_field and hf[addr_field] is not None else str(hf.id())
                 hhs_val  = str(hf[hh_hhs_field]) if (hh_hhs_field and hh_hhs_field in hh_names and hf[hh_hhs_field] is not None) else None
@@ -2512,6 +2623,13 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                                     pass  # classification must never block output
                         if not bf_matched:
                             nf["INFRA_STATUS"] = "Proposed"
+
+                        # HDD classification: drill crossings (method=nearest)
+                        # are Horizontal Directional Drilling road crossings.
+                        method_val = str(f["method"] if "method" in merged_final.fields().names() else "").lower()
+                        if method_val == "nearest" or (not method_val and nf.geometry() and nf.geometry().length() < 65):
+                            nf["trench_type"] = "HDD"
+
                         sinkFinal.addFeature(nf)
                         written += 1
                     feedback.pushInfo(f"✅ Final_Trenches layer written with {written} features (incl. POLYGON_ID/PDP_ID).")

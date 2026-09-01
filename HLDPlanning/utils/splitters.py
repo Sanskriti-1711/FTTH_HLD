@@ -54,15 +54,26 @@ def plan_splitters(hh, sizes=SPLITTER_SIZES, util_min=SPLIT_UTIL_MIN, util_max=S
                 cnt[p] = cnt[p - s] + 1
                 pick[p] = s
 
-    # Rank reachable port totals >= lo: prefer utilisation inside [min, max],
-    # then fewest splitters, then tightest fit (fewest ports).
+    # Rank by practical HH fit, not only minimum module count.  This keeps
+    # small serving areas on 1:8/1:16 and prefers multiple 1:32 modules over
+    # an oversized 1:64 whenever the smaller plan has a tighter fit.
     best = None
     for P in range(lo, hi + 1):
         if cnt[P] >= INF:
             continue
         util = 100.0 * hh / P
-        in_band = 0 if (util_min <= util <= util_max) else 1   # 0 sorts first
-        key = (in_band, cnt[P], P)
+        in_band = 0 if (util_min <= util <= util_max) else 1
+        sizes_used = []
+        remaining = P
+        while remaining > 0:
+            choices = [s for s in sizes if s <= remaining and cnt[remaining - s] + 1 == cnt[remaining]]
+            if not choices:
+                break
+            s = min(choices)
+            sizes_used.append(s)
+            remaining -= s
+        largest = max(sizes_used) if sizes_used else max(sizes)
+        key = (in_band, P - hh, largest, cnt[P], P)
         if best is None or key < best[0]:
             best = (key, P)
 

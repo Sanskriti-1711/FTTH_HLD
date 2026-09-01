@@ -50,10 +50,13 @@ LAYER_TABLES: Dict[str, str] = {
     "distribution_cable": "cable_layer",
     "feeder_ducts": "duct_layer",
     "distribution_ducts": "duct_layer",
+    "drop_ducts": "duct_layer",
     "trenches": "trench_layer",
     "chambers": "chambers",
     "poles": "poles",
     "brownfield": "brownfield",
+    "aerial_drop_trenches": "aerial_drop_trench_layer",
+    "aerial_trenches": "aerial_drop_trench_layer",
     # Backward-compatible aliases
     "object": "object_layer",
     "object_layer": "object_layer",
@@ -90,6 +93,7 @@ TABLE_TO_PUBLIC_NAME = {
     "chambers": "chambers",
     "poles": "poles",
     "brownfield": "brownfield",
+    "aerial_drop_trench_layer": "aerial_drop_trenches",
 }
 
 _TABLES = tuple(TABLE_TO_PUBLIC_NAME.keys())
@@ -594,7 +598,8 @@ def load_geojson_file(
 def get_layer_geojson(
     project_id: str, layer: str
 ) -> Optional[Dict[str, Any]]:
-    table = normalize_layer_name(layer)
+    requested_layer = (layer or "").strip().lower().replace("-", "_")
+    table = normalize_layer_name(requested_layer)
     conn = get_conn()
     with conn.cursor() as cur:
         # Table may not exist on DBs created before a layer was added
@@ -617,9 +622,16 @@ def get_layer_geojson(
                 )
                 FROM {table}
                 WHERE project_id = %s
+                  AND (
+                    %s NOT IN ('cable_layer', 'duct_layer')
+                    OR properties->>'STAGE' = %s
+                    OR properties->>'stage' = %s
+                    OR properties->>'DUCT_TYPE' = %s
+                    OR properties->>'duct_type' = %s
+                  )
                 """
             ).format(table=_gis_ident(table)),
-            (project_id,),
+            (project_id, table, requested_layer, requested_layer, requested_layer, requested_layer),
         )
         row = cur.fetchone()
     if not row or row[0] is None:
@@ -724,6 +736,13 @@ def delete_project(project_id: str) -> None:
     """
     conn = get_conn()
     with conn.cursor() as cur:
+        # Django-owned HLD layer metadata references ftth_projects without
+        # ON DELETE CASCADE. Remove those rows before deleting the project;
+        # spatial GIS rows are cleared separately by clear_project_layers().
+        cur.execute(
+            "DELETE FROM business.ftth_hld_layers WHERE ftth_project_id = %s",
+            (project_id,),
+        )
         cur.execute(
             sql.SQL("DELETE FROM {projects} WHERE project_id = %s").format(
                 projects=_biz_ident("ftth_projects")

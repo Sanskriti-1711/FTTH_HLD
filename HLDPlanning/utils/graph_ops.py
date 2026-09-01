@@ -61,6 +61,8 @@ def add_brownfield_edges_to_graph(G, registry, step_m: float, eps_val: float, qk
         Number of brownfield segment edges added (connectors are not counted).
     """
     count = 0
+    survey_count = 0  # mandatory survey paths (weight=0)
+    brownfield_count = 0  # preferred brownfield (weight=0.1)
 
     # Coarse spatial index of the graph nodes that exist BEFORE injection, so
     # connector edges only ever link to real graph nodes (sidewalks/tangents)
@@ -107,6 +109,10 @@ def add_brownfield_edges_to_graph(G, registry, step_m: float, eps_val: float, qk
                    has_capacity=True,
                    verify_status=edge.verify_status)
         count += 1
+        if edge.use_mode == "survey":
+            survey_count += 1
+        else:
+            brownfield_count += 1
 
         # Bridge this segment's endpoints to the nearest pre-existing graph
         # node within connect_tol so slightly-offset corridors get reused.
@@ -120,7 +126,10 @@ def add_brownfield_edges_to_graph(G, registry, step_m: float, eps_val: float, qk
                 if target is None:
                     continue
                 cdist = math.hypot(pt[0] - target[0], pt[1] - target[1])
-                G.add_edge(key, target, weight=base_weight * cdist)
+                # Survey mandatory paths get zero-weight connectors so the
+                # algorithm can enter/exit the forced corridor freely.
+                conn_weight = 0.0 if edge.use_mode == "survey" else base_weight * cdist
+                G.add_edge(key, target, weight=conn_weight)
     return count
 
 def snap_to_nodes(pt: QgsPointXY, nodes, max_dist: float):
