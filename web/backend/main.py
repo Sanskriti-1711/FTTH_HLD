@@ -774,9 +774,10 @@ LLD_LAYER_ORDER = [
     "objects", "polygons", "pdps", "mfg",
     "final_trenches", "feeder_trench", "distribution_trench",
     "drill_trench",
-    "feeder_cable", "distribution_cable",
+    "feeder_cable", "distribution_cable", "aerial_cable",
     "feeder_ducts", "distribution_ducts", "drop_ducts",
     "chambers", "poles",
+    "aerial_drop_trenches",
     "existing_infrastructure", "existing_infrastructure_points",
     "brownfield",
 ]
@@ -908,9 +909,32 @@ DUCT_LAYERS = {"feeder_ducts", "distribution_ducts", "drop_ducts"}
 # distribution cable → distribution ducts). Drop ducts serve premises only.
 CABLE_TO_DUCT = {"feeder_cable": "feeder_ducts", "distribution_cable": "distribution_ducts"}
 
+# LLD distribution-cable capacity contract. The physical catalogue remains
+# unchanged; these fields describe grouped HH usage and reserve two fibres.
+LLD_DISTRIBUTION_FIBERS = 48
+LLD_RESERVED_SPARE_FIBERS = 2
+# One feeder duct may serve up to four PDPs; this is the enforced capacity
+# contract used by both verify and full-replan output enrichment.
+LLD_MAX_PDPS_PER_DUCT = 4
+
 # Coverage / creation tolerance in degrees (~50 m). Must stay consistent with
 # the network-connectivity tolerance used by _validate_network().
 LLD_COVERAGE_TOL = 0.0005
+
+# Reroute detection tolerance in degrees (~1 m). A reroute is a deliberate
+# change of the engineer's chosen path — even a small nudge (a few metres)
+# must be detected and propagated. The coverage tolerance (50 m) is far too
+# coarse for this: a 10 m reroute would look "unchanged" and the duct/cable
+# would stay on the old route.
+LLD_REROUTE_TOL = 1e-5
+
+# Relay/ride tolerance in degrees (~8 m at Berlin latitude). A dependent line
+# "rides on" the moved region when its vertices are within this distance of
+# the old path — co-located corridor lines (a duct drawn a few metres beside
+# its trench) still count as riding it and must follow the reroute. Matches
+# the survey app's 8 m co-location tolerance so app-side and engine-side
+# propagation agree.
+LLD_RELAY_TOL = 1e-4
 
 
 def _seg_point_dist(p: Any, a: Any, b: Any) -> float:
@@ -1067,6 +1091,248 @@ def _propagate_support_layers(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict
     return created
 
 
+# Reroute propagation — an approved survey reroute of ANY corridor line
+# (trench, duct or cable) REPLACES the old path for the rerouted region: the
+# LLD must never keep both paths. The whole corridor follows — every other
+# line layer (feeder / distribution / drop, trench / duct / cable) that rides
+# on the changed region is re-laid onto the new path THERE ONLY; vertices
+# outside the changed region (shared endpoints, parts running on other
+# unchanged lines) stay exactly where they are. This mirrors the survey app's
+# bundle-reroute propagation (Plan B: app + engine both amend), so the engine
+# works correctly with any survey dataset, even one where only a single layer
+# was re-drawn.
+#
+# "Editing the layers altogether": reroute the feeder -> distribution and
+# garden (drop) riding that region follow; reroute a cable -> the trench and
+# ducts under it follow. Already-approved features are never re-laid (the
+# engineer's own re-draw wins).
+# ---------------------------------------------------------------------------
+CORRIDOR_LINE_LAYERS = sorted(
+    set(TRENCH_LAYERS) | set(DUCT_LAYERS) | set(CABLE_LAYERS)
+)
+
+
+def _nearest_point_on_path(p: Any, path: List[Any]) -> List[float]:
+    """Project ``p`` onto the nearest segment of ``path`` (Euclidean)."""
+    best = [p[0], p[1]]
+    best_d = float("inf")
+    for a, b in zip(path, path[1:]):
+        ax, ay = a[0], a[1]
+        bx, by = b[0], b[1]
+        dx, dy = bx - ax, by - ay
+        seg2 = dx * dx + dy * dy
+        if seg2 == 0:
+            q = (ax, ay)
+        else:
+            t = ((p[0] - ax) * dx + (p[1] - ay) * dy) / seg2
+            t = max(0.0, min(1.0, t))
+            q = (ax + t * dx, ay + t * dy)
+        d = ((p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2) ** 0.5
+        if d < best_d:
+            best_d = d
+            best = [q[0], q[1]]
+    return best
+
+
+def _point_near_segments(p: Any, index: Dict[Tuple[int, int], List[Any]], cell: float, tol: float) -> bool:
+    """True when ``p`` lies within ``tol`` of any segment in the grid index."""
+    kx, ky = int(p[0] / cell), int(p[1] / cell)
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for a, b in index.get((kx + dx, ky + dy), []):
+                if _seg_point_dist(p, a, b) <= tol:
+                    return True
+    return False
+
+
+def _relay_dependents(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, int]:
+    """Re-lay the rerouted REGION of every other corridor line layer onto the
+    rerouted line — the whole corridor follows any reroute (trench -> ducts
+    + cables; feeder -> distribution + drop; cable -> trench + ducts). Only
+    the moved region moves; shared endpoints and parts on other (unmoved)
+    lines stay exactly where they are. Returns counts per relayed layer."""
+    relayed: Dict[str, int] = {}
+
+    # Approved-changed lines whose geometry genuinely differs from the BEFORE
+    # state. The before/after pair is carried INSIDE the approved dataset (the
+    # survey change's own frozen original_geometry) — never a live HLD lookup.
+    changed: List[Tuple[str, List[Any], List[Any]]] = []
+    for layer, feats in by_layer.items():
+        for f in feats:
+            props = f.get("properties") or {}
+            if not props.get("approved"):
+                continue
+            orig_lines = _line_strings(props.get("original_geometry"))
+            cur_lines = _line_strings(f.get("geometry"))
+            if not orig_lines or not cur_lines:
+                continue
+            if orig_lines == cur_lines:
+                continue
+            changed.append((layer, orig_lines[0], cur_lines[0]))
+
+    # Trenches re-lay first so their ducts/cables follow the trench; then a
+    # rerouted duct re-lays its cable onto the duct; a rerouted cable re-lays
+    # the trench/ducts under it (physical precedence: cable rides in the
+    # duct, duct rides in the trench).
+    changed.sort(
+        key=lambda c: (
+            0 if c[0] in TRENCH_LAYERS else (1 if c[0] in DUCT_LAYERS else 2),
+            c[0],
+        )
+    )
+
+    for layer, orig_path, new_path in changed:
+        # Every other corridor line layer follows this reroute.
+        dependents = [d for d in CORRIDOR_LINE_LAYERS if d != layer]
+        if not dependents:
+            continue
+
+        # ── The changed REGION of the original path = the runs of the
+        #    original that the new path no longer covers. Endpoints are
+        #    shared, so only the moved middle is uncovered. Uses the tight
+        #    reroute tolerance so even a small (few-metre) reroute counts. ──
+        rtol = LLD_REROUTE_TOL
+        new_index, new_cell = _build_segment_index([new_path], rtol)
+        orig_uncovered = _uncovered_points(orig_path, new_index, new_cell, rtol)
+        if not orig_uncovered:
+            continue  # structurally different but spatially identical
+        region_lines = _runs(orig_uncovered)
+        if not region_lines:
+            continue
+        # The ride check uses the wider relay tolerance so co-located lines
+        # drawn a few metres beside the trench still count as riding it.
+        region_index, region_cell = _build_segment_index(region_lines, LLD_RELAY_TOL)
+
+        for dep_layer in dependents:
+            for f in by_layer.get(dep_layer, []):
+                props = f.get("properties") or {}
+                if props.get("approved"):
+                    continue  # engineer already re-drew this dependent
+                geom = f.get("geometry") or {}
+                lines = _line_strings(geom)
+                if not lines:
+                    continue
+                new_lines = []
+                moved_any = 0
+                for ln in lines:
+                    if len(ln) < 2:
+                        new_lines.append([list(p) for p in ln])
+                        continue
+                    new_coords = []
+                    moved = 0
+                    for p in ln:
+                        if _point_near_segments(p, region_index, region_cell, LLD_RELAY_TOL):
+                            new_coords.append(_nearest_point_on_path(p, new_path))
+                            moved += 1
+                        else:
+                            new_coords.append([p[0], p[1]])
+                    new_lines.append(new_coords)
+                    moved_any += moved
+                if not moved_any:
+                    continue
+                if geom.get("type") == "MultiLineString":
+                    f["geometry"] = {"type": "MultiLineString", "coordinates": new_lines}
+                else:
+                    f["geometry"] = {"type": "LineString", "coordinates": new_lines[0] if new_lines else []}
+                props["lld_relayed"] = True
+                props["lld_relay_reason"] = "followed rerouted %s (%d vertices moved)" % (layer, moved_any)
+                relayed[dep_layer] = relayed.get(dep_layer, 0) + 1
+    return relayed
+
+
+def _purge_old_region(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, int]:
+    """Hard guarantee: after the relay and coverage passes, no corridor line
+    may still ride the OLD region of an approved reroute. Anything the relay
+    missed (e.g. a dependent that was itself approved-and-re-drawn, or a line
+    added by the coverage pass along the old footprint) is snapped onto the
+    new path. This enforces the invariant "the old path is never used" no
+    matter what the input dataset contains.
+
+    Returns a count of purged features per layer.
+    """
+    purged: Dict[str, int] = {}
+
+    # Old regions of approved reroutes.
+    old_regions: List[Tuple[str, List[Any], List[Any]]] = []
+    for layer, feats in by_layer.items():
+        for f in feats:
+            props = f.get("properties") or {}
+            if not props.get("approved"):
+                continue
+            orig_lines = _line_strings(props.get("original_geometry"))
+            cur_lines = _line_strings(f.get("geometry"))
+            if not orig_lines or not cur_lines:
+                continue
+            if orig_lines == cur_lines:
+                continue
+            rtol = LLD_REROUTE_TOL
+            new_index, new_cell = _build_segment_index(cur_lines, rtol)
+            uncovered = _uncovered_points(orig_lines[0], new_index, new_cell, rtol)
+            region_lines = _runs(uncovered)
+            if region_lines:
+                old_regions.append((layer, region_lines, cur_lines[0]))
+
+    if not old_regions:
+        return purged
+
+    # One combined index of every old region so a single pass catches all.
+    all_region_lines: List[Any] = []
+    for (_layer, region_lines, _new_path) in old_regions:
+        all_region_lines.extend(region_lines)
+    region_index, region_cell = _build_segment_index(all_region_lines, LLD_RELAY_TOL)
+
+    for layer in CORRIDOR_LINE_LAYERS:
+        for f in by_layer.get(layer, []):
+            props = f.get("properties") or {}
+            if props.get("approved"):
+                continue  # the engineer's own re-draw is authoritative
+            geom = f.get("geometry") or {}
+            lines = _line_strings(geom)
+            if not lines:
+                continue
+            new_lines = []
+            moved_any = 0
+            for ln in lines:
+                if len(ln) < 2:
+                    new_lines.append([list(p) for p in ln])
+                    continue
+                new_coords = []
+                moved = 0
+                for p in ln:
+                    if _point_near_segments(p, region_index, region_cell, LLD_RELAY_TOL):
+                        # Snap to the nearest approved new path (the reroute
+                        # that owns this old region).
+                        best = None
+                        best_d = float("inf")
+                        for (_ol, _rl, new_path) in old_regions:
+                            q = _nearest_point_on_path(p, new_path)
+                            # nearest_point_on_path already projects p onto the
+                            # path; use the true distance from p to q.
+                            d = ((p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2) ** 0.5
+                            if d < best_d:
+                                best_d = d
+                                best = q
+                        if best is not None:
+                            new_coords.append(best)
+                            moved += 1
+                        else:
+                            new_coords.append([p[0], p[1]])
+                    else:
+                        new_coords.append([p[0], p[1]])
+                new_lines.append(new_coords)
+                moved_any += moved
+            if not moved_any:
+                continue
+            if geom.get("type") == "MultiLineString":
+                f["geometry"] = {"type": "MultiLineString", "coordinates": new_lines}
+            else:
+                f["geometry"] = {"type": "LineString", "coordinates": new_lines[0] if new_lines else []}
+            props["lld_purged"] = True
+            props["lld_purge_reason"] = "old rerouted region no longer used (%d vertices snapped)" % moved_any
+            purged[layer] = purged.get(layer, 0) + 1
+    return purged
+
+
 # ---------------------------------------------------------------------------
 # LLD — drop-connection planning for new/moved premises (Phase 1)
 #
@@ -1180,6 +1446,8 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
         "drop_ducts": 0,
         "distribution_cable": 0,
         "final_trenches": 0,
+        "aerial_drop_trenches": 0,
+        "aerial_cable": 0,
     }
     objects = by_layer.get("objects") or []
     if not objects:
@@ -1276,9 +1544,35 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
 
     def path_ending_at(ln: List[Any], o: Any) -> List[Any]:
         """Return a path along `ln` that ENDS at the premise."""
-        if len(ln) >= 2 and ((ln[0][0] - o[0]) ** 2 + (ln[0][1] - o[1]) ** 2) ** 0.5 <= DROP_CONNECT_TOL:
+        if len(ln) >= 2 and ((ln[0][0] - o[0]) ** 2 + (ln[0][1] - o[1]) ** 2) <= DROP_CONNECT_TOL:
             return [ln[1], ln[0]]
         return ln
+
+    def _nearest_pole_id(o: Any) -> Optional[str]:
+        poles = by_layer.get("poles") or []
+        best_d, best_id = float("inf"), None
+        for pole in poles:
+            for pt in _points(pole.get("geometry")):
+                d = ((o[0] - pt[0]) ** 2 + (o[1] - pt[1]) ** 2) ** 0.5
+                if d < best_d:
+                    best_d, best_id = d, (pole.get("properties") or {}).get("POLE_ID") or pole.get("properties", {}).get("pole_id")
+        return best_id
+
+    def _pole_point_by_id(pole_id: str, by_layer: Dict[str, List[Dict[str, Any]]]) -> Optional[Any]:
+        poles = by_layer.get("poles") or []
+        for pole in poles:
+            props = pole.get("properties") or {}
+            if str(props.get("POLE_ID") or props.get("pole_id") or "") == pole_id:
+                pts = _points(pole.get("geometry"))
+                if pts:
+                    return pts[0]
+        return None
+
+    def _route_aerial_drop(pole_pt: Any, premise_pt: Any, by_layer: Dict[str, List[Dict[str, Any]]]) -> List[Any]:
+        dist = ((pole_pt[0] - premise_pt[0]) ** 2 + (pole_pt[1] - premise_pt[1]) ** 2) ** 0.5
+        if dist > 0.0001:
+            return [pole_pt, premise_pt]
+        return []
 
     for obj in objects:
         pts = _points(obj.get("geometry"))
@@ -1357,6 +1651,57 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
         hh = str(props.get("HH") or props.get("hhs") or "1")
         addr = str(props.get("ADDR_ID") or props.get("addr_id") or props.get("SRC_ID") or "")
 
+        # ── Aerial drop: engineer explicitly flagged aerial_required ──────────
+        aerial_required = str(props.get("aerial_required") or props.get("AERIAL_REQUIRED") or "").lower()
+        if aerial_required in ("true", "1", "yes", "y") and not has_drop and not has_cable:
+            pole_id = str(props.get("assigned_pole") or props.get("POLE_ID") or "")
+            if not pole_id:
+                pole_id = _nearest_pole_id(o)
+            if pole_id:
+                pole_pt = _pole_point_by_id(pole_id, by_layer)
+                if pole_pt:
+                    aerial_path = _route_aerial_drop(pole_pt, o, by_layer)
+                    if aerial_path and len(aerial_path) >= 2:
+                        length_m = _approx_meters(aerial_path)
+                        make_feature(
+                            "aerial_drop_trenches",
+                            {"type": "LineString", "coordinates": aerial_path},
+                            {
+                                **common,
+                                "TRENCH_TYPE": "Aerial_Drop",
+                                "CONSTRUCTION_METHOD": "Overhead",
+                                "CABLE_TYPE": "Aerial",
+                                "FIBRE_COUNT": 12,
+                                "FROM_POLE": pole_id,
+                                "TO_PREMISE": addr,
+                                "POLE_SPACING_M": 50.0,
+                                "LENGTH_M": length_m,
+                                "AERIAL_REASON": "survey_flagged",
+                            },
+                            "aerial drop trench for %s (engineer flagged)" % obj_ref,
+                        )
+                        make_feature(
+                            "aerial_cable",
+                            {"type": "LineString", "coordinates": aerial_path},
+                            {
+                                **common,
+                                "CABLE_TYPE": "Aerial",
+                                "FIBER_COUNT": 12,
+                                "SOURCE_NODE": pole_id,
+                                "hhs": hh,
+                                "length_m": length_m,
+                                "CONNECTION_TYPE": "Aerial drop",
+                            },
+                            "aerial drop cable for %s" % obj_ref,
+                        )
+                        props["AERIAL_TRENCH_ID"] = "AT-%s" % uuid.uuid4().hex[:8]
+                        drop_ends.append(o)
+                        cable_ends.append(o)
+                        continue
+            feedback.pushWarning(
+                "Premise %s: aerial_required but no pole found — falling back to UG." % obj_ref
+            )
+
         if not has_drop:
             # 3a. Drop duct + its garden trench. The garden trench is mirrored
             #     into final_trenches exactly like the HLD pipeline does
@@ -1431,6 +1776,31 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
         cable_ends.append(o)
 
     return created
+
+
+def _enrich_lld_distribution_cables(by_layer: Dict[str, List[Dict[str, Any]]]) -> int:
+    """Rebuild grouped cable geometry and apply final LLD capacity fields."""
+    from lld_cable_geometry import regroup_distribution_cables
+
+    cables = by_layer.get("distribution_cable") or []
+    regroup_distribution_cables(cables)
+    updated = 0
+    for feature in cables:
+        props = feature.setdefault("properties", {})
+        members = [v.strip() for v in str(props.get("ADDR_IDS") or props.get("addr_id") or "").split(",") if v.strip()]
+        try:
+            hh_count = int(float(props.get("HH_COUNT") or props.get("hhs") or len(members) or 1))
+        except (TypeError, ValueError):
+            hh_count = max(1, len(members))
+        props["ADDR_IDS"] = ",".join(members)
+        props["HH_COUNT"] = hh_count
+        props["FIBER_COUNT"] = LLD_DISTRIBUTION_FIBERS
+        props["RESERVED_SPARE_FIBERS"] = LLD_RESERVED_SPARE_FIBERS
+        props["ACTIVE_FIBERS"] = hh_count
+        props["AVAILABLE_FIBERS"] = max(0, LLD_DISTRIBUTION_FIBERS - LLD_RESERVED_SPARE_FIBERS - hh_count)
+        props["CONNECTION_TYPE"] = "Shared trunk + branches" if len(members) > 1 else "Dedicated drop"
+        updated += 1
+    return updated
 
 
 def _validate_network(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
@@ -1529,8 +1899,23 @@ def _run_lld(
     task = _lld_task(project_id, lld_version)
     task.update({"status": "running", "stage": "Grouping layers", "updated_at": _now()})
     try:
-        # ── 1. Group the approved dataset (HLD + approved survey changes) by
-        #       its `layer` property, preserving the HLD layer structure. ────
+        # ── 0. Input contract: the ONLY input is the Approved Survey Version
+        #       (full layer set + approved survey changes - approved removals).
+        #       Every feature in it is survey / survey-confirmed ground truth.
+        #       No HLD layers, routing or topology are consulted anywhere in
+        #       this pipeline — the LLD is built from the survey dataset alone.
+        approved_count = sum(
+            1 for f in dataset.get("features") or []
+            if (f.get("properties") or {}).get("approved")
+        )
+        _lld_append(
+            project_id, lld_version, "info",
+            "LLD input = Approved Survey Version only (%d features, %d approved survey change(s)); no HLD layer references."
+            % (len(dataset.get("features") or []), approved_count),
+        )
+
+        # ── 1. Group the approved dataset by its `layer` property, preserving
+        #       the HLD layer structure. ────────────────────────────────────
         by_layer: Dict[str, List[Dict[str, Any]]] = {}
         for feat in dataset.get("features") or []:
             props = feat.get("properties") or {}
@@ -1539,6 +1924,36 @@ def _run_lld(
 
         if not by_layer:
             raise RuntimeError("Approved dataset contains no features")
+
+        # ── 1a. Reroute propagation: an approved reroute of a trench/duct must
+        #       carry the duct/cable laid in it onto the new path, so the LLD
+        #       follows the engineer's reroute instead of keeping the old path.
+        task.update({"stage": "Applying approved reroutes", "progress": 15, "updated_at": _now()})
+        relayed = _relay_dependents(by_layer)
+        relay_summary = ", ".join("%s=%d" % (k, v) for k, v in relayed.items() if v)
+        if relay_summary:
+            _lld_append(
+                project_id, lld_version, "info",
+                "Reroute propagation: re-laid %s onto the rerouted support path." % relay_summary,
+            )
+        else:
+            _lld_append(
+                project_id, lld_version, "info",
+                "Reroute propagation: no approved reroutes required re-laying duct/cable.",
+            )
+
+        # ── 1a2. Old-path purge: hard guarantee that nothing still rides the
+        #       OLD region of an approved reroute. Any line the relay missed is
+        #       snapped onto the new path, so the coverage pass below can never
+        #       re-create a trench along the old route. "Old path never used."
+        task.update({"stage": "Purging old rerouted regions", "progress": 18, "updated_at": _now()})
+        purged = _purge_old_region(by_layer)
+        purge_summary = ", ".join("%s=%d" % (k, v) for k, v in purged.items() if v)
+        if purge_summary:
+            _lld_append(
+                project_id, lld_version, "info",
+                "Old-path purge: snapped %s off the old rerouted region onto the new path." % purge_summary,
+            )
 
         # ── 1b. Cross-layer propagation: every cable must lie on a trench + duct,
         #       every duct must lie on a trench. Missing supporting features are
@@ -1574,6 +1989,23 @@ def _run_lld(
                 project_id, lld_version, "info",
                 "Drop-connection planning: all premises already served by a drop duct.",
             )
+
+        for duct_feature in by_layer.get("feeder_ducts") or []:
+            duct_props = duct_feature.setdefault("properties", {})
+            try:
+                pdp_ids = [v.strip() for v in str(duct_props.get("pdp_ids") or "").split(",") if v.strip()]
+            except Exception:
+                pdp_ids = []
+            duct_props["capacity_total"] = LLD_MAX_PDPS_PER_DUCT
+            duct_props["capacity_used"] = len(pdp_ids)
+            duct_props["capacity_spare"] = max(0, LLD_MAX_PDPS_PER_DUCT - len(pdp_ids))
+            duct_props["MAX_PDPS_PER_DUCT"] = LLD_MAX_PDPS_PER_DUCT
+
+        cable_count = _enrich_lld_distribution_cables(by_layer)
+        _lld_append(
+            project_id, lld_version, "info",
+            "LLD cable enrichment: %d distribution cable feature(s), 48-fibre catalogue, 2 reserved spare fibres." % cable_count,
+        )
 
         task.update({"stage": "Validating network", "progress": 30, "updated_at": _now()})
         validation = _validate_network(by_layer)
@@ -1648,6 +2080,534 @@ def _run_lld(
     except Exception as exc:
         task.update({"status": "failed", "error": str(exc), "updated_at": _now()})
         _lld_append(project_id, lld_version, "error", str(exc))
+
+
+# ---------------------------------------------------------------------------
+# LLD Phase 2 — Mode B: full re-plan (re-run the HLD oneclick pipeline with
+# the Approved Survey Version as input)
+#
+# Mode A (the _run_lld path above) patches approved changes onto the HLD
+# baseline — right for attribute fixes, nudges and reroutes, which only change
+# the physical path ("the muscle"). Mode B re-derives the whole design when the
+# change is structural (PDP moved, polygon/premise regrouping, UG<->aerial)
+# — the logical network ("the brain") changed and must be re-planned.
+#
+# Mode B feeds the approved survey segments back into the shortest-route
+# algorithm as BROWNFIELD input (preferred reuse, weight 0.1x) while the
+# original roads + address Excel drive the routing graph — so the fresh
+# design still follows shortest-path logic, but respects every approved
+# survey recommendation. The old path is never part of the input, so it
+# cannot reappear.
+# ---------------------------------------------------------------------------
+
+# oneclick output filename -> LLD layer name (public layer set).
+_REPLAN_OUTPUT_MAP = [
+    ("Objects", "objects"),
+    ("Polygons", "polygons"),
+    ("PDPs", "pdps"),
+    ("MFG", "mfg"),
+    ("Feeder_Trench", "feeder_trench"),
+    ("Distribution_Trench", "distribution_trench"),
+    ("Drill_Trench", "drill_trench"),
+    ("Final_Trenches", "final_trenches"),
+    ("Feeder_Cable", "feeder_cable"),
+    ("Distribution_Cable", "distribution_cable"),
+    ("Aerial_Drop_Trenches", "aerial_drop_trenches"),
+    ("Aerial_Cable", "aerial_cable"),
+    ("Feeder_Ducts", "feeder_ducts"),
+    ("Distribution_Ducts", "distribution_ducts"),
+    ("Drop_Ducts", "drop_ducts"),
+    ("Chambers", "chambers"),
+    ("Poles", "poles"),
+    ("Existing_Infrastructure", "existing_infrastructure"),
+    ("Existing_Infrastructure_Points", "existing_infrastructure_points"),
+]
+
+
+# Approved survey layer -> oneclick brownfield param (+ the GeoJSON filename
+# the engine's _match_brownfield_param resolver recognises). Multiple approved
+# layers can merge into one brownfield param (e.g. all duct tiers -> BF_DUCTS).
+_REPLAN_BF_GROUPS = [
+    ("final_trenches", "BF_TRENCHES", "bf_trenches.geojson"),
+    ("feeder_ducts", "BF_DUCTS", "bf_ducts.geojson"),
+    ("distribution_ducts", "BF_DUCTS", "bf_ducts.geojson"),
+    ("drop_ducts", "BF_DUCTS", "bf_ducts.geojson"),
+    ("feeder_cable", "BF_FIBRE", "bf_fibre.geojson"),
+    ("distribution_cable", "BF_FIBRE", "bf_fibre.geojson"),
+    ("pdps", "BF_EXISTING_PDP", "bf_pdps.geojson"),
+    ("mfg", "BF_EXISTING_MFG", "bf_mfg.geojson"),
+    ("chambers", "BF_CHAMBERS", "bf_chambers.geojson"),
+]
+
+
+# LLD layers the replan should NOT emit standalone (mirror LLD_EXCLUDED_LAYERS
+# + layers the LLD results page never shows).
+_REPLAN_EXCLUDED = {"garden_trench"}
+
+
+# Survey duct_type / condition / spare_capacity -> pipeline capacity fields.
+# The engineer records these in the field; without translation the pipeline
+# assumes every existing duct is empty (capacity_used=0, total=default 2) and
+# would route through a full or blocked duct.
+_DUCT_TYPE_TOTAL = {
+    "single": 1, "1-way": 1, "1way": 1,
+    "twin": 2, "2-way": 2, "2way": 2,
+    "quad": 4, "4-way": 4, "4way": 4,
+}
+
+
+def _survey_capacity(props: Dict[str, Any]) -> Tuple[int, int, str]:
+    """Map survey duct attributes to (capacity_total, capacity_used, verify_status).
+
+    - total: ``duct_type`` (single/twin/quad) or an explicit capacity attr;
+      falls back to the pipeline default (2).
+    - used: ``spare_capacity`` % is inverted against total; ``occupied`` or a
+      blocked/collapsed condition forces the duct full (excluded from routing).
+    - verify: condition/occupancy recorded on-site -> Verified, else Survey Required.
+    """
+    total = None
+    for key in ("capacity_total", "capacity", "subducts", "sub_ducts",
+                "n_subducts", "cap"):
+        raw = props.get(key)
+        if raw is not None:
+            try:
+                total = int(raw)
+                break
+            except (TypeError, ValueError):
+                continue
+    if total is None:
+        d = str(props.get("duct_type") or props.get("DUCT_TYPE") or "").lower()
+        total = _DUCT_TYPE_TOTAL.get(d) or 2
+    total = max(1, total)
+
+    used = 0
+    occupied = props.get("occupied")
+    if occupied in (True, "true", "True", "1", 1, "yes"):
+        used = total
+    else:
+        spare = props.get("spare_capacity")
+        if spare is not None:
+            try:
+                pct = int(spare)
+                used = round(total * (100 - pct) / 100)
+            except (TypeError, ValueError):
+                pass
+
+    condition = str(props.get("condition") or "").lower()
+    if condition in ("blocked", "collapsed"):
+        used = total  # unusable -> exclude from routing graph
+
+    if used > total:
+        used = total
+
+    if condition in ("excellent", "good", "verified"):
+        verify = "Verified"
+    elif condition in ("blocked", "collapsed", "damaged"):
+        verify = "Verified"  # on-site confirmed (as unusable)
+    elif occupied in (True, "true", "True", "1", 1, "yes") or spare is not None:
+        verify = "Verified"  # capacity/occupancy recorded on-site
+    else:
+        verify = "Survey Required"
+    return total, used, verify
+
+
+def _write_replan_brownfield(bf_dir: Path, dataset: Dict[str, Any]) -> List[str]:
+    """Write approved survey segments as brownfield GeoJSON files for the
+    oneclick pipeline. Returns the qgis_process ``--`` BF_* args.
+
+    Two-tier brownfield model:
+    - **USE_MODE=survey** (mandatory): the engineer's approved path is the
+      field truth. The routing algorithm MUST follow it (weight=0, forced).
+    - **USE_MODE=brownfield** (preferred): existing HLD infrastructure is
+      available for reuse but the algorithm may choose a better path
+      (weight=0.1, preferred).
+
+    Survey duct fields are translated into the pipeline's capacity model
+    (``capacity_total`` / ``capacity_used`` / ``verify_status``) so the
+    engineer's field observation of spare capacity actually gates routing.
+    """
+    bf_dir.mkdir(parents=True, exist_ok=True)
+    by_file: Dict[str, List[Dict[str, Any]]] = {}
+    for feat in dataset.get("features") or []:
+        props = feat.get("properties") or {}
+        layer = props.get("layer") or ""
+        if not props.get("approved"):
+            continue
+        for (src_layer, _param, filename) in _REPLAN_BF_GROUPS:
+            if layer == src_layer:
+                # ── Mandatory: the survey-approved path is the field truth ──
+                props["USE_MODE"] = "survey"
+
+                # Translate survey duct capacity/condition into pipeline fields.
+                if filename == "bf_ducts.geojson":
+                    total, used, verify = _survey_capacity(props)
+                    props["capacity_total"] = total
+                    props["capacity_used"] = used
+                    props["verify_status"] = verify
+                elif filename == "bf_trenches.geojson":
+                    # Field-confirmed reuse of existing corridor -> Verified.
+                    ct = str(props.get("construction_type") or "").lower()
+                    if ct.startswith("existing"):
+                        props["verify_status"] = "Verified"
+                by_file.setdefault(filename, []).append(feat)
+                break
+
+    args: List[str] = []
+    for (src_layer, param, filename) in _REPLAN_BF_GROUPS:
+        feats = by_file.get(filename)
+        if not feats:
+            continue
+        fc = {"type": "FeatureCollection", "features": feats}
+        path = bf_dir / filename
+        path.write_text(json.dumps(fc), encoding="utf-8")
+        if f"{param}={path}" not in args:
+            args.append(f"{param}={path}")
+    if args:
+        args.insert(0, "USE_BROWNFIELD=true")
+    return args
+
+
+def _drop_generated_corridor_duplicates(
+    by_layer: Dict[str, List[Dict[str, Any]]],
+    approved_by_layer: Dict[str, List[Dict[str, Any]]],
+) -> Dict[str, int]:
+    """Remove generated corridor features that DUPLICATE an approved survey
+    route. The re-plan algorithm is brownfield-aware, so it often re-creates
+    a trench/duct/cable along the very corridor the engineer rerouted. That
+    generated twin is a whole-feature copy of the superseded path — snapping
+    its vertices (relay/purge) only produces a hybrid old+new line, so it
+    must be DELETED, not moved. Only features lying ENTIRELY inside the
+    approved corridor region (old path ∪ new path, within relay tolerance)
+    are removed — long trunk lines that merely pass through the region are
+    kept and are snapped onto the approved path by the purge pass. Returns
+    counts per layer of removed features.
+    """
+    removed: Dict[str, int] = {}
+    for layer, approved_features in approved_by_layer.items():
+        regions: List[Any] = []
+        for approved in approved_features:
+            aprop = approved.get("properties") or {}
+            for geom in (approved.get("geometry"), aprop.get("original_geometry")):
+                for ln in _line_strings(geom):
+                    if len(ln) >= 2:
+                        regions.append(ln)
+        if not regions:
+            continue
+        rindex, rcell = _build_segment_index(regions, LLD_RELAY_TOL)
+        kept: List[Dict[str, Any]] = []
+        cnt = 0
+        for f in by_layer.get(layer, []):
+            props = f.get("properties") or {}
+            if props.get("approved") or props.get("lld_created"):
+                kept.append(f)
+                continue
+            lines = _line_strings(f.get("geometry"))
+            if not lines:
+                kept.append(f)
+                continue
+            all_inside = True
+            for ln in lines:
+                if len(ln) < 2:
+                    continue
+                # Dense sampling: every sample point must ride the approved
+                # corridor region for the feature to count as a duplicate.
+                for p in _sample_polyline(ln, LLD_RELAY_TOL * 0.5):
+                    if not _point_near_segments(p, rindex, rcell, LLD_RELAY_TOL):
+                        all_inside = False
+                        break
+                if not all_inside:
+                    break
+            if all_inside:
+                cnt += 1
+            else:
+                kept.append(f)
+        if cnt:
+            by_layer[layer] = kept
+            removed[layer] = removed.get(layer, 0) + cnt
+    return removed
+
+
+def _run_lld_replan(
+    project_id: str,
+    lld_version: str,
+    dataset: Dict[str, Any],
+) -> None:
+    """Mode B: re-run the HLD oneclick pipeline with the approved survey
+    segments as brownfield, emitting a genuinely fresh design as the LLD
+    output. Uses the project's original roads + address Excel so the
+    shortest-route algorithm runs on the same routing graph."""
+    task = _lld_task(project_id, lld_version)
+    task.update({"status": "running", "stage": "Preparing re-plan inputs", "updated_at": _now()})
+    try:
+        # ── 1. Original HLD inputs (roads + excel) drive the routing graph ──
+        inputs_dir = OUTPUT_DIR / project_id / "inputs"
+        excel = inputs_dir / "Main_DataSet.xlsx"
+        if not excel.exists():
+            xlsx = sorted(inputs_dir.glob("*.xlsx"))
+            excel = xlsx[0] if xlsx else None
+        roads = inputs_dir / "berlin-roads-bundle.zip"
+        if not roads.exists():
+            candidates = sorted(inputs_dir.glob("roads*")) + sorted(inputs_dir.glob("*.gpkg"))
+            roads = candidates[0] if candidates else None
+        if not excel or not excel.exists():
+            raise RuntimeError(
+                "Full re-plan needs the original address Excel (inputs/Main_DataSet.xlsx) — missing on disk."
+            )
+        if not roads or not roads.exists():
+            raise RuntimeError(
+                "Full re-plan needs the original roads file (inputs/roads*) — missing on disk."
+            )
+
+        # ── 2. Brownfield: approved survey segments ONLY ───────────────────
+        # The routing graph is the original roads + address Excel (network
+        # base data, NOT HLD design output). The brownfield input is the
+        # approved survey dataset alone — no HLD feeder/distribution/cable
+        # reference layers are ever fed in. Every approved segment is forced
+        # (USE_MODE=survey, weight 0) so the router MUST follow survey paths.
+        task.update({"stage": "Writing approved survey as brownfield", "updated_at": _now()})
+        replan_root = OUTPUT_DIR / project_id / "replan" / lld_version
+        bf_args = _write_replan_brownfield(replan_root / "brownfield", dataset)
+        if bf_args:
+            _lld_append(project_id, lld_version, "info",
+                        "Mode B re-plan: brownfield = approved survey segments only (%s); no HLD design layers fed."
+                        % ", ".join(bf_args))
+        else:
+            _lld_append(project_id, lld_version, "warn",
+                        "Mode B re-plan: no approved survey segments found to feed as brownfield.")
+
+        # ── 3. Run the oneclick pipeline (shortest-route algo, survey-aware) ──
+        task.update({"stage": "Running full design pipeline", "updated_at": _now()})
+        design_dir = replan_root / "design"
+        design_dir.mkdir(parents=True, exist_ok=True)
+        qgis = _find_qgis_process()
+        if not qgis:
+            raise RuntimeError("qgis_process not found — full re-plan requires QGIS.")
+        cmd = [
+            qgis, "run", "hldplanning:end_to_end_pipeline", "--",
+            f"EXCEL={excel}",
+            f"ROADS={roads}",
+            f"OUTPUT_DIR={design_dir}",
+            "POLY_METHOD=3",
+        ]
+        cmd.extend(bf_args)
+        if os.name == "nt" and qgis.lower().endswith((".bat", ".cmd")):
+            cmd = " ".join(_quote_cmd_arg(part) for part in cmd)
+        _run_command(project_id, cmd, design_dir)
+
+        # ── 4. Map fresh outputs to LLD layers + build the by_layer set ──
+        task.update({"stage": "Ingesting fresh design", "progress": 80, "updated_at": _now()})
+        by_layer: Dict[str, List[Dict[str, Any]]] = {}
+        for oneclick_name, lld_layer in _REPLAN_OUTPUT_MAP:
+            if lld_layer in _REPLAN_EXCLUDED:
+                continue
+            gpkg = design_dir / f"{oneclick_name}.gpkg"
+            geojson = design_dir / f"{oneclick_name}.geojson"
+            if not geojson.exists() and gpkg.exists():
+                _convert_gpkg_to_geojson(gpkg, geojson)
+            if not geojson.exists():
+                _lld_append(project_id, lld_version, "warn",
+                            f"Mode B: fresh design has no {oneclick_name} layer — skipping.")
+                continue
+            try:
+                fc = json.loads(geojson.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            feats = fc.get("features") or []
+            for f in feats:
+                props = dict(f.get("properties") or {})
+                props["layer"] = lld_layer
+                props.setdefault("feature_id", "LLD-%s-%s" % (lld_layer, uuid.uuid4().hex[:10]))
+                f["properties"] = props
+            by_layer.setdefault(lld_layer, []).extend(feats)
+            _lld_append(project_id, lld_version, "info",
+                        f"Mode B: fresh {lld_layer} layer — {len(feats)} features.")
+
+        if not by_layer:
+            raise RuntimeError("Mode B pipeline produced no layers.")
+
+        # ── 5. Enforce approved survey routes as authoritative ────────────
+        # The re-plan's generated layers are only a routing scaffold. For each
+        # approved survey corridor feature, replace the generated feature's
+        # geometry in the affected region with the engineer's geometry. This
+        # deliberately does not require sidewalk/road alignment: field truth
+        # wins. Then relay dependent layers and purge the superseded footprint.
+        task.update({"stage": "Enforcing approved survey routes", "progress": 84, "updated_at": _now()})
+        approved_by_layer: Dict[str, List[Dict[str, Any]]] = {}
+        for feat in dataset.get("features") or []:
+            props = feat.get("properties") or {}
+            layer = props.get("layer")
+            geom = feat.get("geometry")
+            if props.get("approved") and layer in CORRIDOR_LINE_LAYERS and _line_strings(geom):
+                approved_by_layer.setdefault(layer, []).append(feat)
+
+        # Remove generated twins that fully duplicate an approved corridor
+        # BEFORE overlaying the authoritative route, so the engineer's path
+        # is the ONLY line in that region (old path never coexists with the
+        # new path). Long trunk lines passing through are kept for the purge.
+        dropped = _drop_generated_corridor_duplicates(by_layer, approved_by_layer)
+        dropped_summary = ", ".join("%s=%d" % (k, v) for k, v in dropped.items() if v) or "none"
+
+        authoritative = 0
+        for layer, approved_features in approved_by_layer.items():
+            for approved in approved_features:
+                aprop = approved.get("properties") or {}
+                target_id = aprop.get("feature_id")
+                target = next(
+                    (f for f in by_layer.get(layer, [])
+                     if (f.get("properties") or {}).get("feature_id") == target_id),
+                    None,
+                )
+                if target is None:
+                    # The fresh algorithm assigns new ids, so the approved
+                    # route is appended as the authoritative feature.
+                    target = {
+                        "type": "Feature",
+                        "geometry": approved.get("geometry"),
+                        "properties": dict(aprop),
+                    }
+                    by_layer.setdefault(layer, []).append(target)
+                else:
+                    target["geometry"] = approved.get("geometry")
+                    target["properties"] = {**(target.get("properties") or {}), **aprop}
+                target.setdefault("properties", {})["survey_authoritative"] = True
+                authoritative += 1
+
+        relayed = _relay_dependents(by_layer)
+        purged = _purge_old_region(by_layer)
+        relay_summary = ", ".join("%s=%d" % (k, v) for k, v in relayed.items() if v) or "none"
+        purge_summary = ", ".join("%s=%d" % (k, v) for k, v in purged.items() if v) or "none"
+        _lld_append(
+            project_id, lld_version, "info",
+            "Survey route enforcement: %d approved route(s) authoritative; "
+            "field geometry retained regardless of sidewalk alignment; "
+            "generated_duplicates_removed=%s; relay=%s; old_path_purge=%s."
+            % (authoritative, dropped_summary, relay_summary, purge_summary),
+        )
+
+        # ── 6. Apply the same final cable/duct contract as Verify mode ────
+        # Full re-plan has fresh HLD output, but it must still pass through
+        # the shared grouped-cable normalization before LLD files are written.
+        from lld_cable_geometry import regroup_distribution_cables
+        regroup_distribution_cables(by_layer.get("distribution_cable") or [])
+        for duct_feature in by_layer.get("feeder_ducts") or []:
+            duct_props = duct_feature.setdefault("properties", {})
+            pdp_ids = [v.strip() for v in str(duct_props.get("pdp_ids") or "").split(",") if v.strip()]
+            duct_props["capacity_total"] = LLD_MAX_PDPS_PER_DUCT
+            duct_props["capacity_used"] = len(pdp_ids)
+            duct_props["capacity_spare"] = max(0, LLD_MAX_PDPS_PER_DUCT - len(pdp_ids))
+            duct_props["MAX_PDPS_PER_DUCT"] = LLD_MAX_PDPS_PER_DUCT
+
+        # ── 6. Validate + write layers + zip (same contract as _run_lld) ──
+        task.update({"stage": "Validating fresh design", "progress": 90, "updated_at": _now()})
+        validation = _validate_network(by_layer)
+        _lld_append(
+            project_id, lld_version, "info",
+            "Validation: %d layers, %d features, %d continuity issue(s), %d attribute issue(s), %d drop issue(s)."
+            % (
+                validation["summary"]["layers"],
+                validation["summary"]["total_features"],
+                validation["summary"]["continuity_issues"],
+                validation["summary"]["attribute_issues"],
+                validation["summary"].get("drop_issues", 0),
+            ),
+        )
+
+        output_dir = OUTPUT_DIR / project_id / "lld" / lld_version
+        output_dir.mkdir(parents=True, exist_ok=True)
+        layer_files: Dict[str, List[str]] = {}
+        order = {name: i for i, name in enumerate(LLD_LAYER_ORDER)}
+        for layer in sorted(by_layer.keys(), key=lambda n: (order.get(n, 999), n)):
+            fc = {"type": "FeatureCollection", "features": by_layer[layer]}
+            geojson_path = output_dir / f"{layer}.geojson"
+            geojson_path.write_text(json.dumps(fc), encoding="utf-8")
+            layer_files[layer] = [str(geojson_path)]
+
+        zip_name = f"{project_id}_{lld_version}_lld.zip"
+        zip_path = output_dir / zip_name
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for layer, files in layer_files.items():
+                for fp in files:
+                    zf.write(fp, arcname=f"{layer}.geojson")
+
+        downloads = [
+            {
+                "name": zip_name,
+                "url": f"/ftth/lld/download/{project_id}/{lld_version}",
+                "size_bytes": zip_path.stat().st_size,
+            }
+        ]
+        for layer, files in layer_files.items():
+            for fp in files:
+                p = Path(fp)
+                downloads.append({
+                    "name": f"{layer}.geojson",
+                    "url": f"/ftth/lld/results/{project_id}/{lld_version}/layers/{layer}",
+                    "size_bytes": p.stat().st_size,
+                })
+
+        task.update(
+            {
+                "status": "completed",
+                "stage": "Complete",
+                "progress": 100,
+                "files": layer_files,
+                "layers": [
+                    {"name": layer, "feature_count": len(by_layer[layer]), "files": files}
+                    for layer, files in layer_files.items()
+                ],
+                "downloads": downloads,
+                "validation": validation,
+                "output_dir": str(output_dir),
+                "mode": "replan",
+                "updated_at": _now(),
+            }
+        )
+    except Exception as exc:
+        task.update({"status": "failed", "error": str(exc), "updated_at": _now()})
+        _lld_append(project_id, lld_version, "error", str(exc))
+
+
+@app.post("/ftth/lld/replan", status_code=202)
+async def run_lld_replan(
+    background_tasks: BackgroundTasks,
+    request: Request,
+) -> Dict[str, Any]:
+    """Start a Mode B LLD run: re-run the HLD oneclick pipeline with the
+    approved survey dataset as brownfield input, producing a genuinely fresh
+    design. Same request shape as /ftth/lld/run.
+
+    Body (JSON):
+        {
+          "project_id": "<hld-project-id>",
+          "lld_version": "LLD-V01",
+          "dataset": {"type": "FeatureCollection", "features": [...]}
+        }
+    """
+    body = None
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    project_id = (body or {}).get("project_id") or ""
+    lld_version = (body or {}).get("lld_version") or ""
+    dataset = (body or {}).get("dataset") or {}
+
+    if not project_id or not lld_version:
+        raise HTTPException(status_code=400, detail="project_id and lld_version are required")
+    if not isinstance(dataset.get("features"), list):
+        raise HTTPException(status_code=400, detail="dataset.features must be a list")
+
+    task = _lld_task(project_id, lld_version)
+    task.update({
+        "status": "queued",
+        "stage": "Queued (Mode B re-plan)",
+        "progress": 0,
+        "mode": "replan",
+        "updated_at": _now(),
+    })
+    background_tasks.add_task(_run_lld_replan, project_id, lld_version, dataset)
+    return _lld_public_task(project_id, lld_version)
 
 
 @app.post("/ftth/lld/run", status_code=202)
