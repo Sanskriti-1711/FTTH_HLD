@@ -1153,6 +1153,122 @@ def _point_near_segments(p: Any, index: Dict[Tuple[int, int], List[Any]], cell: 
     return False
 
 
+def _project_path_point(p: Any, path: List[Any]) -> Tuple[List[float], int, float]:
+    """Project ``p`` onto ``path``. Returns (point, segment_index, t) so a
+    sub-arc of the path can be extracted later."""
+    best = ([p[0], p[1]], 0, 0.0)
+    best_d = float("inf")
+    for i in range(len(path) - 1):
+        ax, ay = path[i][0], path[i][1]
+        bx, by = path[i + 1][0], path[i + 1][1]
+        dx, dy = bx - ax, by - ay
+        seg2 = dx * dx + dy * dy
+        if seg2 == 0:
+            continue
+        t = ((p[0] - ax) * dx + (p[1] - ay) * dy) / seg2
+        t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+        q = [ax + dx * t, ay + dy * t]
+        d = (p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2
+        if d < best_d:
+            best_d, best = d, (q, i, t)
+    return best
+
+
+def _arc_len_between(
+    pa: List[float], ia: int, ta: float,
+    pb: List[float], ib: int, tb: float,
+    run: List[Any],
+) -> float:
+    """Arc length along ``run`` between two projected points."""
+    if ia > ib or (ia == ib and ta > tb):
+        pa, pb, ia, ib, ta, tb = pb, pa, ib, ia, tb, ta
+    if ia == ib:
+        return ((pb[0] - pa[0]) ** 2 + (pb[1] - pa[1]) ** 2) ** 0.5
+    length = ((run[ia + 1][0] - pa[0]) ** 2 + (run[ia + 1][1] - pa[1]) ** 2) ** 0.5
+    for j in range(ia + 1, ib):
+        a2, b2 = run[j], run[j + 1]
+        length += ((b2[0] - a2[0]) ** 2 + (b2[1] - a2[1]) ** 2) ** 0.5
+    length += ((pb[0] - run[ib][0]) ** 2 + (pb[1] - run[ib][1]) ** 2) ** 0.5
+    return length
+
+
+def _segment_rides_region(a: Any, b: Any, region_lines: List[Any], tol: float) -> bool:
+    """True when segment ``a->b`` runs ALONG a rerouted region (not merely
+    crosses it): both endpoints lie within ``tol`` of the SAME region run and
+    the region arc between their projections is a real run (> 2*tol)
+    comparable to the chord. Perpendicular cross-streets project both ends to
+    ~the same point (arc ~ 0) and are left untouched."""
+    for run in region_lines:
+        if len(run) < 2:
+            continue
+        pa, ia, ta = _project_path_point(a, run)
+        pb, ib, tb = _project_path_point(b, run)
+        da = ((a[0] - pa[0]) ** 2 + (a[1] - pa[1]) ** 2) ** 0.5
+        db = ((b[0] - pb[0]) ** 2 + (b[1] - pb[1]) ** 2) ** 0.5
+        # Small slack so a point sitting exactly at the tolerance boundary
+        # (e.g. a relayed line 1e-4 from the old path) still counts.
+        if da > tol * 1.01 or db > tol * 1.01:
+            continue
+        arc = _arc_len_between(pa, ia, ta, pb, ib, tb, run)
+        chord = ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
+        if arc > 2 * tol and chord >= 0.3 * arc:
+            return True
+    return False
+
+
+def _splice_new_path(a: Any, b: Any, new_path: List[Any]) -> List[List[float]]:
+    """Coordinates of ``new_path`` between the projections of ``a`` and ``b``:
+    the interpolated endpoints plus the new path's own intermediate vertices
+    (deduplicated). Replaces the segment a->b with the reroute geometry."""
+    pa, ia, ta = _project_path_point(a, new_path)
+    pb, ib, tb = _project_path_point(b, new_path)
+    if ia > ib or (ia == ib and ta > tb):
+        pa, pb, ia, ib, ta, tb = pb, pa, ib, ia, tb, ta
+    if ia == ib:
+        out = [pa]
+        if (pa[0] - pb[0]) ** 2 + (pa[1] - pb[1]) ** 2 > 1e-18:
+            out.append(pb)
+        return out
+    out = [pa]
+    for j in range(ia + 1, ib + 1):
+        out.append(list(new_path[j]))
+    if (out[-1][0] - pb[0]) ** 2 + (out[-1][1] - pb[1]) ** 2 > 1e-18:
+        out.append(pb)
+    return out
+
+
+def _dedup_coords(coords: List[List[float]]) -> List[List[float]]:
+    """Drop consecutive exact-duplicate coordinates (splice boundaries)."""
+    out: List[List[float]] = []
+    for p in coords:
+        if out and (out[-1][0] - p[0]) ** 2 + (out[-1][1] - p[1]) ** 2 < 1e-18:
+            continue
+        out.append(p)
+    return out
+
+
+def _snap_vertex_to_new_path(
+    p: Any,
+    region_lines: List[Any],
+    new_path: List[Any],
+    tol: float,
+) -> Optional[List[float]]:
+    """If vertex ``p`` lies within ``tol`` of an OLD rerouted region, return
+    its projection onto the NEW path (the vertex rides the moved corridor and
+    must follow). Returns None when the vertex is not near any region run —
+    used as a fallback for dense polylines whose individual segments are
+    shorter than the splice arc threshold."""
+    for run in region_lines:
+        if len(run) < 2:
+            continue
+        q, _, _ = _project_path_point(p, run)
+        d = ((p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2) ** 0.5
+        if d <= tol * 1.01:
+            proj, _, _ = _project_path_point(p, new_path)
+            return proj
+    return None
+
+
 def _relay_dependents(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, int]:
     """Re-lay the rerouted REGION of every other corridor line layer onto the
     rerouted line — the whole corridor follows any reroute (trench -> ducts
@@ -1208,10 +1324,6 @@ def _relay_dependents(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, in
         region_lines = _runs(orig_uncovered)
         if not region_lines:
             continue
-        # The ride check uses the wider relay tolerance so co-located lines
-        # drawn a few metres beside the trench still count as riding it.
-        region_index, region_cell = _build_segment_index(region_lines, LLD_RELAY_TOL)
-
         for dep_layer in dependents:
             for f in by_layer.get(dep_layer, []):
                 props = f.get("properties") or {}
@@ -1227,14 +1339,41 @@ def _relay_dependents(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, in
                     if len(ln) < 2:
                         new_lines.append([list(p) for p in ln])
                         continue
-                    new_coords = []
+                    new_coords: List[List[float]] = []
                     moved = 0
-                    for p in ln:
-                        if _point_near_segments(p, region_index, region_cell, LLD_RELAY_TOL):
-                            new_coords.append(_nearest_point_on_path(p, new_path))
-                            moved += 1
+                    for i in range(len(ln) - 1):
+                        a, b = ln[i], ln[i + 1]
+                        if _segment_rides_region(a, b, region_lines, LLD_RELAY_TOL):
+                            # The segment runs ALONG the moved region — splice
+                            # the reroute's own geometry in (this also covers
+                            # sparse polylines whose crossing happens BETWEEN
+                            # two vertices, which vertex-projection missed).
+                            splice = _splice_new_path(a, b, new_path)
+                            if len(splice) >= 2:
+                                if new_coords and (
+                                    (new_coords[-1][0] - splice[0][0]) ** 2
+                                    + (new_coords[-1][1] - splice[0][1]) ** 2
+                                ) < 1e-18:
+                                    new_coords.extend(splice[1:])
+                                else:
+                                    new_coords.extend(splice)
+                                moved += 1
+                            else:
+                                new_coords.append(list(b))
                         else:
-                            new_coords.append([p[0], p[1]])
+                            # Dense polyline: the segment is too short to
+                            # qualify for a splice, but its far vertex rides
+                            # the moved region — snap it onto the new path so
+                            # the line follows vertex by vertex.
+                            snapped = _snap_vertex_to_new_path(
+                                b, region_lines, new_path, LLD_RELAY_TOL
+                            )
+                            if snapped is not None:
+                                new_coords.append(snapped)
+                                moved += 1
+                            else:
+                                new_coords.append(list(b))
+                    new_coords = _dedup_coords(new_coords)
                     new_lines.append(new_coords)
                     moved_any += moved
                 if not moved_any:
@@ -1244,7 +1383,7 @@ def _relay_dependents(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, in
                 else:
                     f["geometry"] = {"type": "LineString", "coordinates": new_lines[0] if new_lines else []}
                 props["lld_relayed"] = True
-                props["lld_relay_reason"] = "followed rerouted %s (%d vertices moved)" % (layer, moved_any)
+                props["lld_relay_reason"] = "followed rerouted %s (%d segments re-laid)" % (layer, moved_any)
                 relayed[dep_layer] = relayed.get(dep_layer, 0) + 1
     return relayed
 
@@ -1284,12 +1423,6 @@ def _purge_old_region(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, in
     if not old_regions:
         return purged
 
-    # One combined index of every old region so a single pass catches all.
-    all_region_lines: List[Any] = []
-    for (_layer, region_lines, _new_path) in old_regions:
-        all_region_lines.extend(region_lines)
-    region_index, region_cell = _build_segment_index(all_region_lines, LLD_RELAY_TOL)
-
     for layer in CORRIDOR_LINE_LAYERS:
         for f in by_layer.get(layer, []):
             props = f.get("properties") or {}
@@ -1305,29 +1438,47 @@ def _purge_old_region(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, in
                 if len(ln) < 2:
                     new_lines.append([list(p) for p in ln])
                     continue
-                new_coords = []
+                new_coords: List[List[float]] = []
                 moved = 0
-                for p in ln:
-                    if _point_near_segments(p, region_index, region_cell, LLD_RELAY_TOL):
-                        # Snap to the nearest approved new path (the reroute
-                        # that owns this old region).
-                        best = None
-                        best_d = float("inf")
-                        for (_ol, _rl, new_path) in old_regions:
-                            q = _nearest_point_on_path(p, new_path)
-                            # nearest_point_on_path already projects p onto the
-                            # path; use the true distance from p to q.
-                            d = ((p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2) ** 0.5
+                for i in range(len(ln) - 1):
+                    a, b = ln[i], ln[i + 1]
+                    # Splice the segment onto the reroute's new path when it
+                    # rides an old region. Covers sparse polylines whose
+                    # crossing lies BETWEEN two vertices (vertex-projection
+                    # could never bend those). Perpendicular cross-streets are
+                    # left untouched (_segment_rides_region rejects them).
+                    splice = None
+                    snapped = None
+                    best_d = float("inf")
+                    for (_ol, region_lines, new_path) in old_regions:
+                        if _segment_rides_region(a, b, region_lines, LLD_RELAY_TOL):
+                            mid = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2]
+                            q = _nearest_point_on_path(mid, new_path)
+                            d = (mid[0] - q[0]) ** 2 + (mid[1] - q[1]) ** 2
                             if d < best_d:
                                 best_d = d
-                                best = q
-                        if best is not None:
-                            new_coords.append(best)
-                            moved += 1
+                                splice = _splice_new_path(a, b, new_path)
+                        elif snapped is None:
+                            # Dense polyline fallback: far vertex rides an
+                            # old region — snap it onto that reroute's path.
+                            snapped = _snap_vertex_to_new_path(
+                                b, region_lines, new_path, LLD_RELAY_TOL
+                            )
+                    if splice is not None and len(splice) >= 2:
+                        if new_coords and (
+                            (new_coords[-1][0] - splice[0][0]) ** 2
+                            + (new_coords[-1][1] - splice[0][1]) ** 2
+                        ) < 1e-18:
+                            new_coords.extend(splice[1:])
                         else:
-                            new_coords.append([p[0], p[1]])
+                            new_coords.extend(splice)
+                        moved += 1
+                    elif snapped is not None:
+                        new_coords.append(snapped)
+                        moved += 1
                     else:
-                        new_coords.append([p[0], p[1]])
+                        new_coords.append(list(b))
+                new_coords = _dedup_coords(new_coords)
                 new_lines.append(new_coords)
                 moved_any += moved
             if not moved_any:
@@ -1337,7 +1488,7 @@ def _purge_old_region(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, in
             else:
                 f["geometry"] = {"type": "LineString", "coordinates": new_lines[0] if new_lines else []}
             props["lld_purged"] = True
-            props["lld_purge_reason"] = "old rerouted region no longer used (%d vertices snapped)" % moved_any
+            props["lld_purge_reason"] = "old rerouted region no longer used (%d segments re-laid)" % moved_any
             purged[layer] = purged.get(layer, 0) + 1
     return purged
 
