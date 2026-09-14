@@ -21,8 +21,8 @@ class COMMON_FIELDS:
     ASSET_TYPE = "ASSET_TYPE"           # duct | chamber | pole | fibre | cabinet | trench
 
     # HLD_attr.docx civil-infrastructure catalogue
-    USAGE_TYPE = "USAGE_TYPE"           # Feeder | Distribution | Garden (trench usage)
-    CONSTRUCT = "CONSTRUCT"             # Open Cut | Micro Trench | HDD
+    USAGE_TYPE = "USAGE_TYPE"           # Feeder | Distribution | Drop (trench usage)
+    CONSTRUCT = "CONSTRUCT"             # Open Cut | HDD | Garden (Micro-Trenching)
     WIDTH_MM = "WIDTH_MM"
     DEPTH_MM = "DEPTH_MM"
     SURFACE = "SURFACE"                 # Asphalt | Concrete | Footpath
@@ -72,8 +72,8 @@ class COMMON_FIELDS:
     TO_PREMISE = "TO_PREMISE"              # ADDR_ID
 
     # Trench catalogue (used by multiple algorithms)
-    TRENCH_TYPE = "TRENCH_TYPE"            # Feeder | Distribution | Garden | Aerial_Drop
-    CONSTRUCTION_METHOD = "CONSTRUCTION_METHOD"  # Open Cut | Micro Trench | HDD | Overhead
+    TRENCH_TYPE = "TRENCH_TYPE"            # Feeder | Distribution | Drop | Aerial_Drop
+    CONSTRUCTION_METHOD = "CONSTRUCTION_METHOD"  # Open Cut | HDD | Garden (Micro-Trenching) | Overhead
     FIBER_COUNT = "FIBER_COUNT"
     POLE_SPACING_M = "POLE_SPACING_M"
     CROSSINGS = "CROSSINGS"

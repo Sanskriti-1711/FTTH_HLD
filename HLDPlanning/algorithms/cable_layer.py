@@ -14,6 +14,9 @@ and the styling/add-to-project cosmetics plus the dead OUT_MERGED_INPUTS
 output were removed.
 """
 
+import math
+from collections import defaultdict
+
 from qgis.PyQt.QtCore import QMetaType
 from qgis.PyQt.QtGui import QColor
 from qgis.core import (
@@ -22,7 +25,7 @@ from qgis.core import (
     QgsProcessingParameterFeatureSink, QgsProcessingException,
     QgsFeatureSink, QgsFields, QgsField, QgsWkbTypes,
     QgsFeature, QgsProcessingUtils, QgsSymbol, QgsGeometry,
-    QgsCoordinateReferenceSystem, QgsPointXY,
+    QgsCoordinateReferenceSystem, QgsPointXY, QgsSpatialIndex, QgsVectorLayer,
 )
 from qgis import processing
 
@@ -37,6 +40,9 @@ from ..utils.layer_ops import (
     linemerge_layer,
     find_first_alg,
 )
+from ..utils.geom import round_key_xy, geom_substring, path_len, lcp_len, edges_to_geom
+from ..utils.graph import add_edge, dijkstra_with_parents, reconstruct_path
+from ..utils.snap import snap_point_create_virtual
 
 
 def _polyline_of(geom: QgsGeometry):
@@ -67,6 +73,24 @@ def _concat_polylines(*polys, tol=0.01):
         if pts:
             out.extend(pts)
     return out
+
+
+def _geom_tail_xy(geom):
+    """Return the last vertex of a (multi)polyline as 'x,y' or ''."""
+    if not geom or geom.isEmpty():
+        return ""
+    try:
+        if geom.isMultipart():
+            parts = geom.asMultiPolyline()
+            pt = parts[-1][-1] if parts else None
+        else:
+            pl = geom.asPolyline()
+            pt = pl[-1] if pl else None
+        if pt is not None:
+            return f"{pt.x():.2f},{pt.y():.2f}"
+    except Exception:
+        pass
+    return ""
 
 
 def _join_object_cable(dist_geom: QgsGeometry, garden_geom: QgsGeometry, proj_geom=None):
@@ -120,6 +144,27 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
     SAME_FOOTWAY_TOL_M = 0.5
     RESERVED_SPARE_FIBERS = 2
 
+    # --- Shared feeder-cable planning (single-trunk policy, 96F target) ---
+    FEEDER_LADDER = (12, 24, 48, 72, 96, 144, 288)
+    # Trunk sizing: carry at most 70% of the cable size (≥30% spare). The HLD
+    # review asks for ONE standard trunk per direction — e.g. a 96F feeder
+    # covering all PDPs of an MFG (66 modules → 96F at 68.8% util) instead of
+    # several small 12F/24F cables.
+    FEEDER_SPARE_RATIO = 0.7
+    # Hard overflow: when an MFG's total demand exceeds this share of the
+    # largest ladder cable, a second trunk is started for the remainder.
+    FEEDER_TRUNK_MAX_DEMAND = int(FEEDER_SPARE_RATIO * 288)
+    # Graph/snap parameters for the feeder route tree (mirror duct_layer feeder)
+    SNAP_TOL = 1.5
+    NODE_TOL = 0.5
+    END_EPS  = 0.25
+    INT_EPS  = 0.25
+
+    # --- New optional inputs (shared feeder planning) ---
+    FINAL_TRENCH = "FINAL_TRENCHES"
+    PDP_POINTS   = "PDP_POINTS"
+    MFG_POINTS   = "MFG_POINTS"
+
     # ------------------------- UI -------------------------
     def initAlgorithm(self, config=None):
         self.addParameter(QgsProcessingParameterVectorLayer(
@@ -143,23 +188,465 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
             self.O_DIST, "Distribution Cable (per object)", QgsProcessing.TypeVectorLine
         ))
 
+        # Optional shared-feeder inputs.  When all three are provided the
+        # feeder cable is PLANNED from the Final_Trenches route tree (PDPs
+        # clubbed onto shared cables, sized by splitter demand with 40%
+        # spare); otherwise the old Feeder_Trench copy behaviour is kept.
+        self.addParameter(QgsProcessingParameterVectorLayer(
+            self.FINAL_TRENCH, "Final Trenches (route tree; shared feeder planning)",
+            [QgsProcessing.TypeVectorLine], optional=True,
+        ))
+        self.addParameter(QgsProcessingParameterVectorLayer(
+            self.PDP_POINTS, "PDP Points (SPLIT_CNT demand; shared feeder planning)",
+            [QgsProcessing.TypeVectorPoint], optional=True,
+        ))
+        self.addParameter(QgsProcessingParameterVectorLayer(
+            self.MFG_POINTS, "MFG Points (shared feeder planning)",
+            [QgsProcessing.TypeVectorPoint], optional=True,
+        ))
+
+    # ---------------- shared feeder planning ----------------
+
+    def _pdp_demand(self, pdp_lyr, fid, f_pdp):
+        """Feeder-fibre demand for a PDP: splitter module count (SPLIT_CNT).
+        Fallbacks: SPL_PORTS//64 → ceil(HH/32) → 1 (never 0)."""
+        f = pdp_lyr.getFeature(fid) if hasattr(pdp_lyr, "getFeature") else None
+        if f is None:
+            return 1
+        fld_cnt = first_field_case_insensitive(pdp_lyr, ["SPLIT_CNT", "split_cnt"])
+        if fld_cnt:
+            try:
+                v = int(f[fld_cnt])
+                if v and v > 0:
+                    return v
+            except Exception:
+                pass
+        fld_ports = first_field_case_insensitive(pdp_lyr, ["SPL_PORTS", "spl_ports"])
+        if fld_ports:
+            try:
+                v = int(f[fld_ports])
+                if v and v > 0:
+                    return max(1, v // 64)
+            except Exception:
+                pass
+        fld_hh = first_field_case_insensitive(pdp_lyr, ["HH", "hh"])
+        if fld_hh:
+            try:
+                hh = int(float(f[fld_hh] or 0))
+                if hh and hh > 0:
+                    return max(1, int(math.ceil(hh / 32.0)))
+            except Exception:
+                pass
+        return 1
+
+    def _ladder_size(self, demand):
+        """Smallest standard cable size whose 70% (30%-spare) capacity holds demand."""
+        for s in self.FEEDER_LADDER:
+            if demand <= self.FEEDER_SPARE_RATIO * s:
+                return s
+        return self.FEEDER_LADDER[-1]
+
+    def _group_feeder_cables(self, paths, demands, pid_mfg, edge_geom, edge_len,
+                             pdp_label):
+        """Club ALL PDPs of an MFG onto ONE standard trunk feeder cable.
+
+        Input:
+          paths     : pid -> (edge_list, length)  — MFG→PDP routes on the
+                      Final_Trenches graph (full path from MFG)
+          demands   : pid -> splitter-module demand (feeder fibres)
+          pid_mfg   : pid -> MFG label
+
+        Strategy (HLD review: 'use 96F and cover all PDPs in one direction
+        under a single feeder cable'):
+          - One trunk per MFG. Every PDP is a member; shared corridors are
+            drawn once, divergences become tap-off branch parts of the same
+            cable feature (multi-part geometry) — physically ONE cable laid
+            in the single feeder trench, spliced at each PDP.
+          - Trunk size = smallest ladder size whose 70% capacity covers the
+            MFG's total demand (e.g. 66 modules → 96F at 68.8% util).
+          - Only when the total demand overflows the largest ladder cable
+            (288F) is a second trunk started for the remainder.
+          - PDPs not routable from any MFG (should not happen) fall back to
+            their own small cable rather than being dropped.
+
+        Returns a list of cable dicts with keys:
+          cable_id, members (full edge lists MFG→each PDP), demand, size,
+          pdp_ids, splice_of, splice_pt, mfg_id, polygon_id.
+        """
+        ladder = self.FEEDER_LADDER
+
+        def size_for(demand):
+            """Smallest ladder size whose 70% capacity covers `demand`."""
+            for s in ladder:
+                if demand <= self.FEEDER_SPARE_RATIO * s:
+                    return s
+            return ladder[-1]
+
+        # 1) Partition PDPs by MFG.
+        by_mfg = defaultdict(list)
+        for pid in paths:
+            by_mfg[pid_mfg.get(pid, "")].append(pid)
+
+        cables = []
+        cid = 1
+        for mfg, pids in by_mfg.items():
+            # Longest routes first so trunk spines are the long corridors.
+            pids.sort(key=lambda q: paths[q][1], reverse=True)
+            total = sum(max(1, int(demands.get(q, 1) or 1)) for q in pids)
+            # One trunk per MFG; only overflow beyond the largest ladder
+            # cable forces a second trunk.
+            n_trunks = max(1, -(-total // self.FEEDER_TRUNK_MAX_DEMAND))
+            cap = -(-total // n_trunks)          # per-trunk demand split
+            trunks = [{"members": [], "demand": 0, "pdp_ids": []}
+                      for _ in range(n_trunks)]
+            # Longest-fit assignment into the trunks (bin packing when >1).
+            for q in pids:
+                d = max(1, int(demands.get(q, 1) or 1))
+                t = min(trunks, key=lambda tt: tt["demand"]) if n_trunks > 1 else trunks[0]
+                t["members"].append(list(paths[q][0]))
+                t["demand"] += d
+                t["pdp_ids"].append(pdp_label.get(q, str(q)))
+            for t in trunks:
+                if not t["members"]:
+                    continue
+                cables.append({
+                    "cable_id": cid,
+                    "members": t["members"],
+                    "demand": t["demand"],
+                    "size": size_for(t["demand"]),
+                    "pdp_ids": t["pdp_ids"],
+                    "splice_of": "",
+                    "splice_pt": "",
+                    "mfg_id": mfg,
+                    "polygon_id": "",
+                })
+                cid += 1
+        # Orphan PDPs without any routable path never appear in `paths`, so
+        # nothing is silently dropped — callers already filtered them.
+        return cables
+
+
+    def _plan_shared_feeders(self, final_tr, pdp_pts, mfg_pts, context, feedback):
+        """Build clubbed feeder cables from the Final_Trenches route tree.
+
+        Returns (QgsFields, [QgsFeature]) or raises on unrecoverable errors
+        (caller falls back to the legacy trench-copy path).
+        """
+        import heapq as _heapq
+        crs_t = QgsCoordinateReferenceSystem(self.DEFAULT_CRS_AUTHID)
+        net = reproject_if_needed(fix_geometries(final_tr, context, feedback), crs_t, context, feedback)
+        pdps = reproject_if_needed(fix_geometries(pdp_pts, context, feedback), crs_t, context, feedback)
+        mfgs = reproject_if_needed(fix_geometries(mfg_pts, context, feedback), crs_t, context, feedback)
+
+        f_pdp = first_field_case_insensitive(pdps, ["PDP_ID", "pdp_id", "pdp"])
+        f_mfg = first_field_case_insensitive(mfgs, ["MFG_ID", "mfg_id", "mfg"])
+        if not f_pdp:
+            raise QgsProcessingException("Shared feeder planning: PDP layer has no PDP_ID field.")
+        f_poly = first_field_case_insensitive(pdps, ["POLYGON_ID", "polygon_id"])
+
+        # ---- Graph from Final_Trenches (mirror feeder-duct graph build) ----
+        net_single = processing.run(
+            "native:multiparttosingleparts",
+            {"INPUT": net, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
+            context=context, feedback=feedback)["OUTPUT"]
+        try:
+            inter = processing.run(
+                "native:lineintersections",
+                {"INPUT": net_single, "INTERSECT": net_single,
+                 "INPUT_FIELDS": [], "INTERSECT_FIELDS": [],
+                 "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
+                context=context, feedback=feedback)["OUTPUT"]
+        except Exception:
+            inter = processing.run(
+                "qgis:lineintersections",
+                {"INPUT": net_single, "INTERSECT": net_single,
+                 "INPUT_FIELDS": [], "INTERSECT_FIELDS": [],
+                 "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
+                context=context, feedback=feedback)["OUTPUT"]
+        inter = processing.run(
+            "native:deleteduplicategeometries",
+            {"INPUT": inter, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
+            context=context, feedback=feedback)["OUTPUT"]
+
+        seg_index = QgsSpatialIndex(net_single.getFeatures())
+        fid_to_geom, fid_to_len = {}, {}
+        for f in net_single.getFeatures():
+            g = f.geometry()
+            if not g or g.isEmpty():
+                continue
+            fid_to_geom[f.id()] = g
+            fid_to_len[f.id()] = g.length()
+
+        fid_breaks = defaultdict(list)
+        fid_break_xy = defaultdict(dict)
+        for fid, L in fid_to_len.items():
+            geom = fid_to_geom[fid]
+            p0 = geom.interpolate(0.0).asPoint()
+            pL = geom.interpolate(L).asPoint()
+            fid_breaks[fid].extend([0.0, L])
+            fid_break_xy[fid][0.0] = (p0.x(), p0.y())
+            fid_break_xy[fid][L] = (pL.x(), pL.y())
+
+        snap_tol, node_tol, end_eps, int_eps = (self.SNAP_TOL, self.NODE_TOL,
+                                                self.END_EPS, self.INT_EPS)
+        for fp in inter.getFeatures():
+            pg = fp.geometry()
+            if not pg or pg.isEmpty():
+                continue
+            pt = pg.asPoint()
+            rect = pg.buffer(snap_tol * 2.0, 8).boundingBox()
+            for fid in seg_index.intersects(rect):
+                g = fid_to_geom.get(fid)
+                if not g:
+                    continue
+                if g.distance(pg) <= int_eps:
+                    L = fid_to_len[fid]
+                    d = g.lineLocatePoint(pg)
+                    if d <= 1e-6 or (L - d) <= 1e-6:
+                        continue
+                    fid_breaks[fid].append(d)
+                    fid_break_xy[fid][d] = (pt.x(), pt.y())
+
+        mfg_nodes, mfg_label = {}, {}
+        for fm in mfgs.getFeatures():
+            nk, _fid = snap_point_create_virtual(
+                fm.geometry(), seg_index, fid_to_geom, fid_to_len,
+                fid_breaks, fid_break_xy, snap_tol, node_tol, end_eps)
+            if nk is not None:
+                mfg_nodes[fm.id()] = (nk, _fid)
+                mfg_label[fm.id()] = str(fm[f_mfg] or fm.id())
+
+        pdp_nodes, pdp_label, pdp_poly = {}, {}, {}
+        for fp in pdps.getFeatures():
+            nk, _fid = snap_point_create_virtual(
+                fp.geometry(), seg_index, fid_to_geom, fid_to_len,
+                fid_breaks, fid_break_xy, snap_tol, node_tol, end_eps)
+            if nk is not None:
+                pdp_nodes[fp.id()] = (nk, _fid)
+                pdp_label[fp.id()] = str(fp[f_pdp] or fp.id())
+                pdp_poly[fp.id()] = str(fp[f_poly]) if f_poly else ""
+
+        if not mfg_nodes or not pdp_nodes:
+            raise QgsProcessingException(
+                "Shared feeder planning: no MFG/PDP could be snapped to the network.")
+
+        adj, edge_geom, edge_len = defaultdict(list), {}, {}
+        for fid, breaks in fid_breaks.items():
+            geom = fid_to_geom.get(fid)
+            L = fid_to_len.get(fid, 0.0)
+            if not geom or L <= 0:
+                continue
+            uniq = sorted(set(b for b in breaks if 0.0 <= b <= L))
+            if len(uniq) < 2:
+                continue
+            coords_at = {}
+            for d in uniq:
+                c = fid_break_xy[fid].get(d)
+                if c is None:
+                    pt = geom.interpolate(d).asPoint()
+                    c = (pt.x(), pt.y())
+                coords_at[d] = c
+            for i in range(len(uniq) - 1):
+                d0, d1 = uniq[i], uniq[i + 1]
+                if (d1 - d0) <= 1e-6:
+                    continue
+                p0, p1 = coords_at[d0], coords_at[d1]
+                u = round_key_xy(p0[0], p0[1], node_tol)
+                v = round_key_xy(p1[0], p1[1], node_tol)
+                sub = geom_substring(geom, d0, d1)
+                add_edge(adj, edge_geom, edge_len, u, v, sub)
+
+        # Label every node with its nearest MFG (multi-source Dijkstra).
+        label_dist = {}
+        heap = []
+        for mfg_id, (node_k, _) in mfg_nodes.items():
+            if node_k in adj:
+                _heapq.heappush(heap, (0.0, str(node_k), node_k, mfg_id))
+        while heap:
+            dist_u, _tie, u, lab = _heapq.heappop(heap)
+            if u in label_dist and dist_u > label_dist[u][0] + 1e-9:
+                continue
+            if u not in label_dist:
+                label_dist[u] = (dist_u, lab)
+            for v, seg_id, w in adj.get(u, []):
+                cand = dist_u + w
+                if (v not in label_dist) or (cand + 1e-9 < label_dist[v][0]) or \
+                   (abs(cand - label_dist[v][0]) <= 1e-9 and str(lab) < str(label_dist[v][1])):
+                    _heapq.heappush(heap, (cand, str(seg_id), v, lab))
+
+        pdp_to_mfg = {}
+        for pid, (nk, _) in pdp_nodes.items():
+            if nk in label_dist:
+                pdp_to_mfg[pid] = label_dist[nk][1]
+
+        paths, demands, pid_mfg = {}, {}, {}
+        for pid, (nk, _) in pdp_nodes.items():
+            mfg_id = pdp_to_mfg.get(pid)
+            if mfg_id is None or mfg_id not in mfg_nodes:
+                continue
+            mnode = mfg_nodes[mfg_id][0]
+            if mnode not in adj:
+                continue
+            dist, parent = dijkstra_with_parents(mnode, adj)
+            path = reconstruct_path(parent, nk, mnode)
+            if not path:
+                continue
+            paths[pid] = (path, path_len(edge_len, path))
+            demands[pid] = self._pdp_demand(pdps, pid, f_pdp)
+            pid_mfg[pid] = mfg_label[mfg_id]
+
+        if not paths:
+            raise QgsProcessingException(
+                "Shared feeder planning: no MFG→PDP paths could be routed.")
+
+        cables = self._group_feeder_cables(
+            paths, demands, pid_mfg, edge_geom, edge_len, pdp_label)
+
+        fields = QgsFields()
+        for nm, t in (
+            ("cable_id", QMetaType.Type.Int),
+            ("CABLE_TYPE", QMetaType.Type.QString),
+            ("FIBER_COUNT", QMetaType.Type.Int),
+            ("SPLIT_MODULES", QMetaType.Type.Int),
+            ("UTIL_PCT", QMetaType.Type.Double),
+            ("SPARE_PCT", QMetaType.Type.Double),
+            ("PDP_IDS", QMetaType.Type.QString),
+            ("PDP_COUNT", QMetaType.Type.Int),
+            ("SPLICE_OF", QMetaType.Type.QString),
+            ("SPLICE_POINT", QMetaType.Type.QString),
+            ("length_m", QMetaType.Type.Double),
+            ("POLYGON_ID", QMetaType.Type.QString),
+            ("MFG_ID", QMetaType.Type.QString),
+            ("REVIEW", QMetaType.Type.Int),
+        ):
+            fields.append(QgsField(nm, t))
+
+        feats = []
+        for c in cables:
+            # Drawn geometry: union of every member route — shared trunk
+            # segments are drawn once, branch routes become separate parts
+            # (tap-offs off the trunk), exactly like distribution cables.
+            seen_segs, segs = set(), []
+            for p in c["members"]:
+                for s in p:
+                    if s not in seen_segs:
+                        seen_segs.add(s)
+                        segs.append(s)
+            geom = edges_to_geom(edge_geom, segs)
+            if not geom or geom.isEmpty():
+                continue
+            nf = QgsFeature(fields)
+            nf.setGeometry(geom)
+            nf["cable_id"] = c["cable_id"]
+            nf["CABLE_TYPE"] = "Feeder"
+            nf["FIBER_COUNT"] = c["size"]
+            nf["SPLIT_MODULES"] = c["demand"]
+            nf["UTIL_PCT"] = round((c["demand"] / c["size"]) * 100.0, 1) if c["size"] else 0.0
+            nf["SPARE_PCT"] = round(max(0.0, 100.0 - nf["UTIL_PCT"]), 1)
+            nf["PDP_IDS"] = ",".join(c["pdp_ids"])
+            nf["PDP_COUNT"] = len(c["pdp_ids"])
+            nf["SPLICE_OF"] = c["splice_of"]
+            nf["SPLICE_POINT"] = c["splice_pt"]
+            nf["length_m"] = round(sum(edge_len.get(s, 0.0) for s in segs), 2)
+            nf["POLYGON_ID"] = c.get("polygon_id") or ""
+            nf["MFG_ID"] = c.get("mfg_id") or ""
+            nf["REVIEW"] = 1 if c["demand"] > self.FEEDER_SPARE_RATIO * self.FEEDER_LADDER[-1] else 0
+            feats.append(nf)
+        return fields, feats
+
     # ------------------------ run -------------------------
+    def _resolve_layer(self, v, context):
+        """Resolve a raw parameter value to a usable QgsVectorLayer.
+
+        Mirrors duct_layer's robust resolver: accepts live layers, processing
+        feature sources/definitions, temp layer ids/names, and OGR paths.
+        Returns None when nothing resolvable is found.
+        """
+        # 1) Already a live QgsVectorLayer?
+        try:
+            if isinstance(v, QgsVectorLayer) and v.isValid():
+                return v
+        except Exception:
+            pass
+        # 2) Processing feature source / definition -> materialise to memory
+        try:
+            from qgis.core import QgsProcessingFeatureSource, QgsProcessingFeatureSourceDefinition
+            if (isinstance(v, QgsProcessingFeatureSource) or
+                    isinstance(v, QgsProcessingFeatureSourceDefinition)):
+                return processing.run(
+                    "native:savefeatures",
+                    {"INPUT": v, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
+                    context=context,
+                )["OUTPUT"]
+        except Exception:
+            pass
+        # 3) Resolve by layer id/name via Processing utils
+        try:
+            from qgis.core import QgsProcessingUtils
+            cand = QgsProcessingUtils.mapLayerFromString(str(v), context)
+            if cand and cand.isValid():
+                return cand
+        except Exception:
+            pass
+        # 4) Try as OGR path/URI
+        try:
+            lyr = QgsVectorLayer(str(v), "resolved", "ogr")
+            if lyr.isValid():
+                return lyr
+        except Exception:
+            pass
+        return None
+
     def processAlgorithm(self, p, context, feedback):
         feeder_src = self.parameterAsVectorLayer(p, self.FEEDER_SRC, context)
-        if feeder_src is None:
-            raise QgsProcessingException("Feeder Trench layer is required.")
+        final_tr = self._resolve_layer(p.get(self.FINAL_TRENCH), context)
+        pdp_pts = self._resolve_layer(p.get(self.PDP_POINTS), context)
+        mfg_pts = self._resolve_layer(p.get(self.MFG_POINTS), context)
 
-        # Copy feeder trench → feeder cable
-        f_fields, f_wkb, f_crs = feeder_src.fields(), feeder_src.wkbType(), feeder_src.crs()
-        sinkF, outFeederId = self.parameterAsSink(p, self.O_FEEDER, context, f_fields, f_wkb, f_crs)
-        copied = 0
-        for f in feeder_src.getFeatures():
-            nf = QgsFeature(f_fields)
-            nf.setGeometry(f.geometry())
-            nf.setAttributes(f.attributes())
-            sinkF.addFeature(nf, QgsFeatureSink.FastInsert)
-            copied += 1
-        feedback.pushInfo(f"Feeder: copied {copied} features.")
+        # Shared feeder planning: when Final_Trenches + PDP + MFG are all
+        # provided, plan clubbed feeder cables (splitter demand, 40% spare,
+        # tap-off branches) instead of copying the per-PDP Feeder_Trench.
+        shared_plan = None   # (fields, [QgsFeature]) or None
+        if final_tr is not None and pdp_pts is not None and mfg_pts is not None:
+            try:
+                shared_plan = self._plan_shared_feeders(
+                    final_tr, pdp_pts, mfg_pts, context, feedback)
+                feedback.pushInfo(
+                    f"Feeder: shared planning active — {len(shared_plan[1])} planned feeder cables.")
+            except Exception as e:
+                feedback.reportError(f"⚠️ Shared feeder planning failed ({e}); falling back to trench copy.")
+                shared_plan = None
+            # An empty plan means nothing routed — fall back instead of
+            # silently emitting an empty Feeder_Cable layer.
+            if shared_plan is not None and not shared_plan[1]:
+                feedback.pushWarning("Feeder: shared planning produced 0 cables — falling back to trench copy.")
+                shared_plan = None
+
+        if shared_plan is not None:
+            f_fields, shared_feats = shared_plan
+            f_wkb = QgsWkbTypes.MultiLineString
+            f_crs = QgsCoordinateReferenceSystem(self.DEFAULT_CRS_AUTHID)
+            sinkF, outFeederId = self.parameterAsSink(p, self.O_FEEDER, context, f_fields, f_wkb, f_crs)
+            copied = 0
+            for nf in shared_feats:
+                sinkF.addFeature(nf, QgsFeatureSink.FastInsert)
+                copied += 1
+            feedback.pushInfo(f"Feeder: wrote {copied} planned cable features.")
+        else:
+            # Copy feeder trench → feeder cable (legacy behaviour)
+            if feeder_src is None:
+                raise QgsProcessingException(
+                    "Feeder Trench layer is required (or provide Final_Trenches + PDP + MFG for shared planning).")
+            f_fields, f_wkb, f_crs = feeder_src.fields(), feeder_src.wkbType(), feeder_src.crs()
+            sinkF, outFeederId = self.parameterAsSink(p, self.O_FEEDER, context, f_fields, f_wkb, f_crs)
+            copied = 0
+            for f in feeder_src.getFeatures():
+                nf = QgsFeature(f_fields)
+                nf.setGeometry(f.geometry())
+                nf.setAttributes(f.attributes())
+                sinkF.addFeature(nf, QgsFeatureSink.FastInsert)
+                copied += 1
+            feedback.pushInfo(f"Feeder: copied {copied} features.")
 
         # --- Distribution build: one cable per object (PDP → object) ---
         garden = self.parameterAsVectorLayer(p, self.GARDEN_L, context)

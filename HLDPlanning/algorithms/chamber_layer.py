@@ -2,27 +2,37 @@
 """
 Chamber Layer — generate planned civil chambers for the HLD.
 
-Implements the 'Simple Rule for HLD' from HLD_attr.docx:
+Implements the 8-rule chamber placement logic:
 
+  1. Splitter locations            → Chamber at every PDP (FAT/FDT/FDH/PFP point)
+  2. Branching points              → Manhole/Handhole where >= 3 distinct ducts
+                                     converge (feeder / distribution junction)
+  3. Feeder→Distribution transition→ covered by the PDP Chamber (feeder and
+                                     distribution meet there)
+  4. Distribution→Drop transition  → Handhole at every distribution-duct
+                                     endpoint that connects to a drop duct
+  5. Cable joint locations         → covered by junction chambers (rule 2)
+  6. Direction changes             → Manhole/Handhole at duct bends > 45°
+  7. Road crossings / HDD pits     → DHH at BOTH ends (entry + exit) of every drill crossing
+  8. Long straight routes          → intermediate pull Manholes/Handholes
+                                     every ~250 m along long duct runs
+
+Types follow the HLD_attr.docx Simple Rule:
     Manhole   → Feeder network            (large duct banks, backbone access)
     Chamber   → Feeder + Distribution     (splicing, branching, cable pulling)
     Handhole  → Distribution + Garden     (FAT access, garden cable connections)
 
-Placement rules:
-  - Chamber   : one at every PDP (feeder and distribution meet there)
-  - Manhole   : at every used tangent drill crossing + every feeder-duct
-                junction vertex (>= 2 feeder ducts within 1.5 m)
-  - Handhole  : at every distribution-duct junction vertex
-                (>= 2 distribution ducts within 1.5 m)
-
-Candidates within 2 m are collapsed (Chamber > Manhole > Handhole).
+Candidates within their rule-specific spacing are collapsed
+(Chamber > Manhole > Handhole, densest junction first).
 """
+import math
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     QgsProcessing, QgsProcessingAlgorithm,
     QgsProcessingParameterVectorLayer, QgsProcessingParameterFeatureSink,
     QgsProcessingException, QgsWkbTypes, QgsFeature, QgsFeatureSink,
     QgsGeometry, QgsPointXY, QgsRectangle, QgsSpatialIndex,
+    QgsVectorLayer,
 )
 
 from ..utils.fields import COMMON_FIELDS, THIN_PROFILES, build_fields
@@ -33,17 +43,62 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
 
     P_FEEDER_DUCTS = "INPUT_FEEDER_DUCTS"
     P_DIST_DUCTS = "INPUT_DIST_DUCTS"
+    P_DROP_DUCTS = "INPUT_DROP_DUCTS"   # drop ducts: distribution→drop transitions
     P_PDP = "INPUT_PDP"
     P_TANGENTS = "INPUT_TANGENT_CROSSINGS"
     P_TRENCHES = "INPUT_TRENCHES"
+    P_AOI = "INPUT_AOI"                 # design boundary (dissolved AOI polygon)
+    P_BUILDINGS = "INPUT_BUILDINGS"     # building footprints (chamber exclusion)
     OUT_CHAMBERS = "OUT_CHAMBERS"
 
     JUNCTION_RADIUS_M = 1.5     # how close two DISTINCT ducts must pass to count as a junction
-    JUNCTION_SPACING_M = 80.0   # min spacing between junction-derived Manholes/Handholes
-    HANDHOLE_SPACING_M = 100.0  # wider spacing for handholes (Distribution-level)
+    JUNCTION_MIN_DUCTS = 3      # distinct ducts required for a junction chamber (rule 2)
+    JUNCTION_SPACING_M = 40.0   # min spacing between junction-derived Manholes/Handholes
+    HANDHOLE_SPACING_M = 40.0   # min spacing for distribution-level handholes
     CHAMBER_SPACING_M = 2.0     # collapse chamber candidates closer than this
+    BEND_ANGLE_DEG = 60.0       # direction change above this gets a structure (rule 6)
+    BEND_SPACING_M = 25.0       # min spacing between bend-derived structures
+    BEND_MIN_LEG_M = 3.0        # both legs of the angle must be at least this long (snap zigzags)
+    DROP_TRANSITION_SPACING_M = 30.0  # min spacing between distribution→drop handholes
+    DROP_TRANSITION_MIN_DROPS = 2     # >= drop ducts tapping within CONN_RADIUS_M
+    PULL_SPACING_M = 250.0      # intermediate pull structures along long runs (rule 8)
+    PULL_MIN_RUN_M = 500.0      # only runs longer than this get intermediate pulls
+    PULL_END_SKIP_M = 50.0      # don't place a pull structure this close to a run end
+    PULL_CLEARANCE_M = 40.0     # a prior structure only blocks a pull point this close
     CONN_RADIUS_M = 3.0         # ducts within this radius count as 'connected'
     TRENCH_JOIN_M = 3.0         # parent trench join tolerance
+    TRENCH_SNAP_M = 5.0         # max shift to snap a chamber ONTO the trench path
+
+    # HLD review rules: chambers must sit inside the design boundary, and out
+    # of buildings EXCEPT high-density PDPs (> PDP_INBUILDING_HH homes), where
+    # the PDP/chamber may be installed inside the building to shorten drops.
+    INSIDE_TOL_M = 2.0          # 'outside boundary' tolerance (edge slivers)
+    SNAP_OUT_MAX_M = 15.0       # max shift to snap a chamber out of a building
+    SNAP_OUT_STEP_M = 2.0       # radial search step for the snap-out
+    PDP_INBUILDING_HH = 50      # > this many HP → PDP/chamber may stay in-building
+
+    # ── Standard chamber catalogue (HLD review: exactly 3 types) ──
+    # code  type                   size             use
+    # HH    Handhole               300x300/450x450  Pulling point, route access, micro-trench network
+    # DHH   Distribution Handhole  600x600          Splitter installation, distribution splicing, HDD entry/exit
+    # MH    Manhole                1200x1200        Feeder splicing, FDH/FDC locations, major network junctions
+    CHAMBER_CATALOGUE = {
+        "HH":  ("Handhole",              "300x300 / 450x450 mm"),
+        "DHH": ("Distribution Handhole", "600x600 mm"),
+        "MH":  ("Manhole",               "1200x1200 mm"),
+    }
+    # Type per placement reason:
+    #   PDP (splitter install + F2D) → DHH; HDD entry/exit → DHH;
+    #   feeder-side branching junctions → MH; distribution/drop access,
+    #   direction changes and pull points → HH.
+    REASON_TYPE = {
+        "Splitter/F2D (PDP)": "DHH",
+        "HDD pit": "DHH",
+        "Branching junction": "MH",
+        "Drop transition": "HH",
+        "Direction change": "HH",
+        "Pull point": "HH",
+    }
 
     def tr(self, s):
         return QCoreApplication.translate("ChamberLayerAlgorithm", s)
@@ -65,11 +120,14 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
 
     def shortHelpString(self):
         return self.tr(
-            "Plans civil chambers from the designed network: a Chamber at every "
-            "PDP, Manholes at feeder junctions and drill crossings, Handholes at "
-            "distribution junctions.  Implements the HLD_attr.docx Simple Rule "
-            "(Manhole = Feeder, Chamber = Feeder+Distribution, "
-            "Handhole = Distribution+Garden)."
+            "Plans civil chambers from the designed network using the 8-rule "
+            "logic: Chamber at every PDP (splitter + feeder→distribution "
+            "transition), Manholes/Handholes at branching junctions (≥3 "
+            "ducts), Handholes at distribution→drop transition points, "
+            "Manholes at HDD/drill pits, structures at >45° direction changes, "
+            "and intermediate pull chambers every ~250 m on long straight "
+            "runs. Implements the HLD_attr.docx Simple Rule (Manhole = Feeder, "
+            "Chamber = Feeder+Distribution, Handhole = Distribution+Garden)."
         )
 
     def initAlgorithm(self, config=None):
@@ -79,6 +137,10 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
         ))
         self.addParameter(QgsProcessingParameterVectorLayer(
             self.P_DIST_DUCTS, self.tr("Distribution Ducts [lines]"),
+            [QgsProcessing.TypeVectorLine], optional=True,
+        ))
+        self.addParameter(QgsProcessingParameterVectorLayer(
+            self.P_DROP_DUCTS, self.tr("Drop Ducts [lines] (optional; distribution→drop transitions)"),
             [QgsProcessing.TypeVectorLine], optional=True,
         ))
         self.addParameter(QgsProcessingParameterVectorLayer(
@@ -92,6 +154,14 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(QgsProcessingParameterVectorLayer(
             self.P_TRENCHES, self.tr("Final Trenches [lines] (optional; for parent id)"),
             [QgsProcessing.TypeVectorLine], optional=True,
+        ))
+        self.addParameter(QgsProcessingParameterVectorLayer(
+            self.P_AOI, self.tr("Design boundary / AOI [polygons] (optional; chambers kept inside)"),
+            [QgsProcessing.TypeVectorPolygon], optional=True,
+        ))
+        self.addParameter(QgsProcessingParameterVectorLayer(
+            self.P_BUILDINGS, self.tr("Buildings [polygons] (optional; chambers snapped out)"),
+            [QgsProcessing.TypeVectorPolygon], optional=True,
         ))
         self.addParameter(QgsProcessingParameterFeatureSink(
             self.OUT_CHAMBERS, self.tr("Chambers (planned)"),
@@ -188,33 +258,256 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
                     out.append((x, y, len(distinct)))
         return out
 
+    # Rule order mirrors the 8-rule spec: splitter locations first, then
+    # branching junctions, HDD pits, drop transitions, direction changes,
+    # and finally intermediate pull structures.  A higher-ranked rule always
+    # beats a lower one at the same spot, regardless of raw weight.
+    RULE_ORDER = {
+        "Splitter/F2D (PDP)": 0,
+        # HDD pits rank WITH branching junctions: their exact weight (999)
+        # places them first among rank-1, so junction manholes are not
+        # dropped next to an entry/exit pit that already provides access.
+        "HDD pit": 1,
+        "Branching junction": 1,
+        "Drop transition": 3,
+        "Direction change": 4,
+        "Pull point": 5,
+    }
+
+    def _rule_rank(self, cand):
+        reason = cand[7] if len(cand) > 7 else ""
+        return self.RULE_ORDER.get(reason, 9)
+
     def _place_structures(self, candidates):
         """Greedy placement: highest priority first, densest junctions first.
 
-        A candidate is kept unless a previously kept structure of any type sits
-        within its type-specific spacing (2 m for chambers, JUNCTION_SPACING
-        for junction-derived Manholes/Handholes).  Returns the kept list.
+        Sort key = (type priority, rule order, weight) so that branching
+        junctions (rule 1 in the 8-rule spec) are never starved by bend or
+        pull candidates whose raw weight (angle degrees, spacing) is larger.
+
+        Candidates carry their own rule-specific spacing as the 7th tuple
+        element (2 m for chambers, 40 m for junctions, 25 m for bends, 20 m
+        for drop transitions, 250 m for pull structures).  A candidate is
+        kept unless a previously kept structure sits within that spacing.
+
+        Pull chambers (rule 8) are the exception: they exist precisely to
+        fill long empty stretches every ~250 m, so they must be spaced
+        against each other, not suppressed by every nearby PDP / handhole.
+        A prior structure only blocks a pull point if it sits right at the
+        spot (within PULL_CLEARANCE_M).  Returns the kept list.
         """
-        spacing = {
-            "Chamber": self.CHAMBER_SPACING_M,
-            "Manhole": self.JUNCTION_SPACING_M,
-            "Handhole": self.HANDHOLE_SPACING_M,
-        }
-        ordered = sorted(candidates, key=lambda c: (-c[2], -c[5]))
+        ordered = sorted(
+            candidates,
+            key=lambda c: (-c[2], self._rule_rank(c), -c[5]),
+        )
         kept = []
         index = QgsSpatialIndex()
-        for x, y, prio, ctype, equip, weight in ordered:
-            sp = spacing.get(ctype, self.CHAMBER_SPACING_M)
-            rect = QgsRectangle(x - sp, y - sp, x + sp, y + sp)
+        for cand in ordered:
+            x, y, prio, ctype, equip, weight = cand[:6]
+            reason = cand[7] if len(cand) > 7 else ""
+            sp = cand[6] if len(cand) > 6 else self.CHAMBER_SPACING_M
+            if reason == "Pull point":
+                # Only blocked by a structure essentially at the same spot;
+                # spacing against *other* pull points is their own 250 m.
+                cl = self.PULL_CLEARANCE_M
+                rect = QgsRectangle(x - cl, y - cl, x + cl, y + cl)
+            else:
+                rect = QgsRectangle(x - sp, y - sp, x + sp, y + sp)
             if index.intersects(rect):
                 continue
             fid = len(kept)
-            kept.append((x, y, prio, ctype, equip, weight))
+            kept.append(cand)
             feat = QgsFeature()
             feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(x, y)))
             feat.setId(fid)
             index.addFeature(feat)
         return kept
+
+    def _line_parts_xy(self, geom):
+        """Yield lists of (x, y) vertices, one list per (multi)line part."""
+        if geom is None or geom.isEmpty():
+            return
+        parts = geom.constGet()
+        try:
+            if QgsWkbTypes.isMultiType(parts.wkbType()):
+                for part in parts.parts():
+                    pts = [(part.pointN(i).x(), part.pointN(i).y())
+                           for i in range(part.numPoints())]
+                    if len(pts) >= 2:
+                        yield pts
+            else:
+                pts = [(parts.pointN(i).x(), parts.pointN(i).y())
+                       for i in range(parts.numPoints())]
+                if len(pts) >= 2:
+                    yield pts
+        except Exception:
+            return
+
+    def _bend_points(self, lyr, min_deg):
+        """Rule 6 — direction changes: vertices where the line turns > min_deg.
+
+        Returns (x, y, turn_degrees). Only interior vertices of each part are
+        considered (a 3-point angle). Small zig-zags from snapping are ignored
+        by requiring both adjacent segments to be non-trivial in length.
+        """
+        if lyr is None:
+            return []
+        out = []
+        min_len = 1.0e-6
+        for f in lyr.getFeatures():
+            g = f.geometry()
+            for pts in self._line_parts_xy(g):
+                for i in range(1, len(pts) - 1):
+                    ax, ay = pts[i - 1]
+                    bx, by = pts[i]
+                    cx, cy = pts[i + 1]
+                    v1x, v1y = bx - ax, by - ay
+                    v2x, v2y = cx - bx, cy - by
+                    l1 = math.hypot(v1x, v1y)
+                    l2 = math.hypot(v2x, v2y)
+                    if l1 < min_len or l2 < min_len:
+                        continue
+                    if l1 < self.BEND_MIN_LEG_M or l2 < self.BEND_MIN_LEG_M:
+                        continue  # snap-artefact zigzag, not a real direction change
+                    dot = (v1x * v2x + v1y * v2y) / (l1 * l2)
+                    dot = max(-1.0, min(1.0, dot))
+                    turn = math.degrees(math.acos(dot))
+                    if turn > min_deg:
+                        out.append((bx, by, round(turn, 1)))
+        return out
+
+    def _drop_transition_points(self, dist_lyr, drop_lyr, radius):
+        """Rule 4 — distribution→drop transitions.
+
+        A Handhole is needed where a distribution duct terminates and drop
+        ducts begin.  For every distribution-duct endpoint, count how many
+        DISTINCT drop ducts tap within `radius`; yield (x, y, n_drops). The
+        caller gates on n_drops so isolated single drop-taps (served with a
+        direct joint) don't spawn handholes everywhere. Endpoints are gathered
+        per part so every tap-off point is considered.
+        """
+        if dist_lyr is None or drop_lyr is None or drop_lyr.featureCount() == 0:
+            return []
+        # Spatial index of drop ducts
+        drop_index = QgsSpatialIndex()
+        drop_geoms = {}
+        for f in drop_lyr.getFeatures():
+            g = f.geometry()
+            if g is None or g.isEmpty():
+                continue
+            drop_index.addFeature(f)
+            drop_geoms[f.id()] = g
+        out = []
+        seen = set()
+        for f in dist_lyr.getFeatures():
+            g = f.geometry()
+            for pts in self._line_parts_xy(g):
+                for (x, y) in (pts[0], pts[-1]):
+                    key = (round(x, 1), round(y, 1))
+                    if key in seen:
+                        continue
+                    rect = QgsRectangle(x - radius, y - radius, x + radius, y + radius)
+                    qpt = QgsGeometry.fromPointXY(QgsPointXY(x, y))
+                    ndrops = 0
+                    for hfid in drop_index.intersects(rect):
+                        dg = drop_geoms.get(hfid)
+                        if dg is not None and dg.distance(qpt) <= radius:
+                            ndrops += 1
+                    seen.add(key)
+                    out.append((x, y, ndrops))
+        return out
+
+    HDD_SNAP_M = 30.0          # tangent midpoints sit mid-road; allow a wider snap
+
+    def _pull_points(self, lyr, spacing_m, min_run_m, end_skip_m):
+        """Rule 8 — intermediate pull structures along long straight runs.
+
+        The duct layers are stored as MultiLineStrings whose parts come out
+        of the route union in ARBITRARY order.  Concatenating them blindly
+        creates phantom jump segments between disconnected parts and pull
+        candidates landed in the middle of nowhere (the 'chambers not on
+        the trench' bug).  Now the parts are first chained into connected
+        runs (greedy nearest-endpoint continuation) and each run is walked
+        independently — candidates only ever sit on real duct geometry.
+        Returns (x, y, 0) candidates.
+        """
+        if lyr is None or spacing_m <= 0:
+            return []
+        out = []
+        seen = set()
+        jump_tol = 1.0  # parts whose endpoints are farther apart are separate runs
+        for f in lyr.getFeatures():
+            g = f.geometry()
+            parts = [list(p) for p in self._line_parts_xy(g) if len(p) >= 2]
+            if not parts:
+                continue
+            # ── chain the parts into connected runs ──
+            # Greedy: start from the part with the globally lowest x (any
+            # deterministic anchor), then repeatedly append the part whose
+            # start/end continues the current chain end.
+            used = [False] * len(parts)
+            runs = []
+
+            def _dist(a, b):
+                return math.hypot(a[0] - b[0], a[1] - b[1])
+
+            for _ in range(len(parts)):
+                # anchor: first unused part (deterministic)
+                try:
+                    i0 = used.index(False)
+                except ValueError:
+                    break
+                used[i0] = True
+                run = list(parts[i0])
+                extended = True
+                while extended:
+                    extended = False
+                    best_j, best_rev, best_d = None, False, jump_tol
+                    for j in range(len(parts)):
+                        if used[j]:
+                            continue
+                        pj = parts[j]
+                        d_fwd = _dist(run[-1], pj[0])
+                        if d_fwd < best_d:
+                            best_d, best_j, best_rev = d_fwd, j, False
+                        d_rev = _dist(run[-1], pj[-1])
+                        if d_rev < best_d:
+                            best_d, best_j, best_rev = d_rev, j, True
+                    if best_j is not None:
+                        pj = parts[best_j]
+                        run.extend(pj[1:] if not best_rev else list(reversed(pj))[1:])
+                        used[best_j] = True
+                        extended = True
+                runs.append(run)
+
+            # Walk each run independently; never bridge across runs.
+            for pts in runs:
+                if len(pts) < 2:
+                    continue
+                total = 0.0
+                segs = []
+                for (ax, ay), (bx, by) in zip(pts, pts[1:]):
+                    seg = math.hypot(bx - ax, by - ay)
+                    segs.append((seg, (ax, ay), (bx, by)))
+                    total += seg
+                if total < min_run_m:
+                    continue
+                cum = 0.0
+                nxt = spacing_m
+                for seg, (ax, ay), (bx, by) in segs:
+                    end = cum + seg
+                    while nxt <= end - 1e-9:
+                        t = (nxt - cum) / seg if seg > 0 else 0.0
+                        x = ax + t * (bx - ax)
+                        y = ay + t * (by - ay)
+                        if nxt > end_skip_m and (total - nxt) > end_skip_m:
+                            key = (round(x, 1), round(y, 1))
+                            if key not in seen:
+                                seen.add(key)
+                                out.append((x, y, 0))
+                        nxt += spacing_m
+                    cum = end
+        return out
 
     def _count_ducts_near(self, index, feature_geoms, x, y, radius):
         """Count duct features whose geometry passes within radius of (x, y)."""
@@ -249,17 +542,91 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
                             break
         return best
 
+    def _dissolve_union(self, lyr):
+        """Union of all geometries in a layer (or None when empty/invalid)."""
+        if lyr is None or not lyr.isValid() or lyr.featureCount() == 0:
+            return None
+        u = QgsGeometry()
+        for f in lyr.getFeatures():
+            g = f.geometry()
+            if g is None or g.isEmpty():
+                continue
+            if u.isEmpty():
+                u = QgsGeometry(g)
+            else:
+                u = u.combine(g)
+        return u if (u and not u.isEmpty()) else None
+
+    def _snap_out_of_building(self, pt, bldg_union):
+        """Radial search for the nearest point outside the building union.
+        Returns the original point when no exit is found within SNAP_OUT_MAX_M."""
+        if bldg_union is None:
+            return pt
+        g = QgsGeometry.fromPointXY(QgsPointXY(pt[0], pt[1]))
+        if not bldg_union.contains(g):
+            return pt
+        step = self.SNAP_OUT_STEP_M
+        for r_m in range(step, self.SNAP_OUT_MAX_M + 1, step):
+            for ang in range(0, 360, 30):
+                a = math.radians(ang)
+                qx = pt[0] + r_m * math.cos(a)
+                qy = pt[1] + r_m * math.sin(a)
+                qg = QgsGeometry.fromPointXY(QgsPointXY(qx, qy))
+                if not bldg_union.contains(qg):
+                    return (qx, qy)
+        return pt  # keep original when no nearby exit (better than teleporting)
+
+    def _snap_onto_trenches(self, pt, trench_lines, max_m=None):
+        """Snap a chamber ONTO the nearest trench path (chambers are the
+        openings of the UG trench — they must lie on it).
+
+        trench_lines: list of QgsGeometry. Returns the projected point as
+        (x, y); the original point when the trench network is empty or the
+        nearest trench is farther than ``max_m`` (default TRENCH_SNAP_M).
+        HDD pits use a larger cap: the tangent midpoint sits mid-road while
+        the trench follows the footway."""
+        if not trench_lines:
+            return pt
+        cap = self.TRENCH_SNAP_M if max_m is None else max_m
+        g = QgsGeometry.fromPointXY(QgsPointXY(pt[0], pt[1]))
+        best_d, best_xy = None, None
+        for tg in trench_lines:
+            try:
+                d = tg.distance(g)
+            except Exception:
+                continue
+            if best_d is None or d < best_d:
+                best_d = d
+                best_xy = None
+                try:
+                    # QgsGeometry.closestPoint() is NOT available on this
+                    # QGIS build — project the point onto the line with
+                    # lineLocatePoint + interpolate instead.
+                    along = tg.lineLocatePoint(g)
+                    proj = tg.interpolate(along)
+                    if proj and not proj.isEmpty():
+                        p = proj.asPoint()
+                        best_xy = (p.x(), p.y())
+                except Exception:
+                    best_xy = None
+        if best_d is None or best_d > cap or best_xy is None:
+            return pt
+        return best_xy
+
     # ── main ─────────────────────────────────────────────────────────────
 
     def processAlgorithm(self, params, context, feedback):
         feeder = self._layer(params, self.P_FEEDER_DUCTS, context)
         dist = self._layer(params, self.P_DIST_DUCTS, context)
+        drop = self._layer(params, self.P_DROP_DUCTS, context)
         pdp_lyr = self._layer(params, self.P_PDP, context)
         tangents = self._layer(params, self.P_TANGENTS, context)
         trenches = self._layer(params, self.P_TRENCHES, context)
+        aoi_lyr = self._layer(params, self.P_AOI, context)
+        bldg_lyr = self._layer(params, self.P_BUILDINGS, context)
 
         crs = None
-        for lyr in (feeder, dist, pdp_lyr, tangents, trenches):
+        for lyr in (feeder, dist, drop, pdp_lyr, tangents, trenches):
             if lyr is not None and lyr.isValid():
                 crs = lyr.crs()
                 break
@@ -268,10 +635,12 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
                 self.tr("At least one input layer is required."))
 
         # ── gather raw candidates ────────────────────────────────────────
-        candidates = []  # (x, y, priority, type)
+        candidates = []
+        # Tuples: (x, y, priority, type, equipment, weight, min_spacing_m, reason)
+        # Priority: Chamber=3 > Manhole=2 > Handhole=1 (denser junctions win)
 
-        # Chamber at every PDP (feeder + distribution meet)
-        pdp_ids = {}
+        # Rule 1 + 3 — Chamber at every PDP (splitter location; feeder and
+        # distribution meet there, so it doubles as the F2D transition point).
         if pdp_lyr is not None:
             for f in pdp_lyr.getFeatures():
                 g = f.geometry()
@@ -284,19 +653,80 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
                 pid = ""
                 if f.fields().indexOf("PDP_ID") >= 0:
                     pid = str(f["PDP_ID"] or "")
-                candidates.append((pt.x(), pt.y(), 3, "Chamber", pid, 999))
+                candidates.append((pt.x(), pt.y(), 3, "Chamber", pid, 999,
+                                   self.CHAMBER_SPACING_M, "Splitter/F2D (PDP)"))
 
-        # Manhole at used drill crossings (feeder access)
-        # Filter: skip crossings within 100m of an already-placed candidate
-        DRILL_DEDUP_M = 100.0
+        # Rule 7 — HDD entry/exit pits at used drill crossings.
+        # A drill (HDD) trench needs a chamber at BOTH ends so the cable can
+        # be pulled through — one mid-road manhole is not enough. The drill
+        # legs arrive merged into Final_Trenches as chained segments tagged
+        # HDD; an endpoint where two legs chain together (another endpoint
+        # within JOINT_TOL_M) is an INTERIOR joint, not an entry/exit. Only
+        # single-incident endpoints get a pit. The tangent-crossing layer
+        # (perpendicular drill segments) is kept as a fallback for runs
+        # where the trench layer does not carry the drill legs.
+        DRILL_DEDUP_M = 60.0
+        JOINT_TOL_M = 2.0
         seen_drill = []
-        if tangents is not None:
+
+        # (a) Primary: entry/exit pits from the HDD legs in Final_Trenches.
+        hdd_occ = []  # every HDD leg endpoint: (x, y, occurrence index)
+        if trenches is not None and trenches.isValid() and \
+                trenches.fields().indexOf("trench_type") >= 0:
+            for f in trenches.getFeatures():
+                tt = str(f["trench_type"] or "").strip().lower()
+                if tt != "hdd":
+                    continue
+                g = f.geometry()
+                if g is None or g.isEmpty() or \
+                        g.type() != QgsWkbTypes.LineGeometry:
+                    continue
+                parts = []
+                try:
+                    cg = g.constGet()
+                    if QgsWkbTypes.isMultiType(cg.wkbType()):
+                        for part in cg.parts():
+                            pts = [(part.pointN(i).x(), part.pointN(i).y())
+                                   for i in range(part.numPoints())]
+                            if len(pts) >= 2:
+                                parts.append(pts)
+                    else:
+                        pts = [(cg.pointN(i).x(), cg.pointN(i).y())
+                               for i in range(cg.numPoints())]
+                        if len(pts) >= 2:
+                            parts.append(pts)
+                except Exception:
+                    continue
+                for pts in parts:
+                    hdd_occ.append((pts[0][0], pts[0][1], len(hdd_occ)))
+                    hdd_occ.append((pts[-1][0], pts[-1][1], len(hdd_occ)))
+        for x, y, idx in hdd_occ:
+            neighbours = sum(
+                1 for x2, y2, j in hdd_occ
+                if j != idx and (x2 - x) ** 2 + (y2 - y) ** 2 <= JOINT_TOL_M ** 2)
+            if neighbours:
+                continue  # interior joint — legs chain here, not an opening
+            too_close = any((x - sx) ** 2 + (y - sy) ** 2 < 4.0
+                            for sx, sy in seen_drill)
+            if not too_close:
+                candidates.append((x, y, 2, "Chamber", "", 999,
+                                   self.CHAMBER_SPACING_M, "HDD pit"))
+                seen_drill.append((x, y))
+
+        # (b) Fallback: tangent-crossing midpoints, only when the trench
+        # layer carried no HDD legs at all (drills available solely as
+        # perpendicular tangent segments). Dedup so a row of pits on one
+        # HDD run collapses to a single manhole.
+        if not hdd_occ and tangents is not None:
             for f in tangents.getFeatures():
                 g = f.geometry()
                 if g is None or g.isEmpty():
                     continue
                 try:
-                    pt = g.asPoint()
+                    if g.type() == QgsWkbTypes.LineGeometry:
+                        pt = g.centroid().asPoint()
+                    else:
+                        pt = g.asPoint()
                 except Exception:
                     continue
                 px, py = pt.x(), pt.y()
@@ -306,18 +736,123 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
                         too_close = True
                         break
                 if not too_close:
-                    candidates.append((px, py, 2, "Manhole", "", 999))
+                    candidates.append((px, py, 2, "Manhole", "", 999,
+                                       self.JUNCTION_SPACING_M, "HDD pit"))
                     seen_drill.append((px, py))
 
-        # Manhole at feeder-duct junctions (≥3 distinct ducts required)
+        # Rule 2 — Branching points: Manhole at feeder junctions, Handhole at
+        # distribution junctions (>= JUNCTION_MIN_DUCTS distinct ducts).
         for x, y, w in self._junction_points(feeder, self.JUNCTION_RADIUS_M):
-            if w >= 3:
-                candidates.append((x, y, 2, "Manhole", "", w))
-
-        # Handhole at distribution-duct junctions (>= 3 distinct ducts required)
+            if w >= self.JUNCTION_MIN_DUCTS:
+                candidates.append((x, y, 2, "Manhole", "", w,
+                                   self.JUNCTION_SPACING_M, "Branching junction"))
         for x, y, w in self._junction_points(dist, self.JUNCTION_RADIUS_M):
-            if w >= 3:
-                candidates.append((x, y, 1, "Handhole", "", w))
+            if w >= self.JUNCTION_MIN_DUCTS:
+                candidates.append((x, y, 1, "Handhole", "", w,
+                                   self.HANDHOLE_SPACING_M, "Branching junction"))
+
+        # Rule 4 — Distribution→Drop transition: Handhole only where a
+        # cluster of drop ducts taps off (>= DROP_TRANSITION_MIN_DROPS within
+        # CONN_RADIUS_M). Single drop-taps need no structure — the drop
+        # connects directly in a shallow joint.
+        for x, y, ndrops in self._drop_transition_points(dist, drop, self.CONN_RADIUS_M):
+            if ndrops >= self.DROP_TRANSITION_MIN_DROPS:
+                candidates.append((x, y, 1, "Handhole", "", ndrops,
+                                   self.DROP_TRANSITION_SPACING_M, "Drop transition"))
+
+        # Rule 6 — Direction changes > 45°: Manhole on feeder bends,
+        # Handhole on distribution bends.
+        for x, y, deg in self._bend_points(feeder, self.BEND_ANGLE_DEG):
+            candidates.append((x, y, 2, "Manhole", "", int(deg),
+                               self.BEND_SPACING_M, "Direction change"))
+        for x, y, deg in self._bend_points(dist, self.BEND_ANGLE_DEG):
+            candidates.append((x, y, 1, "Handhole", "", int(deg),
+                               self.BEND_SPACING_M, "Direction change"))
+
+        # Rule 8 — Long straight routes: intermediate pull Manholes on feeder
+        # runs, Handholes on distribution runs, every ~250 m.
+        for x, y, _w in self._pull_points(
+                feeder, self.PULL_SPACING_M, self.PULL_MIN_RUN_M, self.PULL_END_SKIP_M):
+            candidates.append((x, y, 2, "Manhole", "", 1,
+                               self.PULL_SPACING_M, "Pull point"))
+        for x, y, _w in self._pull_points(
+                dist, self.PULL_SPACING_M, self.PULL_MIN_RUN_M, self.PULL_END_SKIP_M):
+            candidates.append((x, y, 1, "Handhole", "", 1,
+                               self.PULL_SPACING_M, "Pull point"))
+
+        # ── boundary + building constraints (HLD review) ─────────────────
+        # Chambers must be inside the design boundary and out of buildings,
+        # EXCEPT high-density PDP chambers (>50 HP) which may stay in-building.
+        aoi_union = self._dissolve_union(aoi_lyr)
+        bldg_union = self._dissolve_union(bldg_lyr)
+
+        # ── trench-path snapping (chambers ARE the trench openings) ──────
+        trench_lines = []
+        if trenches is not None and trenches.isValid():
+            for f in trenches.getFeatures():
+                g = f.geometry()
+                if g and not g.isEmpty() and g.type() == QgsWkbTypes.LineGeometry:
+                    trench_lines.append(g)
+
+        high_density_pdps = set()
+        if pdp_lyr is not None and bldg_union is not None:
+            f_pid = "PDP_ID" if (pdp_lyr.fields().indexOf("PDP_ID") >= 0) else None
+            f_hh = None
+            for nm in ("HH", "hh", "HP", "hp", "HOMES", "UNITS"):
+                if pdp_lyr.fields().indexOf(nm) >= 0:
+                    f_hh = nm
+                    break
+            if f_pid and f_hh:
+                for f in pdp_lyr.getFeatures():
+                    try:
+                        if int(float(f[f_hh] or 0)) > self.PDP_INBUILDING_HH:
+                            high_density_pdps.add(str(f[f_pid] or ""))
+                    except Exception:
+                        continue
+        dropped_boundary = 0
+        snapped_building = 0
+        snapped_trench = 0
+        # ALWAYS run the constraint loop — the trench-path snap is mandatory
+        # (chambers are the openings of the UG trench), while the boundary and
+        # building rules apply only when those layers are supplied.
+        constrained = []
+        for cand in candidates:
+            x, y = cand[0], cand[1]
+            # HDD pits are placed at the midpoint of the road-crossing tangent
+            # line, which sits mid-road while the trench follows the footway —
+            # they get a wider snap cap so they still end up ON the path.
+            reason0 = cand[7] if len(cand) > 7 else ""
+            cap = self.HDD_SNAP_M if reason0 == "HDD pit" else None
+            # Rule: snap ONTO the trench path first — the chamber is the
+            # opening of the UG trench and must lie on it.
+            if trench_lines:
+                nx, ny = self._snap_onto_trenches((x, y), trench_lines, max_m=cap)
+                if (nx, ny) != (x, y):
+                    snapped_trench += 1
+                    x, y = nx, ny
+            # Rule: keep within the design boundary (small edge tolerance).
+            if aoi_union is not None:
+                ptg = QgsGeometry.fromPointXY(QgsPointXY(x, y))
+                if not aoi_union.contains(ptg):
+                    if aoi_union.distance(ptg) > self.INSIDE_TOL_M:
+                        dropped_boundary += 1
+                        continue
+            # Rule: snap chambers out of buildings. High-density PDP
+            # chambers (splitter in-building exemption) stay put.
+            if bldg_union is not None:
+                equip = cand[4] if len(cand) > 4 else ""
+                if not (equip and any(equip.startswith(hd) for hd in high_density_pdps)):
+                    nx, ny = self._snap_out_of_building((x, y), bldg_union)
+                    if (nx, ny) != (x, y):
+                        snapped_building += 1
+                        x, y = nx, ny
+            # Final re-snap: a building snap-out may have pulled the
+            # chamber off the trench — chambers must LIE on the path.
+            if trench_lines:
+                x, y = self._snap_onto_trenches((x, y), trench_lines, max_m=cap)
+            cand = (x, y) + tuple(cand[2:])
+            constrained.append(cand)
+        candidates = constrained
 
         # ── collapse duplicates (highest priority, densest first) ────────
         kept = self._place_structures(candidates)
@@ -343,28 +878,33 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
             out_fields, QgsWkbTypes.Point, crs,
         )
 
-        counters = {"Manhole": 0, "Chamber": 0, "Handhole": 0}
+        counters = {"HH": 0, "DHH": 0, "MH": 0}
+        reason_counts = {}
         written = 0
-        for x, y, prio, ctype, equip, _w in kept:
-            counters[ctype] += 1
-            struct_id = f"{ctype[0:2].upper()}-{counters[ctype]:04d}"
+        for cand in kept:
+            x, y, prio, ctype, equip, weight = cand[:6]
+            reason = cand[7] if len(cand) > 7 else ""
+            # ── Standard catalogue: HH / DHH / MH (fixed sizes) ──
+            code = self.REASON_TYPE.get(reason, "HH")
+            if reason == "Branching junction" and prio < 2:
+                code = "HH"  # distribution-level junctions stay handholes
+            type_name, size_str = self.CHAMBER_CATALOGUE[code]
+            counters[code] += 1
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+            struct_id = f"{code}-{counters[code]:04d}"
             conn = self._count_ducts_near(duct_index, duct_geoms, x, y, self.CONN_RADIUS_M)
-            if conn <= 2:
-                size = "Small (600×450 mm)"
-            elif conn <= 4:
-                size = "Medium (1000×750 mm)"
-            else:
-                size = "Large (1500×1200 mm)"
+            # Fixed catalogue sizes — no Small/Medium/Large buckets.
+            size = size_str
 
             feat = QgsFeature(out_fields)
             feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(x, y)))
             feat[COMMON_FIELDS.STRUCT_ID] = struct_id
-            feat[COMMON_FIELDS.CHAMBER_TYPE] = ctype
+            feat[COMMON_FIELDS.CHAMBER_TYPE] = code  # HH | DHH | MH
             feat[COMMON_FIELDS.PARENT_TRENCH] = self._nearest_trench(
                 trenches, x, y, self.TRENCH_JOIN_M)
             feat[COMMON_FIELDS.CONN_DUCTS] = conn
             feat[COMMON_FIELDS.SIZE] = size
-            feat[COMMON_FIELDS.EQUIPMENT] = equip or ""
+            feat[COMMON_FIELDS.EQUIPMENT] = (equip or "") + (("; " + reason) if reason else "")
             feat[COMMON_FIELDS.CAPACITY_USED] = 0
             feat[COMMON_FIELDS.CAPACITY_TOTAL] = conn
             feat[COMMON_FIELDS.INFRA_STATUS] = InfraStatus.PROPOSED
@@ -374,10 +914,14 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
                 sink.addFeature(feat, QgsFeatureSink.FastInsert)
                 written += 1
 
+        rc = ", ".join(f"{k}: {v}" for k, v in sorted(reason_counts.items()))
         feedback.pushInfo(self.tr(
             f"Chamber layer: {written} planned structures "
-            f"(Manhole: {counters['Manhole']}, Chamber: {counters['Chamber']}, "
-            f"Handhole: {counters['Handhole']})."))
+            f"(MH: {counters['MH']}, DHH: {counters['DHH']}, HH: {counters['HH']}).\n"
+            f"  Placement reasons: {rc or 'none'}\n"
+            f"  Boundary: {dropped_boundary} candidate(s) outside design boundary removed; "
+            f"{snapped_building} chamber(s) snapped out of buildings; "
+            f"{snapped_trench} chamber(s) snapped onto trench paths (tol {self.TRENCH_SNAP_M} m)."))
 
         result = {}
         if out_id:

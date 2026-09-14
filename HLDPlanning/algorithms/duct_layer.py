@@ -35,7 +35,7 @@ from qgis.core import (
     QgsFields, QgsField, QgsWkbTypes,
     QgsGeometry, QgsPointXY, QgsProject,
     QgsProcessingUtils, QgsSymbol,
-    QgsVectorLayer,
+    QgsVectorLayer, QgsCoordinateTransform,
 )
 from qgis import processing
 from ..utils.geom import round_key_xy, geom_substring, edges_to_geom, path_len, is_prefix, lcp_len
@@ -1044,9 +1044,15 @@ class DuctLayer(QgsProcessingAlgorithm):
     P_CRS     = "TARGET_CRS"
     P_PSEUDO  = "PSEUDO_OBJECT_POINTS"
     P_GARDEN  = "GARDEN_TRENCHES"
+    # New: cable layers (optional).  When provided, ducts are bundled per
+    # route from the actual planned cables; otherwise the legacy duct
+    # builders run unchanged.
+    P_FEEDER_CABLES = "FEEDER_CABLES"
+    P_DIST_CABLES   = "DIST_CABLES"
     O_FEEDER  = "OUT_FEEDER_DUCTS"
     O_DISTR   = "OUT_DISTRIBUTION_DUCTS"
     O_DROP    = "OUT_DROP_DUCTS"
+    O_COUPLE  = "OUT_COUPLEURS"   # couplers at pseudo → object duct connections
 
     def createInstance(self): return DuctLayer()
     def name(self): return "05_duct_layer"
@@ -1070,12 +1076,16 @@ class DuctLayer(QgsProcessingAlgorithm):
         self.addParameter(QgsProcessingParameterVectorLayer(self.P_FINAL, "Final Tangent Trenches (optional)", [QgsProcessing.TypeVectorLine], optional=True))
         self.addParameter(QgsProcessingParameterVectorLayer(self.P_PSEUDO, "Pseudo Object/HH Points on Footway (optional; distribution duct ends)", [QgsProcessing.TypeVectorPoint], optional=True))
         self.addParameter(QgsProcessingParameterVectorLayer(self.P_GARDEN, "Garden Trenches (optional; drop-duct source)", [QgsProcessing.TypeVectorLine], optional=True))
+        self.addParameter(QgsProcessingParameterVectorLayer(self.P_FEEDER_CABLES, "Feeder Cables (optional; one 4-way duct per route)", [QgsProcessing.TypeVectorLine], optional=True))
+        self.addParameter(QgsProcessingParameterVectorLayer(self.P_DIST_CABLES, "Distribution Cables (optional; one 2-way duct per co-route)", [QgsProcessing.TypeVectorLine], optional=True))
         self.addParameter(QgsProcessingParameterVectorDestination(self.O_FEEDER, "Feeder_Ducts"))
         self.addParameter(QgsProcessingParameterVectorDestination(self.O_DISTR, "Distribution_Ducts"))
         self.addParameter(QgsProcessingParameterVectorDestination(self.O_DROP, "Drop_Ducts (small; pseudo → object)"))
+        self.addParameter(QgsProcessingParameterVectorDestination(self.O_COUPLE, "Coupleurs (pseudo → object connection points)", optional=True))
 
     def _build_drop_ducts(self, p, context, feedback, out_spec,
-                          garden_lyr, pseudo_lyr, obj_lyr, crs):
+                          garden_lyr, pseudo_lyr, obj_lyr, crs,
+                          coupler_out_spec=None):
         """Small 'drop' ducts that connect each pseudo object/HH point on the
         footway to the object/building itself.
 
@@ -1083,10 +1093,16 @@ class DuctLayer(QgsProcessingAlgorithm):
         and carry PDP_ID / ADDR_ID / POLYGON_ID / MFG_ID).  Fallback: straight
         lines between pseudo point and object joined by address id.  Emits an
         empty layer when nothing is available so downstream stages stay stable.
-        Returns the output layer id (or None).
+
+        When ``coupler_out_spec`` is provided, ALSO emits one COUPLER point per
+        drop duct at the pseudo (footway) end — the joint where the drop duct
+        meets the distribution duct (HLD review: mark every pseudo ↔ object
+        duct connection with a coupler, own layer + ids).
+
+        Returns (drop_layer_id, coupler_layer_id).
         """
         if not out_spec:
-            return None
+            return None, None
 
         fields = QgsFields()
         for nm, t in (
@@ -1105,13 +1121,36 @@ class DuctLayer(QgsProcessingAlgorithm):
         sink, out_id = QgsProcessingUtils.createFeatureSink(
             out_spec, context, fields, QgsWkbTypes.LineString, crs)
         if sink is None:
-            return None
+            return None, None
+
+        # Coupler sink (optional output).
+        c_fields = QgsFields()
+        for nm, t in (
+            ("coupler_id", QMetaType.Type.QString),
+            ("COUPLER_TYPE", QMetaType.Type.QString),
+            ("PDP_ID", QMetaType.Type.QString),
+            ("ADDR_ID", QMetaType.Type.QString),
+            ("HH_ID", QMetaType.Type.QString),
+            ("POLYGON_ID", QMetaType.Type.QString),
+            ("MFG_ID", QMetaType.Type.QString),
+            ("DUCT_UID", QMetaType.Type.Int),
+            ("SIDE", QMetaType.Type.QString),
+        ):
+            c_fields.append(QgsField(nm, t))
+        c_sink, c_id = None, None
+        if coupler_out_spec:
+            try:
+                c_sink, c_id = QgsProcessingUtils.createFeatureSink(
+                    coupler_out_spec, context, c_fields, QgsWkbTypes.Point, crs)
+            except Exception:
+                c_sink, c_id = None, None
 
         uid = 0
         made = 0
+        n_cpl = 0
 
         def _add(pdp, addr, hh, poly, mfg, geom, side):
-            nonlocal uid, made
+            nonlocal uid, made, n_cpl
             if not geom or geom.isEmpty():
                 return
             f = QgsFeature(fields)
@@ -1126,6 +1165,29 @@ class DuctLayer(QgsProcessingAlgorithm):
             f["SIDE"] = side
             f["DUCT_UID"] = uid
             sink.addFeature(f, QgsFeatureSink.FastInsert)
+            # Coupler at the pseudo (footway) end of the drop duct — the joint
+            # where the drop duct meets the distribution network.
+            if c_sink is not None:
+                try:
+                    ln = (geom.asMultiPolyline()[0] if geom.isMultipart()
+                          else geom.asPolyline())
+                    if ln:
+                        cpt = QgsPointXY(ln[-1])
+                        cf = QgsFeature(c_fields)
+                        cf.setGeometry(QgsGeometry.fromPointXY(cpt))
+                        cf["coupler_id"] = f"CPL-{uid + 1:04d}"
+                        cf["COUPLER_TYPE"] = "Optical coupler (drop ↔ distribution)"
+                        cf["PDP_ID"] = pdp
+                        cf["ADDR_ID"] = addr
+                        cf["HH_ID"] = hh
+                        cf["POLYGON_ID"] = poly
+                        cf["MFG_ID"] = mfg
+                        cf["DUCT_UID"] = uid
+                        cf["SIDE"] = side
+                        c_sink.addFeature(cf, QgsFeatureSink.FastInsert)
+                        n_cpl += 1
+                except Exception:
+                    pass
             uid += 1
             made += 1
 
@@ -1266,10 +1328,268 @@ class DuctLayer(QgsProcessingAlgorithm):
                         None,
                     )
 
-        feedback.pushInfo(f"✅ Drop (small) ducts created: {made}")
+        feedback.pushInfo(f"✅ Drop (small) ducts created: {made}; couplers placed: {n_cpl}")
         if sink:
             del sink
+        if c_sink:
+            del c_sink
+        return out_id, c_id
+
+    def _build_route_ducts(self, cables_lyr, out_uri, profile_key, crs,
+                           context, feedback, subtract_lyr=None):
+        """Build ONE duct per connected route from a cable layer.
+
+        Cables that co-route (spatially touch within a small tolerance) are
+        clubbed into a single duct feature carrying the cable ids, so a route
+        with several feeder/distribution cables gets exactly one duct
+        (4-way for Feeder, 2-way for Distribution) instead of one per cable.
+
+        ``subtract_lyr`` (optional): geometry to remove from every duct — used
+        for Distribution so the drop legs (footway → object, i.e. the Garden
+        Trenches, which are covered by the separate Drop_Ducts layer) are NOT
+        duplicated inside the distribution duct. The duct then stops at the
+        footway and carries only the route trunk.
+
+        Returns the output layer id (or None when there is nothing to write).
+        """
+        if out_uri is None or cables_lyr is None:
+            return None
+        if cables_lyr.featureCount() == 0:
+            return None
+
+        # Pre-combine the subtract geometry once (same CRS as the cables).
+        subtract_union = None
+        if subtract_lyr is not None and subtract_lyr.featureCount() > 0:
+            try:
+                src_crs = subtract_lyr.crs()
+                tgt_crs = crs
+                xform = None
+                if src_crs.isValid() and tgt_crs.isValid() and src_crs.authid() != tgt_crs.authid():
+                    xform = QgsCoordinateTransform(src_crs, tgt_crs, QgsProject.instance())
+                geoms = []
+                for sf in subtract_lyr.getFeatures():
+                    sg = sf.geometry()
+                    if not sg or sg.isEmpty():
+                        continue
+                    if xform is not None:
+                        try:
+                            sg = sg.clone()
+                            sg.transform(xform)
+                        except Exception:
+                            continue
+                    geoms.append(sg)
+                if geoms:
+                    from ..utils.geometry_ops import unary_union_geoms as _uug_sub
+                    subtract_union = _uug_sub(geoms)
+                    # The cable layer builds the drop legs from a fixed/
+                    # reprojected copy of the garden input, so its vertices can
+                    # differ from this raw layer by a few cm. Buffer the
+                    # subtract geometry slightly so GEOS difference removes the
+                    # whole leg instead of leaving slivers (verified: 3% -> 0%
+                    # overlap with Drop_Ducts at 0.05 m).
+                    if subtract_union is not None and not subtract_union.isEmpty():
+                        try:
+                            subtract_union = subtract_union.buffer(0.05, 8)
+                        except Exception:
+                            pass
+            except Exception:
+                subtract_union = None
+
+        # Local catalogue profile (same values as utils.attr_enrich.DUCT_PROFILE)
+        _PROFILES = {
+            "Feeder": {"ways": 4, "duct_type": "4-Way HDPE"},
+            "Distribution": {"ways": 2, "duct_type": "2-Way HDPE"},
+        }
+        prof = _PROFILES.get(profile_key, _PROFILES["Distribution"])
+        ways = int(prof.get("ways", 4 if profile_key == "Feeder" else 2))
+
+        fld_id = first_field_case_insensitive(
+            cables_lyr, ["cable_id", "CABLE_ID", "id", "fid"])
+        fld_pdp = first_field_case_insensitive(
+            cables_lyr, ["PDP_IDS", "pdp_ids", "PDP_ID", "pdp_id"])
+        fld_poly = first_field_case_insensitive(
+            cables_lyr, ["POLYGON_ID", "polygon_id"])
+
+        feats = []          # list of QgsFeature (valid geometry only)
+        fid_to_idx = {}
+        idx = QgsSpatialIndex()
+        for f in cables_lyr.getFeatures():
+            g = f.geometry()
+            if not g or g.isEmpty():
+                continue
+            fid_to_idx[f.id()] = len(feats)
+            feats.append(f)
+            idx.addFeature(f)
+        if not feats:
+            return None
+
+        # --- Union-find: club cables whose geometries touch within TOL m ---
+        TOL = 0.5
+        parent = list(range(len(feats)))
+
+        def _find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        def _union(a, b):
+            ra, rb = _find(a), _find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        for i, f in enumerate(feats):
+            g = f.geometry()
+            bb = g.buffer(TOL, 8).boundingBox()
+            for fid in idx.intersects(bb):
+                j = fid_to_idx.get(fid)
+                if j is None or j <= i:
+                    continue
+                try:
+                    if g.distance(feats[j].geometry()) <= TOL:
+                        _union(i, j)
+                except Exception:
+                    pass
+
+        groups = defaultdict(list)
+        for i in range(len(feats)):
+            groups[_find(i)].append(i)
+
+        fields = QgsFields()
+        for nm, t in (
+            ("DUCT_TYPE", QMetaType.Type.QString),
+            ("capacity_total", QMetaType.Type.Int),
+            ("ways_used", QMetaType.Type.Int),
+            ("cables_carried", QMetaType.Type.QString),
+            ("pdp_ids", QMetaType.Type.QString),
+            ("POLYGON_ID", QMetaType.Type.QString),
+            ("length_m", QMetaType.Type.Double),
+            ("REVIEW", QMetaType.Type.Int),
+            ("INFRA_STATUS", QMetaType.Type.QString),
+        ):
+            fields.append(QgsField(nm, t))
+
+        try:
+            sink, out_id = QgsProcessingUtils.createFeatureSink(
+                out_uri, context, fields, QgsWkbTypes.MultiLineString, crs)
+        except Exception as e:
+            try:
+                feedback.reportError(f"Route duct sink failed: {e}")
+            except Exception:
+                pass
+            return None
+        if sink is None:
+            return None
+
+        made = 0
+        flag_cnt = 0
+        for members in groups.values():
+            # A corridor may carry more cables than the duct has ways: emit
+            # several {ways}-way ducts along the same route, keeping cables
+            # that co-route longest together, instead of one oversized duct.
+            for bin_ in self._chunk_into_ducts(members, feats, ways):
+                geoms = []
+                cable_ids = []
+                pdp_set = []
+                poly_set = []
+                for i in bin_:
+                    f = feats[i]
+                    g = f.geometry()
+                    if g and not g.isEmpty():
+                        geoms.append(g)
+                    if fld_id is not None:
+                        v = f.attribute(fld_id)
+                        if v is not None:
+                            cable_ids.append(str(v))
+                    if fld_pdp is not None:
+                        v = f.attribute(fld_pdp)
+                        if v is not None:
+                            pdp_set.append(str(v))
+                    if fld_poly is not None:
+                        v = f.attribute(fld_poly)
+                        if v is not None:
+                            poly_set.append(str(v))
+                if not geoms:
+                    continue
+                from ..utils.geometry_ops import unary_union_geoms as _uug
+                ug = _uug(geoms)
+                if not ug or ug.isEmpty():
+                    continue
+                # Distribution: strip the drop legs (footway → object) so they
+                # stay exclusively in the Drop_Ducts layer instead of being
+                # duplicated inside the distribution duct.
+                if subtract_union is not None and not subtract_union.isEmpty():
+                    try:
+                        ug_trimmed = ug.difference(subtract_union)
+                        if ug_trimmed is not None and not ug_trimmed.isEmpty():
+                            ug = ug_trimmed
+                    except Exception:
+                        pass
+                n_cab = len(cable_ids)
+                nf = QgsFeature(fields)
+                nf.setGeometry(ug)
+                nf["DUCT_TYPE"] = prof.get("duct_type", "4-Way HDPE" if profile_key == "Feeder" else "2-Way HDPE")
+                nf["capacity_total"] = ways
+                nf["ways_used"] = n_cab      # always <= ways by construction
+                nf["cables_carried"] = ",".join(cable_ids)
+                nf["pdp_ids"] = ",".join(dict.fromkeys(pdp_set))
+                nf["POLYGON_ID"] = ",".join(dict.fromkeys(poly_set))
+                nf["length_m"] = round(float(ug.length()), 2)
+                nf["REVIEW"] = 0
+                nf["INFRA_STATUS"] = "Proposed"
+                sink.addFeature(nf, QgsFeatureSink.FastInsert)
+                made += 1
+                if n_cab > ways:
+                    flag_cnt += 1
+
+        if sink:
+            del sink
+        feedback.pushInfo(
+            f"✅ Route ducts ({profile_key}): {made} x {ways}-way duct(s) from "
+            f"{len(feats)} cables over {len(groups)} route group(s) "
+            f"(cables split into {ways}-way ducts, {flag_cnt} oversized).")
         return out_id
+
+    @staticmethod
+    def _chunk_into_ducts(members, feats, ways):
+        """Split a corridor's cable indices into bins of <= `ways` cables.
+
+        Greedy: each bin starts from the longest remaining cable, then fills
+        with the cables sharing the most length with the bin so far — so the
+        cables that co-route longest end up in the same duct. Bins never
+        exceed the duct's way count, so no duct is ever oversized.
+        """
+        remaining = list(members)
+        bins = []
+        while remaining:
+            seed = max(remaining, key=lambda i: (
+                feats[i].geometry().length() if feats[i].geometry() else 0.0))
+            bin_ = [seed]
+            remaining.remove(seed)
+            bin_geom = feats[seed].geometry()
+            while len(bin_) < ways and remaining:
+                best, best_share = None, 0.0
+                for j in remaining:
+                    g = feats[j].geometry()
+                    if not g or g.isEmpty():
+                        best, best_share = j, float("inf")
+                        break
+                    try:
+                        sh = bin_geom.intersection(g).length()
+                    except Exception:
+                        sh = 0.0
+                    if sh > best_share:
+                        best_share, best = sh, j
+                if best is None:
+                    break
+                bin_.append(best)
+                remaining.remove(best)
+                try:
+                    bin_geom = bin_geom.combine(feats[best].geometry())
+                except Exception:
+                    pass
+            bins.append(bin_)
+        return bins
 
     def processAlgorithm(self, p, context, feedback):
         # Resolve parent output URIs up front
@@ -1393,7 +1713,28 @@ class DuctLayer(QgsProcessingAlgorithm):
             feeder.INC_TRUNK: True,
             feeder.MAX_K:     4,
         }
-        feeder.processAlgorithm(feeder_params, context, feedback)
+
+        # Route-based feeder ducts: when the Feeder_Cable layer is available
+        # (planned from Final_Trenches), emit ONE 4-way duct per connected
+        # route carrying the cables on it, instead of prefix-branch bundling.
+        feeder_route_done = False
+        feeder_cables = _as_layer_any(self.P_FEEDER_CABLES,
+                                      fallback_names=["Feeder_Cable", "Feeder_Cables"])
+        if feeder_cables is not None and feeder_cables.featureCount() > 0:
+            try:
+                _rid = self._build_route_ducts(
+                    feeder_cables, out_feeder_uri, "Feeder",
+                    net_lyr.crs(), context, feedback)
+                feeder_route_done = _rid is not None
+            except Exception as e:
+                try:
+                    feedback.reportError(
+                        f"Route-based feeder ducts failed ({e}); falling back to bundling algorithm.")
+                except Exception:
+                    pass
+                feeder_route_done = False
+        if not feeder_route_done:
+            feeder.processAlgorithm(feeder_params, context, feedback)
 
         # --- DROP DUCTS (small connections: pseudo object point → object) ---
         feedback.pushInfo("⚙️ Building small drop ducts (pseudo → object) …")
@@ -1401,15 +1742,18 @@ class DuctLayer(QgsProcessingAlgorithm):
         garden_lyr = _as_layer_any(self.P_GARDEN)
         obj_lyr = self.parameterAsVectorLayer(p, self.P_OBJECTS, context) or self.parameterAsSource(p, self.P_OBJECTS, context)
         try:
-            out_drop_id = self._build_drop_ducts(
+            out_coupler_uri = self.parameterAsOutputLayer(p, self.O_COUPLE, context)
+            out_drop_id, out_coupler_id = self._build_drop_ducts(
                 p, context, feedback, out_drop_uri,
-                garden_lyr, pseudo_lyr, obj_lyr, net_lyr.crs())
+                garden_lyr, pseudo_lyr, obj_lyr, net_lyr.crs(),
+                coupler_out_spec=out_coupler_uri)
         except Exception as e:
             try:
                 feedback.reportError(f"Drop ducts failed: {e}")
             except Exception:
                 pass
             out_drop_id = None
+            out_coupler_id = None
 
         # --- DISTRIBUTION ---
         feedback.pushInfo("⚙️ Running embedded Distribution algorithm …")
@@ -1519,6 +1863,37 @@ class DuctLayer(QgsProcessingAlgorithm):
                 self.O_DROP:   locals().get("out_drop_id", None),
             }
         
+        # Route-based distribution ducts: when the Distribution_Cable layer is
+        # available, emit ONE 2-way duct per connected co-route carrying the
+        # cables on it (bundled), instead of per-side per-PDP groups.
+        dist_route_done = False
+        dist_cables = _as_layer_any(self.P_DIST_CABLES,
+                                    fallback_names=["Distribution_Cable", "Distribution_Cables"])
+        if dist_cables is not None and dist_cables.featureCount() > 0:
+            try:
+                # Subtract the Garden Trenches (drop legs, footway → object)
+                # from the distribution ducts: those segments are covered by
+                # the separate Drop_Ducts layer and must not be duplicated.
+                _rid = self._build_route_ducts(
+                    dist_cables, out_distr_uri, "Distribution",
+                    QgsCoordinateReferenceSystem(self.DEFAULT_CRS_AUTHID),
+                    context, feedback,
+                    subtract_lyr=garden_lyr)
+                dist_route_done = _rid is not None
+            except Exception as e:
+                try:
+                    feedback.reportError(
+                        f"Route-based distribution ducts failed ({e}); falling back to grouping algorithm.")
+                except Exception:
+                    pass
+                dist_route_done = False
+        if dist_route_done:
+            return {
+                self.O_FEEDER: locals().get("out_feeder_uri", None),
+                self.O_DISTR:  out_distr_uri,
+                self.O_DROP:   locals().get("out_drop_id", None),
+            }
+
         # Safe run
         try:
             distr.processAlgorithm(distr_params, context, feedback)
@@ -1541,13 +1916,15 @@ class DuctLayer(QgsProcessingAlgorithm):
                 self.O_FEEDER: locals().get("out_feeder_uri", None),
                 self.O_DISTR:  None,
                 self.O_DROP:   locals().get("out_drop_id", None),
+                self.O_COUPLE: locals().get("out_coupler_id", None),
             }
-        
+
         # Success: return URIs so Processing auto-loads the layer(s)
         return {
             self.O_FEEDER: out_feeder_uri,
             self.O_DISTR:  out_distr_uri,
             self.O_DROP:   out_drop_id,
+            self.O_COUPLE: locals().get("out_coupler_id", None),
         }
 
 

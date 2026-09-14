@@ -20,6 +20,8 @@ segfaults.  Every function here therefore:
   2. creates them in one pass,
   3. then iterates features and sets values.
 """
+import json
+import math
 import os
 
 try:
@@ -33,12 +35,23 @@ except Exception:  # pragma: no cover
 # ── Catalogue defaults (per-deployment tuning points) ───────────────────────
 
 TRENCH_CONSTRUCT = {
+    # Construction classes (user spec): the trench network carries ONLY
+    # Open Cut / HDD / Garden — the fibre tier (feeder/distribution/drop)
+    # is a duct+cable attribute, not a trench property.
+    "Open Cut": "Open Cut",
+    "HDD": "HDD",
+    "Garden": "Garden",     # Micro-Trenching for pseudo-object → object legs
+    # Legacy tier tags map onto the construction catalogue so outputs from
+    # earlier runs still enrich correctly when re-processed.
     "Feeder": "Open Cut",
     "Distribution": "Open Cut",
-    "Garden": "Micro Trench",
+    "Drop": "Garden",
+    "Hdd": "HDD",
 }
-TRENCH_WIDTH_MM = {"Feeder": 300, "Distribution": 300, "Garden": 150}
-TRENCH_DEPTH_MM = {"Feeder": 900, "Distribution": 900, "Garden": 450}
+TRENCH_WIDTH_MM = {"Open Cut": 300, "HDD": 300, "Garden": 150,
+                   "Feeder": 300, "Distribution": 300, "Drop": 150}
+TRENCH_DEPTH_MM = {"Open Cut": 900, "HDD": 900, "Garden": 450,
+                   "Feeder": 900, "Distribution": 900, "Drop": 450}
 
 DUCT_PROFILE = {
     "Feeder": {"ways": 4, "diameter_mm": 110, "occupied": 1, "duct_type": "4-Way HDPE"},
@@ -49,6 +62,8 @@ DUCT_PROFILE = {
 CABLE_PROFILE = {
     "Feeder": {"fiber_count": 288},
     "Distribution": {"fiber_count": 48},
+    "Drop": {"fiber_count": 12},
+    # Backward-compat alias for old pipeline outputs.
     "Garden": {"fiber_count": 12},
 }
 
@@ -184,6 +199,37 @@ def _first_field_value(path, field):
 
 # ── Trench enrichment ────────────────────────────────────────────────────────
 
+def enrich_trench_sublayers(out_dir, feedback=None):
+    """Write USAGE_TYPE / CONSTRUCT (+ trench_type when missing) onto the
+    Feeder/Distribution/Garden sub-layer GPKGs so the per-tier layers carry
+    the same civil-infrastructure classification as Final_Trenches."""
+    specs = [
+        ("Feeder_Trench.gpkg", "Open Cut"),
+        ("Distribution_Trench.gpkg", "Open Cut"),
+        ("Garden_Trench.gpkg", "Garden"),
+        ("Drill_Trench.gpkg", "HDD"),
+    ]
+    total = 0
+    for fname, usage in specs:
+        path = os.path.join(out_dir, fname)
+        ds, lyr = _open_lyr(path)
+        if lyr is None:
+            continue
+        _create_fields(lyr, [
+            ("USAGE_TYPE", ogr.OFTString, 24),
+            ("CONSTRUCT", ogr.OFTString, 24),
+        ])
+        for f in lyr:
+            f.SetField("USAGE_TYPE", usage)
+            f.SetField("CONSTRUCT", TRENCH_CONSTRUCT.get(usage, "Open Cut"))
+            lyr.SetFeature(f)
+            total += 1
+        ds = None
+    if feedback and total:
+        feedback.pushInfo(f"  [enrich] Trench sub-layers: {total} classification attributes applied.")
+    return total
+
+
 def enrich_trenches(trench_path, feedback=None):
     ds, lyr = _open_lyr(trench_path)
     if lyr is None:
@@ -200,8 +246,16 @@ def enrich_trenches(trench_path, feedback=None):
     ])
     n = 0
     for f in lyr:
-        tt = str(_get(lyr, f, "trench_type") or _get(lyr, f, "USAGE_TYPE") or "")
-        tt_canon = tt.strip().title() or "Distribution"
+        # trench_type now carries the construction class (Open Cut / HDD /
+        # Garden) straight from the pipeline; legacy tier tags (Feeder /
+        # Distribution / Drop / Garden-from-old-runs) canonicalise onto it.
+        tt = str(_get(lyr, f, "trench_type") or _get(lyr, f, "CONSTRUCT") or
+                 _get(lyr, f, "USAGE_TYPE") or "Open Cut")
+        tt_canon = tt.strip().title()
+        if tt_canon == "Hdd":
+            tt_canon = "HDD"
+        if tt_canon not in ("Open Cut", "HDD", "Garden"):
+            tt_canon = TRENCH_CONSTRUCT.get(tt_canon, "Open Cut")
         sidewalk = str(_get(lyr, f, "sidewalk") or "")
         f.SetField("USAGE_TYPE", tt_canon)
         f.SetField("CONSTRUCT", TRENCH_CONSTRUCT.get(tt_canon, "Open Cut"))
@@ -217,6 +271,302 @@ def enrich_trenches(trench_path, feedback=None):
     ds = None
     if feedback:
         feedback.pushInfo(f"  [enrich] Final_Trenches: {n} civil attributes applied.")
+    return n
+
+
+# ── Duct segmentation at chambers ───────────────────────────────────────────
+
+def _chamber_points(chamber_path, feedback=None):
+    """Read all chamber positions (x, y, struct_id) from Chambers.gpkg."""
+    ds, lyr = _open_lyr(chamber_path)
+    pts = []
+    if lyr is None:
+        return pts
+    id_idx = lyr.GetLayerDefn().GetFieldIndex("STRUCT_ID")
+    for f in lyr:
+        g = f.GetGeometryRef()
+        if g is None or g.IsEmpty():
+            continue
+        try:
+            pt = g.GetPoint(0)
+        except Exception:
+            continue
+        sid = str(f.GetField(id_idx)) if (id_idx >= 0 and f.GetField(id_idx)) else ""
+        pts.append((pt[0], pt[1], sid))
+    ds = None
+    if feedback:
+        feedback.pushInfo(f"  [segment] {len(pts)} chamber anchor points loaded.")
+    return pts
+
+
+
+
+
+def _splice_points_into_line(coords, cut_pts, tol_m):
+    """Splice chamber positions INTO a polyline as vertices (geometry stays
+    one continuous line — ducts run unbroken through chambers).
+
+    Returns (new_coords, hits, sections):
+      hits     — chamber ids spliced in, in corridor order
+      sections — [(start_chamber|None, end_chamber|None, length_m), …] the
+                 chamber-bounded sections along the part (start/end of the
+                 whole part are None unless a chamber sits at the endpoint).
+    """
+    if len(coords) < 2 or not cut_pts:
+        return coords, [], []
+
+    def _dist(a, b):
+        return math.hypot(a[0] - b[0], a[1] - b[1])
+
+    total_len = sum(_dist(coords[i], coords[i + 1]) for i in range(len(coords) - 1))
+    if total_len <= 0:
+        return coords, [], []
+
+    # Project every chamber onto the part: (arc_pos, xy, id)
+    proj = []
+    for cx, cy, cid in cut_pts:
+        best_d, best_pos, best_xy = None, None, None
+        cum = 0.0
+        for i in range(len(coords) - 1):
+            ax, ay = coords[i]
+            bx, by = coords[i + 1]
+            dx, dy = bx - ax, by - ay
+            seg2 = dx * dx + dy * dy
+            if seg2 == 0:
+                continue
+            t = ((cx - ax) * dx + (cy - ay) * dy) / seg2
+            t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+            qx, qy = ax + t * dx, ay + t * dy
+            d = math.hypot(cx - qx, cy - qy)
+            if best_d is None or d < best_d:
+                best_d, best_pos, best_xy = d, cum + t * math.sqrt(seg2), (qx, qy)
+            cum += math.sqrt(seg2)
+        if best_d is not None and best_d <= tol_m:
+            proj.append((best_pos, best_xy, cid))
+    if not proj:
+        return coords, [], []
+    # Clamp projections that land within 2 m of the part endpoints onto the
+    # endpoint itself — a chamber at a corridor start/end becomes the
+    # section boundary instead of a sliver stub section.
+    clamped = []
+    for pos, xy, cid in proj:
+        if pos < min(2.0, total_len * 0.01):
+            pos = 0.0
+        elif total_len - pos < min(2.0, total_len * 0.01):
+            pos = total_len
+        clamped.append((pos, xy, cid))
+    proj = clamped
+    # Deduplicate chambers splicing at the same spot; keep corridor order.
+    proj.sort(key=lambda p: p[0])
+    dedup = []
+    for pos, xy, cid in proj:
+        if dedup and abs(dedup[-1][0] - pos) < 0.01:
+            continue
+        dedup.append((pos, xy, cid))
+    proj = dedup
+
+    # Splice the projected points into the vertex list, in arc order.
+    out = []
+    pi = 0
+    cum = 0.0
+    for i in range(len(coords) - 1):
+        ax, ay = coords[i]
+        bx, by = coords[i + 1]
+        seg_len = _dist(coords[i], coords[i + 1])
+        seg_end = cum + seg_len
+        if not out:
+            out.append([ax, ay])
+        # All projections inside this segment are appended IN ORDER before
+        # the segment's end vertex — never after it (prevents duplicates).
+        while pi < len(proj) and proj[pi][0] < seg_end - 1e-9:
+            pos, (qx, qy), _cid = proj[pi]
+            if pos > cum + 1e-9:  # skip one sitting exactly on the start vertex
+                out.append([qx, qy])
+            pi += 1
+        out.append([bx, by])
+        cum = seg_end
+    # Any projection exactly at total_len: the final end vertex is already
+    # there (appended above), nothing to do.
+
+    # Section chain: boundaries at 0, each hit arc, total_len. Zero-length
+    # boundary sections (chamber exactly on a part endpoint) are dropped.
+    boundaries = [0.0] + [p[0] for p in proj] + [total_len]
+    ids = [None] + [p[2] for p in proj] + [None]
+    sections = []
+    for i in range(len(boundaries) - 1):
+        L = round(boundaries[i + 1] - boundaries[i], 2)
+        if L <= 0:
+            continue
+        sections.append((ids[i], ids[i + 1], L))
+    return out, [p[2] for p in proj], sections
+
+
+def splice_ducts_at_chambers(feeder_path, dist_path, chamber_path, feedback=None,
+                             snap_tol_m=3.0):
+    """Splice chamber positions into duct corridors (keeps ducts continuous).
+
+    Feeder and distribution ducts are continuous routed corridors (the feeder
+    is a single branched MultiLineString). Chambers sit ON the duct — ducts
+    pass through them. This pass:
+
+      1. adds a vertex at every chamber lying on a part (within ``snap_tol_m``)
+         so the geometry carries the section breaks, without splitting the
+         corridor into separate features;
+      2. records the chamber-bounded sections per feature in
+         ``SECTIONS_JSON``  [{start, end, length_m}, …]  and the ordered
+         chamber chain in ``SECTION_CHAIN`` ("|A|B|C|"), plus ``N_SECTIONS``.
+
+    Feature count is unchanged. START/END_CHAMBER keep their meaning from
+    enrich_ducts (endpoints of the corridor). Drop ducts are NOT touched.
+    """
+    chambers = _chamber_points(chamber_path, feedback)
+    if not chambers:
+        if feedback:
+            feedback.pushInfo("  [splice] No chambers — duct splicing skipped.")
+        return 0
+
+    total_spliced = 0
+    for path, label in ((feeder_path, "Feeder"), (dist_path, "Distribution")):
+        ds, lyr = _open_lyr(path)
+        if lyr is None:
+            continue
+        _create_fields(lyr, [
+            ("SECTION_CHAIN", ogr.OFTString, 256),
+            ("N_SECTIONS", ogr.OFTInteger),
+            ("SECTIONS_JSON", ogr.OFTString, 0),  # 0 = unlimited (GPKG text)
+        ])
+
+        n_spliced = 0
+        lyr.StartTransaction()
+        try:
+            for f in lyr:
+                g = f.GetGeometryRef()
+                if g is None or g.IsEmpty():
+                    continue
+                multi = g.GetGeometryName().startswith("MULTI")
+                parts = []
+                if multi:
+                    for part in g:
+                        pts = part.GetPoints()
+                        if pts and len(pts) >= 2:
+                            parts.append([(p[0], p[1]) for p in pts])
+                else:
+                    pts = g.GetPoints()
+                    if pts and len(pts) >= 2:
+                        parts.append([(p[0], p[1]) for p in pts])
+
+                chain: list = []
+                all_sections = []
+                changed = False
+                new_geoms = []
+                for part in parts:
+                    new_pts, hits, sections = _splice_points_into_line(
+                        part, chambers, snap_tol_m)
+                    if hits:
+                        changed = True
+                        chain.extend(hits)
+                        all_sections.extend(sections)
+                    new_geoms.append(new_pts)
+
+                if not changed:
+                    continue
+
+                def _mk_ls(pts):
+                    ls = ogr.Geometry(ogr.wkbLineString)
+                    for x, y in pts:
+                        ls.AddPoint_2D(x, y)
+                    return ls
+
+                if multi:
+                    ng = ogr.Geometry(ogr.wkbMultiLineString)
+                    for pts in new_geoms:
+                        if len(pts) >= 2:
+                            ng.AddGeometry(_mk_ls(pts))
+                else:
+                    ng = _mk_ls(new_geoms[0]) if new_geoms else None
+                if ng is None or ng.IsEmpty():
+                    continue
+                f.SetGeometry(ng)
+                f.SetField("SECTION_CHAIN", "|" + "|".join(chain) + "|")
+                f.SetField("N_SECTIONS", len(all_sections))
+                try:
+                    f.SetField("SECTIONS_JSON", json.dumps([
+                        {"start": s, "end": e, "length_m": L}
+                        for s, e, L in all_sections]))
+                except Exception:
+                    f.SetField("SECTIONS_JSON", "")
+                lyr.SetFeature(f)
+                n_spliced += 1
+            lyr.CommitTransaction()
+        except Exception:
+            lyr.RollbackTransaction()
+            raise
+        ds = None
+        total_spliced += n_spliced
+        if feedback:
+            feedback.pushInfo(
+                f"  [splice] {label} ducts: {n_spliced} corridor feature(s) "
+                "spliced at chambers (geometry continuous).")
+    return total_spliced
+
+
+def _endpoints(feat):
+    """(first_vertex, last_vertex) of a (multi)linestring feature.
+
+    NOTE: ogr's Geometry.GetPoints() returns None on MultiLineString
+    geometries — parts must be iterated explicitly. First point of the first
+    part and last point of the last part are the run's endpoints."""
+    g = feat.GetGeometryRef()
+    if g is None or g.IsEmpty():
+        return None, None
+    first = last = None
+    if g.GetGeometryName().startswith("MULTI"):
+        for part in g:
+            pts = part.GetPoints() if part else None
+            if not pts:
+                continue
+            if first is None:
+                first = (pts[0][0], pts[0][1])
+            last = (pts[-1][0], pts[-1][1])
+    else:
+        pts = g.GetPoints()
+        if pts:
+            first = (pts[0][0], pts[0][1])
+            last = (pts[-1][0], pts[-1][1])
+    return first, last
+
+
+def _stamp_run_chambers(path, chamber_path, tol_m=15.0):
+    """Populate START_CHAMBER/END_CHAMBER on every duct run from the chambers
+    nearest its first/last vertex (within tol_m). Returns count stamped."""
+    if not chamber_path or not os.path.isfile(chamber_path):
+        return 0
+    ds, lyr = _open_lyr(path)
+    if lyr is None:
+        return 0
+    si = lyr.GetLayerDefn().GetFieldIndex("START_CHAMBER")
+    ei = lyr.GetLayerDefn().GetFieldIndex("END_CHAMBER")
+    if si < 0 and ei < 0:
+        ds = None
+        return 0
+    n = 0
+    for f in lyr:
+        sx_sy, ex_ey = _endpoints(f)
+        if sx_sy is None or ex_ey is None:
+            continue
+        start_id = _nearest_id(chamber_path, sx_sy[0], sx_sy[1], tol_m, "STRUCT_ID")
+        end_id = _nearest_id(chamber_path, ex_ey[0], ex_ey[1], tol_m, "STRUCT_ID")
+        changed = False
+        if si >= 0 and f.GetField(si) != start_id:
+            f.SetField(si, start_id)
+            changed = True
+        if ei >= 0 and f.GetField(ei) != end_id:
+            f.SetField(ei, end_id)
+            changed = True
+        if changed:
+            lyr.SetFeature(f)
+            n += 1
+    ds = None
     return n
 
 
@@ -250,9 +600,15 @@ def enrich_ducts(feeder_path, dist_path, drop_path, trench_path, chamber_path, f
             f.SetField("WAYS", prof["ways"])
             f.SetField("DIAMETER_MM", prof["diameter_mm"])
             f.SetField("LENGTH_M", round(_geom_len_m(f), 1))
-            occ = (prof["occupied"] / prof["ways"]) * 100.0
-            f.SetField("OCCUPANCY_PCT", round(occ, 1))
-            f.SetField("SPARE_PCT", round(100.0 - occ, 1))
+            # Occupancy comes from the real cables_carried count when the
+            # route-based duct builder ran; else fall back to the catalogue
+            # default occupancy (1 cable per duct).
+            cc = str(_get(lyr, f, "cables_carried") or "")
+            n_cab = len([c for c in cc.split(",") if c.strip()]) if cc.strip() else 0
+            occupied = n_cab if n_cab > 0 else int(prof.get("occupied", 1))
+            occ = (occupied / prof["ways"]) * 100.0
+            f.SetField("OCCUPANCY_PCT", round(min(occ, 100.0), 1))
+            f.SetField("SPARE_PCT", round(max(0.0, 100.0 - occ), 1))
             f.SetField("INFRA_STATUS", "Proposed")
             pts = list(_line_points(f))
             if pts:
@@ -317,12 +673,18 @@ def enrich_cables(feeder_path, dist_path, objects_path, mfg_path, feedback=None)
         mfg_id = _first_field_value(mfg_path, "MFG_ID") or "MFG00001"
         for f in lyr:
             f.SetField("CABLE_TYPE", "Feeder")
-            f.SetField("FIBER_COUNT", prof["fiber_count"])
+            # The shared-feeder planner writes the real FIBER_COUNT / UTIL_PCT
+            # / SPLIT_MODULES; prefer those, fall back to the catalogue profile.
+            fc = _num(lyr, f, "FIBER_COUNT", 0) or prof["fiber_count"]
+            f.SetField("FIBER_COUNT", int(fc))
             f.SetField("LENGTH_M", round(_geom_len_m(f), 1))
             f.SetField("SOURCE_NODE", mfg_id)
-            pid = str(_get(lyr, f, "PDP_ID") or "").upper()
-            hh = hh_by_pdp.get(pid, 0)
-            util = min(100.0, (hh / prof["fiber_count"]) * 100.0)
+            util = _num(lyr, f, "UTIL_PCT", 0)
+            if not util:
+                pid = str(_get(lyr, f, "PDP_IDS") or _get(lyr, f, "PDP_ID") or "")
+                pid0 = (pid.split(",")[0] if pid else "").upper()
+                hh = hh_by_pdp.get(pid0, 0)
+                util = min(100.0, (hh / fc) * 100.0)
             f.SetField("UTIL_PCT", round(util, 1))
             f.SetField("INFRA_STATUS", "Proposed")
             lyr.SetFeature(f)
@@ -472,7 +834,24 @@ def enrich_all(out_dir, feedback=None):
         return os.path.join(out_dir, name)
 
     n = 0
+    # Splice chambers into the duct corridors FIRST (continuous geometry —
+    # ducts run unbroken through chambers; sections recorded in attributes).
+    # enrich_ducts then stamps catalogue attrs + endpoint chambers on the
+    # still-whole corridors.
+    try:
+        n_sp = splice_ducts_at_chambers(
+            p("Feeder_Ducts.gpkg"), p("Distribution_Ducts.gpkg"),
+            p("Chambers.gpkg"), feedback,
+        )
+        if feedback and n_sp:
+            feedback.pushInfo(
+                f"  [enrich] Duct splicing: {n_sp} corridor(s) spliced at chambers.")
+    except Exception as exc:
+        if feedback:
+            feedback.pushInfo(f"  [splice] Duct splicing skipped: {exc}")
+
     n += enrich_trenches(p("Final_Trenches.gpkg"), feedback)
+    n += enrich_trench_sublayers(out_dir, feedback)
     n += enrich_ducts(
         p("Feeder_Ducts.gpkg"), p("Distribution_Ducts.gpkg"), p("Drop_Ducts.gpkg"),
         p("Final_Trenches.gpkg"), p("Chambers.gpkg"), feedback,

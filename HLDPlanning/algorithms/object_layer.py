@@ -1,14 +1,47 @@
 # -*- coding: utf-8 -*-
 import os, re, json, warnings
-import pandas as pd
+# pandas is imported lazily inside _get_pd() -- must stay lazy for qgis_process embedded Python
+def _get_pd():
+    global _pd_lazy
+    if _pd_lazy is None:
+        import pandas as pd
+        _pd_lazy = pd
+    return _pd_lazy
+def _get_gpd():
+    global _gpd_lazy
+    if _gpd_lazy is None:
+        import geopandas as gpd
+        _gpd_lazy = gpd
+    return _gpd_lazy
+_pd_lazy = None
+_gpd_lazy = None
 
-try:
-    import geopandas as gpd
-    from shapely.geometry import Point
-    _GEO_OK = True
-except Exception:
-    _GEO_OK = False
-    Point = None  # type: ignore
+# GeoPandas/Shapely are imported lazily by _get_gpd(); Point is resolved lazily
+# by _get_point() so qgis_process's embedded Python never pays the import at
+# module load time.
+_GEO_OK = True
+Point = None  # resolved lazily by _get_point()
+
+
+def _get_point():
+    """Lazily import shapely's Point; returns None when shapely is missing."""
+    global Point, _GEO_OK
+    if Point is None:
+        try:
+            from shapely.geometry import Point as _Point
+            Point = _Point
+        except Exception:
+            _GEO_OK = False
+    return Point
+
+
+def _mk_point(x, y):
+    """Build a shapely Point at (x, y), or None when shapely is unavailable."""
+    P = _get_point()
+    try:
+        return P(float(x), float(y)) if P else None
+    except Exception:
+        return None
 
 warnings.filterwarnings("ignore", category=UserWarning, module="geopandas")
 
@@ -171,7 +204,7 @@ class BuildObjectLayer(QgsProcessingAlgorithm):
 
         # --- Load Excel (tolerant sheet handling)
         try:
-            xf = pd.ExcelFile(excel)
+            xf = _get_pd().ExcelFile(excel)
             if sheet:
                 if sheet not in xf.sheet_names:
                     feedback.pushInfo(self.tr(f"Sheet '{sheet}' not found. Falling back to first sheet '{xf.sheet_names[0]}'."))
@@ -238,7 +271,7 @@ class BuildObjectLayer(QgsProcessingAlgorithm):
             from_sheet = False
             if xcol and ycol and (xcol in df.columns) and (ycol in df.columns):
                 xv = row.get(xcol); yv = row.get(ycol)
-                if pd.notna(xv) and pd.notna(yv) and str(xv).strip() and str(yv).strip():
+                if _get_pd().notna(xv) and _get_pd().notna(yv) and str(xv).strip() and str(yv).strip():
                     try:
                         xv_f = float(xv); yv_f = float(yv)
                     except Exception:
@@ -248,7 +281,7 @@ class BuildObjectLayer(QgsProcessingAlgorithm):
                             # Values fit lat/lon range: treat as WGS84 directly.
                             attr_lon, attr_lat = xv_f, yv_f
                             sources.append("sheet_lonlat")
-                            geometries.append(Point(xv_f, yv_f) if Point else None)
+                            geometries.append(_mk_point(xv_f, yv_f))
                             source_crs_values.append("EPSG:4326")
                         else:
                             # Values look projected: the GEOMETRY column keeps
@@ -269,7 +302,7 @@ class BuildObjectLayer(QgsProcessingAlgorithm):
                                 ))
                                 attr_lon, attr_lat = xv_f, yv_f
                             sources.append("sheet_xy")
-                            geometries.append(Point(xv_f, yv_f) if Point else None)
+                            geometries.append(_mk_point(xv_f, yv_f))
                             source_crs_values.append(out_epsg)
                         lons.append(attr_lon); lats.append(attr_lat)
                         statuses.append("ok"); queries.append("from_sheet")
@@ -326,12 +359,12 @@ class BuildObjectLayer(QgsProcessingAlgorithm):
             if lat2 and lon2:
                 lats.append(lat2); lons.append(lon2); statuses.append("ok")
                 sources.append("nominatim_cache" if was_cache else "nominatim_live")
-                geometries.append(Point(float(lon2), float(lat2)) if Point else None)
+                geometries.append(_mk_point(lon2, lat2))
                 source_crs_values.append("EPSG:4326")
             else:
                 lats.append(None); lons.append(None); statuses.append("not_found")
                 sources.append("nominatim_live" if force_live else "nominatim")
-                geometries.append(Point(0.0, 85.0) if include_all and Point else None)
+                geometries.append(_mk_point(0.0, 85.0) if include_all else None)
                 source_crs_values.append("EPSG:4326")
 
             queries.append(json.dumps(attempts, ensure_ascii=False))
@@ -367,14 +400,14 @@ class BuildObjectLayer(QgsProcessingAlgorithm):
                 idxs = [i for i, crs in enumerate(source_crs_values) if crs == src_crs]
                 part_df = df.iloc[idxs].copy()
                 part_geoms = [geometries[i] for i in idxs]
-                part = gpd.GeoDataFrame(part_df, geometry=part_geoms, crs=src_crs)
+                part = _get_gpd().GeoDataFrame(part_df, geometry=part_geoms, crs=src_crs)
                 if src_crs != out_epsg:
                     part = part.to_crs(out_epsg)
                 parts.append(part)
-            gdf = pd.concat(parts).sort_index()
-            gdf = gpd.GeoDataFrame(gdf, geometry="geometry", crs=out_epsg)
+            gdf = _get_pd().concat(parts).sort_index()
+            gdf = _get_gpd().GeoDataFrame(gdf, geometry="geometry", crs=out_epsg)
         else:
-            gdf = gpd.GeoDataFrame(df, geometry=geometries, crs="EPSG:4326")
+            gdf = _get_gpd().GeoDataFrame(df, geometry=geometries, crs="EPSG:4326")
 
         # keep all or drop missing geometries
         gdf_ok = gdf.copy() if include_all else gdf[gdf["geometry"].notna()].copy()

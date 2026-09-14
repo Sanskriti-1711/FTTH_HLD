@@ -2436,14 +2436,21 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                 )["OUTPUT"]
                 return as_layer(res, context, f"tagged_{type_label}")
 
-            # Combine available trench types (tagging for downstream BOQ)
+            # Construction-class tagging (user spec): the published trench
+            # network carries ONLY construction sub-categories — "Open Cut"
+            # (feeder + distribution routes combined), "Garden"
+            # (pseudo-object → object drop legs) and "HDD" (used drill
+            # crossings). The old Feeder/Distribution/Drop usage tags are
+            # gone: in the field there is one trench per route and the ducts
+            # /cables ride inside it, regardless of which fibre tier they
+            # belong to.
             parts = []
             if _feeder and _feeder.featureCount():
-                parts.append(_tag_simple(_feeder, "Feeder"))
+                parts.append(_tag_simple(_feeder, "Open Cut"))
+            if _dist and _dist.featureCount():
+                parts.append(_tag_simple(_dist, "Open Cut"))
             if _garden and _garden.featureCount():
                 parts.append(_tag_simple(_garden, "Garden"))
-            if _dist and _dist.featureCount():
-                parts.append(_tag_simple(_dist, "Distribution"))
 
             # NOTE: no separate Connector stubs anymore — feeder features now
             # physically span MFG → PDP (device points embedded in the route),
@@ -2504,18 +2511,287 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                     except Exception as _e:
                         feedback.reportError(f"Final trim vs buildings failed; continuing. Error: {_e}")
 
-                # Write Final_Trenches with POLYGON_ID / PDP_ID propagation
-                # Build extended fields including POLYGON_ID and PDP_ID
+                # ── Clubbing pass: merge collinear / overlapping trench segments ──
+                # per PDP into consolidated route trenches so each route/location has
+                # one trench (carrying multiple ducts/cables) instead of many fragments.
+                # Strategy: group by PDP_ID, union geometries (with a small cluster
+                # tolerance so near-coincident segments merge), then split the union
+                # back into simple segments at self-intersections for clean output.
+                _club_tol = 1.0  # metre tolerance for treating segments as "same route"
+                club_src_fields = merged_final.fields()
+                club_poly_src = club_src_fields.lookupField("POLYGON_ID")
+                club_pdp_src = club_src_fields.lookupField("PDP_ID")
+
+                def _clubbing_union(geoms):
+                    """Union a list of trench geometries and return the consolidated
+                    route pieces. A line union is already noded at every crossing,
+                    so exploding the multipart result yields exactly one simple
+                    piece per contiguous route — no extra split pass needed (the
+                    previous native:splitlineswithlines approach was slow and
+                    collapsed the whole network into a single feature when the
+                    child algorithm rejected a raw-geometry input)."""
+                    if not geoms:
+                        return []
+                    ug = _unary_union_geoms(geoms)
+                    if not ug or ug.isEmpty():
+                        return []
+                    if not ug.isMultipart():
+                        return [ug] if ug.length() >= 0.05 else []
+                    parts = []
+                    try:
+                        for pts in ug.asMultiPolyline():
+                            if not pts:
+                                continue
+                            pg = QgsGeometry.fromPolylineXY(pts)
+                            if pg.length() >= 0.05:
+                                parts.append(pg)
+                    except Exception:
+                        return [ug] if ug.length() >= 0.05 else []
+                    return parts if parts else ([ug] if ug.length() >= 0.05 else [])
+
+                # Helper: normalise a field value to a stripped string or None.
+                # Must be defined BEFORE the clubbing/grouping loop so the grouping
+                # code (which calls _sval) can reference it without triggering
+                # UnboundLocalError (Python treats any later ``def _sval`` in the
+                # same scope as making _sval local everywhere above it).
+                def _sval(v):
+                    if v is None:
+                        return None
+                    s = str(v).strip()
+                    return s if s and s.upper() != "NULL" else None
+
+                # Split the merged network into open-cut route sources and
+                # garden drop-leg sources by their construction tag.
+                club_tt_src = club_src_fields.lookupField("trench_type")
+                _open_cut_srcs = []   # [(geom, src_feature)] feeder + distribution routes
+                _garden_srcs = []     # [(geom, src_feature)] drop legs (footway → object)
+                _merged_final_count = 0            # getFeatures() has no len() — count while iterating
+                for f in merged_final.getFeatures():
+                    _merged_final_count += 1
+                    g = f.geometry()
+                    if not g or g.isEmpty():
+                        continue
+                    ttv = _sval(f[club_tt_src]) if club_tt_src >= 0 else None
+                    if ttv == "Garden":
+                        _garden_srcs.append((g, f))
+                    else:
+                        _open_cut_srcs.append((g, f))
+
+                # Used drill (tangent) crossing geometries — pieces of the
+                # routed network that follow a drill crossing are HDD, not
+                # Open Cut.
+                _drill_geoms = []
+                if drills_used is not None:
+                    try:
+                        for df in drills_used.getFeatures():
+                            dg = df.geometry()
+                            if dg and not dg.isEmpty():
+                                _drill_geoms.append(dg)
+                    except Exception:
+                        _drill_geoms = []
+
+                def _attr_of(pg, srcs):
+                    """Sources riding this consolidated piece (within the club
+                    tolerance) plus a nearest-source fallback so attributes are
+                    never lost when a piece sits slightly off every source."""
+                    near = [(sg, sf) for sg, sf in srcs if sg.distance(pg) <= _club_tol]
+                    if not near:
+                        near = [min(srcs, key=lambda s: s[0].distance(pg))]
+                    return near
+
+                def _ids_of(near, idx):
+                    """Ordered unique attribute values across contributing sources."""
+                    seen, out = set(), []
+                    for _, sf in near:
+                        v = _sval(sf[idx]) if idx >= 0 else None
+                        if v and v not in seen:
+                            seen.add(v)
+                            out.append(v)
+                    return out
+
+                # ── Clubbing of the open-cut network, three steps:
+                #   1. ONE union over feeder + distribution geometries → the
+                #      noded network with every duplicate overlap removed
+                #      (feeder and distribution riding the same street become
+                #      ONE line, exactly the single-trench model).
+                #   2. Explode to contiguous pieces and attach attributes from
+                #      the sources riding each piece (bbox-prefiltered).
+                #   3. Re-merge contiguous pieces that share the SAME route
+                #      attributes (same PDP set) so a route comes back as one
+                #      whole trench instead of confetti from the noding.
+                clubbed_features = []  # (geom, trench_type, pdp_id, pdp_ids, poly_id, poly_ids, n_fragments, src_feature)
+                if _open_cut_srcs:
+                    _src_geoms = [g for g, _ in _open_cut_srcs]
+                    _src_bboxes = [g.boundingBox() for g in _src_geoms]
+                    _oc_pieces = _clubbing_union(_src_geoms)
+
+                    # Piece → contributing sources (bbox prefilter, then exact
+                    # distance) with nearest-source fallback.
+                    _piece_attrs = []   # [(pdp_ids, poly_ids, near_count, src_feature)]
+                    for pg in _oc_pieces:
+                        pb = pg.boundingBox()
+                        near = []
+                        for i, (sg, sf) in enumerate(_open_cut_srcs):
+                            sb = _src_bboxes[i]
+                            if (sb.xMaximum() + _club_tol < pb.xMinimum() or
+                                    sb.xMinimum() - _club_tol > pb.xMaximum() or
+                                    sb.yMaximum() + _club_tol < pb.yMinimum() or
+                                    sb.yMinimum() - _club_tol > pb.yMaximum()):
+                                continue
+                            if sg.distance(pg) <= _club_tol:
+                                near.append((sg, sf))
+                        if not near:
+                            j = min(range(len(_src_geoms)),
+                                    key=lambda i: _src_geoms[i].distance(pg))
+                            near = [(_src_geoms[j], _open_cut_srcs[j][1])]
+                        _piece_attrs.append((
+                            tuple(_ids_of(near, club_pdp_src)),
+                            tuple(_ids_of(near, club_poly_src)),
+                            len(near), near[0][1]))
+
+                    # Per-piece construction class FIRST: a piece lying on a
+                    # used drill crossing is HDD; assembled corridors never
+                    # mix classes. (Overlap test, not proximity — a route
+                    # must never inherit HDD from a single crossing.)
+                    def _on_drill(pg):
+                        for dg in _drill_geoms:
+                            if dg.distance(pg) <= 0.5 and pg.buffer(0.25, 8).intersects(dg):
+                                return True
+                        return False
+
+                    # ── Assemble whole corridors via degree-2 chain merging ──
+                    # Two exploded pieces belong to the same physical trench
+                    # when they meet at a node where exactly two pieces meet
+                    # (degree 2), carry the same construction class and share
+                    # at least one PDP (an empty PDP set joins freely). At real
+                    # junctions (degree >= 3) branches stay separate features.
+                    # This turns the noding confetti back into one trench per
+                    # route — the fix for 'multiple trenches at one location'.
+                    _n_pieces = len(_oc_pieces)
+                    _parent = list(range(_n_pieces))
+
+                    def _find(a):
+                        while _parent[a] != a:
+                            _parent[a] = _parent[_parent[a]]
+                            a = _parent[a]
+                        return a
+
+                    def _union(a, b):
+                        ra, rb = _find(a), _find(b)
+                        if ra != rb:
+                            _parent[rb] = ra
+
+                    _eps = 0.5  # endpoint snap tolerance (m) for node keys
+
+                    def _nk(pt):
+                        return (round(pt.x() / _eps), round(pt.y() / _eps))
+
+                    _end_nodes = defaultdict(list)   # node key -> [piece idx]
+                    _pdps = [set(a[0]) for a in _piece_attrs]
+                    _tts = ["HDD" if _on_drill(pg) else "Open Cut" for pg in _oc_pieces]
+                    for i, pg in enumerate(_oc_pieces):
+                        try:
+                            pts = pg.asPolyline() or []
+                        except Exception:
+                            pts = []
+                        if len(pts) >= 2:
+                            _end_nodes[_nk(pts[0])].append(i)
+                            _end_nodes[_nk(pts[-1])].append(i)
+                        else:
+                            c = pg.centroid().asPoint()
+                            _end_nodes[_nk(c)].append(i)
+
+                    for _node, idxs in _end_nodes.items():
+                        uniq = sorted(set(idxs))
+                        if len(uniq) == 2:
+                            # Degree-2 node: a simple continuation of one route.
+                            i, j = uniq
+                            if _tts[i] == _tts[j] and (
+                                    not _pdps[i] or not _pdps[j]
+                                    or (_pdps[i] & _pdps[j])):
+                                _union(i, j)
+                        elif len(uniq) > 2:
+                            # Junction node (crossing / branching): pieces of
+                            # the SAME route (identical class + PDP set) are
+                            # continuations of one trench — e.g. a route that
+                            # crosses another route must not be chopped into
+                            # separate features at every crossing. Different
+                            # routes meeting here stay separate trenches.
+                            _groups_at = defaultdict(list)
+                            for i in uniq:
+                                _groups_at[(_tts[i], tuple(sorted(_pdps[i])))].append(i)
+                            for _g in _groups_at.values():
+                                for k in range(1, len(_g)):
+                                    _union(_g[0], _g[k])
+
+                    _chains = defaultdict(list)
+                    for i in range(_n_pieces):
+                        _chains[_find(i)].append(i)
+                    for _root, idxs in _chains.items():
+                        geoms = [_oc_pieces[i] for i in idxs]
+                        merged = _unary_union_geoms(geoms) if len(geoms) > 1 else geoms[0]
+                        pdp_u, poly_u, src_ft = set(), set(), None
+                        for i in idxs:
+                            a = _piece_attrs[i]
+                            pdp_u.update(a[0])
+                            poly_u.update(a[1])
+                            if src_ft is None:
+                                src_ft = a[3]
+                        pdp_l, poly_l = sorted(pdp_u), sorted(poly_u)
+                        clubbed_features.append(
+                            (merged, _tts[idxs[0]],
+                             pdp_l[0] if pdp_l else None,
+                             ",".join(pdp_l) if pdp_l else None,
+                             poly_l[0] if poly_l else None,
+                             ",".join(poly_l) if poly_l else None,
+                             len(idxs), src_ft)
+                        )
+
+                # Garden drop legs pass through as their own features (one per
+                # object): they are the pseudo-object → object digs. Garden
+                # sources carry pdp_pol_id (PDP-polygon id) rather than
+                # PDP_ID/POLYGON_ID — use it as the traceability fallback.
+                _g_pdp_pol = merged_final.fields().lookupField("pdp_pol_id")
+                for g, f in _garden_srcs:
+                    pdp_v = _sval(f[club_pdp_src]) if club_pdp_src >= 0 else None
+                    poly_v = _sval(f[club_poly_src]) if club_poly_src >= 0 else None
+                    if not pdp_v and _g_pdp_pol >= 0:
+                        pdp_v = _sval(f[_g_pdp_pol])
+                    if not poly_v and _g_pdp_pol >= 0:
+                        poly_v = _sval(f[_g_pdp_pol])
+                    clubbed_features.append((g, "Garden", pdp_v, pdp_v, poly_v, poly_v, 1, f))
+
+                _tt_counts = defaultdict(int)
+                for _cf in clubbed_features:
+                    _tt_counts[_cf[1]] += 1
+                feedback.pushInfo(
+                    "Trench consolidation: {} segments → {} trench features ({})".format(
+                        _merged_final_count, len(clubbed_features),
+                        ", ".join("{}: {}".format(k, v) for k, v in sorted(_tt_counts.items())) or "none",
+                    )
+                )
+
+                # ── Write Final_Trenches with POLYGON_ID / PDP_ID propagation ──
+                # Build extended fields: carry forward every field from the tagged
+                # per-type source layers (Feeder/Distribution/Drop) plus explicit
+                # POLYGON_ID, PDP_ID and the brownfield + fragment-count hints.
                 ext_fields = QgsFields()
                 for field in merged_final.fields():
                     if field.name() not in ("POLYGON_ID", "PDP_ID"):
                         ext_fields.append(QgsField(field.name(), field.type(), field.typeName(), field.length(), field.precision()))
                 ext_fields.append(QgsField("POLYGON_ID", QMetaType.Type.QString))
                 ext_fields.append(QgsField("PDP_ID", QMetaType.Type.QString))
+                # Consolidation traceability: every PDP / polygon a shared
+                # route trench serves (comma-joined). The single-valued
+                # columns are kept for backward compatibility.
+                ext_fields.append(QgsField("PDP_IDS", QMetaType.Type.QString))
+                ext_fields.append(QgsField("POLYGON_IDS", QMetaType.Type.QString))
                 # Brownfield classification fields
                 ext_fields.append(QgsField("INFRA_STATUS", QMetaType.Type.QString))
                 ext_fields.append(QgsField("VERIFY_STATUS", QMetaType.Type.QString))
                 ext_fields.append(QgsField("REUSE_SOURCE", QMetaType.Type.QString))
+                # Clubbing hint: how many source segments were merged into this trench
+                ext_fields.append(QgsField("FRAGMENTS_MERGED", QMetaType.Type.Int))
 
                 sinkFinal, final_id = self.parameterAsSink(
                     p, self.O_FINAL, context,
@@ -2530,15 +2806,6 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                     src_fields = merged_final.fields()
                     poly_src = src_fields.lookupField("POLYGON_ID")
                     pdp_src = src_fields.lookupField("PDP_ID")
-
-                    def _sval(v):
-                        if v is None:
-                            return None
-                        s = str(v).strip()
-                        return s if s and s.upper() != "NULL" else None
-
-                    written = 0
-                    bf_tagged = 0
                     # ── Brownfield classification: spatial overlap pass ──
                     # Build the brownfield line-asset index ONCE, then tag each
                     # feature INLINE as it is copied into the final sink.
@@ -2548,6 +2815,7 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                     bf_reg = None
                     bf_idx = None
                     bf_geoms = {}
+                    bf_tagged = 0  # must exist even when the index build fails
                     TOL_M = 2.0  # 2m tolerance for "following same route"
                     try:
                         # Use the shared (toggle-aware) loader so turning the
@@ -2575,34 +2843,44 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                         bf_idx = None
                         bf_geoms = {}
 
-                    for f in merged_final.getFeatures():
+                    # Write consolidated (clubbed) trench features.
+                    # Each clubbed feature = one consolidated route trench carrying
+                    # multiple ducts/cables that previously lived in separate segments.
+                    # The brownfield + HDD classification is applied per consolidated
+                    # feature, using the union geometry for spatial checks.
+                    _ext_names = {fld.name() for fld in ext_fields}
+                    written = 0
+                    for pg, tt, pdp_val, pdp_ids, poly_val, poly_ids, n_frags, src_ft in clubbed_features:
                         nf = QgsFeature(ext_fields)
-                        nf.setGeometry(f.geometry())
-                        # Copy all attributes from merged_final except POLYGON_ID/PDP_ID
-                        # (those fields are appended separately below to avoid duplicates)
-                        for field in merged_final.fields():
-                            if field.name() not in ("POLYGON_ID", "PDP_ID"):
-                                nf[field.name()] = f[field.name()]
-                        poly_val = _sval(f[poly_src]) if poly_src >= 0 else None
-                        pdp_val = _sval(f[pdp_src]) if pdp_src >= 0 else None
-                        # Fallback: NetworkManager lookup keyed by the local pdp id
-                        if pdp_val and not poly_val and pdp_id_lookup:
-                            lu = pdp_id_lookup.get(pdp_val)
-                            if lu:
-                                poly_val = lu[0]
-                                pdp_val = lu[1] or pdp_val
+                        nf.setGeometry(pg)
+                        # Construction class on the consolidated trench — the
+                        # single source of truth for USAGE_TYPE/CONSTRUCT.
+                        nf["trench_type"] = tt
+                        if "USAGE_TYPE" in _ext_names:
+                            nf["USAGE_TYPE"] = tt
+                        if "CONSTRUCT" in _ext_names:
+                            nf["CONSTRUCT"] = tt
+                        # Copy other source attributes from the first contributing feature.
+                        if src_ft is not None:
+                            for field in club_src_fields:
+                                fn = field.name()
+                                if fn not in ("POLYGON_ID", "PDP_ID", "POLYGON_IDS", "PDP_IDS",
+                                              "trench_type", "USAGE_TYPE", "CONSTRUCT"):
+                                    v = src_ft[fn]
+                                    if v is not None and fn in _ext_names:
+                                        nf[fn] = v
                         nf["POLYGON_ID"] = poly_val
                         nf["PDP_ID"] = pdp_val
-                        # Brownfield classification (inline, before adding to the
-                        # sink) — if this trench part follows an existing
-                        # duct/trench/fibre corridor within tolerance, mark it
-                        # Reused and consume capacity from the matched asset.
-                        # Non-matching (or brownfield-less) features default to
-                        # 'Proposed' so INFRA_STATUS is fully populated per the
-                        # schema enum (Existing | Reused | Proposed | Removed).
+                        if "POLYGON_IDS" in _ext_names:
+                            nf["POLYGON_IDS"] = poly_ids
+                        if "PDP_IDS" in _ext_names:
+                            nf["PDP_IDS"] = pdp_ids
+                        nf["FRAGMENTS_MERGED"] = n_frags
+
+                        # Brownfield classification on the consolidated geometry.
                         bf_matched = False
                         if bf_idx is not None and bf_geoms:
-                            fg = f.geometry()
+                            fg = pg
                             if fg and not fg.isEmpty():
                                 try:
                                     bb = fg.buffer(TOL_M, 8).boundingBox()
@@ -2618,18 +2896,14 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                                                 pass
                                             bf_tagged += 1
                                             bf_matched = True
-                                            break  # one classification per feature
+                                            break  # one classification per consolidated trench
                                 except Exception:
                                     pass  # classification must never block output
                         if not bf_matched:
                             nf["INFRA_STATUS"] = "Proposed"
 
-                        # HDD classification: drill crossings (method=nearest)
-                        # are Horizontal Directional Drilling road crossings.
-                        method_val = str(f["method"] if "method" in merged_final.fields().names() else "").lower()
-                        if method_val == "nearest" or (not method_val and nf.geometry() and nf.geometry().length() < 65):
-                            nf["trench_type"] = "HDD"
-
+                        # Every feature already carries its construction class
+                        # (Open Cut / HDD / Garden) from the consolidation pass.
                         sinkFinal.addFeature(nf)
                         written += 1
                     feedback.pushInfo(f"✅ Final_Trenches layer written with {written} features (incl. POLYGON_ID/PDP_ID).")

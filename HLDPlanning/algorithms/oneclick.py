@@ -176,6 +176,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
     OUT_FEEDER_DUCTS = "OUT_FEEDER_DUCTS"
     OUT_DIST_DUCTS = "OUT_DIST_DUCTS"
     OUT_DROP_DUCTS = "OUT_DROP_DUCTS"
+    OUT_COUPLEURS = "OUT_COUPLEURS"
 
     # HLD_attr civil layers
     P_AERIAL_ZONES = "AERIAL_ZONES"
@@ -199,6 +200,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         OUT_FEEDER_DUCTS: "Feeder_Ducts.gpkg",
         OUT_DIST_DUCTS: "Distribution_Ducts.gpkg",
         OUT_DROP_DUCTS: "Drop_Ducts.gpkg",
+        OUT_COUPLEURS: "Coupleurs.gpkg",
         OUT_CHAMBERS: "Chambers.gpkg",
         OUT_POLES: "Poles.gpkg",
         OUT_AERIAL_TRENCHES: "Aerial_Drop_Trenches.gpkg",
@@ -233,6 +235,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
     _TR_POLY, _TR_ROADS_KEY, _TR_PDP = "INPUT_POLY", "INPUT_ROADS", "INPUT_PDP"
     _TR_HH, _TR_BLDG, _TR_MFG_KEY = "INPUT_HOUSEHOLDS", "INPUT_BUILDINGS", "INPUT_MFG"
     _TR_TAN_USED = "OUT_TANGENT_TRENCHES_USED"
+    _TR_AOI_DISS = "OUT_S1_AOI_BUFFER_DISSOLVED"
     _TR_SIDE_L, _TR_SIDE_R = "OUT_SIDEWALK_LEFT", "OUT_SIDEWALK_RIGHT"
     _TR_MERGED_PDP, _TR_FEEDER_FINAL = "OUT_MERGED_PDP", "OUT_FEEDER_FINAL"
     _TR_GARDEN, _TR_FINAL, _TR_FINAL_TAN = (
@@ -255,6 +258,9 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         "FEEDER_TRENCH", "GARDEN_TRENCHES", "DISTR_TRENCHES",
     )
     _CB_PROJ = "PDP_PROJECTIONS"
+    _CB_FINAL_TR = "FINAL_TRENCHES"
+    _CB_PDP = "PDP_POINTS"
+    _CB_MFG = "MFG_POINTS"
     _CB_OUT_FEEDER, _CB_OUT_DIST = "OUT_FEEDER_CABLE", "OUT_DISTRIBUTION_CABLE"
 
     _DU_NETWORK, _DU_MFG, _DU_PDP, _DU_OBJECTS = (
@@ -264,9 +270,11 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         "SIDEWALK_LEFT", "SIDEWALK_RIGHT", "FINAL_TANGENT_TRENCHES",
     )
     _DU_PSEUDO, _DU_GARDEN = "PSEUDO_OBJECT_POINTS", "GARDEN_TRENCHES"
+    _DU_FEEDER_CABLES, _DU_DIST_CABLES = "FEEDER_CABLES", "DIST_CABLES"
     _DU_OUT_FEEDER, _DU_OUT_DIST, _DU_OUT_DROP = (
         "OUT_FEEDER_DUCTS", "OUT_DISTRIBUTION_DUCTS", "OUT_DROP_DUCTS",
     )
+    _DU_OUT_COUPLE = "OUT_COUPLEURS"
 
     _METHOD_OPTIONS = [
         "Convex Hull (optional inset)",
@@ -536,7 +544,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             QgsProcessing.TypeVectorLine, optional=True, createByDefault=True
         ))
         self.addParameter(QgsProcessingParameterFeatureSink(
-            self.OUT_GARDEN_TRENCH,            self.tr("Trenches - Garden (HH->Footway)"),
+            self.OUT_GARDEN_TRENCH,            self.tr("Trenches - Drop (HH->Footway)"),
             QgsProcessing.TypeVectorLine, optional=True, createByDefault=True
         ))
         self.addParameter(QgsProcessingParameterFeatureSink(
@@ -562,6 +570,10 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(QgsProcessingParameterFeatureSink(
             self.OUT_DROP_DUCTS,            self.tr("Ducts - Drop (pseudo → object)"),
             QgsProcessing.TypeVectorLine, optional=True, createByDefault=True
+        ))
+        self.addParameter(QgsProcessingParameterFeatureSink(
+            self.OUT_COUPLEURS,            self.tr("Coupleurs (pseudo → object connection points)"),
+            QgsProcessing.TypeVectorPoint, optional=True, createByDefault=True
         ))
         self.addParameter(QgsProcessingParameterFeatureSink(
             self.OUT_CHAMBERS,            self.tr("Civil - Chambers (planned)"),
@@ -877,6 +889,15 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         }
         if results.get("pdp_proj"):
             params[self._CB_PROJ] = results["pdp_proj"]
+        # Shared feeder planning inputs (Final_Trenches + PDPs + MFG).
+        # When all three are present the feeder cable is PLANNED (clubbed,
+        # sized by splitter demand); otherwise the legacy trench-copy runs.
+        if results.get("trenches"):
+            params[self._CB_FINAL_TR] = results["trenches"]
+        if results.get("pdp"):
+            params[self._CB_PDP] = results["pdp"]
+        if results.get("mfg"):
+            params[self._CB_MFG] = results["mfg"]
         return processing.run(ALG.CABLE, params, context=context, feedback=feedback,
                               is_child_algorithm=True)
 
@@ -889,6 +910,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             self._DU_OUT_FEEDER: self._dest(parameters, self.OUT_FEEDER_DUCTS, context),
             self._DU_OUT_DIST: self._dest(parameters, self.OUT_DIST_DUCTS, context),
             self._DU_OUT_DROP: self._dest(parameters, self.OUT_DROP_DUCTS, context),
+            self._DU_OUT_COUPLE: self._dest(parameters, self.OUT_COUPLEURS, context),
         }
         if results.get("pseudo_hh"):
             params[self._DU_PSEUDO] = results["pseudo_hh"]
@@ -898,6 +920,16 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             params[self._DU_SIDE_L] = results["sidewalk_l"]
         if results.get("sidewalk_r"):
             params[self._DU_SIDE_R] = results["sidewalk_r"]
+        # Route-based duct bundling inputs: when the cable layers exist, the
+        # duct stage emits ONE duct per connected route carrying the cables
+        # on it (4-way Feeder / 2-way Distribution).
+        cables = results.get("cables") or {}
+        fc = cables.get(self._CB_OUT_FEEDER)
+        if fc:
+            params[self._DU_FEEDER_CABLES] = fc
+        dc = cables.get(self._CB_OUT_DIST)
+        if dc:
+            params[self._DU_DIST_CABLES] = dc
         return processing.run(ALG.DUCT, params, context=context, feedback=feedback,
                               is_child_algorithm=True)
 
@@ -912,9 +944,12 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         params = {
             "INPUT_FEEDER_DUCTS": ducts.get(self._DU_OUT_FEEDER),
             "INPUT_DIST_DUCTS": ducts.get(self._DU_OUT_DIST),
+            "INPUT_DROP_DUCTS": ducts.get(self._DU_OUT_DROP),
             "INPUT_PDP": results.get("pdp"),
             "INPUT_TANGENT_CROSSINGS": tangents,
             "INPUT_TRENCHES": results.get("trenches"),
+            "INPUT_AOI": self._fast_resolve(results.get("aoi"), context),
+            "INPUT_BUILDINGS": self.parameterAsVectorLayer(parameters, self.P_BUILDINGS, context),
             "OUT_CHAMBERS": self._dest(parameters, self.OUT_CHAMBERS, context),
         }
         return processing.run(ALG.CHAMBER, params, context=context, feedback=feedback,
@@ -1308,6 +1343,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         results["pseudo_hh"] = tr.get("OUT_PSEUDO_HH")
         results["pdp_proj"] = tr.get("OUT_PDP_TO_SIDE")
         results["tangents_used"] = tr.get(self._TR_TAN_USED)
+        results["aoi"] = tr.get(self._TR_AOI_DISS)
         results["distribution"] = (
             tr.get(self._TR_DIST_LINES)
             or tr.get(self._TR_DIST_DISS)
@@ -1323,6 +1359,8 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             results["garden"], "Garden_Trench.gpkg", out_dir, context, feedback)
         results["pseudo_hh"] = self._save_layer_to_gpkg(
             results["pseudo_hh"], "Pseudo_HH.gpkg", out_dir, context, feedback)
+        results["tangents_used"] = self._save_layer_to_gpkg(
+            results["tangents_used"], "Tangent_Crossings.gpkg", out_dir, context, feedback)
 
         if feedback.isCanceled():
             return {}
@@ -1367,6 +1405,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         n_fd = self._fast_count(duct.get(self._DU_OUT_FEEDER), context)
         n_dd = self._fast_count(duct.get(self._DU_OUT_DIST), context)
         n_dr = self._fast_count(duct.get(self._DU_OUT_DROP), context)
+        n_cp = self._fast_count(duct.get(self._DU_OUT_COUPLE), context)
         parts = []
         if n_fd is not None:
             parts.append("Feeder: {}".format(n_fd))
@@ -1374,6 +1413,8 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             parts.append("Dist: {}".format(n_dd))
         if n_dr is not None:
             parts.append("Drop: {}".format(n_dr))
+        if n_cp is not None:
+            parts.append("Couplers: {}".format(n_cp))
         fc_str = ("{} features, ".format(", ".join(parts))) if parts else ""
         feedback.pushInfo(self.tr("  [timing] Duct Layer: {}{:.3f}s".format(fc_str, elapsed)))
         fd = results["ducts"].get(self._DU_OUT_FEEDER)
@@ -1388,6 +1429,10 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         if dr:
             results["ducts"][self._DU_OUT_DROP] = self._save_layer_to_gpkg(
                 dr, "Drop_Ducts.gpkg", out_dir, context, feedback)
+        cp = results["ducts"].get(self._DU_OUT_COUPLE)
+        if cp:
+            results["ducts"][self._DU_OUT_COUPLE] = self._save_layer_to_gpkg(
+                cp, "Coupleurs.gpkg", out_dir, context, feedback)
 
         if feedback.isCanceled():
             return {}
@@ -1689,7 +1734,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             self.OUT_MFG:        ("Network", "MFG", 1),
             self.OUT_FEEDER_TRENCH:  ("Trenches", "Feeder", 0),
             self.OUT_DIST_TRENCH:    ("Trenches", "Distribution", 1),
-            self.OUT_GARDEN_TRENCH:  ("Trenches", "Garden", 2),
+            self.OUT_GARDEN_TRENCH:  ("Trenches", "Drop (HH->Footway)", 2),
             self.OUT_TRENCHES:       ("Trenches", "Final Trenches", 3),
             self.OUT_FEEDER_CABLE: ("Cables", "Feeder", 0),
             self.OUT_DIST_CABLE:   ("Cables", "Distribution", 1),

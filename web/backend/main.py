@@ -51,16 +51,18 @@ ONECLICK_OUTPUTS: List[Tuple[str, str, str]] = [
     ("polygons", "Polygons.gpkg", "Polygons.geojson"),
     ("pdps", "PDPs.gpkg", "PDPs.geojson"),
     ("mfg", "MFG.gpkg", "MFG.geojson"),
-    ("trenches", "Feeder_Trench.gpkg", "Feeder_Trench.geojson"),
-    ("trenches", "Distribution_Trench.gpkg", "Distribution_Trench.geojson"),
-    ("trenches", "Garden_Trench.gpkg", "Garden_Trench.geojson"),
-    ("trenches", "Drill_Trench.gpkg", "Drill_Trench.geojson"),
+    # ONE trench layer (user spec): the published trench network is a single
+    # Final_Trenches layer whose features carry the construction sub-category
+    # (Open Cut / HDD / Garden). The old per-tier Feeder/Distribution/Garden
+    # sub-layer publications are gone — ducts and cables (which do keep their
+    # tiers) ride inside the one trench per route.
     ("trenches", "Final_Trenches.gpkg", "Final_Trenches.geojson"),
     ("cables", "Feeder_Cable.gpkg", "Feeder_Cable.geojson"),
     ("cables", "Distribution_Cable.gpkg", "Distribution_Cable.geojson"),
     ("ducts", "Feeder_Ducts.gpkg", "Feeder_Ducts.geojson"),
     ("ducts", "Distribution_Ducts.gpkg", "Distribution_Ducts.geojson"),
     ("ducts", "Drop_Ducts.gpkg", "Drop_Ducts.geojson"),
+    ("coupleurs", "Coupleurs.gpkg", "Coupleurs.geojson"),
     ("chambers", "Chambers.gpkg", "Chambers.geojson"),
     ("poles", "Poles.gpkg", "Poles.geojson"),
     ("brownfield", "Existing_Infrastructure.gpkg", "Existing_Infrastructure.geojson"),
@@ -149,19 +151,46 @@ def _find_qgis_process() -> Optional[str]:
     override = os.environ.get("QGIS_EXECUTABLE", "").strip()
     if override and os.path.isfile(override):
         return os.path.abspath(override)
-    for name in ("qgis_process-qgis", "qgis_process"):
-        found = shutil.which(name)
-        if found:
-            return found
+    # Windows: only the official QGIS launcher BATs are safe. They call
+    # o4w_env.bat, which sets every DLL search path qgis_process.exe needs;
+    # launching the .exe directly (or via a hand-rolled env) crashes at
+    # startup with 0xC0000135 (STATUS_DLL_NOT_FOUND). The engine's
+    # _run_command prepends Python312's site-packages to PYTHONPATH and the
+    # official BAT appends (never replaces) it, so pandas stays importable.
     if os.name == "nt":
-        for base in (r"C:\Program Files", r"C:\OSGeo4W64\bin"):
+        prog_files = [os.environ.get("ProgramFiles", r"C:\Program Files"),
+                      r"C:\Program Files (x86)"]
+        bases: List[str] = []
+        for prog in prog_files:
+            try:
+                bases.extend(
+                    os.path.join(prog, d) for d in os.listdir(prog)
+                    if d.lower().startswith(("qgis", "osgeo4w"))
+                )
+            except OSError:
+                continue
+        bases.append(r"C:\OSGeo4W64")
+        launcher_names = ("qgis_process-qgis.bat", "qgis_process.bat", "qgis_process.cmd")
+        for base in bases:
+            for sub in ("bin", os.path.join("apps", "qgis", "bin")):
+                for name in launcher_names:
+                    cand = os.path.join(base, sub, name)
+                    if os.path.isfile(cand):
+                        return cand
+        # Last resort: a bounded walk that only accepts launcher BATs.
+        for base in bases:
             if not os.path.isdir(base):
                 continue
             for root, _dirs, files in os.walk(base):
                 for filename in files:
                     lower = filename.lower()
-                    if lower.startswith("qgis_process") and lower.endswith((".bat", ".cmd", ".exe")):
+                    if lower.startswith("qgis_process") and lower.endswith((".bat", ".cmd")):
                         return os.path.join(root, filename)
+        return None
+    for name in ("qgis_process-qgis", "qgis_process"):
+        found = shutil.which(name)
+        if found:
+            return found
     return None
 
 
@@ -175,6 +204,12 @@ def _run_command(project_id: str, cmd: Union[List[str], str], output_dir: Path) 
     env = os.environ.copy()
     env.setdefault("QT_QPA_PLATFORM", "offscreen")
     env.setdefault("QGIS_PLUGINPATH", str(ROOT_DIR))
+    # Ensure qgis_process can find pandas/numpy/etc. from QGIS's Python312
+    _qgispython = str(ROOT_DIR / "HLDPlanning" / "python")  # fallback
+    _py312site = r"C:\Program Files\QGIS 3.44.6\apps\Python312\Lib\site-packages"
+    if os.path.isdir(_py312site) and _py312site not in env.get("PYTHONPATH", ""):
+        existing = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = _py312site + (";" + existing if existing else "")
     # Line-buffer stdout so plugin progress reaches the API logger
     # instead of waiting for the kernel buffer to fill or process exit.
     env.setdefault("PYTHONUNBUFFERED", "1")
@@ -331,7 +366,18 @@ def _ingest_outputs(project_id: str, output_dir: Path) -> List[Dict[str, Any]]:
             if gpkg_path.exists():
                 layer_files.setdefault(public_layer, []).append(str(gpkg_path))
             continue
-        if not geojson_path.exists():
+        # Re-convert when the GPKG is newer than the GeoJSON: stages like
+        # the attribute-enrichment pass rewrite the GPKGs in place AFTER the
+        # per-stage GeoJSON exports, so a re-run must not ingest the stale
+        # previous run's GeoJSON.
+        needs_convert = (
+            not geojson_path.exists()
+            or (
+                gpkg_path.exists()
+                and gpkg_path.stat().st_mtime > geojson_path.stat().st_mtime
+            )
+        )
+        if needs_convert:
             _convert_gpkg_to_geojson(gpkg_path, geojson_path)
         if geojson_path.exists():
             layer_files.setdefault(public_layer, []).append(str(geojson_path))
@@ -679,8 +725,14 @@ def get_layer(project_id: str, layer: str) -> Dict[str, Any]:
             return data
 
     task = tasks.get(project_id)
-    if task is None:
-        task = _restore_task_from_disk(project_id)
+    if task is None or not (task.get("files") or {}).get(layer):
+        # A task restored from PostGIS (engine restart) carries layer counts
+        # but no on-disk file paths, so grouped layers (cables/ducts) that
+        # PostGIS resolves to None would 404 here. Fall back to disk output
+        # paths whenever the current task has none for the requested layer.
+        restored = _restore_task_from_disk(project_id)
+        if restored is not None:
+            task = restored
     if task:
         files = (task.get("files") or {}).get(layer, [])
         geojson_files = [
@@ -772,10 +824,10 @@ def projects(limit: int = 50) -> List[Dict[str, Any]]:
 
 LLD_LAYER_ORDER = [
     "objects", "polygons", "pdps", "mfg",
-    "final_trenches", "feeder_trench", "distribution_trench",
-    "drill_trench",
+    "final_trenches",
     "feeder_cable", "distribution_cable", "aerial_cable",
     "feeder_ducts", "distribution_ducts", "drop_ducts",
+    "coupleurs",
     "chambers", "poles",
     "aerial_drop_trenches",
     "existing_infrastructure", "existing_infrastructure_points",
@@ -1106,18 +1158,55 @@ def _propagate_support_layers(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict
 # garden (drop) riding that region follow; reroute a cable -> the trench and
 # ducts under it follow. Already-approved features are never re-laid (the
 # engineer's own re-draw wins).
-# Trench sub-layers are the components of final_trenches (final = feeder +
-# distribution + garden merged, each tagged with trench_type). They must
-# follow a survey reroute of the final trench exactly like ducts/cables do —
-# otherwise the results viewer shows the old generated sub-path next to the
-# new final trench (visible duplication) even though the final trench is
-# supposed to be the combination of the three.
-TRENCH_SUB_LAYERS = {"feeder_trench", "distribution_trench"}
+# Trench sub-layers are the components of final_trenches. The single-trench
+# redesign removed the per-tier feeder/distribution publications — the trench
+# network is final_trenches alone, whose features carry the construction class
+# (Open Cut / HDD / Garden). Kept as a set so legacy survey imports that still
+# carry the old sub-layers degrade gracefully.
+TRENCH_SUB_LAYERS: set = set()
 
 # ---------------------------------------------------------------------------
 CORRIDOR_LINE_LAYERS = sorted(
     set(TRENCH_LAYERS) | set(DUCT_LAYERS) | set(CABLE_LAYERS) | TRENCH_SUB_LAYERS
 )
+
+
+# ---------------------------------------------------------------------------
+# Hierarchy-aware reroute propagation. Network tiers: feeder (0) feeds the
+# distribution (1) which feeds the garden/drop (2). A reroute of a feature at
+# tier T may only re-lay/purge features at tier >= T (same tier or downstream):
+# rerouting the feeder carries the distribution/garden riding that region —
+# but rerouting a DISTRIBUTION trench must NEVER drag the FEEDER backbone,
+# which merely runs near the same corridor (that bug purged 29/30 feeder
+# trenches in one run). ``None`` = tier-unknown (HDD/road-crossing and other
+# generic construction classes) — follows any reroute as before.
+
+
+def _reroute_tier(layer: str, props: Dict[str, Any]) -> Optional[int]:
+    """Network tier of a corridor feature (0 feeder / 1 distribution /
+    2 drop-garden), or None when the tier cannot be determined."""
+    if layer in ("feeder_cable", "feeder_ducts"):
+        return 0
+    if layer in ("distribution_cable", "distribution_ducts"):
+        return 1
+    if layer == "drop_ducts":
+        return 2
+    if layer in TRENCH_LAYERS or layer in TRENCH_SUB_LAYERS:
+        tt = str(props.get("trench_type") or props.get("USAGE_TYPE") or "").strip().lower()
+        if "feeder" in tt:
+            return 0
+        if "distribution" in tt or "dist" in tt:
+            return 1
+        if "garden" in tt or "drop" in tt:
+            return 2
+        return None  # HDD / unknown construction class
+    return None
+
+
+def _tier_blocks_reroute(changed_tier: Optional[int], dep_tier: Optional[int]) -> bool:
+    """True when ``dep_tier`` is UPSTREAM of ``changed_tier`` (both known) and
+    must therefore never follow (be re-laid/purged by) that reroute."""
+    return changed_tier is not None and dep_tier is not None and dep_tier < changed_tier
 
 
 def _nearest_point_on_path(p: Any, path: List[Any]) -> List[float]:
@@ -1280,7 +1369,7 @@ def _relay_dependents(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, in
     # Approved-changed lines whose geometry genuinely differs from the BEFORE
     # state. The before/after pair is carried INSIDE the approved dataset (the
     # survey change's own frozen original_geometry) — never a live HLD lookup.
-    changed: List[Tuple[str, List[Any], List[Any]]] = []
+    changed: List[Tuple[str, List[Any], List[Any], Dict[str, Any]]] = []
     for layer, feats in by_layer.items():
         for f in feats:
             props = f.get("properties") or {}
@@ -1292,7 +1381,7 @@ def _relay_dependents(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, in
                 continue
             if orig_lines == cur_lines:
                 continue
-            changed.append((layer, orig_lines[0], cur_lines[0]))
+            changed.append((layer, orig_lines[0], cur_lines[0], props))
 
     # Trenches re-lay first so their ducts/cables follow the trench; then a
     # rerouted duct re-lays its cable onto the duct; a rerouted cable re-lays
@@ -1306,7 +1395,11 @@ def _relay_dependents(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, in
         )
     )
 
-    for layer, orig_path, new_path in changed:
+    for layer, orig_path, new_path, cprops in changed:
+        # Hierarchy guard: a downstream reroute (distribution/garden) must
+        # never drag the upstream feeder backbone that merely runs near the
+        # same corridor (see _reroute_tier above).
+        changed_tier = _reroute_tier(layer, cprops)
         # Every other corridor line layer follows this reroute.
         dependents = [d for d in CORRIDOR_LINE_LAYERS if d != layer]
         if not dependents:
@@ -1329,6 +1422,8 @@ def _relay_dependents(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, in
                 props = f.get("properties") or {}
                 if props.get("approved"):
                     continue  # engineer already re-drew this dependent
+                if _tier_blocks_reroute(changed_tier, _reroute_tier(dep_layer, props)):
+                    continue  # upstream tier (e.g. feeder) never follows a downstream reroute
                 geom = f.get("geometry") or {}
                 lines = _line_strings(geom)
                 if not lines:
@@ -1418,7 +1513,9 @@ def _purge_old_region(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, in
             uncovered = _uncovered_points(orig_lines[0], new_index, new_cell, rtol)
             region_lines = _runs(uncovered)
             if region_lines:
-                old_regions.append((layer, region_lines, cur_lines[0]))
+                old_regions.append(
+                    (layer, region_lines, cur_lines[0], _reroute_tier(layer, props))
+                )
 
     if not old_regions:
         return purged
@@ -1428,6 +1525,7 @@ def _purge_old_region(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, in
             props = f.get("properties") or {}
             if props.get("approved"):
                 continue  # the engineer's own re-draw is authoritative
+            dep_tier = _reroute_tier(layer, props)
             geom = f.get("geometry") or {}
             lines = _line_strings(geom)
             if not lines:
@@ -1450,7 +1548,9 @@ def _purge_old_region(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, in
                     splice = None
                     snapped = None
                     best_d = float("inf")
-                    for (_ol, region_lines, new_path) in old_regions:
+                    for (_ol, region_lines, new_path, rtier) in old_regions:
+                        if _tier_blocks_reroute(rtier, dep_tier):
+                            continue  # upstream tier: exempt from this reroute
                         if _segment_rides_region(a, b, region_lines, LLD_RELAY_TOL):
                             mid = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2]
                             q = _nearest_point_on_path(mid, new_path)
@@ -1961,7 +2061,7 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
                     "trench_type": "Garden",
                     "USAGE_TYPE": "Garden",
                     "SURFACE": "Footpath",
-                    "CONSTRUCT": "Micro Trench",
+                    "CONSTRUCT": "Garden",
                     "REINSTATE": "Sidewalk",
                     "DEPTH_MM": 450,
                     "WIDTH_MM": 150,
@@ -2362,9 +2462,6 @@ _REPLAN_OUTPUT_MAP = [
     ("Polygons", "polygons"),
     ("PDPs", "pdps"),
     ("MFG", "mfg"),
-    ("Feeder_Trench", "feeder_trench"),
-    ("Distribution_Trench", "distribution_trench"),
-    ("Drill_Trench", "drill_trench"),
     ("Final_Trenches", "final_trenches"),
     ("Feeder_Cable", "feeder_cable"),
     ("Distribution_Cable", "distribution_cable"),
@@ -2373,6 +2470,7 @@ _REPLAN_OUTPUT_MAP = [
     ("Feeder_Ducts", "feeder_ducts"),
     ("Distribution_Ducts", "distribution_ducts"),
     ("Drop_Ducts", "drop_ducts"),
+    ("Coupleurs", "coupleurs"),
     ("Chambers", "chambers"),
     ("Poles", "poles"),
     ("Existing_Infrastructure", "existing_infrastructure"),
@@ -2541,8 +2639,10 @@ def _drop_generated_corridor_duplicates(
     removed: Dict[str, int] = {}
     for layer, approved_features in approved_by_layer.items():
         regions: List[Any] = []
+        approved_tiers: List[Optional[int]] = []
         for approved in approved_features:
             aprop = approved.get("properties") or {}
+            approved_tiers.append(_reroute_tier(layer, aprop))
             for geom in (approved.get("geometry"), aprop.get("original_geometry")):
                 for ln in _line_strings(geom):
                     if len(ln) >= 2:
@@ -2557,6 +2657,14 @@ def _drop_generated_corridor_duplicates(
             if props.get("approved") or props.get("lld_created"):
                 kept.append(f)
                 continue
+            gen_tier = _reroute_tier(layer, props)
+            if (
+                gen_tier is not None
+                and approved_tiers
+                and all(_tier_blocks_reroute(t, gen_tier) for t in approved_tiers)
+            ):
+                kept.append(f)
+                continue  # upstream tier: never a duplicate of a downstream reroute
             lines = _line_strings(f.get("geometry"))
             if not lines:
                 kept.append(f)
