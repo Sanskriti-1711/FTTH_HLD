@@ -93,11 +93,14 @@ def _create_fields(lyr, fields):
     """Create all (name, type[, width]) fields up front, before iterating."""
     if lyr is None:
         return
-    existing = {lyr.GetLayerDefn().GetFieldDefn(i).GetName()
+    # Compare case-insensitively: OGR/SQLite field names are, so asking to
+    # create LENGTH_M on a layer that already has length_m fails with
+    # "A field with the same name already exists" and spams the run log.
+    existing = {lyr.GetLayerDefn().GetFieldDefn(i).GetName().lower()
                 for i in range(lyr.GetLayerDefn().GetFieldCount())}
     for spec in fields:
         name = spec[0]
-        if name in existing:
+        if name.lower() in existing:
             continue
         ftype = spec[1] if len(spec) > 1 else ogr.OFTString
         width = spec[2] if len(spec) > 2 else 48
@@ -241,7 +244,7 @@ def enrich_trenches(trench_path, feedback=None):
         ("DEPTH_MM", ogr.OFTInteger),
         ("SURFACE", ogr.OFTString, 24),
         ("REINSTATE", ogr.OFTString, 24),
-        ("LENGTH_M", ogr.OFTReal),
+        ("length_m", ogr.OFTReal),
         ("INFRA_STATUS", ogr.OFTString, 24),
     ])
     n = 0
@@ -256,14 +259,30 @@ def enrich_trenches(trench_path, feedback=None):
             tt_canon = "HDD"
         if tt_canon not in ("Open Cut", "HDD", "Garden"):
             tt_canon = TRENCH_CONSTRUCT.get(tt_canon, "Open Cut")
-        sidewalk = str(_get(lyr, f, "sidewalk") or "")
+        # ``sidewalk`` is a STRING field in the delivered GPKG, so the literal
+        # "false"/"0" are truthy in Python — that silently flipped every
+        # reinstatement to Footpath/Sidewalk. Normalise it explicitly.
+        _sw_raw = str(_get(lyr, f, "sidewalk") or "").strip().lower()
+        _sw_mixed = _sw_raw == "mixed"
+        sidewalk = _sw_raw not in ("", "false", "0", "no", "none", "null")
         f.SetField("USAGE_TYPE", tt_canon)
         f.SetField("CONSTRUCT", TRENCH_CONSTRUCT.get(tt_canon, "Open Cut"))
         f.SetField("WIDTH_MM", TRENCH_WIDTH_MM.get(tt_canon, 300))
         f.SetField("DEPTH_MM", TRENCH_DEPTH_MM.get(tt_canon, 900))
-        f.SetField("SURFACE", "Footpath" if sidewalk else "Asphalt")
-        f.SetField("REINSTATE", "Sidewalk" if sidewalk else "Road")
-        f.SetField("LENGTH_M", round(_geom_len_m(f), 1))
+        # A grouped trench (one feature per construction sub-category) carries
+        # the whole category, so its runs no longer share one sidewalk flag.
+        # trench_layer aggregates it to "Mixed" when they disagree; report the
+        # real reinstatement mix instead of defaulting the category to asphalt.
+        if _sw_mixed:
+            f.SetField("SURFACE", "Mixed (Footpath + Asphalt)")
+            f.SetField("REINSTATE", "Mixed (Sidewalk + Road)")
+        else:
+            f.SetField("SURFACE", "Footpath" if sidewalk else "Asphalt")
+            f.SetField("REINSTATE", "Sidewalk" if sidewalk else "Road")
+        # The layer carries ``length_m`` (created by the trench layer); OGR
+        # field names are case-insensitive, so write that field rather than
+        # trying to add a duplicate LENGTH_M column.
+        f.SetField("length_m", round(_geom_len_m(f), 1))
         if not _get(lyr, f, "INFRA_STATUS"):
             f.SetField("INFRA_STATUS", "Proposed")
         lyr.SetFeature(f)

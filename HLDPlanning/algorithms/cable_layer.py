@@ -40,7 +40,10 @@ from ..utils.layer_ops import (
     linemerge_layer,
     find_first_alg,
 )
-from ..utils.geom import round_key_xy, geom_substring, path_len, lcp_len, edges_to_geom
+from ..utils.geom import (
+    round_key_xy, geom_substring, path_len, lcp_len, edges_to_geom,
+    merge_contiguous_runs,
+)
 from ..utils.graph import add_edge, dijkstra_with_parents, reconstruct_path
 from ..utils.snap import snap_point_create_virtual
 
@@ -144,15 +147,19 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
     SAME_FOOTWAY_TOL_M = 0.5
     RESERVED_SPARE_FIBERS = 2
 
-    # --- Shared feeder-cable planning (single-trunk policy, 96F target) ---
+    # --- Shared feeder-cable planning (three-trunk policy) ---
     FEEDER_LADDER = (12, 24, 48, 72, 96, 144, 288)
-    # Trunk sizing: carry at most 70% of the cable size (≥30% spare). The HLD
-    # review asks for ONE standard trunk per direction — e.g. a 96F feeder
-    # covering all PDPs of an MFG (66 modules → 96F at 68.8% util) instead of
-    # several small 12F/24F cables.
+    # Trunk sizing: carry at most 70% of the cable size (≥30% spare).
     FEEDER_SPARE_RATIO = 0.7
-    # Hard overflow: when an MFG's total demand exceeds this share of the
-    # largest ladder cable, a second trunk is started for the remainder.
+    # User spec: THREE capacity-balanced trunk cables leave every MFG and
+    # pick up PDPs until the trunk is exhausted.  A trunk is exhausted when
+    # it reaches EITHER limit, whichever comes first:
+    #   • capacity — 70% of the largest ladder cable (201 of 288F), or
+    #   • route length — 1,000 m of laid cable.
+    # Remaining PDPs spill onto a 4th+ trunk so none are ever dropped.
+    FEEDER_TRUNKS_PER_MFG = 3
+    FEEDER_LENGTH_LIMIT_M = 1000.0
+    # Hard capacity cap per trunk: 70% of the largest ladder cable.
     FEEDER_TRUNK_MAX_DEMAND = int(FEEDER_SPARE_RATIO * 288)
     # Graph/snap parameters for the feeder route tree (mirror duct_layer feeder)
     SNAP_TOL = 1.5
@@ -248,7 +255,7 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
 
     def _group_feeder_cables(self, paths, demands, pid_mfg, edge_geom, edge_len,
                              pdp_label):
-        """Club ALL PDPs of an MFG onto ONE standard trunk feeder cable.
+        """Split an MFG's PDPs across THREE capacity-balanced trunk cables.
 
         Input:
           paths     : pid -> (edge_list, length)  — MFG→PDP routes on the
@@ -256,24 +263,32 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
           demands   : pid -> splitter-module demand (feeder fibres)
           pid_mfg   : pid -> MFG label
 
-        Strategy (HLD review: 'use 96F and cover all PDPs in one direction
-        under a single feeder cable'):
-          - One trunk per MFG. Every PDP is a member; shared corridors are
-            drawn once, divergences become tap-off branch parts of the same
-            cable feature (multi-part geometry) — physically ONE cable laid
-            in the single feeder trench, spliced at each PDP.
-          - Trunk size = smallest ladder size whose 70% capacity covers the
-            MFG's total demand (e.g. 66 modules → 96F at 68.8% util).
-          - Only when the total demand overflows the largest ladder cable
-            (288F) is a second trunk started for the remainder.
-          - PDPs not routable from any MFG (should not happen) fall back to
-            their own small cable rather than being dropped.
+        Strategy (user spec: 'three cables start at the MFG and cover the
+        PDPs until they reach their length'):
+          - Every MFG starts FEEDER_TRUNKS_PER_MFG (3) trunk cables.  The
+            trunks are CAPACITY-BALANCED, not direction-sectored: each PDP
+            (longest route first) goes to the feasible trunk carrying the
+            least demand, so the three fill together instead of one
+            hoarding the load.
+          - A trunk takes no more PDPs once it reaches EITHER limit, which
+            ever comes first:
+              • capacity — 70% of the largest ladder cable (201 of 288F), so
+                every trunk keeps ≥30% spare, or
+              • route length — 1,000 m of laid cable (shared corridors
+                counted once over the union of its member routes).
+          - PDPs left over when all three are exhausted open a 4th+ trunk,
+            so nothing is dropped.
+          - Shared corridors are drawn once; divergences become tap-off
+            branch parts of the same cable feature.
 
         Returns a list of cable dicts with keys:
           cable_id, members (full edge lists MFG→each PDP), demand, size,
-          pdp_ids, splice_of, splice_pt, mfg_id, polygon_id.
+          pdp_ids, splice_of, splice_pt, mfg_id, polygon_id, trunk_no,
+          length, length_capped.
         """
         ladder = self.FEEDER_LADDER
+        max_demand = self.FEEDER_TRUNK_MAX_DEMAND      # 201 = 70% of 288F
+        len_limit = self.FEEDER_LENGTH_LIMIT_M
 
         def size_for(demand):
             """Smallest ladder size whose 70% capacity covers `demand`."""
@@ -281,6 +296,10 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
                 if demand <= self.FEEDER_SPARE_RATIO * s:
                     return s
             return ladder[-1]
+
+        def route_len(segs):
+            """Laid length of a trunk: each edge counted once over the union."""
+            return sum(edge_len.get(s, 0.0) for s in segs)
 
         # 1) Partition PDPs by MFG.
         by_mfg = defaultdict(list)
@@ -290,23 +309,46 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
         cables = []
         cid = 1
         for mfg, pids in by_mfg.items():
-            # Longest routes first so trunk spines are the long corridors.
+            # Longest routes first so the trunks fill evenly along their span.
             pids.sort(key=lambda q: paths[q][1], reverse=True)
-            total = sum(max(1, int(demands.get(q, 1) or 1)) for q in pids)
-            # One trunk per MFG; only overflow beyond the largest ladder
-            # cable forces a second trunk.
-            n_trunks = max(1, -(-total // self.FEEDER_TRUNK_MAX_DEMAND))
-            cap = -(-total // n_trunks)          # per-trunk demand split
-            trunks = [{"members": [], "demand": 0, "pdp_ids": []}
-                      for _ in range(n_trunks)]
-            # Longest-fit assignment into the trunks (bin packing when >1).
+            trunks = [
+                {"members": [], "demand": 0, "pdp_ids": [],
+                 "segs": set(), "length": 0.0, "hit_length_limit": False}
+                for _ in range(self.FEEDER_TRUNKS_PER_MFG)
+            ]
             for q in pids:
                 d = max(1, int(demands.get(q, 1) or 1))
-                t = min(trunks, key=lambda tt: tt["demand"]) if n_trunks > 1 else trunks[0]
+                q_segs = set(paths[q][0])
+                # Feasible = keeps BOTH limits; emptiest feasible trunk wins.
+                best = None
+                for t in sorted(trunks, key=lambda tt: tt["demand"]):
+                    if t["demand"] + d > max_demand:
+                        continue
+                    proj_segs = t["segs"] | q_segs
+                    proj_len = route_len(proj_segs)
+                    if proj_len > len_limit:
+                        # This trunk was closed out by the length cap, not by
+                        # capacity — record it so the attribute table can tell
+                        # the two apart.
+                        t["hit_length_limit"] = True
+                        continue
+                    best = (t, proj_segs, proj_len)
+                    break
+                if best is None:
+                    # All three exhausted — open another trunk for the
+                    # remainder rather than dropping the PDP.
+                    nt = {"members": [], "demand": 0, "pdp_ids": [],
+                          "segs": set(), "length": 0.0, "hit_length_limit": False}
+                    trunks.append(nt)
+                    best = (nt, q_segs, route_len(q_segs))
+                t, proj_segs, proj_len = best
                 t["members"].append(list(paths[q][0]))
                 t["demand"] += d
                 t["pdp_ids"].append(pdp_label.get(q, str(q)))
-            for t in trunks:
+                t["segs"] = proj_segs
+                t["length"] = proj_len
+
+            for idx, t in enumerate(trunks, start=1):
                 if not t["members"]:
                     continue
                 cables.append({
@@ -319,6 +361,9 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
                     "splice_pt": "",
                     "mfg_id": mfg,
                     "polygon_id": "",
+                    "trunk_no": idx,
+                    "length": t["length"],
+                    "length_capped": 1 if t.get("hit_length_limit") else 0,
                 })
                 cid += 1
         # Orphan PDPs without any routable path never appear in `paths`, so
@@ -518,6 +563,9 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
             ("POLYGON_ID", QMetaType.Type.QString),
             ("MFG_ID", QMetaType.Type.QString),
             ("REVIEW", QMetaType.Type.Int),
+            ("TRUNK_NO", QMetaType.Type.Int),
+            ("LENGTH_LIMIT_M", QMetaType.Type.Double),
+            ("LENGTH_CAPPED", QMetaType.Type.Int),
         ):
             fields.append(QgsField(nm, t))
 
@@ -532,7 +580,11 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
                     if s not in seen_segs:
                         seen_segs.add(s)
                         segs.append(s)
-            geom = edges_to_geom(edge_geom, segs)
+            # Merge the per-edge fragments into continuous runs: the cable
+            # must trace one continuous trunk with tap-off branches, not
+            # thousands of 1-2 m stubs (which also made the whole tree select
+            # as one giant highlight).
+            geom = merge_contiguous_runs(edges_to_geom(edge_geom, segs))
             if not geom or geom.isEmpty():
                 continue
             nf = QgsFeature(fields)
@@ -551,6 +603,11 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
             nf["POLYGON_ID"] = c.get("polygon_id") or ""
             nf["MFG_ID"] = c.get("mfg_id") or ""
             nf["REVIEW"] = 1 if c["demand"] > self.FEEDER_SPARE_RATIO * self.FEEDER_LADDER[-1] else 0
+            # Which of the three (or overflow) trunks this cable is, and
+            # whether it was closed out by the length cap or by capacity.
+            nf["TRUNK_NO"] = int(c.get("trunk_no") or 0)
+            nf["LENGTH_LIMIT_M"] = float(self.FEEDER_LENGTH_LIMIT_M)
+            nf["LENGTH_CAPPED"] = int(c.get("length_capped") or 0)
             feats.append(nf)
         return fields, feats
 
@@ -785,9 +842,11 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
                 continue
             first_gf, first_df, _first_arm, first_pid = resolved[0]
             of = QgsFeature(out_fields)
-            of.setGeometry(QgsGeometry.fromMultiPolylineXY([
+            # Same continuity contract as the feeder: the grouped trunk plus
+            # each house arm are emitted as merged runs, not raw fragments.
+            of.setGeometry(merge_contiguous_runs(QgsGeometry.fromMultiPolylineXY([
                 [QgsPointXY(x, y) for x, y in part] for part in coordinates
-            ]))
+            ])))
             addr_ids = [str(item[0][fld_g_addr]) for item in resolved]
             hh_values = []
             for item, _df, _arm, _pid in resolved:

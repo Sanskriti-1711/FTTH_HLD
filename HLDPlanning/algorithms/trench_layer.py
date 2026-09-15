@@ -42,6 +42,10 @@ from ..utils.geom_utils import geom_str_from_wkb
 # ---- shared utils (from utils/ package)
 from ..utils.layer_io import as_layer, normalize_gpkg_path as _normalize_gpkg_path, materialize_layer as _materialize_layer
 from ..utils.geometry_ops import unary_union_geoms as _unary_union_geoms
+from ..utils.geom import (
+    merge_contiguous_runs as _merge_contiguous_runs,
+    chain_geometry_pieces as _chain_pieces,
+)
 from ..utils.segmentizer import segmentize_merged_lines
 from ..utils.processing_ops import erase_or_difference as _erase_or_difference
 from ..utils.geom_basic import geom_ok as _geom_ok, point_of as _point_of, to_multiline as _to_multiline, safe_collect as _safe_collect
@@ -2687,6 +2691,7 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                         return (round(pt.x() / _eps), round(pt.y() / _eps))
 
                     _end_nodes = defaultdict(list)   # node key -> [piece idx]
+                    _end_dir = {}                    # (node key, piece idx) -> unit dir away from that end
                     _pdps = [set(a[0]) for a in _piece_attrs]
                     _tts = ["HDD" if _on_drill(pg) else "Open Cut" for pg in _oc_pieces]
                     for i, pg in enumerate(_oc_pieces):
@@ -2697,6 +2702,19 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                         if len(pts) >= 2:
                             _end_nodes[_nk(pts[0])].append(i)
                             _end_nodes[_nk(pts[-1])].append(i)
+                            # Unit direction pointing AWAY from each end — the
+                            # straight-through continuation at a crossing is
+                            # the pair whose directions are most opposite.
+                            _l = math.hypot(pts[1].x() - pts[0].x(),
+                                            pts[1].y() - pts[0].y()) or 1.0
+                            _end_dir[(_nk(pts[0]), i)] = (
+                                (pts[1].x() - pts[0].x()) / _l,
+                                (pts[1].y() - pts[0].y()) / _l)
+                            _l2 = math.hypot(pts[-2].x() - pts[-1].x(),
+                                             pts[-2].y() - pts[-1].y()) or 1.0
+                            _end_dir[(_nk(pts[-1]), i)] = (
+                                (pts[-2].x() - pts[-1].x()) / _l2,
+                                (pts[-2].y() - pts[-1].y()) / _l2)
                         else:
                             c = pg.centroid().asPoint()
                             _end_nodes[_nk(c)].append(i)
@@ -2704,32 +2722,63 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                     for _node, idxs in _end_nodes.items():
                         uniq = sorted(set(idxs))
                         if len(uniq) == 2:
-                            # Degree-2 node: a simple continuation of one route.
+                            # Degree-2 node: one route continuing. Merge on the
+                            # construction class only — the PDP set must NOT
+                            # gate this. Every piece is attributed with the PDPs
+                            # riding it, so neighbouring pieces on one street
+                            # carry different sets by construction; requiring
+                            # an intersection chopped the whole network into
+                            # 1-10 m confetti. Attribute sets are unioned on the
+                            # group instead. HDD still never merges into
+                            # Open Cut — that boundary is a real type change.
                             i, j = uniq
-                            if _tts[i] == _tts[j] and (
-                                    not _pdps[i] or not _pdps[j]
-                                    or (_pdps[i] & _pdps[j])):
+                            if _tts[i] == _tts[j]:
                                 _union(i, j)
                         elif len(uniq) > 2:
-                            # Junction node (crossing / branching): pieces of
-                            # the SAME route (identical class + PDP set) are
-                            # continuations of one trench — e.g. a route that
-                            # crosses another route must not be chopped into
-                            # separate features at every crossing. Different
-                            # routes meeting here stay separate trenches.
-                            _groups_at = defaultdict(list)
+                            # Junction (crossing / branching): join the
+                            # straight-through continuation so a route is not
+                            # chopped at every crossing it passes. Pairs are
+                            # ranked by how nearly opposite their directions
+                            # are, and consumed greedily so a 4-way crossing
+                            # pairs both continuations.
+                            _ends = []
                             for i in uniq:
-                                _groups_at[(_tts[i], tuple(sorted(_pdps[i])))].append(i)
-                            for _g in _groups_at.values():
-                                for k in range(1, len(_g)):
-                                    _union(_g[0], _g[k])
+                                d = _end_dir.get((_node, i))
+                                if d:
+                                    _ends.append((i, d))
+                            _pairs = []
+                            for _a in range(len(_ends)):
+                                for _b in range(_a + 1, len(_ends)):
+                                    _ia, _da = _ends[_a]
+                                    _ib, _db = _ends[_b]
+                                    if _ia == _ib or _tts[_ia] != _tts[_ib]:
+                                        continue
+                                    _dot = _da[0] * _db[0] + _da[1] * _db[1]
+                                    _pairs.append((_dot, _ia, _ib))
+                            _pairs.sort()               # most opposite first
+                            _paired = set()
+                            for _dot, _ia, _ib in _pairs:
+                                if _ia in _paired or _ib in _paired:
+                                    continue
+                                if _dot > -0.5:         # >60 deg off straight
+                                    break
+                                _union(_ia, _ib)
+                                _paired.add(_ia)
+                                _paired.add(_ib)
 
                     _chains = defaultdict(list)
                     for i in range(_n_pieces):
                         _chains[_find(i)].append(i)
                     for _root, idxs in _chains.items():
                         geoms = [_oc_pieces[i] for i in idxs]
-                        merged = _unary_union_geoms(geoms) if len(geoms) > 1 else geoms[0]
+                        # Chain the grouped pieces into continuous runs. A
+                        # plain unaryUnion would just re-node them at every
+                        # crossing and hand back the same confetti.
+                        merged = (_chain_pieces(geoms, tol=_eps)
+                                  if len(geoms) > 1 else geoms[0])
+                        if merged is None or merged.isEmpty():
+                            merged = (_unary_union_geoms(geoms)
+                                      if len(geoms) > 1 else geoms[0])
                         pdp_u, poly_u, src_ft = set(), set(), None
                         for i in idxs:
                             a = _piece_attrs[i]
@@ -2761,13 +2810,126 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                         poly_v = _sval(f[_g_pdp_pol])
                     clubbed_features.append((g, "Garden", pdp_v, pdp_v, poly_v, poly_v, 1, f))
 
-                _tt_counts = defaultdict(int)
+                # ── Category grouping (user spec) ─────────────────────────
+                # The published Final_Trenches layer carries exactly ONE
+                # feature per construction sub-category — Open Cut, Garden,
+                # HDD.  Each feature holds every continuous run of that
+                # category as a geometry part, so the map shows one whole
+                # group per sub-category while each part stays a real
+                # continuous trench run.
+                #
+                # Why not fewer parts: a branching trench cannot be a single
+                # line.  Measured on Dry Run 5, the Open Cut network is one
+                # connected network (1,120 of 1,204 run endpoints touch
+                # another run within 1 m; 602 runs collapse to only 18
+                # connected components), so one run per branch span is the
+                # topological minimum — 602 runs is correct, not a merge
+                # failure.
+                #
+                # Sub-metre noding slivers are KEPT inside the geometry so
+                # BOQ / permit totals are unchanged, and are accounted for on
+                # the group as PARTS / SLIVER_PARTS / SLIVER_LEN_M
+                # (HAS_SLIVERS) so downstream tables can exclude them.
+                _SLIVER_M = 1.0
+
+                def _explode_runs(g):
+                    """Split a (possibly multipart) geometry into single runs."""
+                    if g is None or g.isEmpty():
+                        return []
+                    if not g.isMultipart():
+                        pl = g.asPolyline()
+                        return [g] if pl and len(pl) >= 2 else []
+                    out = []
+                    try:
+                        for pts in g.asMultiPolyline():
+                            if pts and len(pts) >= 2:
+                                out.append(QgsGeometry.fromPolylineXY(pts))
+                    except Exception:
+                        return [g]
+                    return out
+
+                def _split_ids(v):
+                    """Comma-joined id string (or scalar) → list of id strings."""
+                    if v is None:
+                        return []
+                    if isinstance(v, str):
+                        return [p.strip() for p in v.split(",") if p.strip()]
+                    s = str(v).strip()
+                    return [s] if s and s.upper() != "NULL" else []
+
+                _groups = {}
                 for _cf in clubbed_features:
-                    _tt_counts[_cf[1]] += 1
+                    _pg, _tt = _cf[0], _cf[1]
+                    # Chain this group's pieces into continuous runs ONCE, so
+                    # the writer and the statistics see identical geometry.
+                    _g2 = _merge_contiguous_runs(_pg)
+                    if _g2 is None or _g2.isEmpty():
+                        _g2 = _pg
+                    _runs = _explode_runs(_g2)
+                    if not _runs:
+                        continue
+                    _grp = _groups.get(_tt)
+                    if _grp is None:
+                        _grp = _groups[_tt] = {
+                            "runs": [], "pdps": set(), "polys": set(),
+                            "frags": 0, "src_ft": _cf[7], "sw": set(),
+                            "n_sliver": 0, "sliver_len": 0.0,
+                        }
+                    _grp["runs"].extend(_runs)
+                    _grp["pdps"].update(_split_ids(_cf[3]))
+                    _grp["polys"].update(_split_ids(_cf[5]))
+                    _grp["frags"] += int(_cf[6] or 0)
+                    # Aggregate the sidewalk flag ACROSS the grouped runs.  With
+                    # one feature per category, copying it from the first route
+                    # would silently label a whole category "Footpath" (or
+                    # "Asphalt") — and SURFACE / REINSTATE are derived from it in
+                    # attr_enrich.  Mixed is carried through so the permit shows
+                    # the real reinstatement mix.
+                    _sw_fld = club_src_fields.lookupField("sidewalk")
+                    if _sw_fld >= 0 and _cf[7] is not None:
+                        try:
+                            _grp["sw"].add(bool(_cf[7][_sw_fld]))
+                        except Exception:
+                            pass
+
+                grouped_features = []
+                for _tt in sorted(_groups):
+                    _grp = _groups[_tt]
+                    for _r in _grp["runs"]:
+                        try:
+                            _L = float(_r.length())
+                        except Exception:
+                            _L = 0.0
+                        if _L < _SLIVER_M:
+                            _grp["n_sliver"] += 1
+                            _grp["sliver_len"] += _L
+                    # collectGeometry keeps every run as its own part — no
+                    # union, so nothing is re-noded and no length is lost.
+                    _geom = QgsGeometry.collectGeometry(_grp["runs"])
+                    if _geom is None or _geom.isEmpty():
+                        continue
+                    _pdp_l, _poly_l = sorted(_grp["pdps"]), sorted(_grp["polys"])
+                    _sw_set = _grp["sw"]
+                    _sw_val = (next(iter(_sw_set)) if len(_sw_set) == 1
+                               else ("Mixed" if _sw_set else None))
+                    grouped_features.append((
+                        _geom, _tt,
+                        _pdp_l[0] if _pdp_l else None,
+                        ",".join(_pdp_l) if _pdp_l else None,
+                        _poly_l[0] if _poly_l else None,
+                        ",".join(_poly_l) if _poly_l else None,
+                        _grp["frags"], _grp["src_ft"],
+                        len(_grp["runs"]), _grp["n_sliver"],
+                        round(_grp["sliver_len"], 2), _grp["runs"], _sw_val,
+                    ))
+
                 feedback.pushInfo(
-                    "Trench consolidation: {} segments → {} trench features ({})".format(
-                        _merged_final_count, len(clubbed_features),
-                        ", ".join("{}: {}".format(k, v) for k, v in sorted(_tt_counts.items())) or "none",
+                    "Trench consolidation: {} segments → {} grouped trench features ({})".format(
+                        _merged_final_count, len(grouped_features),
+                        ", ".join(
+                            "{}: {} runs / {} sliver".format(g[1], g[8], g[9])
+                            for g in grouped_features
+                        ) or "none",
                     )
                 )
 
@@ -2792,6 +2954,29 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                 ext_fields.append(QgsField("REUSE_SOURCE", QMetaType.Type.QString))
                 # Clubbing hint: how many source segments were merged into this trench
                 ext_fields.append(QgsField("FRAGMENTS_MERGED", QMetaType.Type.Int))
+                # Continuous-run accounting on the grouped (one feature per
+                # construction sub-category) trench feature: how many runs the
+                # geometry holds, how much of it is sub-metre noding slivers
+                # (kept in the geometry so BOQ is unchanged, flagged so it can
+                # be excluded from permit section tables), and the total
+                # laid length.
+                ext_fields.append(QgsField("PARTS", QMetaType.Type.Int))
+                ext_fields.append(QgsField("SLIVER_PARTS", QMetaType.Type.Int))
+                ext_fields.append(QgsField("SLIVER_LEN_M", QMetaType.Type.Double))
+                ext_fields.append(QgsField("HAS_SLIVERS", QMetaType.Type.Int))
+                # Metres of this grouped feature that ride existing
+                # infrastructure. A published feature holds a whole
+                # construction sub-category, so it can be partly reused and
+                # partly new; INFRA_STATUS alone cannot express that (stamping
+                # the category "Reused" wrote the entire trench network off as
+                # reuse and the BOQ billed 0 m of trench).
+                ext_fields.append(QgsField("REUSE_LEN_M", QMetaType.Type.Double))
+                # NOTE: no LENGTH_M field here. The source layers already carry
+                # ``length_m`` and OGR field names are case-insensitive, so
+                # appending LENGTH_M makes layer creation fail with "A field
+                # with the same name already exists" — which silently wrote an
+                # EMPTY Final_Trenches and killed the pipeline at Duct Layer.
+                # The grouped total goes into the existing ``length_m``.
 
                 sinkFinal, final_id = self.parameterAsSink(
                     p, self.O_FINAL, context,
@@ -2850,8 +3035,16 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                     # feature, using the union geometry for spatial checks.
                     _ext_names = {fld.name() for fld in ext_fields}
                     written = 0
-                    for pg, tt, pdp_val, pdp_ids, poly_val, poly_ids, n_frags, src_ft in clubbed_features:
+                    for (pg, tt, pdp_val, pdp_ids, poly_val, poly_ids, n_frags, src_ft,
+                         n_parts, n_sliver, sliver_len, run_geoms, sw_val) in grouped_features:
                         nf = QgsFeature(ext_fields)
+                        # Merge the consolidated pieces into continuous runs.  A
+                        # route crossed by another stayed chopped into a separate
+                        # geometry part at every junction (up to ~176 parts on a
+                        # single trench), so it rendered and selected as hundreds
+                        # of stubs instead of one continuous trench.  A branching
+                        # trench legitimately stays multi-part; each part is now
+                        # a real run.
                         nf.setGeometry(pg)
                         # Construction class on the consolidated trench — the
                         # single source of truth for USAGE_TYPE/CONSTRUCT.
@@ -2869,6 +3062,8 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                                     v = src_ft[fn]
                                     if v is not None and fn in _ext_names:
                                         nf[fn] = v
+                        if "sidewalk" in _ext_names and sw_val is not None:
+                            nf["sidewalk"] = sw_val
                         nf["POLYGON_ID"] = poly_val
                         nf["PDP_ID"] = pdp_val
                         if "POLYGON_IDS" in _ext_names:
@@ -2876,31 +3071,74 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                         if "PDP_IDS" in _ext_names:
                             nf["PDP_IDS"] = pdp_ids
                         nf["FRAGMENTS_MERGED"] = n_frags
+                        nf["PARTS"] = int(n_parts)
+                        nf["SLIVER_PARTS"] = int(n_sliver)
+                        nf["SLIVER_LEN_M"] = float(sliver_len)
+                        nf["HAS_SLIVERS"] = 1 if n_sliver else 0
+                        try:
+                            _glen = round(float(pg.length()), 2)
+                        except Exception:
+                            _glen = None
+                        if _glen is not None and "length_m" in _ext_names:
+                            nf["length_m"] = _glen
 
-                        # Brownfield classification on the consolidated geometry.
+                        # Brownfield classification: still evaluated PER RUN so
+                        # capacity accounting and "Reused" detection keep their
+                        # per-segment precision — grouping the features must not
+                        # turn one reused segment into a wholly-reused category.
                         bf_matched = False
+                        bf_sources = []
+                        bf_verify = None
+                        bf_reuse_len = 0.0
+                        _group_len = 0.0
+                        for _rg in run_geoms:
+                            try:
+                                _group_len += float(_rg.length())
+                            except Exception:
+                                pass
                         if bf_idx is not None and bf_geoms:
-                            fg = pg
-                            if fg and not fg.isEmpty():
+                            for fg in run_geoms:
+                                if fg is None or fg.isEmpty():
+                                    continue
+                                _run_reused = False
                                 try:
                                     bb = fg.buffer(TOL_M, 8).boundingBox()
                                     for bf_fid in bf_idx.intersects(bb):
                                         aid, a, bg = bf_geoms[bf_fid]
+                                        if aid in bf_sources:
+                                            continue
                                         if fg.distance(bg) <= TOL_M:
-                                            nf["INFRA_STATUS"] = "Reused"
-                                            nf["VERIFY_STATUS"] = a["verify_status"]
-                                            nf["REUSE_SOURCE"] = aid
+                                            bf_sources.append(aid)
+                                            if bf_verify is None:
+                                                bf_verify = a["verify_status"]
                                             try:
                                                 bf_reg.consume_capacity(aid)
                                             except Exception:
                                                 pass
                                             bf_tagged += 1
                                             bf_matched = True
-                                            break  # one classification per consolidated trench
+                                            _run_reused = True
                                 except Exception:
                                     pass  # classification must never block output
-                        if not bf_matched:
+                                if _run_reused:
+                                    # Count THIS run's metres as reused, not the
+                                    # whole category's.
+                                    try:
+                                        bf_reuse_len += float(fg.length())
+                                    except Exception:
+                                        pass
+                        nf["REUSE_LEN_M"] = round(bf_reuse_len, 2)
+                        if bf_matched:
+                            nf["VERIFY_STATUS"] = bf_verify
+                            nf["REUSE_SOURCE"] = ",".join(bf_sources)
+                        # Wholly reused → "Reused"; partly → "Mixed" (so the BOQ
+                        # bills the new metres via REUSE_LEN_M); none → "Proposed".
+                        if bf_reuse_len <= 0.0:
                             nf["INFRA_STATUS"] = "Proposed"
+                        elif _group_len and bf_reuse_len >= _group_len - 0.5:
+                            nf["INFRA_STATUS"] = "Reused"
+                        else:
+                            nf["INFRA_STATUS"] = "Mixed"
 
                         # Every feature already carries its construction class
                         # (Open Cut / HDD / Garden) from the consolidation pass.

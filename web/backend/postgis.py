@@ -605,6 +605,37 @@ def get_layer_geojson(
 ) -> Optional[Dict[str, Any]]:
     requested_layer = (layer or "").strip().lower().replace("-", "_")
     table = normalize_layer_name(requested_layer)
+
+    # Layer predicate.  The cable builder writes BOTH the feeder and the
+    # distribution cable into one table and tells them apart with the
+    # CABLE_TYPE property ("Feeder" / "Distribution"); the grouped aliases
+    # (cables / cable / cable_layer) mean "every cable row".  The predicates
+    # used to key off a STAGE property/column that the writer never fills, so
+    # every cable request matched nothing and silently fell back to the stale
+    # on-disk GeoJSON — which is why a re-ingest never reached the map.
+    where = sql.SQL("WHERE project_id = %s")
+    params: List[Any] = [project_id]
+    if table == "cable_layer":
+        cable_type = {
+            "feeder_cable": "Feeder",
+            "distribution_cable": "Distribution",
+        }.get(requested_layer)
+        if cable_type is not None:
+            where += sql.SQL(" AND properties->>'CABLE_TYPE' = %s")
+            params.append(cable_type)
+        elif requested_layer not in ("cables", "cable", "cable_layer"):
+            # Unrecognised cable sub-layer name — let the caller fall back to
+            # the on-disk outputs rather than guessing at a type.
+            return None
+    elif table == "duct_layer":
+        # Ducts share one table too but carry no feeder / distribution marker
+        # in their properties, so only the grouped name can be resolved here;
+        # the sub-layer names keep falling back to disk as before.
+        if requested_layer not in ("ducts", "duct", "duct_layer"):
+            return None
+    # Every other table (trenches, chambers, pdps, ...) is one layer = one
+    # table, so there is nothing to discriminate on: return all its rows.
+
     conn = get_conn()
     with conn.cursor() as cur:
         # Table may not exist on DBs created before a layer was added
@@ -626,17 +657,10 @@ def get_layer_geojson(
                     ) ORDER BY fid), '[]'::jsonb)
                 )
                 FROM {table}
-                WHERE project_id = %s
-                  AND (
-                    %s NOT IN ('cable_layer', 'duct_layer')
-                    OR properties->>'STAGE' = %s
-                    OR properties->>'stage' = %s
-                    OR properties->>'DUCT_TYPE' = %s
-                    OR properties->>'duct_type' = %s
-                  )
+                {where}
                 """
-            ).format(table=_gis_ident(table)),
-            (project_id, table, requested_layer, requested_layer, requested_layer, requested_layer),
+            ).format(table=_gis_ident(table), where=where),
+            tuple(params),
         )
         row = cur.fetchone()
     if not row or row[0] is None:
