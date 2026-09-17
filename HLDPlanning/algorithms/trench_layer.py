@@ -612,7 +612,11 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
         # a 25 m default gets enough slack to snap MFG / pseudo-PDPs.
         snap       = max(snap + 50.0, 75.0)
         feedback.pushInfo(f"Effective snap tolerance (with head-room): {snap:g} m")
-        ibufr      = 20.0  # road-intersection buffer (m)
+        # Road-intersection buffer radius (m). Raised from 20 → 26 so the
+        # trench is trimmed further back from every crossing: combined with the
+        # MITER joins on the sidewalk buffers below, corners at road crossings
+        # come out as sharp/right-angled instead of following a wide arc.
+        ibufr      = 26.0  # road-intersection buffer (m)
         final_snap = 0.20  # final snap (m)
         cross_step = 25.0  # mid-block drill spacing (m)
         cross_len  = 60.0  # mid-block drill total length (m)
@@ -1070,8 +1074,10 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
         bufL = as_layer(
             processing.run(
                 "native:buffer",
-                {"INPUT": left_sw, "DISTANCE": sw_buf_w, "SEGMENTS": 5,
-                 "END_CAP_STYLE": 0, "JOIN_STYLE": 0, "MITER_LIMIT": 2.0,
+                {                # JOIN_STYLE 1 = MITER (was 0 = ROUND): sharp corners at road
+                # crossings instead of rounded arcs.
+                "INPUT": left_sw, "DISTANCE": sw_buf_w, "SEGMENTS": 5,
+                 "END_CAP_STYLE": 0, "JOIN_STYLE": 1, "MITER_LIMIT": 2.0,
                  "DISSOLVE": False, "SEPARATE_DISJOINT": False,
                  "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
                 is_child_algorithm=True, context=context, feedback=feedback
@@ -1082,8 +1088,9 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
         bufR = as_layer(
             processing.run(
                 "native:buffer",
-                {"INPUT": right_sw, "DISTANCE": sw_buf_w, "SEGMENTS": 5,
-                 "END_CAP_STYLE": 0, "JOIN_STYLE": 0, "MITER_LIMIT": 2.0,
+                {                # JOIN_STYLE 1 = MITER — see the left-side buffer above.
+                "INPUT": right_sw, "DISTANCE": sw_buf_w, "SEGMENTS": 5,
+                 "END_CAP_STYLE": 0, "JOIN_STYLE": 1, "MITER_LIMIT": 2.0,
                  "DISSOLVE": False, "SEPARATE_DISJOINT": False,
                  "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
                 is_child_algorithm=True, context=context, feedback=feedback
@@ -2735,36 +2742,18 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                             if _tts[i] == _tts[j]:
                                 _union(i, j)
                         elif len(uniq) > 2:
-                            # Junction (crossing / branching): join the
-                            # straight-through continuation so a route is not
-                            # chopped at every crossing it passes. Pairs are
-                            # ranked by how nearly opposite their directions
-                            # are, and consumed greedily so a 4-way crossing
-                            # pairs both continuations.
-                            _ends = []
-                            for i in uniq:
-                                d = _end_dir.get((_node, i))
-                                if d:
-                                    _ends.append((i, d))
-                            _pairs = []
-                            for _a in range(len(_ends)):
-                                for _b in range(_a + 1, len(_ends)):
-                                    _ia, _da = _ends[_a]
-                                    _ib, _db = _ends[_b]
-                                    if _ia == _ib or _tts[_ia] != _tts[_ib]:
-                                        continue
-                                    _dot = _da[0] * _db[0] + _da[1] * _db[1]
-                                    _pairs.append((_dot, _ia, _ib))
-                            _pairs.sort()               # most opposite first
-                            _paired = set()
-                            for _dot, _ia, _ib in _pairs:
-                                if _ia in _paired or _ib in _paired:
-                                    continue
-                                if _dot > -0.5:         # >60 deg off straight
-                                    break
-                                _union(_ia, _ib)
-                                _paired.add(_ia)
-                                _paired.add(_ib)
+                            # JUNCTION (crossing / branching) — runs deliberately
+                            # STOP here. A junction is a real, selectable break
+                            # point: the survey engineer must be able to tap one
+                            # trench section (between two junctions) and edit
+                            # just that section. Joining the straight-through
+                            # continuation here merged a whole street crossing
+                            # many junctions into ONE feature, so tapping it
+                            # selected the entire route instead of one trench.
+                            # Degree-2 nodes (above) still chain collinear
+                            # continuations, so runs are only broken where the
+                            # network genuinely branches or is crossed.
+                            pass
 
                     _chains = defaultdict(list)
                     for i in range(_n_pieces):
@@ -2857,15 +2846,29 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                     s = str(v).strip()
                     return [s] if s and s.upper() != "NULL" else []
 
+                # ── ONE FEATURE PER TRENCH RUN (user spec) ──────────────────
+                # The published Final_Trenches layer previously collapsed the
+                # whole network into one feature PER CONSTRUCTION CATEGORY
+                # (Open Cut / Garden / HDD), each holding every run of that
+                # category as geometry parts. That made an individual trench
+                # impossible to select — tapping one highlighted the entire
+                # network. Each continuous run between junctions is now its own
+                # feature, so the survey engineer taps exactly one trench and
+                # edits exactly that trench; the construction class stays a
+                # 3-value attribute: Open Cut / HDD / Garden.
+                #
+                # A branching trench legitimately stays multi-part inside one
+                # run feature. Sub-metre noding slivers are still KEPT in the
+                # geometry so BOQ / permit totals are unchanged, and are
+                # accounted for per feature via PARTS / SLIVER_PARTS /
+                # SLIVER_LEN_M (HAS_SLIVERS).
                 _groups = {}
                 for _cf in clubbed_features:
                     _pg, _tt = _cf[0], _cf[1]
-                    # Chain this group's pieces into continuous runs ONCE, so
-                    # the writer and the statistics see identical geometry.
-                    _g2 = _merge_contiguous_runs(_pg)
-                    if _g2 is None or _g2.isEmpty():
-                        _g2 = _pg
-                    _runs = _explode_runs(_g2)
+                    # Do NOT re-chain here: _pg is already chained at degree-2
+                    # nodes upstream, and re-merging would rejoin runs across
+                    # the junctions we just split them at.
+                    _runs = _explode_runs(_pg)
                     if not _runs:
                         continue
                     _grp = _groups.get(_tt)
@@ -2875,16 +2878,14 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                             "frags": 0, "src_ft": _cf[7], "sw": set(),
                             "n_sliver": 0, "sliver_len": 0.0,
                         }
-                    _grp["runs"].extend(_runs)
+                    # Track which club feature each run came from so every
+                    # emitted feature can carry that route's own PDP/POLYGON
+                    # ids and sidewalk flag (not the whole category's).
+                    for _r in _runs:
+                        _grp["runs"].append((_r, _cf))
                     _grp["pdps"].update(_split_ids(_cf[3]))
                     _grp["polys"].update(_split_ids(_cf[5]))
                     _grp["frags"] += int(_cf[6] or 0)
-                    # Aggregate the sidewalk flag ACROSS the grouped runs.  With
-                    # one feature per category, copying it from the first route
-                    # would silently label a whole category "Footpath" (or
-                    # "Asphalt") — and SURFACE / REINSTATE are derived from it in
-                    # attr_enrich.  Mixed is carried through so the permit shows
-                    # the real reinstatement mix.
                     _sw_fld = club_src_fields.lookupField("sidewalk")
                     if _sw_fld >= 0 and _cf[7] is not None:
                         try:
@@ -2892,44 +2893,92 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                         except Exception:
                             pass
 
+                # ── Near-duplicate suppression (ONE line per side) ─────────
+                # Left and right sidewalk offsets can produce two nearly
+                # coincident lines on the same side of a street (and slivers
+                # left by successive unions). A run whose geometry lies within
+                # _DUP_TOL of an already-kept run of the SAME construction
+                # class is dropped, so each side of the route carries exactly
+                # ONE trench line instead of parallel duplicates. Genuinely
+                # separate trenches are >1 m apart and stay untouched.
+                _DUP_TOL = 0.75   # metres — co-location tolerance
+                _DUP_FRAC = 0.8   # fraction of the shorter run that must overlap
+                _kept_runs = []   # [(geom, tt)]
+                _dupes = 0
+
+                def _is_duplicate(rg, tt):
+                    if rg is None or rg.isEmpty():
+                        return False
+                    try:
+                        rlen = float(rg.length())
+                    except Exception:
+                        return False
+                    if rlen <= 0:
+                        return True
+                    try:
+                        bb = rg.buffer(_DUP_TOL, 6).boundingBox()
+                    except Exception:
+                        return False
+                    for kg, ktt in _kept_runs:
+                        if ktt != tt:
+                            continue
+                        try:
+                            if not bb.intersects(kg.boundingBox()):
+                                continue
+                            overlap = float(
+                                rg.intersection(kg.buffer(_DUP_TOL, 6)).length()
+                            )
+                        except Exception:
+                            continue
+                        if rlen and (overlap / rlen) >= _DUP_FRAC:
+                            return True
+                    return False
+
                 grouped_features = []
                 for _tt in sorted(_groups):
                     _grp = _groups[_tt]
-                    for _r in _grp["runs"]:
+                    for _r, _cf in _grp["runs"]:
+                        if _is_duplicate(_r, _tt):
+                            _dupes += 1
+                            continue
+                        _kept_runs.append((_r, _tt))
+                        # Per-run accounting — each emitted feature is one trench.
                         try:
                             _L = float(_r.length())
                         except Exception:
                             _L = 0.0
-                        if _L < _SLIVER_M:
-                            _grp["n_sliver"] += 1
-                            _grp["sliver_len"] += _L
-                    # collectGeometry keeps every run as its own part — no
-                    # union, so nothing is re-noded and no length is lost.
-                    _geom = QgsGeometry.collectGeometry(_grp["runs"])
-                    if _geom is None or _geom.isEmpty():
-                        continue
-                    _pdp_l, _poly_l = sorted(_grp["pdps"]), sorted(_grp["polys"])
-                    _sw_set = _grp["sw"]
-                    _sw_val = (next(iter(_sw_set)) if len(_sw_set) == 1
-                               else ("Mixed" if _sw_set else None))
-                    grouped_features.append((
-                        _geom, _tt,
-                        _pdp_l[0] if _pdp_l else None,
-                        ",".join(_pdp_l) if _pdp_l else None,
-                        _poly_l[0] if _poly_l else None,
-                        ",".join(_poly_l) if _poly_l else None,
-                        _grp["frags"], _grp["src_ft"],
-                        len(_grp["runs"]), _grp["n_sliver"],
-                        round(_grp["sliver_len"], 2), _grp["runs"], _sw_val,
-                    ))
+                        _n_sliver = 1 if _L < _SLIVER_M else 0
+                        _sliver_len = _L if _n_sliver else 0.0
+                        # Per-run ids/sidewalk from the contributing club route.
+                        _pdp_l = _split_ids(_cf[3])
+                        _poly_l = _split_ids(_cf[5])
+                        _sw_fld = club_src_fields.lookupField("sidewalk")
+                        _sw_val = None
+                        if _sw_fld >= 0 and _cf[7] is not None:
+                            try:
+                                _sw_val = "Footpath" if bool(_cf[7][_sw_fld]) else "Asphalt"
+                            except Exception:
+                                _sw_val = None
+                        grouped_features.append((
+                            _r, _tt,
+                            _pdp_l[0] if _pdp_l else None,
+                            ",".join(_pdp_l) if _pdp_l else None,
+                            _poly_l[0] if _poly_l else None,
+                            ",".join(_poly_l) if _poly_l else None,
+                            1, _cf[7],
+                            1, _n_sliver,
+                            round(_sliver_len, 2), [_r], _sw_val,
+                        ))
 
                 feedback.pushInfo(
-                    "Trench consolidation: {} segments → {} grouped trench features ({})".format(
+                    "Trench consolidation: {} segments → {} individual trench features "
+                    "({}; {} near-duplicate runs suppressed)".format(
                         _merged_final_count, len(grouped_features),
                         ", ".join(
-                            "{}: {} runs / {} sliver".format(g[1], g[8], g[9])
-                            for g in grouped_features
+                            "{}: {}".format(tt, sum(1 for g in grouped_features if g[1] == tt))
+                            for tt in sorted(_groups)
                         ) or "none",
+                        _dupes,
                     )
                 )
 
@@ -3086,6 +3135,15 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                         # capacity accounting and "Reused" detection keep their
                         # per-segment precision — grouping the features must not
                         # turn one reused segment into a wholly-reused category.
+                        # Reuse means the cable actually rides the EXISTING
+                        # asset, so a run only qualifies when it follows one for
+                        # most of its length AND that asset still has spare
+                        # capacity. Proximity alone is not reuse: a trench
+                        # brushing past an existing duct, or running parallel to
+                        # a full one, was marked reused — which classified ~96%
+                        # of the network as reuse and wrote the whole trench BOQ
+                        # off as nothing to build.
+                        FOLLOW_MIN = 0.5   # fraction of the run that must ride the asset
                         bf_matched = False
                         bf_sources = []
                         bf_verify = None
@@ -3100,33 +3158,50 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                             for fg in run_geoms:
                                 if fg is None or fg.isEmpty():
                                     continue
-                                _run_reused = False
+                                try:
+                                    _rlen = float(fg.length())
+                                except Exception:
+                                    continue
+                                if _rlen <= 0:
+                                    continue
+                                _best = None   # (followed_len, aid, verify_status)
                                 try:
                                     bb = fg.buffer(TOL_M, 8).boundingBox()
                                     for bf_fid in bf_idx.intersects(bb):
                                         aid, a, bg = bf_geoms[bf_fid]
-                                        if aid in bf_sources:
+                                        # A full duct cannot be reused.
+                                        try:
+                                            if bf_reg is not None and not bf_reg.has_capacity(aid):
+                                                continue
+                                        except Exception:
+                                            pass
+                                        if fg.distance(bg) > TOL_M:
                                             continue
-                                        if fg.distance(bg) <= TOL_M:
-                                            bf_sources.append(aid)
-                                            if bf_verify is None:
-                                                bf_verify = a["verify_status"]
-                                            try:
-                                                bf_reg.consume_capacity(aid)
-                                            except Exception:
-                                                pass
-                                            bf_tagged += 1
-                                            bf_matched = True
-                                            _run_reused = True
+                                        # How much of THIS run lies within the
+                                        # tolerance of that asset — the metres
+                                        # that would actually be reused.
+                                        try:
+                                            follow = float(
+                                                fg.intersection(bg.buffer(TOL_M, 8)).length()
+                                            )
+                                        except Exception:
+                                            follow = 0.0
+                                        if _best is None or follow > _best[0]:
+                                            _best = (follow, aid, a["verify_status"])
                                 except Exception:
-                                    pass  # classification must never block output
-                                if _run_reused:
-                                    # Count THIS run's metres as reused, not the
-                                    # whole category's.
+                                    _best = None  # classification must never block output
+                                if _best and _best[0] / _rlen >= FOLLOW_MIN:
+                                    _follow, aid, _verify = _best
+                                    bf_sources.append(aid)
+                                    if bf_verify is None:
+                                        bf_verify = _verify
                                     try:
-                                        bf_reuse_len += float(fg.length())
+                                        bf_reg.consume_capacity(aid)
                                     except Exception:
                                         pass
+                                    bf_tagged += 1
+                                    bf_matched = True
+                                    bf_reuse_len += _follow
                         nf["REUSE_LEN_M"] = round(bf_reuse_len, 2)
                         if bf_matched:
                             nf["VERIFY_STATUS"] = bf_verify

@@ -16,7 +16,7 @@ import subprocess
 import time
 import uuid
 import zipfile
-from collections import deque
+from collections import Counter, deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
@@ -356,6 +356,11 @@ def _ingest_outputs(project_id: str, output_dir: Path) -> List[Dict[str, Any]]:
     if has_postgis:
         postgis.init_schema()
         postgis.clear_project_layers(project_id)
+    # Grouped public layers (ducts = feeder + distribution + drop, cables =
+    # feeder + distribution) are published as several files. Tag each file's
+    # features with its own sub-layer so the tier survives the single shared
+    # GIS table and the results map can expose the tiers as separate toggles.
+    _grouped_counts = Counter(public for public, _g, _j in ONECLICK_OUTPUTS)
     layer_files: Dict[str, List[str]] = {}
 
     for public_layer, gpkg_name, geojson_name in ONECLICK_OUTPUTS:
@@ -382,11 +387,17 @@ def _ingest_outputs(project_id: str, output_dir: Path) -> List[Dict[str, Any]]:
         if geojson_path.exists():
             layer_files.setdefault(public_layer, []).append(str(geojson_path))
             if has_postgis:
+                sublayer = (
+                    geojson_path.stem
+                    if _grouped_counts.get(public_layer, 0) > 1
+                    else None
+                )
                 inserted = postgis.load_geojson_file(
                     project_id,
                     public_layer,
                     str(geojson_path),
                     replace=False,
+                    sublayer=sublayer,
                 )
                 _append(project_id, "info", f"Loaded {inserted} features into {public_layer}.")
         elif gpkg_path.exists():
@@ -796,13 +807,27 @@ def delete_project(project_id: str) -> Dict[str, Any]:
     output_dir = OUTPUT_DIR / project_id
     if output_dir.exists() and output_dir.is_dir():
         shutil.rmtree(str(output_dir), ignore_errors=True)
+    # PostGIS cleanup is best-effort.  The engine's project row is referenced
+    # by Django's permit matrix, so if the caller has not dropped its own rows
+    # yet we get a ForeignKeyViolation — that is a caller-ordering problem,
+    # not a reason to 500 and hide the fact that the disk output was removed.
+    postgis_error: Optional[str] = None
     if postgis.is_available():
-        postgis.clear_project_layers(project_id)
-        postgis.delete_project(project_id)
+        try:
+            postgis.clear_project_layers(project_id)
+            postgis.delete_project(project_id)
+        except Exception as exc:  # noqa: BLE001 - report, never raise
+            postgis_error = f"{type(exc).__name__}: {exc}"
+            print(
+                f"[delete] PostGIS cleanup failed for {project_id}: {postgis_error}",
+                flush=True,
+            )
     return {
         "deleted": True,
         "project_id": project_id,
         "had_in_memory_task": removed_task is not None,
+        "postgis_cleaned": postgis_error is None,
+        "postgis_error": postgis_error,
     }
 
 
@@ -1671,8 +1696,17 @@ def _inherit_trench_sub_layer_attributes(by_layer: Dict[str, List[Dict[str, Any]
         for key in ("trench_type", "USAGE_TYPE", "SURFACE", "CONSTRUCT",
                     "REINSTATE", "DEPTH_MM", "WIDTH_MM", "INFRA_STATUS",
                     "VERIFY_STATUS"):
-            if key not in props and best.get(key) is not None:
-                props[key] = best[key]
+            if key in props or best.get(key) is None:
+                continue
+            # The construction class is a CLOSED 3-value set (Open Cut / HDD /
+            # Garden). Sub-layers carry legacy tier labels (Feeder /
+            # Distribution) — inheriting one of those would corrupt the
+            # classification the engineer and BOQ rely on, so only the
+            # canonical values are accepted.
+            if key in ("trench_type", "USAGE_TYPE", "CONSTRUCT"):
+                if str(best.get(key)).strip() not in ("Open Cut", "HDD", "Garden"):
+                    continue
+            props[key] = best[key]
         props["lld_attr_source"] = "inherited from sub-layer"
         inherited += 1
     return inherited
