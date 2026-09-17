@@ -580,15 +580,13 @@ def _chamber_points(chamber_path, feedback=None):
 
 
 
-def _splice_points_into_line(coords, cut_pts, tol_m):
-    """Splice chamber positions INTO a polyline as vertices (geometry stays
-    one continuous line — ducts run unbroken through chambers).
+def _splice_points_into_line_UNUSED(coords, cut_pts, tol_m):
+    """Retired: chambers are no longer spliced INTO a corridor.
 
-    Returns (new_coords, hits, sections):
-      hits     — chamber ids spliced in, in corridor order
-      sections — [(start_chamber|None, end_chamber|None, length_m), …] the
-                 chamber-bounded sections along the part (start/end of the
-                 whole part are None unless a chamber sits at the endpoint).
+    The network is published as chamber-to-chamber spans instead (see
+    ``_segment_layer_at_chambers``), so nothing splices extra vertices into an
+    existing line any more. Kept only so old callers fail loudly rather than
+    silently, and to be deleted with the next cleanup.
     """
     if len(coords) < 2 or not cut_pts:
         return coords, [], []
@@ -679,116 +677,10 @@ def _splice_points_into_line(coords, cut_pts, tol_m):
     return out, [p[2] for p in proj], sections
 
 
-def splice_ducts_at_chambers(feeder_path, dist_path, chamber_path, feedback=None,
-                             snap_tol_m=3.0):
-    """Splice chamber positions into duct corridors (keeps ducts continuous).
-
-    Feeder and distribution ducts are continuous routed corridors (the feeder
-    is a single branched MultiLineString). Chambers sit ON the duct — ducts
-    pass through them. This pass:
-
-      1. adds a vertex at every chamber lying on a part (within ``snap_tol_m``)
-         so the geometry carries the section breaks, without splitting the
-         corridor into separate features;
-      2. records the chamber-bounded sections per feature in
-         ``SECTIONS_JSON``  [{start, end, length_m}, …]  and the ordered
-         chamber chain in ``SECTION_CHAIN`` ("|A|B|C|"), plus ``N_SECTIONS``.
-
-    Feature count is unchanged. START/END_CHAMBER keep their meaning from
-    enrich_ducts (endpoints of the corridor). Drop ducts are NOT touched.
-    """
-    chambers = _chamber_points(chamber_path, feedback)
-    if not chambers:
-        if feedback:
-            feedback.pushInfo("  [splice] No chambers — duct splicing skipped.")
-        return 0
-
-    total_spliced = 0
-    for path, label in ((feeder_path, "Feeder"), (dist_path, "Distribution")):
-        ds, lyr = _open_lyr(path)
-        if lyr is None:
-            continue
-        _create_fields(lyr, [
-            # One component per tier carries the WHOLE chamber chain, so this
-            # is unlimited text (a 256-char cap truncated the distribution
-            # chain at ~1/25th of its length).
-            ("SECTION_CHAIN", ogr.OFTString, 0),   # 0 = unlimited (GPKG text)
-            ("N_SECTIONS", ogr.OFTInteger),
-            ("SECTIONS_JSON", ogr.OFTString, 0),  # 0 = unlimited (GPKG text)
-        ])
-
-        n_spliced = 0
-        lyr.StartTransaction()
-        try:
-            for f in lyr:
-                g = f.GetGeometryRef()
-                if g is None or g.IsEmpty():
-                    continue
-                multi = g.GetGeometryName().startswith("MULTI")
-                parts = []
-                if multi:
-                    for part in g:
-                        pts = part.GetPoints()
-                        if pts and len(pts) >= 2:
-                            parts.append([(p[0], p[1]) for p in pts])
-                else:
-                    pts = g.GetPoints()
-                    if pts and len(pts) >= 2:
-                        parts.append([(p[0], p[1]) for p in pts])
-
-                chain: list = []
-                all_sections = []
-                changed = False
-                new_geoms = []
-                for part in parts:
-                    new_pts, hits, sections = _splice_points_into_line(
-                        part, chambers, snap_tol_m)
-                    if hits:
-                        changed = True
-                        chain.extend(hits)
-                        all_sections.extend(sections)
-                    new_geoms.append(new_pts)
-
-                if not changed:
-                    continue
-
-                def _mk_ls(pts):
-                    ls = ogr.Geometry(ogr.wkbLineString)
-                    for x, y in pts:
-                        ls.AddPoint_2D(x, y)
-                    return ls
-
-                if multi:
-                    ng = ogr.Geometry(ogr.wkbMultiLineString)
-                    for pts in new_geoms:
-                        if len(pts) >= 2:
-                            ng.AddGeometry(_mk_ls(pts))
-                else:
-                    ng = _mk_ls(new_geoms[0]) if new_geoms else None
-                if ng is None or ng.IsEmpty():
-                    continue
-                f.SetGeometry(ng)
-                f.SetField("SECTION_CHAIN", "|" + "|".join(chain) + "|")
-                f.SetField("N_SECTIONS", len(all_sections))
-                try:
-                    f.SetField("SECTIONS_JSON", json.dumps([
-                        {"start": s, "end": e, "length_m": L}
-                        for s, e, L in all_sections]))
-                except Exception:
-                    f.SetField("SECTIONS_JSON", "")
-                lyr.SetFeature(f)
-                n_spliced += 1
-            lyr.CommitTransaction()
-        except Exception:
-            lyr.RollbackTransaction()
-            raise
-        ds = None
-        total_spliced += n_spliced
-        if feedback:
-            feedback.pushInfo(
-                f"  [splice] {label} ducts: {n_spliced} corridor feature(s) "
-                "spliced at chambers (geometry continuous).")
-    return total_spliced
+# The old ``splice_ducts_at_chambers`` pass (one long corridor carrying a whole
+# chamber chain in SECTION_CHAIN / SECTIONS_JSON / N_SECTIONS) was removed: the
+# corridor is no longer spliced, it is BROKEN at its chambers — see
+# ``segment_ducts_at_chambers``.
 
 
 def _endpoints(feat):
@@ -849,6 +741,326 @@ def _stamp_run_chambers(path, chamber_path, tol_m=15.0):
             n += 1
     ds = None
     return n
+
+
+# ── Chamber-to-chamber segmentation (the selective sequence) ────────────────
+
+SPAN_KIND_CHAMBER = "Chamber span"      # bounded by a chamber at each end
+SPAN_KIND_UNCHAMBERED = "Unchambered"   # nothing on it — kept as one run
+
+
+# The trench network is designed as long routed runs, and the duct pass splices
+# every chamber into the duct corridors as an extra vertex so they stay one
+# continuous feature. That is the wrong unit for the trench itself: a trench is
+# dug chamber to chamber, and the field team, the attribute table and the LLD
+# all work span by span. This pass cuts every run at its chamber anchors and
+# publishes ONE FEATURE PER SPAN — the selective chamber-to-chamber sequence —
+# carrying START_CHAMBER / END_CHAMBER / SPAN_INDEX / SPAN_COUNT / RUN_ID and
+# its own length. Runs with no chamber on them stay whole.
+
+
+def _project_chambers_on_part(coords, chambers, tol_m):
+    """Project chamber points onto one polyline part.
+
+    Returns [(arc_pos, (x, y), chamber_id), …] in corridor order, deduped, for
+    every chamber within ``tol_m`` of the part. Positions within ~2 m of a part
+    endpoint snap onto that endpoint, so a chamber sitting on the run's start
+    or end becomes the span boundary instead of a 30 cm stub.
+    """
+    if len(coords) < 2 or not chambers:
+        return []
+    cum = [0.0]
+    for i in range(len(coords) - 1):
+        cum.append(cum[-1] + math.hypot(coords[i + 1][0] - coords[i][0],
+                                       coords[i + 1][1] - coords[i][1]))
+    total = cum[-1]
+    if total <= 0:
+        return []
+    hits = []
+    for cx, cy, cid in chambers:
+        best = None
+        for i in range(len(coords) - 1):
+            ax, ay = coords[i]
+            bx, by = coords[i + 1]
+            dx, dy = bx - ax, by - ay
+            seg2 = dx * dx + dy * dy
+            if seg2 <= 0:
+                continue
+            t = ((cx - ax) * dx + (cy - ay) * dy) / seg2
+            t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+            qx, qy = ax + t * dx, ay + t * dy
+            d = math.hypot(cx - qx, cy - qy)
+            if best is None or d < best[0]:
+                best = (d, cum[i] + t * math.sqrt(seg2), (qx, qy))
+        if best is None or best[0] > tol_m:
+            continue
+        pos, xy = best[1], best[2]
+        if pos < min(2.0, total * 0.01):
+            pos, xy = 0.0, (coords[0][0], coords[0][1])
+        elif total - pos < min(2.0, total * 0.01):
+            pos, xy = total, (coords[-1][0], coords[-1][1])
+        hits.append((pos, xy, cid))
+    hits.sort(key=lambda h: h[0])
+    out = []
+    for pos, xy, cid in hits:
+        if out and abs(out[-1][0] - pos) < 0.5:
+            continue  # two structures at the same spot — one boundary
+        out.append((pos, xy, cid))
+    return out
+
+
+def _spans_of_part(coords, hits):
+    """Cut a polyline part at its chamber hits.
+
+    Returns [(coords, start_id|None, end_id|None), …] — one entry per
+    chamber-to-chamber span. A part with no hit returns [] so the caller can
+    keep it whole instead.
+    """
+    if len(coords) < 2 or not hits:
+        return []
+    cum = [0.0]
+    for i in range(len(coords) - 1):
+        cum.append(cum[-1] + math.hypot(coords[i + 1][0] - coords[i][0],
+                                       coords[i + 1][1] - coords[i][1]))
+
+    spans = []
+    start_idx = 0
+    # A chamber exactly at the run start becomes the first span's start id.
+    start_id = None
+    if hits[0][0] <= 1e-9:
+        start_id = hits[0][2]
+        start_idx = 1
+    prev_pos = 0.0
+    current = [list(coords[0])]
+    for pos, xy, cid in hits[start_idx:]:
+        for j in range(1, len(coords) - 1):
+            if prev_pos + 1e-9 < cum[j] < pos - 1e-9:
+                current.append(list(coords[j]))
+        current.append([xy[0], xy[1]])
+        if len(current) >= 2:
+            spans.append((current, start_id, cid))
+        prev_pos = pos
+        start_id = cid
+        current = [[xy[0], xy[1]]]
+    # Trailing piece from the last chamber to the run end (no end chamber).
+    for j in range(1, len(coords)):
+        if cum[j] > prev_pos + 1e-9:
+            current.append(list(coords[j]))
+    if len(current) >= 2 and _coords_len(current) > 0.05:
+        spans.append((current, start_id, None))
+    return [sp for sp in spans if _coords_len(sp[0]) > 0.05]
+
+
+def _coords_len(coords):
+    return sum(math.hypot(coords[i + 1][0] - coords[i][0],
+                          coords[i + 1][1] - coords[i][1])
+               for i in range(len(coords) - 1))
+
+
+def _chamber_at(pts, x, y, tol_m=6.0):
+    """Nearest chamber id within ``tol_m`` of (x, y), else ''."""
+    best, best_d = "", tol_m
+    for cx, cy, cid in pts:
+        d = math.hypot(cx - x, cy - y)
+        if d <= best_d:
+            best_d, best = d, cid
+    return best
+
+
+def _segment_layer_at_chambers(path, chambers, feedback=None, label="layer",
+                               snap_tol_m=5.0):
+    """Break every line feature of ``path`` at its chamber anchors.
+
+    Publishes ONE FEATURE PER CHAMBER-TO-CHAMBER SPAN: each feature starts at a
+    chamber and ends at the next one (or at the run end when the run finishes
+    without a structure). All original attributes are carried over unchanged —
+    construction class, surface, reinstatement, PDP/polygon ids, brownfield and
+    capacity flags — and the span's own length is written to ``length_m`` /
+    ``SPAN_LEN_M`` (BOQ and permits sum these per feature). Features the
+    chambers do not touch keep their geometry. Returns the number of spans.
+    """
+    ds, lyr = _open_lyr(path)
+    if lyr is None:
+        return 0
+
+    _create_fields(lyr, [
+        ("START_CHAMBER", ogr.OFTString, 24),
+        ("END_CHAMBER", ogr.OFTString, 24),
+        ("SPAN_INDEX", ogr.OFTInteger),
+        ("SPAN_COUNT", ogr.OFTInteger),
+        ("SPAN_LEN_M", ogr.OFTReal),
+        ("RUN_ID", ogr.OFTString, 40),
+        ("SPAN_KIND", ogr.OFTString, 24),
+    ])
+    defn = lyr.GetLayerDefn()
+    i_start = defn.GetFieldIndex("START_CHAMBER")
+    i_end = defn.GetFieldIndex("END_CHAMBER")
+    i_idx = defn.GetFieldIndex("SPAN_INDEX")
+    i_cnt = defn.GetFieldIndex("SPAN_COUNT")
+    i_len = defn.GetFieldIndex("SPAN_LEN_M")
+    i_run = defn.GetFieldIndex("RUN_ID")
+    i_kind = defn.GetFieldIndex("SPAN_KIND")
+    i_lm = defn.GetFieldIndex("length_m")
+
+    def _mk_coords(coords):
+        ls = ogr.Geometry(ogr.wkbLineString)
+        for x, y in coords:
+            ls.AddPoint_2D(x, y)
+        return ls
+
+    def _mk_line(coords):
+        # The published layer is MULTILINESTRING, so every span is written as a
+        # single-part MultiLineString — a bare LINESTRING would be a geometry
+        # type mismatch for the GeoPackage driver (and for the LLD readers that
+        # expect the layer's declared type).
+        ml = ogr.Geometry(ogr.wkbMultiLineString)
+        ml.AddGeometry(_mk_coords(coords))
+        return ml
+
+    def _stamp(feat, start_id, end_id, index, count, run_id):
+        feat.SetField(i_kind, SPAN_KIND_CHAMBER)
+        length = round(_geom_len_m(feat), 1)
+        feat.SetField(i_start, start_id or "")
+        feat.SetField(i_end, end_id or "")
+        feat.SetField(i_idx, index)
+        feat.SetField(i_cnt, count)
+        feat.SetField(i_len, length)
+        feat.SetField(i_run, run_id)
+        if i_lm >= 0:
+            feat.SetField(i_lm, length)
+
+    planned = []
+    runs = 0
+    cut_runs = 0
+    unchambered = 0
+    anchors = 0
+    for f in lyr:
+        g = f.GetGeometryRef()
+        parts = _line_parts(g)
+        if not parts:
+            continue
+        runs += 1
+        run_id = "RUN-%05d" % f.GetFID()
+        spans = []    # chamber-bounded pieces (the selective sequences)
+        whole = []    # pieces no chamber touches — one uncut run
+        for part in parts:
+            hits = _project_chambers_on_part(part, chambers, snap_tol_m)
+            anchors += len(hits)
+            part_spans = _spans_of_part(part, hits) if hits else []
+            if part_spans:
+                spans.extend(part_spans)
+            else:
+                whole.append(part)
+        if spans and (len(spans) + (1 if whole else 0)) > 1:
+            cut_runs += 1
+        planned.append((f, spans, whole, run_id))
+
+    published = 0
+    lyr.StartTransaction()
+    try:
+        for feat, spans, whole, run_id in planned:
+            if not spans:
+                # Nothing chamber-bounded on this run (``whole`` holds all of
+                # its parts): publish it unchanged as a single unchambered run
+                # — geometry untouched, metadata stamped — so every trench row
+                # states which kind it is.
+                first, last = whole[0][0], whole[-1][-1]
+                _stamp(feat,
+                       _chamber_at(chambers, first[0], first[1]),
+                       _chamber_at(chambers, last[0], last[1]),
+                       1, 1, run_id)
+                feat.SetField(i_kind, SPAN_KIND_UNCHAMBERED)
+                lyr.SetFeature(feat)
+                published += 1
+                unchambered += 1
+                continue
+            count = len(spans)
+            for pos, (coords, start_id, end_id) in enumerate(spans):
+                start_id = start_id or _chamber_at(chambers, coords[0][0], coords[0][1])
+                end_id = end_id or _chamber_at(chambers, coords[-1][0], coords[-1][1])
+                if start_id and start_id == end_id:
+                    # a run that ends at the chamber it started from (a short
+                    # tail past the last structure) — X -> X is not a span
+                    end_id = ""
+                if pos == 0:
+                    # reuse the source feature for the first span (keeps the
+                    # original attribute row + fid)
+                    feat.SetGeometry(_mk_line(coords))
+                    _stamp(feat, start_id, end_id, pos + 1, count, run_id)
+                    lyr.SetFeature(feat)
+                else:
+                    clone = ogr.Feature(defn)
+                    for i in range(defn.GetFieldCount()):
+                        clone.SetField(i, feat.GetField(i))
+                    clone.SetGeometry(_mk_line(coords))
+                    _stamp(clone, start_id, end_id, pos + 1, count, run_id)
+                    lyr.CreateFeature(clone)
+                published += 1
+            if whole:
+                # Everything the chambers do not touch stays ONE feature (a
+                # branched corridor must not explode into one row per piece) —
+                # published as a single uncut run beside the chamber spans.
+                remainder = ogr.Feature(defn)
+                for i in range(defn.GetFieldCount()):
+                    remainder.SetField(i, feat.GetField(i))
+                ml = ogr.Geometry(ogr.wkbMultiLineString)
+                for coords in whole:
+                    ml.AddGeometry(_mk_coords(coords))
+                remainder.SetGeometry(ml)
+                first, last = whole[0][0], whole[-1][-1]
+                _stamp(remainder,
+                       _chamber_at(chambers, first[0], first[1]),
+                       _chamber_at(chambers, last[0], last[1]),
+                       1, 1, run_id)
+                remainder.SetField(i_kind, SPAN_KIND_UNCHAMBERED)
+                lyr.CreateFeature(remainder)
+                published += 1
+        lyr.CommitTransaction()
+    except Exception:
+        lyr.RollbackTransaction()
+        raise
+    ds = None
+    if feedback:
+        feedback.pushInfo(
+            f"  [segment] {label}: {runs} run(s) -> {published} feature(s): "
+            f"{published - unchambered} chamber-to-chamber span(s) + "
+            f"{unchambered} unchambered run(s) ({cut_runs} run(s) cut at "
+            f"{anchors} chamber anchor(s); tol {snap_tol_m:g} m).")
+    return published
+
+
+def segment_trenches_at_chambers(trench_path, chamber_path, feedback=None,
+                                 snap_tol_m=5.0):
+    """Publish Final_Trenches as chamber-to-chamber spans (see the segmenter)."""
+    chambers = _chamber_points(chamber_path, feedback)
+    if not chambers:
+        if feedback:
+            feedback.pushInfo("  [segment] No chambers — trench segmentation skipped.")
+        return 0
+    return _segment_layer_at_chambers(
+        trench_path, chambers, feedback, "Final_Trenches", snap_tol_m)
+
+
+def segment_ducts_at_chambers(feeder_path, dist_path, chamber_path,
+                              feedback=None, snap_tol_m=3.0):
+    """Break the feeder + distribution ducts at their chambers.
+
+    Replaces the old chamber *splicing* (one long corridor carrying a
+    50-chamber chain in ``SECTION_CHAIN``/``SECTIONS_JSON``): a duct is pulled
+    chamber to chamber, so the published unit is the span between two
+    structures. ``enrich_ducts`` runs afterwards and stamps the catalogue
+    attributes + endpoint chambers on every span. Drop ducts are left alone.
+    """
+    chambers = _chamber_points(chamber_path, feedback)
+    if not chambers:
+        if feedback:
+            feedback.pushInfo("  [segment] No chambers — duct segmentation skipped.")
+        return 0
+    total = 0
+    for path, label in ((feeder_path, "Feeder ducts"), (dist_path, "Distribution ducts")):
+        total += _segment_layer_at_chambers(
+            path, chambers, feedback, label, snap_tol_m)
+    return total
 
 
 # ── Duct enrichment ──────────────────────────────────────────────────────────
@@ -1159,23 +1371,21 @@ def enrich_all(out_dir, feedback=None, roads_lyr=None):
         return os.path.join(out_dir, name)
 
     n = 0
-    # Splice chambers into the duct corridors (continuous geometry —
-    # ducts run unbroken through chambers; sections recorded in attributes).
-    # The duct stage already publishes ONE component per tier (feeder =
-    # MFG → every PDP, distribution = PDP → pseudo objects), so the chamber
-    # chain is recorded on that single component.  enrich_ducts then stamps
-    # catalogue attrs + endpoint chambers on the still-whole corridors.
+    # ── Chamber-to-chamber spans ────────────────────────────────────────
+    # A trench is dug chamber to chamber, so the network is published as spans:
+    # every run is broken at the chambers sitting on it and each published
+    # feature is one selective sequence (START_CHAMBER -> END_CHAMBER). This
+    # replaces the old chamber *splicing* pass, which kept one long corridor
+    # and carried a 50-chamber chain in SECTION_CHAIN / SECTIONS_JSON as text.
+    # Ducts keep their routed corridors for now (they carry per-feature
+    # capacity/PDP attributes) — `segment_ducts_at_chambers` applies the same
+    # span model to them when that is wanted.
     try:
-        n_sp = splice_ducts_at_chambers(
-            p("Feeder_Ducts.gpkg"), p("Distribution_Ducts.gpkg"),
-            p("Chambers.gpkg"), feedback,
-        )
-        if feedback and n_sp:
-            feedback.pushInfo(
-                f"  [enrich] Duct splicing: {n_sp} corridor(s) spliced at chambers.")
+        segment_trenches_at_chambers(
+            p("Final_Trenches.gpkg"), p("Chambers.gpkg"), feedback)
     except Exception as exc:
         if feedback:
-            feedback.pushInfo(f"  [splice] Duct splicing skipped: {exc}")
+            feedback.pushInfo(f"  [segment] Trench segmentation skipped: {exc}")
 
     n += enrich_trenches(p("Final_Trenches.gpkg"), feedback, roads_lyr=roads_lyr)
     n += enrich_trench_sublayers(out_dir, feedback)
