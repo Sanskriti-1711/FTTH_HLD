@@ -90,7 +90,6 @@ class Params:
     """Designer knobs (see TRENCH_DESIGN.md §4)."""
 
     target_epsg: int = 25833
-    snap_tol_m: float = 30.0          # anchor → street-graph snap
     simplify_tol_m: float = 2.5       # Douglas–Peucker straightening
     min_vertex_gap_m: float = 5.0     # thin vertices closer than this
     bend_deg: float = 8.0             # drop bends shallower than this
@@ -899,7 +898,11 @@ def place_nodes(network: List[Run], drills: Sequence[dict],
 
     def add(x, y, ntype, priority, run=None, arc=None, ref=None):
         for n in nodes:
-            if math.hypot(n["x"] - x, n["y"] - y) < params.min_node_sep_m:
+            # HDD pits reserve the widest keep-out (they are the drill openings),
+            # every other structure keeps the global minimum separation.
+            sep = (params.hdd_pit_keepout_m if n["NODE_TYPE"] == "HDD_PIT"
+                   else params.min_node_sep_m)
+            if math.hypot(n["x"] - x, n["y"] - y) < sep:
                 return n
         n = {"x": x, "y": y, "NODE_TYPE": ntype, "PRIORITY": priority,
              "run": id(run) if run is not None else None, "arc": arc, "ref": ref}
@@ -1213,7 +1216,7 @@ def design(cfg: dict) -> dict:
     # runs, and two addresses can differ by a multiple of the modulo below).
     for i, r in enumerate(runs):
         r.run_id = "RUN-%05d" % (i + 1)
-    junction_points = _junction_points(runs)
+    junction_points = _junction_points(runs, params.junction_deg)
     nodes = place_nodes(runs, drills, pdps, params, junction_points, log)
 
     spans: List[dict] = []
@@ -1337,13 +1340,15 @@ def _index_spans(span_rows: List[dict]) -> None:
             r["SPAN_COUNT"] = len(rows)
 
 
-def _junction_points(runs: Sequence[Run]) -> List[Tuple[float, float]]:
-    """Points where three or more runs / network ends meet (degree ≥ 3)."""
+def _junction_points(runs: Sequence[Run], min_degree: int = 3,
+                     tol_m: float = 5.0) -> List[Tuple[float, float]]:
+    """Points where ``min_degree`` or more runs / network ends meet."""
     buckets: Dict[Tuple[int, int], int] = defaultdict(int)
     for r in runs:
         for pt in (r.coords[0], r.coords[-1]):
-            buckets[(int(round(pt[0] / 5.0)), int(round(pt[1] / 5.0)))] += 1
-    return [(k[0] * 5.0, k[1] * 5.0) for k, v in buckets.items() if v >= 3]
+            buckets[(int(round(pt[0] / tol_m)), int(round(pt[1] / tol_m)))] += 1
+    return [(k[0] * tol_m, k[1] * tol_m)
+            for k, v in buckets.items() if v >= max(3, min_degree)]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
