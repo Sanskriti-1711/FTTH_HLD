@@ -25,6 +25,7 @@ from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 
+import design
 import postgis
 
 
@@ -790,6 +791,28 @@ def get_layer(project_id: str, layer: str) -> Dict[str, Any]:
                 merged["features"].append(feat)
         return merged
     raise HTTPException(status_code=404, detail="Layer not found")
+
+
+# ======================================================================
+# TRENCH DESIGN (Phase A of TRENCH_DESIGN.md)
+#
+# POST /ftth/hld/design/{project_id}          - (re)run the designer
+# GET  /ftth/hld/results/{project_id}/design  - status + report + layers
+#
+# Inputs are read from the project itself (HLD outputs + roads + optional
+# aerial zones / OSM landuse), never re-uploaded.
+# ======================================================================
+
+@app.post("/ftth/hld/design/{project_id}", status_code=202)
+def run_trench_design(project_id: str, force: bool = False) -> Dict[str, Any]:
+    if not (OUTPUT_DIR / project_id).is_dir():
+        raise HTTPException(status_code=404, detail="Unknown project")
+    return design.start_design(project_id, force=force)
+
+
+@app.get("/ftth/hld/results/{project_id}/design")
+def get_trench_design(project_id: str, layers: bool = True) -> Dict[str, Any]:
+    return design.payload(project_id, include_layers=layers)
 
 
 @app.get("/ftth/hld/download/{project_id}/{file_path:path}")

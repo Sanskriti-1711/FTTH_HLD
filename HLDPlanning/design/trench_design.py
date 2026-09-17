@@ -106,6 +106,10 @@ class Params:
     house_search_m: float = 120.0     # house → network search limit
     road_bbox_buffer_m: float = 400.0  # AOI buffer for reading OSM roads
     crossing_angle_deg: float = 20.0  # below this the trench runs along the road
+    # Aerial: a drop leg inside an aerial zone (or longer than this, when set)
+    # is built aerial — drawn as an aerial drop, never excavated. 0 = length
+    # rule off (zone layer only).
+    aerial_max_leg_m: float = 0.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1075,6 +1079,16 @@ FIELD_LINE = (
     ("VERIFY_STATUS", ogr.OFTString), ("SURFACE", ogr.OFTString),
     ("REINSTATE", ogr.OFTString), ("PDP_ID", ogr.OFTString),
     ("POLYGON_ID", ogr.OFTString), ("SRC", ogr.OFTString),
+    # AERIAL: the span runs through an aerial zone (restricted land). The span
+    # stays an excavated trench span here — the flag tells the planner/BOQ the
+    # corridor is restricted, so a re-route or an aerial span is expected.
+    ("AERIAL", ogr.OFTInteger), ("AERIAL_REASON", ogr.OFTString),
+)
+FIELD_AERIAL = (
+    ("DROP_ID", ogr.OFTString), ("POLYGON_ID", ogr.OFTString),
+    ("TRENCH_TIER", ogr.OFTString), ("TRENCH_TYPE", ogr.OFTString),
+    ("length_m", ogr.OFTReal), ("AERIAL_REASON", ogr.OFTString),
+    ("INFRA_STATUS", ogr.OFTString),
 )
 FIELD_NODE = (
     ("NODE_ID", ogr.OFTString), ("NODE_TYPE", ogr.OFTString),
@@ -1094,6 +1108,113 @@ def _surface_for(tier: str, ttype: str) -> Tuple[str, str]:
     if ttype == "Garden":
         return ("Garden", "Seed")
     return ("Footway", "Pavement")
+
+
+def _zone_polygons(zone_geom) -> List[Tuple[ogr.Geometry, Tuple[float, float, float, float]]]:
+    """Flatten a zone geometry into (polygon, envelope) pairs.
+
+    Zone tests must go against single polygons: ``Contains`` on a
+    GeometryCollection / MultiPolygon is unreliable (it reports points *outside*
+    the parts as contained), which would flag an entire design as "aerial".
+    Invalid polygons are repaired where GDAL can.
+    """
+    out: List[Tuple[ogr.Geometry, Tuple[float, float, float, float]]] = []
+
+    def walk(g) -> None:
+        if g is None or g.IsEmpty():
+            return
+        if g.GetGeometryName() == "POLYGON":
+            if not g.IsValid():
+                try:
+                    g = g.MakeValid()
+                except Exception:
+                    try:
+                        g = g.Buffer(0)
+                    except Exception:
+                        return
+                if g is None or g.IsEmpty():
+                    return
+                for i in range(g.GetGeometryCount() or 1):
+                    walk(g.GetGeometryRef(i) if g.GetGeometryCount() else g)
+                return
+            if g.GetArea() > 0:
+                out.append((g.Clone(), g.GetEnvelope()))
+            return
+        for i in range(g.GetGeometryCount()):
+            walk(g.GetGeometryRef(i))
+
+    walk(zone_geom)
+    return out
+
+
+def _in_zone(zone_polys, x: float, y: float) -> bool:
+    """Point-in-zone test with a per-polygon envelope rejection."""
+    for g, env in zone_polys or ():
+        if x < env[0] or x > env[1] or y < env[2] or y > env[3]:
+            continue
+        if g.Contains(ogr.CreateGeometryFromWkt(f"POINT({x} {y})")):
+            return True
+    return False
+
+
+def _leg_in_zone(zone_polys, leg: dict, samples: int = 6) -> bool:
+    """True when any sampled point of the leg falls inside an aerial zone.
+
+    Sampling the whole leg (not just its midpoint) matters: an aerial zone is
+    often a park the leg crosses, so a midpoint-only test misses it.
+    """
+    if not zone_polys:
+        return False
+    (ax, ay), (bx, by) = leg["coords"][0], leg["coords"][-1]
+    for i in range(samples + 1):
+        t = i / float(samples)
+        x = ax + (bx - ax) * t
+        y = ay + (by - ay) * t
+        if _in_zone(zone_polys, x, y):
+            return True
+    return False
+
+
+def _split_drop_legs(legs: Sequence[dict], zone_polys, params: Params, log
+                     ) -> Tuple[List[dict], List[dict]]:
+    """Split house drop legs into (trenched, aerial).
+
+    Aerial rules, in order:
+
+    1. ``zone``   — the leg lies inside an aerial zone: underground is not
+       permitted there, so the drop is built aerial.
+    2. ``length`` — the leg is longer than ``aerial_max_leg_m`` (when set):
+       the spur can neither be a garden trench nor economically open-cut.
+
+    An aerial leg is **not** a trench: it is published on the ``Aerial_Drops``
+    layer and excluded from every excavated trench output and length.
+    """
+    trenched: List[dict] = []
+    aerial: List[dict] = []
+    for leg in legs:
+        item = dict(leg)
+        if _leg_in_zone(zone_polys, item):
+            item["type"] = "Aerial"
+            item["aerial_reason"] = "zone"
+            aerial.append(item)
+        elif params.aerial_max_leg_m and item["length"] > params.aerial_max_leg_m:
+            item["type"] = "Aerial"
+            item["aerial_reason"] = "length"
+            aerial.append(item)
+        else:
+            trenched.append(item)
+    return trenched, aerial
+
+
+def _aerial_flag(zone_polys, coords: Sequence[Tuple[float, float]]) -> str:
+    """``"zone"`` when the span's own line samples inside an aerial zone."""
+    if not zone_polys or len(coords) < 2:
+        return ""
+    step = max(1, len(coords) // 8)
+    for pt in list(coords)[::step] + [coords[-1]]:
+        if _in_zone(zone_polys, pt[0], pt[1]):
+            return "zone"
+    return ""
 
 
 def design(cfg: dict) -> dict:
@@ -1162,27 +1283,24 @@ def design(cfg: dict) -> dict:
     # attach the pre-straighten network for garden-leg snapping
     network_parts = [r.coords for r in runs]
 
-    # ── garden legs (aerial zones are not trenched) ──────────────────────
-    aerial = None
+    # ── garden legs + aerial classification ──────────────────────────────
+    aerial_polys: List[Tuple[ogr.Geometry, Tuple[float, float, float, float]]] = []
     if cfg.get("aerial"):
-        aerial = _read_polygons_geom(cfg["aerial"], params.target_epsg)
-        if aerial is not None:
-            log("aerial zones: %d polygon part(s) will not be trenched"
-                % aerial.GetGeometryCount())
+        aerial_zone = _read_polygons_geom(cfg["aerial"], params.target_epsg)
+        aerial_polys = _zone_polygons(aerial_zone)
+        if aerial_polys:
+            log("aerial zones: %d polygon(s), %.1f ha - no excavation inside"
+                % (len(aerial_polys),
+                   sum(g.GetArea() for g, _e in aerial_polys) / 10000.0))
     legs = design_garden_legs(network_parts, houses, params, log)
-    if aerial is not None and not aerial.IsEmpty():
-        kept_legs = []
-        aerial_skipped = 0
-        for leg in legs:
-            mx = (leg["coords"][0][0] + leg["coords"][-1][0]) / 2.0
-            my = (leg["coords"][0][1] + leg["coords"][-1][1]) / 2.0
-            if aerial.Contains(ogr.CreateGeometryFromWkt(f"POINT({mx} {my})")):
-                aerial_skipped += 1
-                continue
-            kept_legs.append(leg)
-        if aerial_skipped:
-            log(f"aerial: {aerial_skipped} drop leg(s) excluded from the trench design")
-        legs = kept_legs
+    legs, aerial_legs = _split_drop_legs(legs, aerial_polys, params, log)
+    if aerial_legs:
+        by_reason: Dict[str, int] = defaultdict(int)
+        for leg in aerial_legs:
+            by_reason[leg["aerial_reason"]] += 1
+        log("aerial drops: %d leg(s) (%.1f m) built aerial - %s"
+            % (len(aerial_legs), sum(leg["length"] for leg in aerial_legs),
+               ", ".join(f"{k}: {v}" for k, v in sorted(by_reason.items()))))
     for leg in legs:
         r = Run(coords=leg["coords"], tier="Garden", pdp=None,
                 polygon=(leg["house"].get("POLYGON_ID") or None),
@@ -1232,6 +1350,7 @@ def design(cfg: dict) -> dict:
         sn = sp["start"]["NODE_ID"] if sp["start"] else ""
         en = sp["end"]["NODE_ID"] if sp["end"] else ""
         surf, reinstate = _surface_for(sp["tier"], sp["type"])
+        aerial_reason = _aerial_flag(aerial_polys, sp["coords"])
         span_rows.append({
             "TRENCH_ID": "TR-%06d" % (i + 1),
             "RUN_ID": sp["run_id"],
@@ -1244,6 +1363,8 @@ def design(cfg: dict) -> dict:
             "SURFACE": surf, "REINSTATE": reinstate,
             "PDP_ID": sp["pdp"], "POLYGON_ID": sp["polygon"],
             "SRC": sp["src"],
+            "AERIAL": 1 if aerial_reason else 0,
+            "AERIAL_REASON": aerial_reason or None,
             # The published trench layers are MULTILINESTRING (what the map,
             # LLD and BOQ readers expect) — one part per span.
             "geom": _make_multiline([sp["coords"]]),
@@ -1285,6 +1406,22 @@ def design(cfg: dict) -> dict:
     _write_lines(os.path.join(out_dir, "Tangent_Crossings.gpkg"), "Tangent_Crossings",
                  drill_rows, FIELD_DRILL, params.target_epsg)
 
+    # ── aerial drops (house legs built aerial, never excavated) ───────────
+    aerial_rows = []
+    for i, leg in enumerate(aerial_legs):
+        aerial_rows.append({
+            "DROP_ID": "AD-%05d" % (i + 1),
+            "POLYGON_ID": leg["house"].get("POLYGON_ID") or None,
+            "TRENCH_TIER": "Garden", "TRENCH_TYPE": "Aerial",
+            "length_m": round(leg["length"], 2),
+            "AERIAL_REASON": leg["aerial_reason"],
+            "INFRA_STATUS": "New",
+            "geom": _make_multiline([leg["coords"]]),
+        })
+    _write_lines(os.path.join(out_dir, "Aerial_Drops.gpkg"), "Aerial_Drops",
+                 aerial_rows, FIELD_AERIAL, params.target_epsg,
+                 geom_type=ogr.wkbMultiLineString)
+
     # ── report ───────────────────────────────────────────────────────────
     by_type: Dict[str, float] = defaultdict(float)
     by_tier: Dict[str, float] = defaultdict(float)
@@ -1312,6 +1449,11 @@ def design(cfg: dict) -> dict:
         "nodes": {k: v for k, v in _count_by(nodes, "NODE_TYPE").items()},
         "drills": len(drills),
         "garden_legs": len(legs),
+        "aerial_legs": len(aerial_rows),
+        "aerial_length_m": round(sum(r["length_m"] for r in aerial_rows), 1),
+        "aerial_by_reason": _count_by(
+            [{"r": r["AERIAL_REASON"]} for r in aerial_rows], "r"),
+        "trench_spans_in_aerial_zone": sum(1 for r in span_rows if r["AERIAL"]),
         "elapsed_s": round(time.time() - t0, 1),
         "log": messages,
     }
@@ -1365,6 +1507,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--aerial", default=None,
                     help="optional aerial-zone polygons (never trenched)")
+    ap.add_argument("--aerial-max-leg", type=float, default=0.0,
+                    help="drop legs longer than this are built aerial (0 = off)")
     ap.add_argument("--target-epsg", type=int, default=25833)
     ap.add_argument("--simplify-tol", type=float, default=2.5)
     ap.add_argument("--max-garden", type=float, default=60.0)
@@ -1378,6 +1522,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "mfg": args.mfg, "pdps": args.pdps, "objects": args.objects,
         "polygons": args.polygons, "roads": args.roads, "out": args.out,
         "aerial": args.aerial,
+        "aerial_max_leg_m": args.aerial_max_leg,
         "target_epsg": args.target_epsg, "simplify_tol_m": args.simplify_tol,
         "max_garden_m": args.max_garden,
         "crossing_merge_m": args.crossing_merge,

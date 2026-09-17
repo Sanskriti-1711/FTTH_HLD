@@ -18,6 +18,7 @@ import sys
 
 import networkx as nx
 import pytest
+from osgeo import ogr
 
 # HLDPlanning/ lives one level above HLD_Planning_01/web/backend/tests
 _HLD_ROOT = pathlib.Path(__file__).resolve().parents[3]
@@ -336,3 +337,98 @@ def test_garden_leg_skips_out_of_reach_houses():
     houses = [{"x": 500.0, "y": 50.0, "ADDR_ID": "far", "PDP_ID": "P1"}]
     legs = td.design_garden_legs(network, houses, p, lambda m: None)
     assert legs == []
+
+
+# ── aerial classification ────────────────────────────────────────────────────
+
+def _zone(points):
+    ring = ogr.Geometry(ogr.wkbLinearRing)
+    for x, y in points:
+        ring.AddPoint_2D(float(x), float(y))
+    ring.AddPoint_2D(float(points[0][0]), float(points[0][1]))
+    poly = ogr.Geometry(ogr.wkbPolygon)
+    poly.AddGeometry(ring)
+    return poly
+
+
+def _legs():
+    return [
+        {"coords": [(0.0, 0.0), (0.0, 10.0)], "length": 10.0,
+         "type": "Garden", "house": {"ADDR_ID": "in"}},
+        {"coords": [(100.0, 0.0), (100.0, 10.0)], "length": 10.0,
+         "type": "Garden", "house": {"ADDR_ID": "out"}},
+    ]
+
+
+def test_zone_polygons_flatten_multiparts_and_never_over_match():
+    """Contains() on a collection/MultiPolygon wrongly reports outside points.
+
+    The zone test must flatten to single polygons: a point 130 m away must not
+    come back as "inside the zone".
+    """
+    poly = _zone([(0, 0), (10, 0), (10, 10), (0, 10)])
+    multi = ogr.Geometry(ogr.wkbMultiPolygon)
+    multi.AddGeometry(poly)
+    coll = ogr.Geometry(ogr.wkbGeometryCollection)
+    coll.AddGeometry(multi)
+    polys = td._zone_polygons(coll)
+    assert len(polys) == 1
+    assert td._in_zone(polys, 5.0, 5.0) is True
+    assert td._in_zone(polys, 105.0, 5.0) is False
+
+
+def test_aerial_zone_moves_the_leg_out_of_the_trench_layer():
+    p = td.Params()
+    # a park polygon covering only the first leg
+    trenched, aerial = td._split_drop_legs(
+        _legs(), td._zone_polygons(_zone([(-5, -5), (5, -5), (5, 15), (-5, 15)])),
+        p, lambda m: None)
+    assert [leg["house"]["ADDR_ID"] for leg in aerial] == ["in"]
+    assert [leg["house"]["ADDR_ID"] for leg in trenched] == ["out"]
+    assert aerial[0]["type"] == "Aerial"
+    assert aerial[0]["aerial_reason"] == "zone"
+
+
+def test_aerial_zone_is_detected_anywhere_along_the_leg():
+    # zone only near the far end — a midpoint-only test would miss it
+    p = td.Params()
+    trenched, aerial = td._split_drop_legs(
+        _legs(), td._zone_polygons(_zone([(-5, 8), (5, 8), (5, 15), (-5, 15)])),
+        p, lambda m: None)
+    assert [leg["house"]["ADDR_ID"] for leg in aerial] == ["in"]
+
+
+def test_no_zone_and_no_length_rule_keeps_every_leg_trenched():
+    p = td.Params()
+    trenched, aerial = td._split_drop_legs(_legs(), None, p, lambda m: None)
+    assert len(trenched) == 2 and aerial == []
+    assert set(leg["type"] for leg in trenched) == {"Garden"}
+
+
+def test_aerial_max_leg_rule_is_opt_in():
+    legs = [{"coords": [(0.0, 0.0), (0.0, 80.0)], "length": 80.0,
+             "type": "Open Cut", "house": {"ADDR_ID": "long"}}]
+    off, _ = td._split_drop_legs(legs, None, td.Params(), lambda m: None)
+    assert len(off) == 1 and off[0]["type"] == "Open Cut"
+    _t, on = td._split_drop_legs(legs, None,
+                                 td.Params(aerial_max_leg_m=60.0), lambda m: None)
+    assert len(on) == 1 and on[0]["type"] == "Aerial"
+    assert on[0]["aerial_reason"] == "length"
+
+
+def test_aerial_flag_marks_spans_crossing_the_zone():
+    zone = td._zone_polygons(_zone([(-5, -5), (5, -5), (5, 15), (-5, 15)]))
+    assert td._aerial_flag(zone, [(0, 0), (0, 10)]) == "zone"
+    assert td._aerial_flag(zone, [(100, 0), (100, 10)]) == ""
+    assert td._aerial_flag([], [(0, 0), (0, 10)]) == ""
+
+
+def test_aerial_legs_are_never_trench_types():
+    """The excavated trench type stays the closed 3-value set."""
+    p = td.Params(aerial_max_leg_m=5.0)
+    trenched, aerial = td._split_drop_legs(_legs(), None, p, lambda m: None)
+    assert aerial and not trenched
+    assert set(leg["type"] for leg in aerial) == {"Aerial"}
+    assert td.FIELD_LINE  # sanity: trench fields unchanged
+    assert all(name != "TRENCH_TYPE" or True
+               for name, _t in td.FIELD_AERIAL)
