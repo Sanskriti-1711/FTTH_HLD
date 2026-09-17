@@ -285,6 +285,38 @@ def test_pull_chambers_fill_long_empty_gaps():
     assert len(pulls) == 2                      # 250 m and 500 m on a 600 m run
 
 
+def test_pull_chambers_fill_every_gap_not_just_a_fixed_mark():
+    """A mid-run chamber must not suppress the pull for the whole run.
+
+    Berlin regression: a 329.8 m feeder run (250 m interval) with a centre
+    node published **no PULL node**, because the old rule tested a fixed 250 m
+    mark and skipped it whenever any chamber sat within one interval behind.
+    """
+    run = _run([(0, 0), (330, 0)])
+    p = td.Params()
+    # a junction mid-run, as a drill pit / branch would leave behind
+    drills = [{"coords": [(100.0, -4.25), (100.0, 4.25)], "cls": "residential",
+               "width": 8.5, "arc": 100.0, "run": id(run)}]
+    nodes = td.place_nodes([run], drills, [], p)
+    pulls = sorted(n["arc"] for n in nodes if n["NODE_TYPE"] == "PULL")
+    assert pulls == [250.0]
+    # every chamber-to-chamber gap on the run is now inside the interval
+    chambers = sorted([0.0, 330.0] + [n["arc"] for n in nodes
+                                      if n.get("run") == id(run)])
+    assert max(b - a for a, b in zip(chambers, chambers[1:])) <= p.pull_backbone_m
+
+
+def test_pull_interval_follows_the_tier():
+    """Distribution pulls at 100 m, backbone at 250 m."""
+    p = td.Params()
+    dist = td.place_nodes([_run(tier="Distribution", coords=[(0, 0), (250, 0)])], [], [], p)
+    pulls = [n["arc"] for n in dist if n["NODE_TYPE"] == "PULL"]
+    assert pulls == [100.0, 200.0]
+    # a run shorter than the interval needs none
+    short = td.place_nodes([_run(tier="Distribution", coords=[(0, 0), (90, 0)])], [], [], p)
+    assert [n for n in short if n["NODE_TYPE"] == "PULL"] == []
+
+
 def test_bend_node_placed_on_sharp_turn():
     run = _run([(0, 0), (50, 0), (50, 50)])
     nodes = td.place_nodes([run], [], [], td.Params())
@@ -460,6 +492,107 @@ def test_aerial_flag_marks_spans_crossing_the_zone():
     assert td._aerial_flag(zone, [(0, 0), (0, 10)]) == "zone"
     assert td._aerial_flag(zone, [(100, 0), (100, 10)]) == ""
     assert td._aerial_flag([], [(0, 0), (0, 10)]) == ""
+
+
+def test_garden_leg_records_the_leg_it_branched_off():
+    """Sharing must be traceable: ``parent`` is the leg a drop chains onto.
+
+    The aerial rule walks the chain, so a leg's parent has to be recoverable.
+    A trunk house and a house further along the same street: the second joins
+    the first, not the mains.
+    """
+    p = td.Params()
+    network = [[(0, 0), (0, 100)]]
+    houses = [{"x": 10.0, "y": 50.0, "ADDR_ID": "trunk", "PDP_ID": "P1"},
+              {"x": 10.0, "y": 45.0, "ADDR_ID": "branch", "PDP_ID": "P1"}]
+    legs = td.design_garden_legs(network, houses, p, lambda m: None)
+    by_addr = {leg["house"]["ADDR_ID"]: leg for leg in legs}
+    assert by_addr["trunk"]["parent"] == -1              # meets the mains
+    assert by_addr["branch"]["parent"] == 0              # chains onto the trunk
+    # the branch's root IS a point on the trunk, so the chain reaches the mains
+    trunk = by_addr["trunk"]["coords"]
+    assert trunk[1] == by_addr["branch"]["coords"][0]     # trunk end = branch root
+
+
+def test_aerial_propagates_down_a_drop_chain():
+    """A trench cannot start in mid-air.
+
+    Berlin regression: the sharing rule rooted an 18.6 m **Garden** leg on an
+    aerial drop, leaving 18.6 m of open trench 22 m off the mains and its house
+    40.6 m from any trench. A leg chained onto an aerial leg flies too
+    (``aerial_reason == 'chain'``), so every trenched leg roots on the network.
+    """
+    p = td.Params()
+    # zone covers only the first 5 m of the parent leg (y <= 5)
+    zone = td._zone_polygons(_zone([(-5, -5), (5, -5), (5, 5), (-5, 5)]))
+    legs = [
+        {"coords": [(0.0, 0.0), (0.0, 10.0)], "length": 10.0,
+         "type": "Garden", "house": {"ADDR_ID": "in-zone"}, "parent": -1},
+        {"coords": [(0.0, 10.0), (0.0, 20.0)], "length": 10.0,
+         "type": "Garden", "house": {"ADDR_ID": "outside"}, "parent": 0},
+        {"coords": [(100.0, 0.0), (100.0, 10.0)], "length": 10.0,
+         "type": "Garden", "house": {"ADDR_ID": "clean"}, "parent": -1},
+    ]
+    trenched, aerial = td._split_drop_legs(legs, zone, p, lambda m: None)
+    assert [leg["house"]["ADDR_ID"] for leg in aerial] == ["in-zone", "outside"]
+    assert aerial[0]["aerial_reason"] == "zone"
+    assert aerial[1]["aerial_reason"] == "chain"      # not in the zone itself
+    assert [leg["house"]["ADDR_ID"] for leg in trenched] == ["clean"]
+    # every trenched leg still roots on the mains (-1) or on a trenched parent
+    assert all(leg["parent"] == -1 for leg in trenched)
+
+
+def test_aerial_chain_does_not_leak_past_a_trenched_parent():
+    """A leg whose parent is trenched stays trenched, even if a sibling flies."""
+    p = td.Params()
+    zone = td._zone_polygons(_zone([(-5, -5), (5, -5), (5, 15), (-5, 15)]))
+    legs = [
+        {"coords": [(0.0, 0.0), (0.0, 2.0)], "length": 2.0,
+         "type": "Garden", "house": {"ADDR_ID": "feeder"}, "parent": -1},
+        {"coords": [(0.0, 2.0), (0.0, 4.0)], "length": 2.0,
+         "type": "Garden", "house": {"ADDR_ID": "child"}, "parent": 0},
+    ]
+    trenched, aerial = td._split_drop_legs(legs, zone, p, lambda m: None)
+    # both legs are inside the zone, so both fly - the chain rule never
+    # resurrects a trench inside a zone
+    assert len(aerial) == 2 and not trenched
+    # with no zone at all the same chain is fully trenched
+    trenched, aerial = td._split_drop_legs(legs, None, p, lambda m: None)
+    assert len(trenched) == 2 and not aerial
+
+
+def test_pdp_spur_gap_threshold_is_how_far_a_cabinet_may_float():
+    """A splitter beside the trench gets a spur; the threshold decides when.
+
+    Berlin: the pre-trim pass let an 8 m gap stand (closer than
+    ``min_node_sep_m``), the trim then cut the run back, and PDP00019 was left
+    **17.77 m** from any trench. The post-trim pass runs with a tight tolerance
+    so "every PDP sits on a trench" is true of the FINAL run set.
+    """
+    p = td.Params(min_node_sep_m=10.0)
+    mains = [td.Run(coords=[(0.0, 0.0), (0.0, 100.0)], tier="Feeder")]
+    pdp = {"PDP_ID": "P1", "x": 5.0, "y": 50.0}          # 5 m off the run
+
+    out, stats = td.connect_unreached_pdps(list(mains), [pdp], p, lambda m: None)
+    assert stats["pdp_spurs"] == 0 and len(out) == 1      # 5 m < 10 m: left alone
+
+    out, stats = td.connect_unreached_pdps(list(mains), [pdp], p, lambda m: None,
+                                           max_gap_m=2.0)
+    assert stats["pdp_spurs"] == 1                         # 5 m > 2 m: spurred
+    spur = out[-1]
+    assert spur.src == "pdp-spur" and spur.tier == "Feeder"
+    assert spur.coords[1] == (5.0, 50.0)                   # ends ON the splitter
+    assert td._coords_len(spur.coords) == pytest.approx(5.0)
+    assert stats["max_spur_m"] == pytest.approx(5.0)
+
+
+def test_pdp_already_on_the_trench_gets_no_spur():
+    p = td.Params()
+    mains = [td.Run(coords=[(0.0, 0.0), (0.0, 100.0)], tier="Feeder")]
+    pdp = {"PDP_ID": "P2", "x": 0.0, "y": 50.0}
+    out, stats = td.connect_unreached_pdps(list(mains), [pdp], p, lambda m: None,
+                                           max_gap_m=2.0)
+    assert stats["pdp_spurs"] == 0 and len(out) == 1
 
 
 def test_aerial_legs_are_never_trench_types():

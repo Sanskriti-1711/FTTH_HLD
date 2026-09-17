@@ -166,6 +166,12 @@ class Params:
     # Diagnostic only: a span whose midpoint is further than this from every
     # premise/anchor is reported (never silently removed).
     far_premise_m: float = 80.0
+    # A bore end closer to its run's end than this is a bore continuing onto
+    # the neighbouring run, not a pit (see detect_drills).
+    pit_edge_m: float = 0.3
+    # Cut mains runs back to the part something is connected to (see
+    # trim_unserved_tails). Legs, MFG/PDP ends and junctions are supports.
+    trim_tails: bool = True
     # Aerial: a drop leg inside an aerial zone (or longer than this, when set)
     # is built aerial — drawn as an aerial drop, never excavated. 0 = length
     # rule off (zone layer only).
@@ -609,11 +615,29 @@ class StreetGraph:
     node_xy: Dict[str, Tuple[float, float]]
     index: GridIndex
     node_keys: List[str] = field(default_factory=list)
+    # the largest connected piece of the walkable network: everything routable
+    # belongs to it, and OSM always carries a few stray footway fragments
+    main_component: Set[str] = field(default_factory=set)
 
     def nearest_node(self, x: float, y: float, radius: float) -> Optional[str]:
         best, best_d = None, radius
         for i in self.index.near(x, y, radius):
             key = self.node_keys[i]
+            nx_, ny_ = self.node_xy[key]
+            d = math.hypot(nx_ - x, ny_ - y)
+            if d <= best_d:
+                best_d, best = d, key
+        return best
+
+    def nearest_main_node(self, x: float, y: float, radius: float) -> Optional[str]:
+        """Nearest node that is actually connected to the rest of the network."""
+        if not self.main_component:
+            return self.nearest_node(x, y, radius)
+        best, best_d = None, radius
+        for i in self.index.near(x, y, radius):
+            key = self.node_keys[i]
+            if key not in self.main_component:
+                continue
             nx_, ny_ = self.node_xy[key]
             d = math.hypot(nx_ - x, ny_ - y)
             if d <= best_d:
@@ -682,8 +706,17 @@ def build_street_graph(walkable: Sequence[Tuple[List[Tuple[float, float]], str]]
     for i, k in enumerate(node_keys):
         x, y = node_xy[k]
         idx.add(x, y, i)
+    # The walkable extract is never fully connected: OSM carries stray footway
+    # fragments. Snapping to one of those is what made PDP00004 unreachable —
+    # it sits 8 m from a 4-node island while the real network is 100 m away.
+    main: Set[str] = set()
+    try:
+        comps = nx.connected_components(G)
+        main = set(max(comps, key=len)) if comps else set()
+    except Exception:
+        main = set(node_keys)
     return StreetGraph(G=G, edge_coords=edge_coords, node_xy=node_xy,
-                       index=idx, node_keys=node_keys)
+                       index=idx, node_keys=node_keys, main_component=main)
 
 
 def _class_factor(cls: str, scale: float = 1.0) -> float:
@@ -799,9 +832,25 @@ class Run:
     infra: str = "New"
 
 
-def _snap_anchor(sg: StreetGraph, x: float, y: float, tol: float
-                 ) -> Optional[str]:
-    return sg.nearest_node(x, y, tol)
+def _snap_anchor(sg: StreetGraph, x: float, y: float, tol: float,
+                 fallback: float = 250.0) -> Optional[str]:
+    """Snap an anchor (MFG / PDP / house) onto a node that can be routed from.
+
+    The nearest node is not necessarily usable: a stray footway island is often
+    closer than the real street, and routing from it reaches nothing (PDP00004
+    on the Berlin project: 8 m to a 4-node island, 100 m to the real network,
+    so its whole polygon was designed as a fragment that touched no corridor).
+    Prefer the nearest node of the main component within ``tol``, then widen the
+    search to ``fallback`` before giving up.
+    """
+    key = sg.nearest_node(x, y, tol)
+    if key is not None and (not sg.main_component or key in sg.main_component):
+        return key
+    wider = max(tol, fallback)
+    key = sg.nearest_main_node(x, y, wider)
+    if key is not None:
+        return key
+    return sg.nearest_node(x, y, wider)
 
 
 def design_backbone(sg: StreetGraph, mfg: dict, pdps: Sequence[dict],
@@ -874,29 +923,56 @@ def design_spine(sg: StreetGraph, pdps: Sequence[dict], houses: Sequence[dict],
 def design_garden_legs(network_parts: Sequence[List[Tuple[float, float]]],
                        houses: Sequence[dict], params: Params,
                        log) -> List[dict]:
-    """Straight drop leg from every house to the nearest trench point."""
+    """Straight drop leg from every house to the nearest trench point.
+
+    Houses are attached nearest-the-mains first, and each new leg may join an
+    **already designed leg**, not only the mains. Two houses 70 m up the same
+    street then share one drop trunk (the second branches off the first) instead
+    of running two parallel legs: measured on Berlin, drawing each leg straight
+    from the mains left **200 m of duplicated drop trench**, e.g. an 85.6 m leg
+    lying within 0.6 m of a 66.9 m one for 67 m of its length.
+
+    ``shared_joins`` counts the legs that branched off another leg. Each leg
+    records the leg it branched off (``parent``, ``-1`` when it meets the
+    mains), because that chain decides the aerial rule in ``_split_drop_legs``.
+    """
     legs: List[dict] = []
-    skipped = 0
-    for h in houses:
-        best = (float("inf"), None, None)
-        for coords in network_parts:
-            d, a, q = _project(coords, h["x"], h["y"])
+    parts: List[List[Tuple[float, float]]] = [list(c) for c in network_parts]
+
+    def nearest(x: float, y: float) -> Tuple[float, Optional[Tuple[float, float]], int]:
+        best = (float("inf"), None, -1)
+        for i, coords in enumerate(parts):
+            d, _a, q = _project(coords, x, y)
             if d < best[0]:
-                best = (d, q, (coords, a))
-        if best[1] is None or best[0] > params.house_search_m:
+                best = (d, q, i)
+        return best
+
+    n_mains_parts = len(network_parts)
+    order = sorted(houses, key=lambda h: nearest(h["x"], h["y"])[0])
+    skipped = shared = 0
+    for h in order:
+        d, q, part_i = nearest(h["x"], h["y"])
+        if q is None or d > params.house_search_m:
             skipped += 1
             continue
-        q = best[1]
         if math.hypot(q[0] - h["x"], q[1] - h["y"]) < 0.5:
             continue
+        parent = -1
+        if part_i >= n_mains_parts:
+            shared += 1                      # it joined a leg, not just the mains
+            parent = part_i - n_mains_parts
         length = math.hypot(q[0] - h["x"], q[1] - h["y"])
+        coords = [q, (h["x"], h["y"])]
         legs.append({
-            "coords": [q, (h["x"], h["y"])],
+            "coords": coords,
             "length": length,
             "type": "Garden" if length <= params.max_garden_m else "Open Cut",
             "house": h,
+            "parent": parent,
         })
-    log(f"garden legs: {len(legs)} leg(s), {skipped} house(s) out of reach")
+        parts.append(coords)                 # later houses may share this trunk
+    log(f"garden legs: {len(legs)} leg(s), {skipped} house(s) out of reach, "
+        f"{shared} joined another drop instead of the mains")
     return legs
 
 
@@ -939,11 +1015,35 @@ def detect_drills(vehicular: Sequence[Tuple[List[Tuple[float, float]], str]],
                 road_w = VEHICULAR_WIDTH_M.get(cls, 6.0)
                 bore = road_w / sin_t + params.drill_extra_m
                 half = bore / 2.0
-                e1 = (q[0] - t[0] * half, q[1] - t[1] * half)
-                e2 = (q[0] + t[0] * half, q[1] + t[1] * half)
+                # Clamp the bore to this run. When the crossing sits on a run
+                # boundary — which happens whenever a junction (and therefore a
+                # run break) falls on the carriageway, measured on 37 of 76
+                # bores — the bore carries on into the neighbouring run, which
+                # detects the same crossing at its own end. So this run
+                # publishes only the part of the bore that lies within it, and
+                # places a pit only at an end that is really in open trench
+                # inside this run: a pit at a shared end would sit in the middle
+                # of the carriageway, and a bore drawn past the run end left the
+                # pit hanging in mid-air ~3.5 m off the trench.
+                total_run = _coords_len(run.coords)
+                arc0 = max(0.0, arc - half)
+                arc1 = min(total_run, arc + half)
+                if arc1 - arc0 < 0.2:
+                    continue
+                e1 = _point_at_arc(run.coords, arc0)
+                e2 = _point_at_arc(run.coords, arc1)
+                # the BORE is the straight hole: its length is the chord, not the
+                # arc the trench happens to follow between the two pits
+                bore_len = math.hypot(e2[0] - e1[0], e2[1] - e1[1])
+                if bore_len < 0.2:
+                    continue
                 drills.append({
-                    "coords": [e1, e2], "cls": cls, "width": bore,
-                    "road_width": road_w, "arc": arc, "run": id(run),
+                    "coords": [e1, e2], "cls": cls, "width": bore_len,
+                    "road_width": road_w, "arc": arc, "arc0": arc0,
+                    "arc1": arc1,
+                    "pit_start": arc0 > params.pit_edge_m,
+                    "pit_end": arc1 < total_run - params.pit_edge_m,
+                    "run": id(run),
                 })
     # consolidation: nearest-first, merge close junctions, suppress duplicates
     drills.sort(key=lambda d: (d["arc"], d["cls"]))
@@ -989,6 +1089,23 @@ def _part_points(geom) -> List[Tuple[float, float]]:
     return []
 
 
+def _point_at_arc(coords: Sequence[Tuple[float, float]],
+                  arc: float) -> Tuple[float, float]:
+    """The point sitting at an arc-length position along a line."""
+    cum = _cum(coords)
+    if arc <= 0.0:
+        return (coords[0][0], coords[0][1])
+    if arc >= cum[-1]:
+        return (coords[-1][0], coords[-1][1])
+    for i in range(len(cum) - 1):
+        if cum[i] <= arc <= cum[i + 1]:
+            seg = cum[i + 1] - cum[i]
+            t = 0.0 if seg <= 0 else (arc - cum[i]) / seg
+            return (coords[i][0] + t * (coords[i + 1][0] - coords[i][0]),
+                    coords[i][1] + t * (coords[i + 1][1] - coords[i][1]))
+    return (coords[-1][0], coords[-1][1])
+
+
 def _lerp_dir(coords: Sequence[Tuple[float, float]], arc: float) -> Tuple[float, float]:
     cum = _cum(coords)
     for i in range(len(coords) - 1):
@@ -1031,7 +1148,13 @@ def place_nodes(network: List[Run], drills: Sequence[dict],
     #     one drill are one PAIR: they are ~road-width apart (below the global
     #     separation), so they are inserted without deduping each other.
     for di, d in enumerate(drills):
-        for pt in d["coords"]:
+        ends = ((d["coords"][0], d.get("pit_start", True)),
+                (d["coords"][1], d.get("pit_end", True)))
+        for pt, has_pit in ends:
+            if not has_pit:
+                # The bore continues onto the neighbouring run: this end is not
+                # a pit, it is open trench meeting a bore mid-carriageway.
+                continue
             n = None
             for other in nodes:
                 # Only pits of a DIFFERENT drill may absorb each other: the two
@@ -1073,29 +1196,34 @@ def place_nodes(network: List[Run], drills: Sequence[dict],
             if math.degrees(math.acos(cosang)) > 45.0:
                 add(bx, by, "BEND", 4, run)
 
-    # 5 — interval pull chambers (only across real gaps)
+    # 5 — interval pull chambers. The rule is "no chamber-to-chamber gap on a
+    #     run may exceed the interval", not "place one at exactly the interval
+    #     mark". The old mark-and-test rule skipped a pull whenever any chamber
+    #     sat within one interval behind the mark, so a run with a junction at
+    #     100 m published **no pull at all**: Berlin had a **329.8 m feeder span
+    #     and 0 PULL nodes** with a 250 m interval. Now the chambers already on
+    #     the run are sorted and each gap between them is filled.
     for run in network:
         gap = (params.pull_backbone_m if run.tier == "Feeder"
                else params.pull_dist_m)
         cum = _cum(run.coords)
-        pos = gap
-        while pos < cum[-1] - params.min_node_sep_m:
-            gap_ok = True
-            for n in nodes:
-                d, a, q = _project(run.coords, n["x"], n["y"])
-                if d <= 2.0 and abs(a - pos) < gap:
-                    gap_ok = False
-                    break
-            if gap_ok:
-                for i in range(len(cum) - 1):
-                    if cum[i] <= pos <= cum[i + 1]:
-                        seg = cum[i + 1] - cum[i]
-                        t = 0.0 if seg <= 0 else (pos - cum[i]) / seg
-                        add(run.coords[i][0] + t * (run.coords[i + 1][0] - run.coords[i][0]),
-                            run.coords[i][1] + t * (run.coords[i + 1][1] - run.coords[i][1]),
-                            "PULL", 5, run)
-                        break
-            pos += gap
+        total = cum[-1]
+        if total <= gap:
+            continue
+        on_run = [0.0, total]
+        for n in nodes:
+            if n.get("run") != id(run):
+                continue
+            d, a, _q = _project(run.coords, n["x"], n["y"])
+            if d <= 2.0:
+                on_run.append(a)
+        on_run.sort()
+        for a0, a1 in list(zip(on_run, on_run[1:])):
+            pos = a0 + gap
+            while pos <= a1 - params.min_node_sep_m:
+                q = _point_at_arc(run.coords, pos)
+                add(q[0], q[1], "PULL", 5, run, arc=pos)
+                pos += gap
 
     if log:
         counts: Dict[str, int] = defaultdict(int)
@@ -1169,9 +1297,18 @@ def split_spans(run: Run, nodes: Sequence[dict], params: Params,
                 if covered > 0 and covered >= 0.5 * max(a1 - a0, tb - ta):
                     ttype = tt
                     break
+        length = _coords_len(coords)
+        if ttype == "HDD":
+            # A bore is drilled STRAIGHT. Where the run jogs inside the drilled
+            # arc (small street-graph vertices, not real bends) the arc is
+            # longer than the hole, so an HDD span reports the chord — the
+            # drilled length — and the crossing layer and the trench layer then
+            # agree exactly (measured: 6 bores drifted 0.5–2.2 m before this).
+            length = math.hypot(coords[-1][0] - coords[0][0],
+                                coords[-1][1] - coords[0][1])
         spans.append({
             "coords": coords, "start": n0, "end": n1, "arc0": a0, "arc1": a1,
-            "length": _coords_len(coords), "type": ttype, "tier": run.tier,
+            "length": length, "type": ttype, "tier": run.tier,
             "pdp": run.pdp, "polygon": run.polygon, "src": run.src,
             "infra": run.infra,
             "run_id": getattr(run, "run_id", "RUN-00000"),
@@ -1299,22 +1436,38 @@ def _split_drop_legs(legs: Sequence[dict], zone_polys, params: Params, log
        permitted there, so the drop is built aerial.
     2. ``length`` — the leg is longer than ``aerial_max_leg_m`` (when set):
        the spur can neither be a garden trench nor economically open-cut.
+    3. ``chain``  — the leg **branches off an aerial leg**: the drop already
+       went aerial further out, and a trench cannot start in mid-air. Legs are
+       walked in creation order (nearest the mains first), so a parent is
+       always classified before its children.
 
     An aerial leg is **not** a trench: it is published on the ``Aerial_Drops``
     layer and excluded from every excavated trench output and length.
+
+    Rule 3 exists because rule 1 alone left a hole: on the Berlin project the
+    sharing rule rooted a **Garden** leg on an aerial drop, so 18.6 m of open
+    trench began 22 m off the mains and its house sat **40.6 m from any trench**
+    while still being billed as connected.
     """
     trenched: List[dict] = []
     aerial: List[dict] = []
-    for leg in legs:
+    aerial_idx: Set[int] = set()
+    for i, leg in enumerate(legs):
         item = dict(leg)
+        parent = item.get("parent", -1)
         if _leg_in_zone(zone_polys, item):
-            item["type"] = "Aerial"
-            item["aerial_reason"] = "zone"
-            aerial.append(item)
+            reason = "zone"
         elif params.aerial_max_leg_m and item["length"] > params.aerial_max_leg_m:
+            reason = "length"
+        elif parent >= 0 and parent in aerial_idx:
+            reason = "chain"
+        else:
+            reason = ""
+        if reason:
             item["type"] = "Aerial"
-            item["aerial_reason"] = "length"
+            item["aerial_reason"] = reason
             aerial.append(item)
+            aerial_idx.add(i)
         else:
             trenched.append(item)
     return trenched, aerial
@@ -1409,6 +1562,389 @@ def _span_coords(sp: dict) -> List[Tuple[float, float]]:
         if len(part) >= 2:
             return list(part)
     return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Trimming: a mains run may only exist where something is connected to it
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _leg_attach_points(legs: Sequence[Run],
+                       mains: Sequence[Run]) -> List[Tuple[float, float]]:
+    """Where every drop **chain** meets the mains (the point service starts at).
+
+    A leg may branch off another leg rather than off the mains (see
+    ``design_garden_legs``), so the point that has to stay in the network is the
+    one at the root of its chain, not its own free end.
+    """
+    segs = [(r.coords[i], r.coords[i + 1])
+            for r in mains for i in range(len(r.coords) - 1)]
+    tol = 2.0
+
+    def mains_dist(p) -> float:
+        return min((_point_seg_dist(p[0], p[1], x, y) for x, y in segs), default=1e9)
+
+    # which leg does this point sit on?
+    def parent_of(p) -> Optional[int]:
+        for i, r in enumerate(legs):
+            if any(_point_seg_dist(p[0], p[1], r.coords[j], r.coords[j + 1]) <= tol
+                   for j in range(len(r.coords) - 1)):
+                return i
+        return None
+
+    def resolve(i: int, seen: Set[int]) -> Tuple[float, float]:
+        r = legs[i]
+        a, b = r.coords[0], r.coords[-1]
+        da, db = mains_dist(a), mains_dist(b)
+        near_end = a if da <= db else b
+        if min(da, db) <= tol:
+            return near_end
+        # neither end is on the mains: walk up to the leg this one joins
+        if i in seen:
+            return near_end
+        seen.add(i)
+        j = parent_of(near_end)
+        if j is None or j == i:
+            j = parent_of(b if near_end is a else a)
+        if j is None or j == i:
+            return near_end
+        return resolve(j, seen)
+
+    return [resolve(i, set()) for i in range(len(legs))]
+
+
+def keep_mfg_component(runs: List[Run], mfg: dict, pdps: Sequence[dict],
+                       params: Params, log) -> Tuple[List[Run], Dict[str, float]]:
+    """Keep only the mains runs that are transitively joined to the MFG.
+
+    Runs are assembled from independent edge sets — the backbone to the PDPs and
+    the per-PDP distribution trees — and nothing checks that the result forms one
+    network. Measured on the Berlin project: **4 components (93 / 3 / 1 / 1),
+    735 m of trench outside the MFG component, with 20 drop legs hanging off
+    fragments that lead nowhere.** Those fragments can never carry service (there
+    is no route from them to the MFG or a PDP), so they are dropped *before* the
+    drop legs are designed — the affected houses then attach to the connected
+    network instead of to a dead fragment.
+
+    A PDP that ends up on a dropped fragment is reported: it is unreachable, and
+    the backbone did not get there.
+    """
+    if not runs:
+        return [], {"components": 0, "dropped_runs": 0, "dropped_m": 0.0,
+                    "unreachable_pdps": 0}
+    tol_end = 1.0        # two runs sharing an end
+    tol_touch = 1.5      # one run's end landing on another run
+    parent = list(range(len(runs)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    # ends at the same point
+    ends: Dict[Tuple[int, int], List[int]] = defaultdict(list)
+    for i, r in enumerate(runs):
+        for p in (r.coords[0], r.coords[-1]):
+            ends[(int(round(p[0] / tol_end)), int(round(p[1] / tol_end)))].append(i)
+    for _k, idxs in ends.items():
+        for other in idxs[1:]:
+            union(idxs[0], other)
+
+    # an end landing on another run (T-join)
+    grid = _SegGrid(cell=25.0)
+    for i, r in enumerate(runs):
+        for j in range(len(r.coords) - 1):
+            grid.add(i, r.coords[j], r.coords[j + 1])
+    for i, r in enumerate(runs):
+        for p in (r.coords[0], r.coords[-1]):
+            j = grid.nearest_index(p[0], p[1], tol_touch, exclude=i)
+            if j is not None:
+                union(i, j)
+
+    groups: Dict[int, List[int]] = defaultdict(list)
+    for i in range(len(runs)):
+        groups[find(i)].append(i)
+
+    # the component the MFG sits on (fall back to the one richest in PDPs)
+    def on_run(i: int, x: float, y: float, tol: float) -> bool:
+        r = runs[i]
+        return any(_point_seg_dist(x, y, r.coords[j], r.coords[j + 1]) <= tol
+                   for j in range(len(r.coords) - 1))
+
+    root = None
+    for i in range(len(runs)):
+        if on_run(i, mfg["x"], mfg["y"], params.pdp_search_m):
+            root = find(i)
+            break
+    if root is None:
+        best = (-1, None)
+        for r_root, members in groups.items():
+            n = sum(1 for p in pdps if any(on_run(i, p["x"], p["y"], params.pdp_search_m)
+                                          for i in members))
+            if n > best[0]:
+                best = (n, r_root)
+        root = best[1]
+
+    kept = [runs[i] for i in groups.get(root, [])]
+    dropped_idx = [i for i in range(len(runs)) if find(i) != root]
+    dropped_m = sum(_coords_len(runs[i].coords) for i in dropped_idx)
+    unreachable = sum(1 for p in pdps
+                      if not any(on_run(i, p["x"], p["y"], params.pdp_search_m)
+                                 for i in groups.get(root, [])))
+    if dropped_idx:
+        log("network: kept %d run(s) joined to the MFG of %d component(s); dropped "
+            "%d run(s) / %.0f m that reach neither the MFG nor a PDP%s"
+            % (len(kept), len(groups), len(dropped_idx), dropped_m,
+               " - %d PDP unreachable" % unreachable if unreachable else ""))
+    return kept, {"components": len(groups), "dropped_runs": len(dropped_idx),
+                  "dropped_m": round(dropped_m, 1),
+                  "unreachable_pdps": unreachable}
+
+
+def connect_unreached_pdps(runs: List[Run], pdps: Sequence[dict],
+                           params: Params, log,
+                           max_gap_m: Optional[float] = None
+                           ) -> Tuple[List[Run], Dict[str, float]]:
+    """Reach every PDP: a splitter that no trench touches cannot be cabled.
+
+    The backbone routes over the walkable street graph, so a PDP whose nearest
+    *routable* node is a distance away ends up beside the network rather than on
+    it. A straight spur from the nearest trench point to the splitter closes
+    that gap (tier Feeder, ``SRC = pdp-spur``), so the F2D chamber ends up on a
+    trench like every other structure.
+
+    ``max_gap_m`` is the largest gap left alone (default ``min_node_sep_m``,
+    the distance at which a separate chamber would be silly). The post-trim
+    pass passes a tight tolerance instead, because there the question is no
+    longer "is another chamber worth it" but "is this cabinet on a trench".
+    """
+    gap_m = params.min_node_sep_m if max_gap_m is None else max_gap_m
+    if not runs or not pdps:
+        return list(runs), {"pdp_spurs": 0, "max_spur_m": 0.0}
+    segs = [(r.coords[j], r.coords[j + 1])
+            for r in runs for j in range(len(r.coords) - 1)]
+    out = list(runs)
+    spurs, longest = 0, 0.0
+    for p in pdps:
+        best = (float("inf"), None, None)
+        for a, b in segs:
+            d = _point_seg_dist(p["x"], p["y"], a, b)
+            if d < best[0]:
+                dx, dy = b[0] - a[0], b[1] - a[1]
+                if dx == 0.0 and dy == 0.0:
+                    q = a
+                else:
+                    t = max(0.0, min(1.0, ((p["x"] - a[0]) * dx + (p["y"] - a[1]) * dy)
+                                          / (dx * dx + dy * dy)))
+                    q = (a[0] + t * dx, a[1] + t * dy)
+                best = (d, q, (a, b))
+        d, q, _seg = best
+        if q is None or d <= gap_m:
+            continue
+        out.append(Run(coords=[q, (p["x"], p["y"])], tier="Feeder",
+                       pdp=str(p.get("PDP_ID") or ""), polygon=None,
+                       src="pdp-spur"))
+        segs.append(((q[0], q[1]), (p["x"], p["y"])))
+        spurs += 1
+        longest = max(longest, d)
+    if spurs:
+        log("pdp spurs: %d splitter(s) within %.1f m of a trench were given a spur "
+            "(longest %.0f m)" % (spurs, gap_m, longest))
+    return out, {"pdp_spurs": spurs, "max_spur_m": round(longest, 1),
+                 "gap_m": round(gap_m, 1)}
+
+
+def trim_unserved_tails(mains: List[Run], legs: Sequence[Run],
+                        anchors_pts: Sequence[Tuple[float, float]],
+                        params: Params, log) -> Tuple[List[Run], Dict[str, float]]:
+    """Cut each mains run back to the part something is actually connected to.
+
+    A position on a run is *supported* when a trench is needed there: the MFG or
+    a PDP sits on it, a drop leg attaches to it, or another run joins it. Any
+    part outside the outermost support is a tail nothing is connected to.
+
+    Why it happens: the distribution spine is routed to the street node nearest
+    each house, but the drop leg is then drawn to the nearest point on the whole
+    network — often a corridor that already passes the house. The branch that
+    was routed for it is left behind, unserved. Measured on the Berlin project:
+    **1 015 m of 7 949 m (12.8 %) across 44 of 98 runs**, and it is what the
+    "loose ends" report was pointing at (a trench stopping 11–28 m short of the
+    nearest premise with nothing attached).
+
+    Supports are read once, from the run set as it stands: because every keeps
+    point (a junction, an anchor, a leg attachment) survives in its own run,
+    shortening one run can never pull the ground out from under another — and a
+    single pass is what keeps that true. (A cascading version was measured to
+    orphan **101 drop legs** on the Berlin project, so the invariant is now
+    checked explicitly at the end: if any drop leg would lose the mains, the runs
+    that carried it are restored and the override is reported.)
+
+    Callers must drop anything not joined to the MFG first
+    (``keep_mfg_component``): a fragment a leg attaches to must have been removed
+    for the leg to attach to the connected network.
+    """
+    if not params.trim_tails or not mains:
+        return list(mains), {"trimmed_runs": 0, "dropped_runs": 0, "removed_m": 0.0,
+                             "restored_runs": 0, "detached_legs": 0}
+    keep_anchor_m = 5.0     # MFG / PDP sits on the run
+    keep_join_m = 2.0       # another run meets this one
+    keep_leg_m = 2.0        # a drop leg attaches here
+    leg_pts = _leg_attach_points(legs, mains)
+    all_segs = [(r.coords[j], r.coords[j + 1])
+                for r in mains for j in range(len(r.coords) - 1)]
+
+    def on_network(p, segs) -> bool:
+        return any(_point_seg_dist(p[0], p[1], a, b) <= keep_leg_m for a, b in segs)
+
+    def keeps_for(r: Run, others: Sequence[Run]) -> List[float]:
+        pos: List[float] = []
+        for p in anchors_pts:
+            d, a, _q = _project(r.coords, p[0], p[1])
+            if d <= keep_anchor_m:
+                pos.append(a)
+        for p in leg_pts:
+            d, a, _q = _project(r.coords, p[0], p[1])
+            if d <= keep_leg_m:
+                pos.append(a)
+        for o in others:
+            for p in (o.coords[0], o.coords[-1]):
+                d, a, _q = _project(r.coords, p[0], p[1])
+                if d <= keep_join_m:
+                    pos.append(a)
+        for end_pt, arc_end in ((r.coords[0], 0.0),
+                                (r.coords[-1], _coords_len(r.coords))):
+            for o in others:
+                if any(_point_seg_dist(end_pt[0], end_pt[1], o.coords[k],
+                                       o.coords[k + 1]) <= keep_join_m
+                       for k in range(len(o.coords) - 1)):
+                    pos.append(arc_end)
+                    break
+        return pos
+
+    keep: List[Run] = []
+    trimmed = dropped = restored = 0
+    removed_len = 0.0
+    for i, r in enumerate(mains):
+        others = [o for j, o in enumerate(mains) if j != i]
+        total = _coords_len(r.coords)
+        pos = keeps_for(r, others)
+        lo, hi = (min(pos), max(pos)) if pos else (0.0, 0.0)
+        if pos and hi - lo >= total - 0.05:
+            keep.append(r)                       # nothing to trim
+            continue
+        if pos and hi - lo >= 1.0:
+            piece = _substring(r.coords, lo, hi)
+            if len(piece) >= 2:
+                removed_len += total - _coords_len(piece)
+                trimmed += 1
+                keep.append(Run(coords=piece, tier=r.tier, pdp=r.pdp,
+                                polygon=r.polygon, src=r.src))
+                continue
+        # no support, or supported at a single point: the whole run is unused
+        if any(on_network(p, [(r.coords[j], r.coords[j + 1])
+                              for j in range(len(r.coords) - 1)]) for p in leg_pts):
+            keep.append(r)                       # a leg hangs off it: never drop
+            restored += 1
+            continue
+        dropped += 1
+        removed_len += total
+
+    # ── stabilise: the supports above were read from the run set as it stood
+    # *before* any of it was trimmed, so one run can end up holding a junction
+    # whose partner this same pass cut away — a stub with nothing on it
+    # (measured: 1 on Berlin, a 6 m feeder tail). Re-trim against the surviving
+    # supports until nothing moves; dropping a run can leave another
+    # unsupported, so this repeats.
+    for _round in range(6):
+        changed = False
+        survivors: List[Run] = []
+        for i, r in enumerate(keep):
+            total = _coords_len(r.coords)
+            others = [o for j, o in enumerate(keep) if j != i]
+            pos = keeps_for(r, others)
+            if not pos:
+                dropped += 1
+                removed_len += total
+                changed = True
+                continue
+            lo, hi = min(pos), max(pos)
+            if hi - lo >= total - 0.05:
+                survivors.append(r)
+                continue
+            if hi - lo < 1.0:
+                # a single support left: only worth keeping if service hangs
+                # off it, and then only as-is (a zero-length piece is nothing)
+                if any(on_network(p, [(r.coords[j], r.coords[j + 1])
+                                      for j in range(len(r.coords) - 1)])
+                       for p in leg_pts):
+                    survivors.append(r)
+                    restored += 1
+                else:
+                    dropped += 1
+                    removed_len += total
+                changed = True
+                continue
+            piece = _substring(r.coords, lo, hi)
+            if len(piece) < 2:
+                dropped += 1
+                removed_len += total
+                changed = True
+                continue
+            removed_len += total - _coords_len(piece)
+            trimmed += 1
+            changed = True
+            survivors.append(Run(coords=piece, tier=r.tier, pdp=r.pdp,
+                                 polygon=r.polygon, src=r.src))
+        keep = survivors
+        if not changed:
+            break
+
+    # invariant: every drop **chain** must still reach the *kept mains*. Legs
+    # are NOT network for this test. A leg may branch off another leg (that is
+    # the sharing rule), but only through a chain that itself reaches the mains
+    # — the roots are resolved against the kept mains, so a chain left hanging
+    # on a trimmed run, or on an aerial leg that is no trench at all, is caught
+    # (measured on Berlin: 1 house stranded 40.6 m from the network).
+    detached: List[Tuple[float, float]] = []
+    for _round in range(6):
+        roots = _leg_attach_points(legs, keep)
+        kept_segs = [(r.coords[j], r.coords[j + 1]) for r in keep
+                     for j in range(len(r.coords) - 1)]
+        detached = [p for p in roots if not on_network(p, kept_segs)]
+        if not detached:
+            break
+        restored_ids = set()
+        for i, r in enumerate(mains):
+            if any(r is k for k in keep):
+                continue
+            mine = [(r.coords[j], r.coords[j + 1]) for j in range(len(r.coords) - 1)]
+            if any(on_network(p, mine) for p in detached):
+                restored_ids.add(i)
+        if not restored_ids:
+            break
+        for i, r in enumerate(mains):
+            if i in restored_ids:
+                keep.append(r)
+                restored += 1
+        removed_len = sum(_coords_len(r.coords) for r in mains) \
+            - sum(_coords_len(r.coords) for r in keep)
+        log("tails: %d drop chain(s) had no mains left - %d run(s) restored"
+            % (len(detached), len(restored_ids)))
+    if detached:
+        log("tails: WARNING %d drop chain(s) still detached from the mains"
+            % len(detached))
+
+    if trimmed or dropped:
+        log("tails: trimmed %d run(s), dropped %d unserved run(s) - %.0f m not dug"
+            % (trimmed, dropped, removed_len))
+    return keep, {"trimmed_runs": trimmed, "dropped_runs": dropped,
+                  "removed_m": round(removed_len, 1), "restored_runs": restored,
+                  "detached_legs": len(detached)}
 
 
 def _anchor_points(pdps, houses, mfgs) -> List[Tuple[float, float]]:
@@ -1630,6 +2166,18 @@ def design(cfg: dict) -> dict:
         f"({sum(1 for r in runs if r.tier == 'Feeder')} feeder, "
         f"{sum(1 for r in runs if r.tier == 'Distribution')} distribution)")
 
+    # ── keep only the network that reaches the MFG / its PDPs ────────────
+    # Runs come from independent edge sets, so the assembly can leave fragments
+    # that no route reaches. They are dropped BEFORE the drops are designed, so
+    # a house that would have attached to a dead fragment attaches to the real
+    # network instead.
+    before = len(runs)
+    runs, conn_stats = keep_mfg_component(runs, mfgs[0], pdps, params, log)
+    if before != len(runs):
+        log("runs after connectivity filter: %d" % len(runs))
+    # every PDP must end up ON a trench, or its splitter cannot be cabled
+    runs, spur_stats = connect_unreached_pdps(runs, pdps, params, log)
+
     # attach the pre-straighten network for garden-leg snapping
     network_parts = [r.coords for r in runs]
 
@@ -1660,17 +2208,44 @@ def design(cfg: dict) -> dict:
         # NOTE: legs are NOT added to ``network_parts`` — a later house must
         # snap to the designed mains, never to another house's drop leg.
 
+    # ── trim the mains back to what is actually connected ────────────────
+    # Drops are already fixed, so the run set can be cut without touching the
+    # service: only MFG/PDP ends, leg attachments and junctions keep a trench.
+    mains_only = [r for r in runs if r.src != "house-drop"]
+    drops_only = [r for r in runs if r.src == "house-drop"]
+    mains_only, tail_stats = trim_unserved_tails(
+        mains_only, drops_only, _anchor_points(pdps, [], mfgs), params, log)
+
+    # ── re-establish "every PDP on a trench" on the FINAL run set ──────────
+    # The trim cuts a run back to its own supports, so a PDP that was 8 m from
+    # the network (closer than ``min_node_sep_m``, hence no spur) can end up
+    # beside it with nothing touching — measured on Berlin: PDP00019 left
+    # **17.77 m** from the nearest trench, a cabinet that cannot be cabled.
+    # The first pass runs before the trim, so the guarantee has to be remade
+    # here, with a tight tolerance: after trimming the question is no longer
+    # "is another chamber worth it" but "is this cabinet on a trench".
+    mains_only, pdp_spur_stats = connect_unreached_pdps(
+        mains_only, pdps, params, log, max_gap_m=2.0)
+    runs = mains_only + drops_only
+    log("runs after trimming: %d (%d feeder, %d distribution, %d garden)"
+        % (len(runs), sum(1 for r in runs if r.tier == "Feeder"),
+           sum(1 for r in runs if r.tier == "Distribution"),
+           sum(1 for r in runs if r.tier == "Garden")))
+
     # ── drills over carriageways ─────────────────────────────────────────
     drills = detect_drills(vehicular, runs, params, log)
 
     # ── per-run HDD arcs (the drill replaces the crossing length) ─────────
     drill_arcs: Dict[int, List[Tuple[float, float]]] = defaultdict(list)
     for d in drills:
-        arc = d.get("arc")
-        if arc is None:
-            continue
-        half = d["width"] / 2.0
-        drill_arcs[d["run"]].append((arc - half, arc + half))
+        arc0, arc1 = d.get("arc0"), d.get("arc1")
+        if arc0 is None or arc1 is None:      # older callers without the clamp
+            arc = d.get("arc")
+            if arc is None:
+                continue
+            half = d["width"] / 2.0
+            arc0, arc1 = arc - half, arc + half
+        drill_arcs[d["run"]].append((arc0, arc1))
 
     for r in runs:
         r.tier_type = getattr(r, "tier_type", "Open Cut")
@@ -1848,6 +2423,10 @@ def design(cfg: dict) -> dict:
         "trench_spans_in_aerial_zone": sum(1 for r in span_rows if r["AERIAL"]),
         "pruned_spans": len(pruned_rows),
         "pruned_length_m": round(sum(s["length_m"] for s in pruned_rows), 1),
+        "tails": tail_stats,
+        "connectivity": conn_stats,
+        "pdp_spurs": spur_stats,
+        "pdp_spurs_after_trim": pdp_spur_stats,
         "loose_ends": len(dangling),
         "spans_far_from_premise": len(far_spans),
         "elapsed_s": round(time.time() - t0, 1),
@@ -1919,6 +2498,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="report spans whose midpoint is this far from any premise")
     ap.add_argument("--keep-orphans", action="store_true",
                     help="keep span groups that reach no anchor (default: prune)")
+    ap.add_argument("--no-trim", action="store_true",
+                    help="keep unserved mains tails (default: trim to the last "
+                         "leg attachment / anchor / junction)")
     args = ap.parse_args(argv)
 
     cfg = {
@@ -1934,6 +2516,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "street_avoid_scale": args.street_avoid_scale,
         "far_premise_m": args.far_premise_m,
         "prune_dangling": not args.keep_orphans,
+        "trim_tails": not args.no_trim,
     }
     design(cfg)
     return 0
