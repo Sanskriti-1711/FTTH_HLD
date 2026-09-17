@@ -329,7 +329,26 @@ def _restore_task_from_disk(project_id: str) -> Optional[Dict[str, Any]]:
     if not layer_files:
         return None
 
+    # A task that already existed in the registry is owned by a pipeline thread
+    # (or was queued by one) — a task created right here is a project known only
+    # from its files (engine restart / no DB).
+    existed = project_id in tasks
     task = _task(project_id)
+    # NEVER override an in-flight run. The results map fetches its layers while
+    # the pipeline is still working, and at that moment none of the output files
+    # are registered on the task yet — so a restore would force the run to
+    # "completed / 100 % / Complete" the instant anyone opened a layer, while the
+    # project row (and the real pipeline) were still running. A live task only
+    # receives the on-disk file paths it is missing; status, stage, progress and
+    # the message log stay exactly as the pipeline reported them.
+    if existed and task.get("status") in ("running", "queued"):
+        merged_files = dict(layer_files)
+        merged_files.update(task.get("files") or {})
+        task["files"] = merged_files
+        if not (task.get("downloads") or []):
+            task["downloads"] = _register_downloads(project_id, output_dir)
+        task.setdefault("output_dir", str(output_dir))
+        return task
     task.update(
         {
             "status": "completed",
@@ -834,7 +853,36 @@ def delete_project(project_id: str) -> Dict[str, Any]:
 @app.get("/ftth/projects")
 def projects(limit: int = 50) -> List[Dict[str, Any]]:
     if postgis.is_available():
-        return postgis.list_projects(limit=limit)
+        rows = postgis.list_projects(limit=limit)
+        # Overlay the live in-memory state for runs the engine is executing
+        # right now. PostGIS only records status at start/finish and has no
+        # progress/stage columns, so a running project would otherwise be
+        # listed with the status/progress of its LAST write — leaving the
+        # project list (and the dashboard) unable to tell whether an
+        # in-flight run is still working or already finished, while the
+        # results page reports the real stage.
+        for row in rows:
+            live = tasks.get(row.get("project_id"))
+            if not live:
+                continue
+            # A live in-memory task is always the more recent truth — it also
+            # covers the window where the pipeline has finished but its final
+            # status write to PostGIS has not landed yet.
+            if live.get("status") not in ("running", "queued", "completed", "failed"):
+                continue
+            row["status"] = live.get("status")
+            # Same completion guarantee as _public_task: only a completed run
+            # reports 100 %, anything in flight is capped at 99 %.
+            if live.get("status") == "completed":
+                row["progress"] = 100
+            else:
+                row["progress"] = min(int(live.get("progress") or 0), 99)
+            row["stage"] = live.get("stage")
+            row["stage_name"] = live.get("stage")
+            row["stage_index"] = live.get("stage_index")
+            row["stage_count"] = live.get("stage_count")
+            row["updated_at"] = live.get("updated_at") or row.get("updated_at")
+        return rows
     return [
         _public_task(project_id)
         for project_id in sorted(tasks, key=lambda pid: tasks[pid].get("created_at", ""), reverse=True)
@@ -1651,6 +1699,71 @@ def _nearest_same_layer_props(
     return out
 
 
+# Canonical construction classes. The trench network is published with a
+# CLOSED 3-value set (Open Cut / HDD / Garden) so BOQ, permits and the field
+# app can rely on it. HLD baselines produced before that redesign — and legacy
+# survey imports — still carry the tier labels (Feeder / Distribution), which
+# the LLD would otherwise pass straight through into its own outputs.
+_TRENCH_CLASS_KEYS = ("trench_type", "USAGE_TYPE", "CONSTRUCT")
+
+
+def _canonical_trench_class(value: Any) -> Optional[str]:
+    """Map any historical trench label onto Open Cut / HDD / Garden."""
+    s = str(value or "").strip().lower()
+    if not s:
+        return None
+    if "garden" in s or "drop" in s:
+        return "Garden"
+    if "hdd" in s or "drill" in s or "bore" in s or "trenchless" in s:
+        return "HDD"
+    # Feeder / Distribution / Open Cut / micro-trench / anything else is civil
+    # open-cut excavation.
+    return "Open Cut"
+
+
+def _normalize_trench_construction_class(
+    by_layer: Dict[str, List[Dict[str, Any]]],
+) -> int:
+    """Force trench_type / USAGE_TYPE / CONSTRUCT to the closed 3-value set.
+
+    Runs on the LLD's trench layers only (``final_trenches`` plus any legacy
+    sub-layers). The baseline label is preserved in ``TRENCH_TIER`` when it was
+    a tier (Feeder / Distribution) so nothing is silently lost, and the network
+    tier used for reroute propagation is read earlier in the pipeline — this is
+    a publication-time normalisation, not a routing input.
+
+    ``aerial_drop_trenches`` is deliberately excluded: it keeps its own
+    ``Aerial_Drop`` class. Returns the number of normalised features.
+    """
+    names = ["final_trenches"] + sorted(TRENCH_SUB_LAYERS)
+    changed = 0
+    for name in names:
+        for f in by_layer.get(name) or []:
+            props = f.setdefault("properties", {})
+            raw = None
+            for key in _TRENCH_CLASS_KEYS:
+                if props.get(key) not in (None, ""):
+                    raw = props.get(key)
+                    break
+            if raw is None:
+                continue
+            raw_s = str(raw).strip()
+            canon = _canonical_trench_class(raw_s)
+            if canon is None:
+                continue
+            if raw_s.lower() != canon.lower():
+                # Remember what the baseline called it (Feeder/Distribution/…).
+                if not props.get("TRENCH_TIER"):
+                    props["TRENCH_TIER"] = raw_s
+                changed += 1
+            # Write the canonical class to all three aliases (filling the ones
+            # the baseline left empty) so every trench feature carries the same
+            # uniform construction class as the HLD publication.
+            for key in _TRENCH_CLASS_KEYS:
+                props[key] = canon
+    return changed
+
+
 def _inherit_trench_sub_layer_attributes(by_layer: Dict[str, List[Dict[str, Any]]]) -> int:
     """final_trenches is the combination of feeder + distribution (+ garden,
     mirrored into it by the pipeline) — every final trench feature should
@@ -2397,6 +2510,17 @@ def _run_lld(
             "LLD cable enrichment: %d distribution cable feature(s), 48-fibre catalogue, 2 reserved spare fibres." % cable_count,
         )
 
+        # Publication-time trench classification: the LLD's own output must
+        # speak the same closed 3-value construction class as the HLD, even
+        # when the HLD baseline predates the single-trench redesign.
+        normalized = _normalize_trench_construction_class(by_layer)
+        if normalized:
+            _lld_append(
+                project_id, lld_version, "info",
+                "Trench classification: %d feature(s) normalised to Open Cut / HDD / Garden "
+                "(baseline tier kept in TRENCH_TIER)." % normalized,
+            )
+
         task.update({"stage": "Validating network", "progress": 30, "updated_at": _now()})
         validation = _validate_network(by_layer)
         _lld_append(
@@ -2915,6 +3039,14 @@ def _run_lld_replan(
             duct_props["MAX_PDPS_PER_DUCT"] = LLD_MAX_PDPS_PER_DUCT
 
         # ── 6. Validate + write layers + zip (same contract as _run_lld) ──
+        normalized = _normalize_trench_construction_class(by_layer)
+        if normalized:
+            _lld_append(
+                project_id, lld_version, "info",
+                "Trench classification: %d feature(s) normalised to Open Cut / HDD / Garden "
+                "(baseline tier kept in TRENCH_TIER)." % normalized,
+            )
+
         task.update({"stage": "Validating fresh design", "progress": 90, "updated_at": _now()})
         validation = _validate_network(by_layer)
         _lld_append(

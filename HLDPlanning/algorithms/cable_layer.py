@@ -126,6 +126,90 @@ def _join_object_cable(dist_geom: QgsGeometry, garden_geom: QgsGeometry, proj_ge
     return QgsGeometry.fromPolylineXY(joined)
 
 
+def _heal_route_graph(adj, edge_geom, edge_len, anchor_nodes, must_reach_nodes,
+                      max_bridge_m=10.0):
+    """Join route-tree islands that hold a PDP back onto the MFG component.
+
+    The trench network is one corridor set on the ground, but the router's
+    graph only links two pieces when they land on the same node key.  Where
+    two source pieces meet within a few centimetres — a noding artefact — the
+    graph can split into islands, and a PDP sitting on one is silently left
+    out of the feeder plan (observed: 6 of 31 PDPs, ~500 premises, with no
+    error anywhere).
+
+    This bridges every island that holds an anchor back onto the component
+    holding the MFG, at the closest pair of nodes, so the feeder really does
+    run from the MFG to every PDP.  Only gaps up to ``max_bridge_m`` are
+    healed: a genuinely isolated island (a trench nobody connects to the MFG)
+    is left alone and reported instead of being linked by an invented line.
+
+    Returns (n_bridges, bridged_metres, [unreachable node keys]).
+    """
+    if not adj:
+        return 0, 0.0, list(must_reach_nodes)
+
+    def components():
+        comp, cid = {}, 0
+        for start in adj:
+            if start in comp:
+                continue
+            stack = [start]
+            comp[start] = cid
+            while stack:
+                u = stack.pop()
+                for v, _sid, _w in adj.get(u, ()):
+                    if v not in comp:
+                        comp[v] = cid
+                        stack.append(v)
+            cid += 1
+        return comp
+
+    comp = components()
+    counts = defaultdict(int)
+    for a in anchor_nodes:
+        if a in comp:
+            counts[comp[a]] += 1
+    if not counts:
+        return 0, 0.0, list(must_reach_nodes)
+    main = max(counts.items(), key=lambda kv: kv[1])[0]
+
+    n_bridges, bridged_m = 0, 0.0
+    while True:
+        islands = {}
+        for n in must_reach_nodes:
+            if n in comp and comp[n] != main:
+                islands.setdefault(comp[n], 0)
+        if not islands:
+            break
+        main_nodes = [n for n, c in comp.items() if c == main]
+        # Heal the island with the shortest possible gap first, so every
+        # bridge is the smallest link that makes the network usable.
+        best = None          # (gap, island_cid, island_node, main_node)
+        for cid in islands:
+            island_nodes = [n for n, c in comp.items() if c == cid]
+            for a in island_nodes:
+                for b in main_nodes:
+                    gap = math.hypot(a[0] - b[0], a[1] - b[1])
+                    if best is None or gap < best[0]:
+                        best = (gap, cid, a, b)
+        if best is None or best[0] > max_bridge_m:
+            break
+        gap, cid, a, b = best
+        link = QgsGeometry.fromPolylineXY([QgsPointXY(b[0], b[1]),
+                                           QgsPointXY(a[0], a[1])])
+        add_edge(adj, edge_geom, edge_len, b, a, link)
+        bridged_m += gap
+        n_bridges += 1
+        for n, c in comp.items():
+            if c == cid:
+                comp[n] = main
+
+    unreachable = [n for n in must_reach_nodes
+                   if n in comp and comp[n] != main]
+    unreachable += [n for n in must_reach_nodes if n not in comp]
+    return n_bridges, bridged_m, unreachable
+
+
 class AlgCableBuilderAll(QgsProcessingAlgorithm):
     # --- Inputs ---
     FEEDER_SRC   = "FEEDER_TRENCH"
@@ -501,6 +585,25 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
                 sub = geom_substring(geom, d0, d1)
                 add_edge(adj, edge_geom, edge_len, u, v, sub)
 
+        # Heal the route tree BEFORE labelling: an island that holds a PDP is
+        # bridged onto the MFG component at the closest pair of nodes, so no
+        # PDP can be silently dropped from the feeder plan.
+        n_bridges, bridged_m, unreachable = _heal_route_graph(
+            adj, edge_geom, edge_len,
+            [n for (n, _f) in mfg_nodes.values()],
+            [n for (n, _f) in pdp_nodes.values()],
+        )
+        n_pdp_total = pdps.featureCount()
+        if n_bridges:
+            feedback.pushInfo(
+                f"Feeder route tree healed: {n_bridges} micro-bridge(s) "
+                f"({bridged_m:.1f} m total) joined so every PDP is reachable.")
+        if unreachable:
+            feedback.pushWarning(
+                f"Feeder route tree: {len(unreachable)} PDP node(s) still "
+                "unreachable from the MFG after healing — these PDPs will not "
+                "be served (check the trench connectivity for them).")
+
         # Label every node with its nearest MFG (multi-source Dijkstra).
         label_dist = {}
         heap = []
@@ -525,20 +628,38 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
                 pdp_to_mfg[pid] = label_dist[nk][1]
 
         paths, demands, pid_mfg = {}, {}, {}
+        skipped = []          # (label, reason)
         for pid, (nk, _) in pdp_nodes.items():
+            label = pdp_label.get(pid, str(pid))
             mfg_id = pdp_to_mfg.get(pid)
             if mfg_id is None or mfg_id not in mfg_nodes:
+                skipped.append((label, "not reachable from any MFG"))
                 continue
             mnode = mfg_nodes[mfg_id][0]
             if mnode not in adj:
+                skipped.append((label, "MFG node is off the route tree"))
                 continue
             dist, parent = dijkstra_with_parents(mnode, adj)
             path = reconstruct_path(parent, nk, mnode)
             if not path:
+                skipped.append((label, "no MFG→PDP path on the route tree"))
                 continue
             paths[pid] = (path, path_len(edge_len, path))
             demands[pid] = self._pdp_demand(pdps, pid, f_pdp)
             pid_mfg[pid] = mfg_label[mfg_id]
+
+        # Make the feeder's PDP coverage explicit: booking 25 of 31 PDPs used
+        # to leave no trace in the log at all.
+        n_unsnapped = max(0, n_pdp_total - len(pdp_nodes))
+        feedback.pushInfo(
+            f"Feeder routing: {len(paths)}/{n_pdp_total} PDP(s) routed from the MFG"
+            + (f"; {n_unsnapped} not on the trench network (snap tolerance "
+               f"{self.SNAP_TOL} m)" if n_unsnapped else ""))
+        for label, reason in skipped[:20]:
+            feedback.pushWarning(f"  Feeder: PDP {label} not routed — {reason}")
+        if len(skipped) > 20:
+            feedback.pushWarning(
+                f"  Feeder: {len(skipped) - 20} further PDP(s) not routed.")
 
         if not paths:
             raise QgsProcessingException(

@@ -1157,6 +1157,26 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
             added_tan = 0
             tid = 1
 
+            # ── Crossing consolidation (fewer road crossings / HDD trenches) ─
+            # A dense urban grid puts several ≥3-way junctions within a few
+            # metres of each other (staggered crossroads, dual carriageways,
+            # paired intersections). Each one used to get its own 60 m
+            # perpendicular drill, so the routed network crossed the same
+            # stretch of road two or three times and produced duplicate HDD
+            # trenches. Two rules now avoid that:
+            #   • CROSSING_MERGE_M    — junctions closer than this share ONE
+            #     crossing (the first junction that yields a valid drill
+            #     serves the whole cluster);
+            #   • CROSSING_DEDUPE_M   — an accepted drill whose GEOMETRY lies
+            #     this close to a new one suppresses it (catches collinear /
+            #     parallel duplicates that point clustering can miss).
+            crossing_merge_m = 45.0
+            crossing_dedupe_m = 25.0
+            accepted_pts = []      # (x, y) of accepted crossings
+            accepted_geoms = []    # drill geometries of accepted crossings
+            merged_skip = 0        # junctions served by an existing crossing
+            overlap_skip = 0       # drills dropped as geometric duplicates
+
             # quick spatial indexes
             idx_roads_exp = QgsSpatialIndex(veh_roads_exploded.getFeatures()) if 'veh_roads_exploded' in locals() and veh_roads_exploded else None
 
@@ -1175,8 +1195,20 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                 return best[1]
 
             if centers and sinkTan:
-                for c in centers:
-                    cpt = QgsPointXY(c)
+                # Deterministic order so the cluster winner (and therefore the
+                # drill position) is reproducible between runs.
+                ordered_centers = sorted(
+                    (QgsPointXY(c) for c in centers),
+                    key=lambda p: (round(p.y(), 2), round(p.x(), 2)),
+                )
+                for cpt in ordered_centers:
+                    # (1) A junction already served by an accepted crossing is
+                    # not crossed a second time — reuse the existing HDD.
+                    if any((cpt.x() - ax) ** 2 + (cpt.y() - ay) ** 2 <= crossing_merge_m ** 2
+                           for ax, ay in accepted_pts):
+                        merged_skip += 1
+                        continue
+
                     roadf = _nearest_road_feat(cpt)
                     if not roadf:
                         continue
@@ -1195,14 +1227,27 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                     if not (left_hits and right_hits):
                         continue
 
+                    # (2) Geometric duplicate of an accepted drill (parallel /
+                    # collinear crossings on the same road) — keep the first.
+                    if any(trench.distance(ag) <= crossing_dedupe_m for ag in accepted_geoms):
+                        overlap_skip += 1
+                        continue
+
                     tf = QgsFeature(tan_fields)
                     tf.setGeometry(trench)
                     tf["id"] = tid
                     sinkTan.addFeature(tf)
                     tid += 1
                     added_tan += 1
+                    accepted_pts.append((cpt.x(), cpt.y()))
+                    accepted_geoms.append(trench)
 
-                feedback.pushInfo(f"✅ Tangent drills created: {added_tan} (radius={ibufr} m, length={cross_len} m).")
+                feedback.pushInfo(
+                    f"✅ Tangent drills created: {added_tan} (radius={ibufr} m, length={cross_len} m). "
+                    f"Crossing consolidation: {merged_skip} junction(s) served by a nearby crossing "
+                    f"(≤{crossing_merge_m:g} m), {overlap_skip} duplicate crossing(s) suppressed "
+                    f"(≤{crossing_dedupe_m:g} m)."
+                )
             else:
                 feedback.pushInfo("ℹ️ No valid centers/roads for tangent drills.")
 

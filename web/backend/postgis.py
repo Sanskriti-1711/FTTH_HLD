@@ -500,7 +500,15 @@ def load_geojson(
     geojson: Dict[str, Any],
     *,
     replace: bool = True,
+    sublayer: Optional[str] = None,
 ) -> int:
+    """Insert a layer's features into its GIS table.
+
+    ``sublayer`` tags every feature that does not already carry one. Grouped
+    layers (ducts = feeder + distribution + drop, cables = feeder +
+    distribution) share a single table, so without the tag the tier is lost on
+    ingest and the results map cannot offer them as separate toggles.
+    """
     table = normalize_layer_name(layer)
     features = geojson.get("features") or []
     source_srid = _guess_source_srid(geojson)
@@ -518,6 +526,9 @@ def load_geojson(
             if not isinstance(feature, dict):
                 continue
             props = feature.get("properties") or {}
+            if sublayer and not props.get("sublayer"):
+                props = dict(props)
+                props["sublayer"] = sublayer
             geom = feature.get("geometry")
             rows.append(
                 (
@@ -590,9 +601,12 @@ def load_geojson_file(
     file_path: str,
     *,
     replace: bool = True,
+    sublayer: Optional[str] = None,
 ) -> int:
     with open(file_path, "r", encoding="utf-8") as f:
-        return load_geojson(project_id, layer, json.load(f), replace=replace)
+        return load_geojson(
+            project_id, layer, json.load(f), replace=replace, sublayer=sublayer
+        )
 
 
 # ---------------------------------------------------------------------------

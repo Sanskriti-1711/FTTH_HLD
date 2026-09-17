@@ -1053,6 +1053,12 @@ class DuctLayer(QgsProcessingAlgorithm):
     O_DISTR   = "OUT_DISTRIBUTION_DUCTS"
     O_DROP    = "OUT_DROP_DUCTS"
     O_COUPLE  = "OUT_COUPLEURS"   # couplers at pseudo → object duct connections
+    # Per-route ducts (one feature per {ways}-way duct).  The published
+    # feeder/distribution layers carry ONE component per tier, so the route
+    # features are written here instead: the chamber stage counts them as
+    # "distinct ducts" at a junction, which is what places the chambers.
+    O_FEEDER_RUNS = "OUT_FEEDER_DUCT_RUNS"
+    O_DIST_RUNS   = "OUT_DISTRIBUTION_DUCT_RUNS"
 
     def createInstance(self): return DuctLayer()
     def name(self): return "05_duct_layer"
@@ -1082,6 +1088,10 @@ class DuctLayer(QgsProcessingAlgorithm):
         self.addParameter(QgsProcessingParameterVectorDestination(self.O_DISTR, "Distribution_Ducts"))
         self.addParameter(QgsProcessingParameterVectorDestination(self.O_DROP, "Drop_Ducts (small; pseudo → object)"))
         self.addParameter(QgsProcessingParameterVectorDestination(self.O_COUPLE, "Coupleurs (pseudo → object connection points)", optional=True))
+        self.addParameter(QgsProcessingParameterVectorDestination(
+            self.O_FEEDER_RUNS, "Feeder_Ducts — per-route runs (chamber inputs)", optional=True))
+        self.addParameter(QgsProcessingParameterVectorDestination(
+            self.O_DIST_RUNS, "Distribution_Ducts — per-route runs (chamber inputs)", optional=True))
 
     def _build_drop_ducts(self, p, context, feedback, out_spec,
                           garden_lyr, pseudo_lyr, obj_lyr, crs,
@@ -1336,7 +1346,7 @@ class DuctLayer(QgsProcessingAlgorithm):
         return out_id, c_id
 
     def _build_route_ducts(self, cables_lyr, out_uri, profile_key, crs,
-                           context, feedback, subtract_lyr=None):
+                           context, feedback, subtract_lyr=None, runs_uri=None):
         """Build ONE duct per connected route from a cable layer.
 
         Cables that co-route (spatially touch within a small tolerance) are
@@ -1469,6 +1479,18 @@ class DuctLayer(QgsProcessingAlgorithm):
         ):
             fields.append(QgsField(nm, t))
 
+        # Per-route layer keeps the run-level schema; the published component
+        # adds the aggregate columns describing what it merged.
+        run_fields = QgsFields(fields)
+        for nm, t in (
+            ("DUCT_ID", QMetaType.Type.QString),
+            ("N_DUCTS", QMetaType.Type.Int),
+            ("WAYS_TOTAL", QMetaType.Type.Int),
+            ("CLUBS", QMetaType.Type.Int),
+            ("BUNDLE_LEN_M", QMetaType.Type.Double),
+        ):
+            fields.append(QgsField(nm, t))
+
         try:
             sink, out_id = QgsProcessingUtils.createFeatureSink(
                 out_uri, context, fields, QgsWkbTypes.MultiLineString, crs)
@@ -1481,6 +1503,18 @@ class DuctLayer(QgsProcessingAlgorithm):
         if sink is None:
             return None
 
+        # Per-route ducts go to their own layer when one is requested: the
+        # chamber stage counts "distinct ducts" passing a junction, and one
+        # component per tier would collapse that count.
+        runs_sink, runs_id = None, None
+        if runs_uri:
+            try:
+                runs_sink, runs_id = QgsProcessingUtils.createFeatureSink(
+                    runs_uri, context, run_fields, QgsWkbTypes.MultiLineString, crs)
+            except Exception:
+                runs_sink, runs_id = None, None
+
+        bins = []            # (geom, cable_ids, pdp_ids, poly_ids, n_cables)
         made = 0
         flag_cnt = 0
         for members in groups.values():
@@ -1526,28 +1560,90 @@ class DuctLayer(QgsProcessingAlgorithm):
                     except Exception:
                         pass
                 n_cab = len(cable_ids)
-                nf = QgsFeature(fields)
-                nf.setGeometry(ug)
-                nf["DUCT_TYPE"] = prof.get("duct_type", "4-Way HDPE" if profile_key == "Feeder" else "2-Way HDPE")
-                nf["capacity_total"] = ways
-                nf["ways_used"] = n_cab      # always <= ways by construction
-                nf["cables_carried"] = ",".join(cable_ids)
-                nf["pdp_ids"] = ",".join(dict.fromkeys(pdp_set))
-                nf["POLYGON_ID"] = ",".join(dict.fromkeys(poly_set))
-                nf["length_m"] = round(float(ug.length()), 2)
-                nf["REVIEW"] = 0
-                nf["INFRA_STATUS"] = "Proposed"
-                sink.addFeature(nf, QgsFeatureSink.FastInsert)
+                bins.append((ug, cable_ids, pdp_set, poly_set, n_cab))
+                if runs_sink is not None:
+                    nf = QgsFeature(run_fields)
+                    nf.setGeometry(ug)
+                    nf["DUCT_TYPE"] = prof.get("duct_type", "4-Way HDPE" if profile_key == "Feeder" else "2-Way HDPE")
+                    nf["capacity_total"] = ways
+                    nf["ways_used"] = n_cab    # always <= ways by construction
+                    nf["cables_carried"] = ",".join(cable_ids)
+                    nf["pdp_ids"] = ",".join(dict.fromkeys(pdp_set))
+                    nf["POLYGON_ID"] = ",".join(dict.fromkeys(poly_set))
+                    nf["length_m"] = round(float(ug.length()), 2)
+                    nf["REVIEW"] = 0
+                    nf["INFRA_STATUS"] = "Proposed"
+                    runs_sink.addFeature(nf, QgsFeatureSink.FastInsert)
                 made += 1
                 if n_cab > ways:
                     flag_cnt += 1
 
+        # ── ONE component per tier, ducts on similar routes CLUBBED ───────
+        # The bins above are parallel ducts along the SAME streets: a corridor
+        # with more cables than the profile holds is built as several {ways}-way
+        # ducts laid side by side.  Published as laid, the same street would be
+        # drawn many times over (measured on the Berlin run: 87% of the
+        # distribution duct metres sit within 1 m of another duct — 148 runs
+        # covering a 6.3 km corridor).  The component therefore carries the
+        # CLUBBED corridor: every duct on the same route dissolved into ONE
+        # line per street.
+        #
+        # Nothing is lost: the material quantity — the sum of the parallel
+        # runs actually laid — is kept in BUNDLE_LEN_M (the BOQ bills that),
+        # N_DUCTS says how many parallel ducts a corridor needs, WAYS_TOTAL
+        # how many ways they provide, and CLUBS how many distinct routes were
+        # clubbed.  Chambers do not split the component: they are spliced into
+        # it afterwards and the chamber-bounded sections are recorded in
+        # SECTIONS_JSON.
+        from ..utils.geometry_ops import unary_union_geoms as _uug_club
+        agg_len = 0.0          # sum of the parallel runs = material metres
+        corridor_len = 0.0
+        agg_used = 0
+        agg_cables, agg_pdps, agg_polys = [], [], []
+        bin_geoms = []
+        for ug, cable_ids, pdp_set, poly_set, n_cab in bins:
+            bin_geoms.append(ug)
+            try:
+                agg_len += float(ug.length())
+            except Exception:
+                pass
+            agg_used += n_cab
+            agg_cables.extend(cable_ids)
+            agg_pdps.extend(pdp_set)
+            agg_polys.extend(poly_set)
+
+        club_geom = _uug_club(bin_geoms) if bin_geoms else None
+        if club_geom is not None and not club_geom.isEmpty():
+            corridor_len = float(club_geom.length())
+            nf = QgsFeature(fields)
+            nf.setGeometry(club_geom)
+            nf["DUCT_TYPE"] = prof.get("duct_type", "4-Way HDPE" if profile_key == "Feeder" else "2-Way HDPE")
+            nf["capacity_total"] = ways
+            nf["ways_used"] = int(agg_used)
+            nf["cables_carried"] = ",".join(agg_cables)
+            nf["pdp_ids"] = ",".join(dict.fromkeys(agg_pdps))
+            nf["POLYGON_ID"] = ",".join(dict.fromkeys(agg_polys))
+            nf["length_m"] = round(corridor_len, 2)
+            nf["BUNDLE_LEN_M"] = round(agg_len, 2)
+            nf["N_DUCTS"] = len(bins)
+            nf["WAYS_TOTAL"] = int(ways) * len(bins)
+            nf["CLUBS"] = len(groups)
+            nf["REVIEW"] = 1 if flag_cnt else 0
+            nf["INFRA_STATUS"] = "Proposed"
+            nf["DUCT_ID"] = f"{profile_key.upper()}-DUCT-001"
+            sink.addFeature(nf, QgsFeatureSink.FastInsert)
+
         if sink:
             del sink
+        if runs_sink:
+            del runs_sink
         feedback.pushInfo(
-            f"✅ Route ducts ({profile_key}): {made} x {ways}-way duct(s) from "
+            f"✅ Route ducts ({profile_key}): {made} x {ways}-way duct run(s) from "
             f"{len(feats)} cables over {len(groups)} route group(s) "
-            f"(cables split into {ways}-way ducts, {flag_cnt} oversized).")
+            f"(cables split into {ways}-way ducts, {flag_cnt} oversized) → clubbed "
+            f"into ONE {corridor_len:,.1f} m corridor component "
+            f"({len(groups)} route(s), {len(bins)} parallel run(s), "
+            f"{int(ways) * len(bins)} ways, {agg_len:,.1f} m of duct material).")
         return out_id
 
     @staticmethod
@@ -1596,6 +1692,11 @@ class DuctLayer(QgsProcessingAlgorithm):
         out_feeder_uri = self.parameterAsOutputLayer(p, self.O_FEEDER, context)
         out_distr_uri  = self.parameterAsOutputLayer(p, self.O_DISTR,  context)
         out_drop_uri   = self.parameterAsOutputLayer(p, self.O_DROP,   context)
+        # Optional per-route duct outputs (chamber-stage inputs).
+        runs_feeder_uri = (self.parameterAsOutputLayer(p, self.O_FEEDER_RUNS, context)
+                           if p.get(self.O_FEEDER_RUNS) else None)
+        runs_dist_uri = (self.parameterAsOutputLayer(p, self.O_DIST_RUNS, context)
+                         if p.get(self.O_DIST_RUNS) else None)
 
         # >>> ADD THE HELPER RIGHT HERE <<<
         from qgis.core import QgsVectorLayer, QgsProject, QgsProcessingUtils
@@ -1724,7 +1825,8 @@ class DuctLayer(QgsProcessingAlgorithm):
             try:
                 _rid = self._build_route_ducts(
                     feeder_cables, out_feeder_uri, "Feeder",
-                    net_lyr.crs(), context, feedback)
+                    net_lyr.crs(), context, feedback,
+                    runs_uri=runs_feeder_uri)
                 feeder_route_done = _rid is not None
             except Exception as e:
                 try:
@@ -1878,7 +1980,8 @@ class DuctLayer(QgsProcessingAlgorithm):
                     dist_cables, out_distr_uri, "Distribution",
                     QgsCoordinateReferenceSystem(self.DEFAULT_CRS_AUTHID),
                     context, feedback,
-                    subtract_lyr=garden_lyr)
+                    subtract_lyr=garden_lyr,
+                    runs_uri=runs_dist_uri)
                 dist_route_done = _rid is not None
             except Exception as e:
                 try:
@@ -1892,6 +1995,9 @@ class DuctLayer(QgsProcessingAlgorithm):
                 self.O_FEEDER: locals().get("out_feeder_uri", None),
                 self.O_DISTR:  out_distr_uri,
                 self.O_DROP:   locals().get("out_drop_id", None),
+                self.O_COUPLE: locals().get("out_coupler_id", None),
+                self.O_FEEDER_RUNS: runs_feeder_uri,
+                self.O_DIST_RUNS:   runs_dist_uri,
             }
 
         # Safe run
@@ -1925,6 +2031,8 @@ class DuctLayer(QgsProcessingAlgorithm):
             self.O_DISTR:  out_distr_uri,
             self.O_DROP:   out_drop_id,
             self.O_COUPLE: locals().get("out_coupler_id", None),
+            self.O_FEEDER_RUNS: runs_feeder_uri,
+            self.O_DIST_RUNS:   runs_dist_uri,
         }
 
 

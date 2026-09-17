@@ -14,6 +14,10 @@ Implements the 8-rule chamber placement logic:
   5. Cable joint locations         → covered by junction chambers (rule 2)
   6. Direction changes             → Manhole/Handhole at duct bends > 45°
   7. Road crossings / HDD pits     → DHH at BOTH ends (entry + exit) of every drill crossing
+                                     These are placed FIRST (before every other rule)
+                                     and reserve the widest keep-out (HDD_PIT_SPACING_M),
+                                     so the drill openings always get their chamber and
+                                     no other structure is stacked next to them.
   8. Long straight routes          → intermediate pull Manholes/Handholes
                                      every ~250 m along long duct runs
 
@@ -24,6 +28,14 @@ Types follow the HLD_attr.docx Simple Rule:
 
 Candidates within their rule-specific spacing are collapsed
 (Chamber > Manhole > Handhole, densest junction first).
+
+Separation rules (HLD review):
+  • HDD pits first — placed before all other rules, widest keep-out.
+  • Every pair of placed structures keeps at least
+    MIN_STRUCTURE_SEPARATION_M so no two chambers sit real close by.
+  • A splitter location (PDP) that falls inside an HDD pit's keep-out is
+    MERGED into that pit (the pit becomes the PDP/F2D chamber and records
+    the PDP id) instead of stacking a second chamber next to it.
 """
 import math
 from qgis.PyQt.QtCore import QCoreApplication
@@ -55,7 +67,15 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
     JUNCTION_MIN_DUCTS = 3      # distinct ducts required for a junction chamber (rule 2)
     JUNCTION_SPACING_M = 40.0   # min spacing between junction-derived Manholes/Handholes
     HANDHOLE_SPACING_M = 40.0   # min spacing for distribution-level handholes
-    CHAMBER_SPACING_M = 2.0     # collapse chamber candidates closer than this
+    CHAMBER_SPACING_M = 2.0     # legacy default (superseded by the rules below)
+    # ── Structure separation (HLD review: no two chambers side by side) ──
+    # HDD entry/exit pits are placed FIRST and reserve the widest keep-out;
+    # every other structure is then placed respecting a global minimum
+    # separation, so two civil structures never end up real close by.
+    HDD_PIT_SPACING_M = 15.0        # keep-out around an HDD entry/exit pit
+    MIN_STRUCTURE_SEPARATION_M = 10.0  # floor between ANY two planned structures
+    MANDATORY_MERGE_M = 20.0        # a splitter location within this of a pit
+                                    # merges into it instead of stacking
     BEND_ANGLE_DEG = 60.0       # direction change above this gets a structure (rule 6)
     BEND_SPACING_M = 25.0       # min spacing between bend-derived structures
     BEND_MIN_LEG_M = 3.0        # both legs of the angle must be at least this long (snap zigzags)
@@ -263,12 +283,13 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
     # and finally intermediate pull structures.  A higher-ranked rule always
     # beats a lower one at the same spot, regardless of raw weight.
     RULE_ORDER = {
-        "Splitter/F2D (PDP)": 0,
-        # HDD pits rank WITH branching junctions: their exact weight (999)
-        # places them first among rank-1, so junction manholes are not
-        # dropped next to an entry/exit pit that already provides access.
-        "HDD pit": 1,
-        "Branching junction": 1,
+        # HDD entry/exit pits are placed FIRST (priority 3 = PDP level, weight
+        # 1000 beats the PDP's 999) so the drill openings are never dropped and
+        # always reserve HDD_PIT_SPACING_M around them. Everything else is then
+        # fitted around them.
+        "HDD pit": 0,
+        "Splitter/F2D (PDP)": 1,
+        "Branching junction": 2,
         "Drop transition": 3,
         "Direction change": 4,
         "Pull point": 5,
@@ -281,14 +302,22 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
     def _place_structures(self, candidates):
         """Greedy placement: highest priority first, densest junctions first.
 
-        Sort key = (type priority, rule order, weight) so that branching
-        junctions (rule 1 in the 8-rule spec) are never starved by bend or
-        pull candidates whose raw weight (angle degrees, spacing) is larger.
+        Sort key = (type priority, rule order, weight) so that HDD pits and PDP
+        chambers (priority 3) are always placed before junctions, bends and
+        pull points, and branching junctions are never starved by bend or pull
+        candidates whose raw weight (angle degrees, spacing) is larger.
 
         Candidates carry their own rule-specific spacing as the 7th tuple
-        element (2 m for chambers, 40 m for junctions, 25 m for bends, 20 m
-        for drop transitions, 250 m for pull structures).  A candidate is
-        kept unless a previously kept structure sits within that spacing.
+        element. The effective keep-out between two structures is the WIDER of
+        the two demands (``max(sp_new, sp_placed)``) — so an HDD pit keeps its
+        HDD_PIT_SPACING_M even against a candidate that would otherwise accept
+        a tighter fit — and a global floor (MIN_STRUCTURE_SEPARATION_M) applies
+        to every pair, so no two chambers end up real close by.
+
+        Mandatory splitter locations are never lost: a PDP chamber that falls
+        inside a placed HDD pit's keep-out is merged INTO that pit (the pit is
+        upgraded into the PDP/F2D chamber and records the PDP id) rather than
+        pushing a second structure next to it.
 
         Pull chambers (rule 8) are the exception: they exist precisely to
         fill long empty stretches every ~250 m, so they must be spaced
@@ -302,18 +331,44 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
         )
         kept = []
         index = QgsSpatialIndex()
+        merged_splitter = 0   # PDP chambers folded into an HDD pit
+        blocked_close = 0     # candidates dropped for sitting too close
         for cand in ordered:
             x, y, prio, ctype, equip, weight = cand[:6]
             reason = cand[7] if len(cand) > 7 else ""
             sp = cand[6] if len(cand) > 6 else self.CHAMBER_SPACING_M
+            # Global floor: no two planned structures closer than this.
+            sp = max(sp, self.MIN_STRUCTURE_SEPARATION_M)
             if reason == "Pull point":
                 # Only blocked by a structure essentially at the same spot;
                 # spacing against *other* pull points is their own 250 m.
-                cl = self.PULL_CLEARANCE_M
+                cl = max(self.PULL_CLEARANCE_M, self.MIN_STRUCTURE_SEPARATION_M)
                 rect = QgsRectangle(x - cl, y - cl, x + cl, y + cl)
             else:
                 rect = QgsRectangle(x - sp, y - sp, x + sp, y + sp)
-            if index.intersects(rect):
+            blocked = False
+            for bid in index.intersects(rect):
+                # index ids == position in `kept`
+                bx, by = kept[bid][0], kept[bid][1]
+                bsp = kept[bid][6] if len(kept[bid]) > 6 else self.CHAMBER_SPACING_M
+                breason = kept[bid][7] if len(kept[bid]) > 7 else ""
+                keepout = max(sp, bsp)
+                if (x - bx) ** 2 + (y - by) ** 2 > keepout ** 2:
+                    continue  # inside the box, outside the real keep-out
+                blocked = True
+                # A splitter location must always own a chamber — if the
+                # blocking structure is an HDD pit, upgrade the pit into the
+                # PDP/F2D chamber instead of stacking two structures here.
+                if reason == "Splitter/F2D (PDP)" and breason == "HDD pit" \
+                        and (x - bx) ** 2 + (y - by) ** 2 <= self.MANDATORY_MERGE_M ** 2:
+                    bk = list(kept[bid])
+                    tag = ("PDP:" + str(equip)) if equip else "PDP"
+                    bk[4] = (str(bk[4]) + ("; " if bk[4] else "") + tag)
+                    kept[bid] = tuple(bk)
+                    merged_splitter += 1
+                break
+            if blocked:
+                blocked_close += 1
                 continue
             fid = len(kept)
             kept.append(cand)
@@ -321,6 +376,10 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
             feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(x, y)))
             feat.setId(fid)
             index.addFeature(feat)
+        self._place_stats = {
+            "merged_splitter": merged_splitter,
+            "blocked_close": blocked_close,
+        }
         return kept
 
     def _line_parts_xy(self, geom):
@@ -654,7 +713,7 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
                 if f.fields().indexOf("PDP_ID") >= 0:
                     pid = str(f["PDP_ID"] or "")
                 candidates.append((pt.x(), pt.y(), 3, "Chamber", pid, 999,
-                                   self.CHAMBER_SPACING_M, "Splitter/F2D (PDP)"))
+                                   self.MIN_STRUCTURE_SEPARATION_M, "Splitter/F2D (PDP)"))
 
         # Rule 7 — HDD entry/exit pits at used drill crossings.
         # A drill (HDD) trench needs a chamber at BOTH ends so the cable can
@@ -709,8 +768,8 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
             too_close = any((x - sx) ** 2 + (y - sy) ** 2 < 4.0
                             for sx, sy in seen_drill)
             if not too_close:
-                candidates.append((x, y, 2, "Chamber", "", 999,
-                                   self.CHAMBER_SPACING_M, "HDD pit"))
+                candidates.append((x, y, 3, "Chamber", "", 1000,
+                                   self.HDD_PIT_SPACING_M, "HDD pit"))
                 seen_drill.append((x, y))
 
         # (b) Fallback: tangent-crossing midpoints, only when the trench
@@ -736,8 +795,8 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
                         too_close = True
                         break
                 if not too_close:
-                    candidates.append((px, py, 2, "Manhole", "", 999,
-                                       self.JUNCTION_SPACING_M, "HDD pit"))
+                    candidates.append((px, py, 3, "Manhole", "", 1000,
+                                       self.HDD_PIT_SPACING_M, "HDD pit"))
                     seen_drill.append((px, py))
 
         # Rule 2 — Branching points: Manhole at feeder junctions, Handhole at
@@ -915,10 +974,16 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
                 written += 1
 
         rc = ", ".join(f"{k}: {v}" for k, v in sorted(reason_counts.items()))
+        stats = getattr(self, "_place_stats", {}) or {}
         feedback.pushInfo(self.tr(
             f"Chamber layer: {written} planned structures "
             f"(MH: {counters['MH']}, DHH: {counters['DHH']}, HH: {counters['HH']}).\n"
             f"  Placement reasons: {rc or 'none'}\n"
+            f"  Separation: {stats.get('blocked_close', 0)} candidate(s) dropped inside an "
+            f"existing keep-out (floor {self.MIN_STRUCTURE_SEPARATION_M:g} m, "
+            f"HDD pit keep-out {self.HDD_PIT_SPACING_M:g} m); "
+            f"{stats.get('merged_splitter', 0)} splitter location(s) merged into the HDD pit "
+            f"they sit on.\n"
             f"  Boundary: {dropped_boundary} candidate(s) outside design boundary removed; "
             f"{snapped_building} chamber(s) snapped out of buildings; "
             f"{snapped_trench} chamber(s) snapped onto trench paths (tol {self.TRENCH_SNAP_M} m)."))

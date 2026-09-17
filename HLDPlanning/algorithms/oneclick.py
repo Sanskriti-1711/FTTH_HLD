@@ -275,6 +275,10 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         "OUT_FEEDER_DUCTS", "OUT_DISTRIBUTION_DUCTS", "OUT_DROP_DUCTS",
     )
     _DU_OUT_COUPLE = "OUT_COUPLEURS"
+    # Per-route ducts (published feeder/distribution layers carry ONE
+    # component per tier; the chamber stage counts the per-route runs).
+    _DU_FEEDER_RUNS = "OUT_FEEDER_DUCT_RUNS"
+    _DU_DIST_RUNS = "OUT_DISTRIBUTION_DUCT_RUNS"
 
     _METHOD_OPTIONS = [
         "Convex Hull (optional inset)",
@@ -930,20 +934,39 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         dc = cables.get(self._CB_OUT_DIST)
         if dc:
             params[self._DU_DIST_CABLES] = dc
+        # Per-route duct layers for the chamber stage (see duct_layer):
+        # junction chambers are placed where >= 3 DISTINCT ducts meet, so that
+        # stage must see the runs rather than the published single component.
+        out_dir = self._output_dir(parameters, context)
+        if out_dir:
+            params[self._DU_FEEDER_RUNS] = os.path.join(
+                out_dir, "Feeder_Ducts_Runs.gpkg")
+            params[self._DU_DIST_RUNS] = os.path.join(
+                out_dir, "Distribution_Ducts_Runs.gpkg")
         return processing.run(ALG.DUCT, params, context=context, feedback=feedback,
                               is_child_algorithm=True)
 
     def run_chamber_layer(self, parameters, results, context, feedback):
         """Stage 7: plan civil chambers from duct junctions + PDPs."""
         ducts = results.get("ducts") or {}
+        # Prefer the per-route duct layers: the published feeder/distribution
+        # layers are ONE component per tier, and the junction rule (>= 3
+        # distinct ducts) plus the distribution-endpoint rule both need the
+        # individual runs.  Falls back to the published layers when the runs
+        # were not produced (no cable-driven duct build).
+        runs = results.get("duct_runs") or {}
+        feeder_ducts_in = (runs.get(self._DU_FEEDER_RUNS)
+                           or ducts.get(self._DU_OUT_FEEDER))
+        dist_ducts_in = (runs.get(self._DU_DIST_RUNS)
+                         or ducts.get(self._DU_OUT_DIST))
         # Resolve the trench stage's temporary tangent-crossing layer to a
         # concrete layer object (or None).  Passing an unresolved temp-id
         # string into a child algorithm has caused native crashes in headless
         # runs, so we never hand the raw id downstream.
         tangents = self._fast_resolve(results.get("tangents_used"), context)
         params = {
-            "INPUT_FEEDER_DUCTS": ducts.get(self._DU_OUT_FEEDER),
-            "INPUT_DIST_DUCTS": ducts.get(self._DU_OUT_DIST),
+            "INPUT_FEEDER_DUCTS": feeder_ducts_in,
+            "INPUT_DIST_DUCTS": dist_ducts_in,
             "INPUT_DROP_DUCTS": ducts.get(self._DU_OUT_DROP),
             "INPUT_PDP": results.get("pdp"),
             "INPUT_TANGENT_CROSSINGS": tangents,
@@ -1401,6 +1424,10 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         duct = self._run("Duct Layer", self.run_duct_layer,
                          parameters, context, steps, feedback, results=results)
         results["ducts"] = duct
+        results["duct_runs"] = {
+            self._DU_FEEDER_RUNS: duct.get(self._DU_FEEDER_RUNS),
+            self._DU_DIST_RUNS: duct.get(self._DU_DIST_RUNS),
+        }
         elapsed = time.time() - t0
         n_fd = self._fast_count(duct.get(self._DU_OUT_FEEDER), context)
         n_dd = self._fast_count(duct.get(self._DU_OUT_DIST), context)
@@ -1509,7 +1536,17 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         if out_dir:
             t_enrich = time.time()
             try:
-                attr_enrich.enrich_all(out_dir, feedback)
+                # The roads input is needed for one thing the pipeline can't
+                # derive itself: attributing each trench SECTION to the road
+                # it runs along (street name + fclass), which the permits,
+                # street tables and BOQ reference all key on.
+                _roads_lyr = None
+                try:
+                    _roads_lyr = self.parameterAsVectorLayer(
+                        parameters, self.P_ROADS, context)
+                except Exception:
+                    _roads_lyr = None
+                attr_enrich.enrich_all(out_dir, feedback, roads_lyr=_roads_lyr)
             except Exception as exc:
                 feedback.pushWarning(
                     self.tr("Catalogue enrichment failed: %s") % exc)

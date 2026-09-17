@@ -233,7 +233,258 @@ def enrich_trench_sublayers(out_dir, feedback=None):
     return total
 
 
-def enrich_trenches(trench_path, feedback=None):
+# ── Road attribution per trench SECTION ─────────────────────────────────────
+# The Final_Trenches layer publishes ONE feature per construction class, each
+# holding every continuous run as a geometry part.  A single road class / street
+# name for a whole 4 km grouped feature is meaningless: permits are street-wise,
+# so each SECTION (part) is attributed to the road it runs along.
+#
+# This runs in the QGIS python (GDAL present) where the project's roads layer is
+# already loaded, and writes a per-section lookup onto the feature:
+#   SECTION_STREETS — JSON { "lon,lat": {n: street, f: fclass, h: highway} }
+# keyed by the section's MID VERTEX (5 dp ≈ 1 m), which the backend resolves
+# without any GDAL.  STREET_NAME carries the dominant street of the feature for
+# the map tooltip; N_SECTIONS the part count.
+
+ROAD_SNAP_M = 40.0     # must match permits/analysis/road_class.SNAP_METERS
+_ROAD_CELL = 0.002     # ~150-220 m grid cell for the nearest-road lookup
+_ROAD_MARGIN = 0.003   # roads beyond this around the AOI can never serve
+
+
+def _mid_key(lon, lat):
+    """Section key — MUST match permits.analysis.sections.coord_key.
+
+    Always WGS84 (lon, lat): the trench GPKG the pipeline writes is projected
+    (EPSG:25833) while the roads input and the ingested PostGIS layer are 4326,
+    so section mid points are transformed before keying and before the street
+    lookup — otherwise the keys never match on the backend side.
+    """
+    return "%.5f,%.5f" % (float(lon), float(lat))
+
+
+def _wgs84_transform(src_srs):
+    """CRS → EPSG:4326 transform (None when the source is already 4326)."""
+    try:
+        from osgeo import osr
+    except Exception:
+        return None
+    if src_srs is None:
+        return None
+    try:
+        if src_srs.GetAuthorityCode(None) == "4326":
+            return None
+        src = src_srs.Clone()
+        dst = osr.SpatialReference()
+        dst.ImportFromEPSG(4326)
+        for srs in (src, dst):
+            try:
+                srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+            except Exception:
+                pass
+        return osr.CoordinateTransformation(src, dst)
+    except Exception:
+        return None
+
+
+def _aoi_wgs84(layer, transform, margin=_ROAD_MARGIN):
+    """Layer extent converted to a WGS84 bbox expanded by ``margin`` degrees."""
+    ext = layer.GetExtent()
+    if not ext or ext[0] > ext[1]:
+        return None
+    minx, maxx, miny, maxy = ext
+    pts = [(minx, miny), (maxx, miny), (minx, maxy), (maxx, maxy),
+           ((minx + maxx) / 2, (miny + maxy) / 2)]
+    if transform is not None:
+        pts = [(transform.TransformPoint(x, y)[0], transform.TransformPoint(x, y)[1])
+               for x, y in pts]
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    return (min(xs) - margin, max(xs) + margin, min(ys) - margin, max(ys) + margin)
+
+
+def _line_parts(geom):
+    """Every LineString inside a (multi)line geometry as a coordinate list."""
+    parts = []
+    if geom is None or geom.IsEmpty():
+        return parts
+    name = geom.GetGeometryName().upper()
+    if "MULTI" in name or name in ("GEOMETRYCOLLECTION", "POLYGON", "MULTIPOLYGON"):
+        for i in range(geom.GetGeometryCount()):
+            parts.extend(_line_parts(geom.GetGeometryRef(i)))
+        return parts
+    if name == "LINESTRING":
+        coords = [(geom.GetX(i), geom.GetY(i)) for i in range(geom.GetPointCount())]
+        if len(coords) >= 2:
+            parts.append(coords)
+    return parts
+
+
+class _RoadIndex:
+    """Nearest-road lookup (name + fclass) for section mid vertices.
+
+    Roads are split into consecutive-point segments, clipped to the trench AOI
+    and bucketed into a coarse lon/lat grid, so a nearest query inspects a
+    handful of candidates instead of the whole 50k-road extract.  Distances are
+    metres via a local equirectangular approximation — exact enough for the
+    40 m snap the attribution uses.
+    """
+
+    def __init__(self, roads_source, aoi, feedback=None):
+        self._cell = _ROAD_CELL
+        self._grid = {}
+        self._keys = []
+        minx, maxx, miny, maxy = aoi
+        n = 0
+        roads_lyr, _roads_ds = _as_ogr_layer(roads_source)
+        if roads_lyr is None:
+            if feedback:
+                feedback.pushInfo("  [street] roads layer not readable — skipped.")
+            return
+        d = roads_lyr.GetLayerDefn()
+        i_name = next((d.GetFieldIndex(f) for f in ("name", "NAME", "street", "STREET")
+                       if d.GetFieldIndex(f) >= 0), -1)
+        i_class = next((d.GetFieldIndex(f) for f in ("fclass", "FCLASS", "highway", "class")
+                        if d.GetFieldIndex(f) >= 0), -1)
+        for feat in roads_lyr:
+            name = (feat.GetField(i_name) or "") if i_name >= 0 else ""
+            fclass = (feat.GetField(i_class) or "") if i_class >= 0 else ""
+            if not name and not fclass:
+                continue
+            for coords in _line_parts(feat.GetGeometryRef()):
+                for i in range(len(coords) - 1):
+                    (ax, ay), (bx, by) = coords[i], coords[i + 1]
+                    if (max(ax, bx) < minx or min(ax, bx) > maxx
+                            or max(ay, by) < miny or min(ay, by) > maxy):
+                        continue
+                    idx = len(self._keys)
+                    self._keys.append((ax, ay, bx, by, str(name), str(fclass)))
+                    n += 1
+                    for cx in range(int(min(ax, bx) / self._cell), int(max(ax, bx) / self._cell) + 1):
+                        for cy in range(int(min(ay, by) / self._cell), int(max(ay, by) / self._cell) + 1):
+                            self._grid.setdefault((cx, cy), []).append(idx)
+        _roads_ds = None  # segments are copied into the index; release GDAL
+        if feedback:
+            feedback.pushInfo(
+                f"  [street] road index: {n} segment(s) inside the AOI "
+                f"({len(self._grid)} grid cell(s)).")
+
+    def nearest(self, lon, lat, snap_m=ROAD_SNAP_M):
+        """Nearest road within ``snap_m`` metres: (street, fclass) or None."""
+        if not self._grid:
+            return None
+        kx = 111320.0 * math.cos(math.radians(lat))
+        ky = 110540.0
+        cx0 = int(lon / self._cell)
+        cy0 = int(lat / self._cell)
+        best = None
+        best_d = snap_m
+        # ±2 cells ≈ ±300 m lon / ±440 m lat — more than enough for a 40 m snap.
+        for cx in range(cx0 - 2, cx0 + 3):
+            for cy in range(cy0 - 2, cy0 + 3):
+                for idx in self._grid.get((cx, cy), ()):
+                    ax, ay, bx, by, name, fclass = self._keys[idx]
+                    axm, aym = (ax - lon) * kx, (ay - lat) * ky
+                    bxm, bym = (bx - lon) * kx, (by - lat) * ky
+                    dx, dy = bxm - axm, bym - aym
+                    L = dx * dx + dy * dy
+                    if L <= 0:
+                        dist = math.hypot(axm, aym)
+                    else:
+                        t = -(axm * dx + aym * dy) / L
+                        t = 0.0 if t < 0 else (1.0 if t > 1 else t)
+                        dist = math.hypot(axm + t * dx, aym + t * dy)
+                    if dist < best_d:
+                        best_d = dist
+                        best = (name, fclass)
+        return best
+
+
+def _as_ogr_layer(source):
+    """Accept an OGR layer, a QgsVectorLayer or a path → (OGR layer, dataset).
+
+    The pipeline hands over a ``QgsVectorLayer``; the OGR API used here needs a
+    plain OGR layer, so the layer's ``source()`` is opened with GDAL.  QGIS
+    sources can carry ``|layername=…`` suffixes and ``/vsizip/`` prefixes, both
+    of which OGR understands.
+    """
+    if source is None or not _HAS_OGR:
+        return None, None
+    if hasattr(source, "GetLayerDefn"):        # already an OGR layer
+        return source, None
+    path = source.source() if hasattr(source, "source") else source
+    if not isinstance(path, str) or not path:
+        return None, None
+    for candidate in (path, path.split("|")[0], "/vsizip/" + path.split("|")[0]):
+        try:
+            ds = ogr.Open(candidate, 0)
+        except Exception:
+            ds = None
+        if ds is not None:
+            lyr = ds.GetLayer(0)
+            if lyr is not None:
+                return lyr, ds
+            ds = None
+    return None, None
+
+
+def _aoi_of(layer, margin=_ROAD_MARGIN):
+    """Extent of a layer expanded by ``margin`` degrees (bbox union)."""
+    ext = layer.GetExtent()
+    if not ext or ext[0] > ext[1]:
+        return None
+    return (ext[0] - margin, ext[1] + margin, ext[2] - margin, ext[3] + margin)
+
+
+def attribute_section_streets(trench_path, roads_source, feedback=None):
+    """Give every trench SECTION the street it runs along (see _RoadIndex)."""
+    ds, lyr = _open_lyr(trench_path)
+    if lyr is None or roads_source is None:
+        return 0
+    _create_fields(lyr, [
+        ("SECTION_STREETS", ogr.OFTString, 0),
+        ("STREET_NAME", ogr.OFTString, 96),
+        ("N_SECTIONS", ogr.OFTInteger),
+    ])
+    transform = _wgs84_transform(lyr.GetSpatialRef())
+    aoi = _aoi_wgs84(lyr, transform)
+    idx = _RoadIndex(roads_source, aoi or (-180.0, 180.0, -90.0, 90.0), feedback)
+    total = 0
+    named = 0
+    for f in lyr:
+        parts = _line_parts(f.GetGeometryRef())
+        sections = {}
+        counts = {}
+        for part in parts:
+            mid = part[len(part) // 2]
+            lon, lat = mid[0], mid[1]
+            if transform is not None:
+                try:
+                    lon, lat = transform.TransformPoint(mid[0], mid[1])[:2]
+                except Exception:
+                    continue
+            hit = idx.nearest(lon, lat)
+            if not hit:
+                continue
+            street, fclass = hit
+            sections[_mid_key(lon, lat)] = {"n": street, "f": fclass}
+            if street:
+                counts[street] = counts.get(street, 0) + 1
+        f.SetField("SECTION_STREETS", json.dumps(sections, ensure_ascii=False))
+        f.SetField("N_SECTIONS", len(parts))
+        if counts:
+            f.SetField("STREET_NAME", max(counts.items(), key=lambda kv: (kv[1], kv[0]))[0])
+            named += 1
+        lyr.SetFeature(f)
+        total += len(sections)
+    ds = None
+    if feedback:
+        feedback.pushInfo(
+            f"  [street] Final_Trenches: {total} section(s) attributed to a road "
+            f"across {named} feature(s).")
+    return total
+
+
+def enrich_trenches(trench_path, feedback=None, roads_lyr=None):
     ds, lyr = _open_lyr(trench_path)
     if lyr is None:
         return 0
@@ -287,9 +538,17 @@ def enrich_trenches(trench_path, feedback=None):
             f.SetField("INFRA_STATUS", "Proposed")
         lyr.SetFeature(f)
         n += 1
-    ds = None
+    ds, lyr = None, None
     if feedback:
         feedback.pushInfo(f"  [enrich] Final_Trenches: {n} civil attributes applied.")
+    # Street attribution needs the roads layer, so it runs after the attribute
+    # pass (which reopened the layer once already).
+    if roads_lyr is not None:
+        try:
+            attribute_section_streets(trench_path, roads_lyr, feedback)
+        except Exception as exc:
+            if feedback:
+                feedback.pushInfo(f"  [street] Section attribution skipped: {exc}")
     return n
 
 
@@ -450,7 +709,10 @@ def splice_ducts_at_chambers(feeder_path, dist_path, chamber_path, feedback=None
         if lyr is None:
             continue
         _create_fields(lyr, [
-            ("SECTION_CHAIN", ogr.OFTString, 256),
+            # One component per tier carries the WHOLE chamber chain, so this
+            # is unlimited text (a 256-char cap truncated the distribution
+            # chain at ~1/25th of its length).
+            ("SECTION_CHAIN", ogr.OFTString, 0),   # 0 = unlimited (GPKG text)
             ("N_SECTIONS", ogr.OFTInteger),
             ("SECTIONS_JSON", ogr.OFTString, 0),  # 0 = unlimited (GPKG text)
         ])
@@ -625,7 +887,25 @@ def enrich_ducts(feeder_path, dist_path, drop_path, trench_path, chamber_path, f
             cc = str(_get(lyr, f, "cables_carried") or "")
             n_cab = len([c for c in cc.split(",") if c.strip()]) if cc.strip() else 0
             occupied = n_cab if n_cab > 0 else int(prof.get("occupied", 1))
-            occ = (occupied / prof["ways"]) * 100.0
+            # A grouped component holds every route of its tier, so its ways
+            # are the AGGREGATE (WAYS_USED over WAYS_TOTAL) rather than one
+            # duct profile — otherwise seven feeder cables on a 4-way profile
+            # read as 175 % occupancy. Fall back to the single-duct rule when
+            # the aggregates are absent (older outputs / drop ducts).
+            total_ways = 0
+            try:
+                total_ways = int(_num(lyr, f, "WAYS_TOTAL", 0))
+            except Exception:
+                total_ways = 0
+            used_ways = 0
+            try:
+                used_ways = int(_num(lyr, f, "WAYS_USED", 0))
+            except Exception:
+                used_ways = 0
+            if total_ways > 0 and used_ways > 0:
+                occ = (used_ways / total_ways) * 100.0
+            else:
+                occ = (occupied / prof["ways"]) * 100.0
             f.SetField("OCCUPANCY_PCT", round(min(occ, 100.0), 1))
             f.SetField("SPARE_PCT", round(max(0.0, 100.0 - occ), 1))
             f.SetField("INFRA_STATUS", "Proposed")
@@ -643,6 +923,27 @@ def enrich_ducts(feeder_path, dist_path, drop_path, trench_path, chamber_path, f
                     chamber_path, sx, sy, 15.0, "STRUCT_ID"))
                 f.SetField("END_CHAMBER", _nearest_id(
                     chamber_path, ex, ey, 15.0, "STRUCT_ID"))
+            # A grouped component (one feature per tier) no longer begins at a
+            # chamber — its first vertex is simply wherever the first member
+            # run started. Take the corridor's endpoints from the chamber
+            # section chain instead: first chamber reached → last chamber
+            # reached. Falls back to the geometric values above when the
+            # corridor has no chamber splices.
+            sec_json = str(_get(lyr, f, "SECTIONS_JSON") or "")
+            if sec_json:
+                try:
+                    secs = json.loads(sec_json)
+                except Exception:
+                    secs = []
+                if isinstance(secs, list) and secs:
+                    starts = [str(s.get("start")) for s in secs
+                              if isinstance(s, dict) and s.get("start")]
+                    ends = [str(s.get("end")) for s in secs
+                            if isinstance(s, dict) and s.get("end")]
+                    if starts:
+                        f.SetField("START_CHAMBER", starts[0])
+                    if ends:
+                        f.SetField("END_CHAMBER", ends[-1])
             lyr.SetFeature(f)
             total += 1
         ds = None
@@ -839,8 +1140,13 @@ def enrich_equipment(pdp_path, mfg_path, feedback=None):
 
 # ── Combined entry point ─────────────────────────────────────────────────────
 
-def enrich_all(out_dir, feedback=None):
-    """Enrich every pipeline GPKG inside out_dir (no-op when out_dir is empty)."""
+def enrich_all(out_dir, feedback=None, roads_lyr=None):
+    """Enrich every pipeline GPKG inside out_dir (no-op when out_dir is empty).
+
+    ``roads_lyr`` is the project's roads input layer (a QgsVectorLayer).  It is
+    only used to attribute each trench SECTION to the road it runs along — the
+    one attribute that cannot be derived from the pipeline's own geometry.
+    """
     if not out_dir or not os.path.isdir(out_dir):
         if feedback:
             feedback.pushInfo(
@@ -853,10 +1159,12 @@ def enrich_all(out_dir, feedback=None):
         return os.path.join(out_dir, name)
 
     n = 0
-    # Splice chambers into the duct corridors FIRST (continuous geometry —
+    # Splice chambers into the duct corridors (continuous geometry —
     # ducts run unbroken through chambers; sections recorded in attributes).
-    # enrich_ducts then stamps catalogue attrs + endpoint chambers on the
-    # still-whole corridors.
+    # The duct stage already publishes ONE component per tier (feeder =
+    # MFG → every PDP, distribution = PDP → pseudo objects), so the chamber
+    # chain is recorded on that single component.  enrich_ducts then stamps
+    # catalogue attrs + endpoint chambers on the still-whole corridors.
     try:
         n_sp = splice_ducts_at_chambers(
             p("Feeder_Ducts.gpkg"), p("Distribution_Ducts.gpkg"),
@@ -869,7 +1177,7 @@ def enrich_all(out_dir, feedback=None):
         if feedback:
             feedback.pushInfo(f"  [splice] Duct splicing skipped: {exc}")
 
-    n += enrich_trenches(p("Final_Trenches.gpkg"), feedback)
+    n += enrich_trenches(p("Final_Trenches.gpkg"), feedback, roads_lyr=roads_lyr)
     n += enrich_trench_sublayers(out_dir, feedback)
     n += enrich_ducts(
         p("Feeder_Ducts.gpkg"), p("Distribution_Ducts.gpkg"), p("Drop_Ducts.gpkg"),
