@@ -55,9 +55,26 @@ from osgeo import ogr, osr
 WALKABLE_CLASSES = (
     "footway", "path", "pedestrian", "living_street", "service",
     "cycleway", "steps", "track", "residential", "unclassified",
+    "bridleway", "sidewalk",
 )
 # Walkable classes that are *not* carriageways — these are never "crossed".
-PURE_FOOTWAY_CLASSES = ("footway", "path", "pedestrian", "cycleway", "steps")
+PURE_FOOTWAY_CLASSES = ("footway", "path", "pedestrian", "cycleway", "steps",
+                        "bridleway", "sidewalk")
+
+# Classes a trench is carried by. These are the carriers the existing HLD
+# engine routes on: footway / path / pedestrian / sidewalk / service /
+# cycleway ("Build network from OSM footways/paths/service; cross vehicular
+# roads with perpendicular drills").
+PREFERRED_CARRIER_CLASSES = (
+    "footway", "path", "pedestrian", "sidewalk", "service", "cycleway",
+)
+# Carriageway classes. A trench CAN run along one (Berlin has streets whose
+# footway is unmapped), but only when no preferred carrier gets there — see
+# CLASS_FACTOR. `track` is a field/dirt track: trenchable only as a last
+# resort.
+FALLBACK_CARRIER_CLASSES = (
+    "residential", "unclassified", "living_street", "track",
+)
 
 # Carriageway width by OSM class — used as the drill (HDD) length base.
 VEHICULAR_WIDTH_M = {
@@ -77,12 +94,43 @@ NON_CARRIER_CLASSES = tuple(
 )
 
 # Edge weight multipliers: routing prefers the sidewalk corridor.
+#
+# The preferred carriers are cheap, carriageways are expensive — a router will
+# walk a footway detour many times longer before it runs a trench down a
+# carriageway. This is the "avoid the streets" rule: the old engine refused to
+# route on carriageways at all, but refusing outright breaks areas with
+# unmapped footways, so they stay reachable at a heavy cost.
+CARRIAGE_FACTOR = 12.0
 CLASS_FACTOR = {
-    "footway": 1.0, "path": 1.0, "pedestrian": 1.0, "cycleway": 1.05,
-    "steps": 1.6, "service": 1.05, "living_street": 1.1, "track": 1.2,
-    "residential": 1.15, "unclassified": 1.2,
+    "footway": 1.0, "path": 1.0, "pedestrian": 1.0, "sidewalk": 1.0,
+    "cycleway": 1.05, "service": 1.05, "steps": 1.6, "bridleway": 1.3,
 }
-NON_CARRIER_FACTOR = 3.0   # still usable when nothing else exists
+
+# The street-avoidance ladder. A trench along a carriageway needs a road
+# opening permit and traffic management, so the cost is ordered by how big the
+# road is — a district road is far worse to dig than a residential street:
+#
+#     residential < tertiary < secondary < primary/motorway
+#
+# Every class stays *routable* (a graph that refuses outright disconnects), but
+# at these weights the router will accept a kilometres-long footway detour
+# before it enters a street, and when it must use one it picks the smallest
+# class available. `track` is a field haul road: cheap to cross, poor to dig.
+STREET_CLASS_FACTOR = {
+    "track": CARRIAGE_FACTOR * 0.85,      # 10.2 — dirt/field track
+    "residential": CARRIAGE_FACTOR,       # 12.0 — base street cost
+    "unclassified": CARRIAGE_FACTOR,
+    "living_street": CARRIAGE_FACTOR,
+    "tertiary_link": CARRIAGE_FACTOR * 2.5,
+    "tertiary": CARRIAGE_FACTOR * 3.0,    # 36.0 — district road
+    "secondary_link": CARRIAGE_FACTOR * 5.0,
+    "secondary": CARRIAGE_FACTOR * 6.0,   # 72.0 — state road
+    "primary_link": CARRIAGE_FACTOR * 8.0,
+    "primary": CARRIAGE_FACTOR * 9.0,     # 108.0 — federal road
+    "trunk": CARRIAGE_FACTOR * 12.0,
+    "motorway": CARRIAGE_FACTOR * 15.0,
+}
+NON_CARRIER_FACTOR = CARRIAGE_FACTOR  # any carriageway not in the ladder
 
 
 @dataclass
@@ -106,6 +154,18 @@ class Params:
     house_search_m: float = 120.0     # house → network search limit
     road_bbox_buffer_m: float = 400.0  # AOI buffer for reading OSM roads
     crossing_angle_deg: float = 20.0  # below this the trench runs along the road
+    # Street avoidance: multiplier on the whole carriageway cost ladder
+    # (STREET_CLASS_FACTOR). 1.0 = the tuned default; raise to push the router
+    # further onto footways, lower to let it use streets sooner.
+    street_avoid_scale: float = 1.0
+    # A designed line that ends in mid-air (no anchor, no junction) is a spur:
+    # prune it. ``prune_anchor_m`` is the tolerance for "this end is an anchor".
+    prune_dangling: bool = True
+    prune_anchor_m: float = 3.0      # how close an end must be to "reach" an anchor
+    prune_join_m: float = 3.0        # how close an end must be to join another span
+    # Diagnostic only: a span whose midpoint is further than this from every
+    # premise/anchor is reported (never silently removed).
+    far_premise_m: float = 80.0
     # Aerial: a drop leg inside an aerial zone (or longer than this, when set)
     # is built aerial — drawn as an aerial drop, never excavated. 0 = length
     # rule off (zone layer only).
@@ -299,6 +359,14 @@ class GridIndex:
                 out.extend(self.cells.get((i, j), ()))
         return out
 
+    def any_within(self, x: float, y: float, radius: float) -> bool:
+        """True when an indexed point lies within ``radius`` of (x, y)."""
+        for i in self.near(x, y, radius):
+            px, py = self.items[i]
+            if math.hypot(px - x, py - y) <= radius:
+                return True
+        return False
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Layer IO
@@ -451,7 +519,17 @@ def _read_road_parts(path: str, target_epsg: int, bbox=None
             if rect is not None:
                 lyr.SetSpatialFilterRect(*rect)
         tr = _transform(lyr_srs, target_epsg)
-        i_cls = lyr.GetLayerDefn().GetFieldIndex("fclass")
+        defn = lyr.GetLayerDefn()
+        i_cls = defn.GetFieldIndex("fclass")
+        i_bridge = defn.GetFieldIndex("bridge")
+        i_tunnel = defn.GetFieldIndex("tunnel")
+
+        def _is_true(idx, feat) -> bool:
+            if idx < 0:
+                return False
+            val = feat.GetField(idx)
+            return str(val).strip().upper() in ("T", "TRUE", "1", "YES")
+
         for f in lyr:
             g = f.GetGeometryRef()
             if g is None or g.IsEmpty():
@@ -460,7 +538,13 @@ def _read_road_parts(path: str, target_epsg: int, bbox=None
             if tr is not None:
                 g.Transform(tr)
             cls = str(f.GetField(i_cls) or "") if i_cls >= 0 else ""
+            # A trench cannot be dug on a bridge deck or through a tunnel, so
+            # those segments are never carriers (they stay crossable).
+            deck = _is_true(i_bridge, f) or _is_true(i_tunnel, f)
             for coords in _part_coords(g):
+                if deck:
+                    veh.append((coords, cls))
+                    continue
                 if cls in WALKABLE_CLASSES:
                     walk.append((coords, cls))
                     # Streets that are walkable *and* drivable (residential,
@@ -562,9 +646,7 @@ def build_street_graph(walkable: Sequence[Tuple[List[Tuple[float, float]], str]]
         return s
 
     def factor(cls: str) -> float:
-        if cls in NON_CARRIER_CLASSES:
-            return NON_CARRIER_FACTOR
-        return CLASS_FACTOR.get(cls, 1.4)
+        return _class_factor(cls, params.street_avoid_scale)
 
     n_edges = 0
     for coords, cls in walkable:
@@ -604,6 +686,21 @@ def build_street_graph(walkable: Sequence[Tuple[List[Tuple[float, float]], str]]
                        index=idx, node_keys=node_keys)
 
 
+def _class_factor(cls: str, scale: float = 1.0) -> float:
+    """Routing weight multiplier for a road class.
+
+    Preferred carriers (footway / path / service / cycleway) are ~1.0; every
+    carriageway comes from :data:`STREET_CLASS_FACTOR`, ordered by road size.
+    ``scale`` (``Params.street_avoid_scale``) dials the whole street penalty
+    up or down without changing the order.
+    """
+    if cls in STREET_CLASS_FACTOR:
+        return max(1.0, STREET_CLASS_FACTOR[cls] * max(0.0, scale))
+    if cls in NON_CARRIER_CLASSES:
+        return max(1.0, NON_CARRIER_FACTOR * max(0.0, scale))
+    return CLASS_FACTOR.get(cls, 1.4)
+
+
 def _path_edges(G: nx.Graph, path: Sequence[str]) -> List[Tuple[str, str]]:
     return [(path[i], path[i + 1]) if path[i] < path[i + 1] else (path[i + 1], path[i])
             for i in range(len(path) - 1)]
@@ -614,6 +711,23 @@ def _route(G: nx.Graph, src: str, dst: str) -> Optional[List[str]]:
         return nx.shortest_path(G, src, dst, weight="weight")
     except Exception:
         return None
+
+
+def _edge_class_lengths(sg: StreetGraph, edge_keys) -> Dict[str, float]:
+    """Metres per road class over a set of routed street edges.
+
+    Reported after routing so the carrier mix (how much of the design runs on
+    a footway vs down a carriageway) is visible in the run log — the point of
+    the class factors is that the carriageway share stays small.
+    """
+    out: Dict[str, float] = defaultdict(float)
+    for ek in edge_keys:
+        if not sg.G.has_edge(*ek):
+            continue
+        cls = str(sg.G.edges[ek].get("cls") or "?")
+        coords = sg.edge_coords.get(ek) or []
+        out[cls] += _coords_len(coords) if len(coords) >= 2 else 0.0
+    return dict(out)
 
 
 def _orient(seg: Sequence[Tuple[float, float]], ref: Tuple[float, float]
@@ -1217,6 +1331,232 @@ def _aerial_flag(zone_polys, coords: Sequence[Tuple[float, float]]) -> str:
     return ""
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Anchored-network checks: "is every trench going somewhere?"
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _SegGrid:
+    """Uniform grid over line segments — nearest-segment queries in O(1)."""
+
+    def __init__(self, cell: float = 25.0) -> None:
+        self.cell = cell
+        self.cells: Dict[Tuple[int, int], List[Tuple[int, Tuple[float, float],
+                                                           Tuple[float, float]]]] = defaultdict(list)
+
+    def add(self, idx: int, a: Tuple[float, float], b: Tuple[float, float]) -> None:
+        c = self.cell
+        x0, x1 = sorted((a[0], b[0]))
+        y0, y1 = sorted((a[1], b[1]))
+        for cx in range(int(math.floor(x0 / c)), int(math.floor(x1 / c)) + 1):
+            for cy in range(int(math.floor(y0 / c)), int(math.floor(y1 / c)) + 1):
+                self.cells[(cx, cy)].append((idx, a, b))
+
+    def nearest(self, x: float, y: float, max_d: float,
+                exclude: Optional[int] = None) -> float:
+        """Distance to the closest indexed segment (``max_d`` when none is near).
+
+        ``exclude`` skips one span's own segments — the question "does this end
+        touch *another* span" is meaningless if the span counts itself (its own
+        endpoint is always 0 m from its own geometry).
+        """
+        c = self.cell
+        best = max_d
+        cx, cy = int(math.floor(x / c)), int(math.floor(y / c))
+        for gx in range(cx - 1, cx + 2):
+            for gy in range(cy - 1, cy + 2):
+                for i, a, b in self.cells.get((gx, gy), ()):
+                    if exclude is not None and i == exclude:
+                        continue
+                    d = _point_seg_dist(x, y, a, b)
+                    if d < best:
+                        best = d
+        return best
+
+    def nearest_index(self, x: float, y: float, max_d: float,
+                      exclude: Optional[int] = None) -> Optional[int]:
+        """Index of the span whose geometry passes closest to (x, y)."""
+        c = self.cell
+        best, best_i = max_d, None
+        cx, cy = int(math.floor(x / c)), int(math.floor(y / c))
+        for gx in range(cx - 1, cx + 2):
+            for gy in range(cy - 1, cy + 2):
+                for i, a, b in self.cells.get((gx, gy), ()):
+                    if exclude is not None and i == exclude:
+                        continue
+                    d = _point_seg_dist(x, y, a, b)
+                    if d < best:
+                        best, best_i = d, i
+        return best_i
+
+
+def _point_seg_dist(x: float, y: float, a: Tuple[float, float],
+                    b: Tuple[float, float]) -> float:
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    if dx == 0.0 and dy == 0.0:
+        return math.hypot(x - a[0], y - a[1])
+    t = ((x - a[0]) * dx + (y - a[1]) * dy) / (dx * dx + dy * dy)
+    t = max(0.0, min(1.0, t))
+    return math.hypot(x - (a[0] + t * dx), y - (a[1] + t * dy))
+
+
+def _span_coords(sp: dict) -> List[Tuple[float, float]]:
+    """Coordinate list of a span row.
+
+    Span rows carry their geometry as a MULTILINESTRING ``geom`` (what the
+    trench layers publish), not a bare coord list.
+    """
+    for part in _part_coords(sp.get("geom")):
+        if len(part) >= 2:
+            return list(part)
+    return []
+
+
+def _anchor_points(pdps, houses, mfgs) -> List[Tuple[float, float]]:
+    """Every point a trench is allowed to end at (premise, PDP, MFG)."""
+    out: List[Tuple[float, float]] = []
+    for group in (houses, pdps, mfgs):
+        out.extend((float(p["x"]), float(p["y"])) for p in group)
+    return out
+
+
+def prune_unanchored_spans(span_rows: List[dict], anchors_pts: Sequence[Tuple[float, float]],
+                           params: Params, log) -> Tuple[List[dict], List[dict]]:
+    """Drop span groups that reach no anchor — a trench to nowhere.
+
+    A designed sub-network is only worth digging when it reaches something: a
+    house/premise, a PDP or a MFG, or joins a group that does. A group of spans
+    that touches none of them is a stray assembly over a disconnected street
+    fragment (the classic "trench extending where it isn't needed").
+
+    Connectivity is *geometry*, not shared endpoints: a service leg that starts
+    mid-span on another run joins that run's group, and a house drop anchors
+    every span it hangs off. (Getting this wrong — endpoint keys only — prunes
+    distribution runs that are in fact feeding houses: measured 18 spans over
+    11 live drops on the Berlin project.)
+
+    Only *whole* groups are dropped: a single span is never cut out of a live
+    chain, so an anchored network cannot be damaged. The removals are written
+    to ``Pruned_Trenches`` so every drop stays auditable.
+    """
+    if not params.prune_dangling or not span_rows:
+        return list(span_rows), []
+    tol = 1.0
+    join_tol = max(1.0, params.prune_join_m)
+
+    def key(pt) -> Tuple[int, int]:
+        return (int(round(pt[0] / tol)), int(round(pt[1] / tol)))
+
+    parent: Dict[int, int] = {i: i for i in range(len(span_rows))}
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    # 1. spans sharing an endpoint are one line
+    ends: Dict[Tuple[int, int], List[int]] = defaultdict(list)
+    for i, sp in enumerate(span_rows):
+        c = _span_coords(sp)
+        if len(c) < 2:
+            continue
+        ends[key(c[0])].append(i)
+        ends[key(c[-1])].append(i)
+    for _k, idxs in ends.items():
+        for other in idxs[1:]:
+            union(idxs[0], other)
+
+    # 2. a span whose end lands on another span's geometry joins it (T-join)
+    grid = _SegGrid(cell=25.0)
+    for i, sp in enumerate(span_rows):
+        c = _span_coords(sp)
+        for j in range(len(c) - 1):
+            grid.add(i, c[j], c[j + 1])
+    for i, sp in enumerate(span_rows):
+        c = _span_coords(sp)
+        if len(c) < 2:
+            continue
+        for pt in (c[0], c[-1]):
+            j = grid.nearest_index(pt[0], pt[1], join_tol, exclude=i)
+            if j is not None:
+                union(i, j)
+
+    anchor_grid = GridIndex(cell=max(20.0, 2 * params.prune_anchor_m))
+    for i, (ax, ay) in enumerate(anchors_pts):
+        anchor_grid.add(ax, ay, i)
+
+    # A span whose end lands on an anchor, or whose SRC is a house drop, anchors
+    # its whole group.
+    anchored: Set[int] = set()
+    for i, sp in enumerate(span_rows):
+        if sp.get("SRC") == "house-drop":
+            anchored.add(find(i))
+            continue
+        c = _span_coords(sp)
+        if len(c) < 2:
+            continue
+        for pt in (c[0], c[-1]):
+            if anchor_grid.any_within(pt[0], pt[1], params.prune_anchor_m):
+                anchored.add(find(i))
+                break
+
+    keep, pruned = [], []
+    pruned_groups: Set[int] = set()
+    for i, sp in enumerate(span_rows):
+        root = find(i)
+        if root in anchored:
+            keep.append(sp)
+        else:
+            pruned.append(sp)
+            pruned_groups.add(root)
+    if pruned:
+        log("pruned %d span(s) (%.1f m) in %d unanchored group(s) - trench to nowhere"
+            % (len(pruned), sum(s["length_m"] for s in pruned), len(pruned_groups)))
+    return keep, pruned
+
+
+def dangling_ends(span_rows: Sequence[dict], anchors_pts: Sequence[Tuple[float, float]],
+                  params: Params, tol: float = 3.0) -> List[dict]:
+    """Designed ends that are neither an anchor nor a junction (diagnostic).
+
+    Reported, never deleted: a single end in mid-air is often the last house of
+    a service leg, while a *chain* of them is a real spur. Counting them per
+    run is what tells us whether the design is reaching where it should.
+    """
+    if not span_rows:
+        return []
+    anchor_grid = GridIndex(cell=max(20.0, 2 * params.prune_anchor_m))
+    for i, (ax, ay) in enumerate(anchors_pts):
+        anchor_grid.add(ax, ay, i)
+    grid = _SegGrid(cell=25.0)
+    for i, sp in enumerate(span_rows):
+        c = _span_coords(sp)
+        for j in range(len(c) - 1):
+            grid.add(i, c[j], c[j + 1])
+    out: List[dict] = []
+    for i, sp in enumerate(span_rows):
+        # a house drop is anchored by definition (its far end is the premise)
+        if sp.get("SRC") == "house-drop":
+            continue
+        c = _span_coords(sp)
+        if len(c) < 2:
+            continue
+        for pt, which in ((c[0], "start"), (c[-1], "end")):
+            if anchor_grid.any_within(pt[0], pt[1], params.prune_anchor_m):
+                continue
+            # a T-join onto *another* span counts as connected
+            if grid.nearest(pt[0], pt[1], tol, exclude=i) < tol:
+                continue
+            out.append({"TRENCH_ID": sp["TRENCH_ID"], "RUN_ID": sp["RUN_ID"],
+                        "which": which, "x": round(pt[0], 1), "y": round(pt[1], 1)})
+    return out
+
+
 def design(cfg: dict) -> dict:
     """Run the designer. ``cfg`` keys mirror the CLI arguments."""
     t0 = time.time()
@@ -1276,6 +1616,16 @@ def design(cfg: dict) -> dict:
             straight = _straighten(coords, params)
             runs.append(Run(coords=straight, tier=tier, pdp=pid,
                             polygon=None, src="street-graph"))
+    carrier_mix = _edge_class_lengths(sg, feeder_keys | dist_keys)
+    log("carriers: " + ", ".join(
+        "%s %.0f m" % (k, v)
+        for k, v in sorted(carrier_mix.items(), key=lambda kv: -kv[1])[:6]))
+    carriage_m = sum(v for k, v in carrier_mix.items()
+                     if k in FALLBACK_CARRIER_CLASSES)
+    if carrier_mix:
+        log("carriageway carrier: %.0f m of %.0f m (%.1f%%) - footway/service first"
+            % (carriage_m, sum(carrier_mix.values()),
+               100.0 * carriage_m / max(1.0, sum(carrier_mix.values()))))
     log(f"runs: {len(runs)} assembled "
         f"({sum(1 for r in runs if r.tier == 'Feeder')} feeder, "
         f"{sum(1 for r in runs if r.tier == 'Distribution')} distribution)")
@@ -1369,6 +1719,45 @@ def design(cfg: dict) -> dict:
             # LLD and BOQ readers expect) — one part per span.
             "geom": _make_multiline([sp["coords"]]),
         })
+    # ── "is every trench going somewhere?" ───────────────────────────────
+    # Anchors: a trench may only end at a premise, a PDP or the MFG (or join
+    # another span). Groups of spans that reach none of them are dropped, and
+    # the end-of-line diagnostic is reported so a partly dangling design shows
+    # up in the run log instead of on the map.
+    anchors_pts = _anchor_points(pdps, houses, mfgs)
+    span_rows, pruned_rows = prune_unanchored_spans(span_rows, anchors_pts, params, log)
+    if pruned_rows:
+        _write_lines(os.path.join(out_dir, "Pruned_Trenches.gpkg"), "Pruned_Trenches",
+                     pruned_rows, FIELD_LINE, params.target_epsg,
+                     geom_type=ogr.wkbMultiLineString)
+    dangling = dangling_ends(span_rows, anchors_pts, params)
+    if dangling:
+        by_run: Dict[str, int] = defaultdict(int)
+        for d in dangling:
+            by_run[d["RUN_ID"]] += 1
+        log("loose ends: %d end(s) not at an anchor/junction across %d run(s) %s"
+            % (len(dangling), len(by_run),
+               ", ".join(sorted(by_run)[:6])))
+
+    # ── spans reaching no premise at all (diagnostic, never removed) ──────
+    grid_houses = GridIndex(cell=50.0)
+    for i, h in enumerate(houses):
+        grid_houses.add(h["x"], h["y"], i)
+    far_spans = []
+    for sp in span_rows:
+        c = _span_coords(sp)
+        if len(c) < 2:
+            continue
+        mid = c[len(c) // 2]
+        if not grid_houses.any_within(mid[0], mid[1], params.far_premise_m):
+            far_spans.append({"TRENCH_ID": sp["TRENCH_ID"],
+                              "TRENCH_TIER": sp["TRENCH_TIER"],
+                              "length_m": sp["length_m"]})
+    if far_spans:
+        log("far from any premise: %d span(s) (%.0f m) - backbone connectors unless "
+            "the ends are loose" % (len(far_spans),
+                                    sum(s["length_m"] for s in far_spans)))
+
     # per-run span indexing
     _index_spans(span_rows)
 
@@ -1447,6 +1836,9 @@ def design(cfg: dict) -> dict:
         "length_by_type_m": {k: round(v, 1) for k, v in sorted(by_type.items())},
         "length_by_tier_m": {k: round(v, 1) for k, v in sorted(by_tier.items())},
         "nodes": {k: v for k, v in _count_by(nodes, "NODE_TYPE").items()},
+        "carrier_length_by_class_m": {k: round(v, 1)
+                                     for k, v in sorted(carrier_mix.items())},
+        "carriageway_carrier_m": round(carriage_m, 1),
         "drills": len(drills),
         "garden_legs": len(legs),
         "aerial_legs": len(aerial_rows),
@@ -1454,6 +1846,10 @@ def design(cfg: dict) -> dict:
         "aerial_by_reason": _count_by(
             [{"r": r["AERIAL_REASON"]} for r in aerial_rows], "r"),
         "trench_spans_in_aerial_zone": sum(1 for r in span_rows if r["AERIAL"]),
+        "pruned_spans": len(pruned_rows),
+        "pruned_length_m": round(sum(s["length_m"] for s in pruned_rows), 1),
+        "loose_ends": len(dangling),
+        "spans_far_from_premise": len(far_spans),
         "elapsed_s": round(time.time() - t0, 1),
         "log": messages,
     }
@@ -1516,6 +1912,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--crossing-dedupe", type=float, default=25.0)
     ap.add_argument("--pull-backbone", type=float, default=250.0)
     ap.add_argument("--pull-dist", type=float, default=100.0)
+    ap.add_argument("--street-avoid-scale", type=float, default=1.0,
+                    help="multiplier on the carriageway cost ladder (1.0 default; "
+                         "raise to avoid streets harder)")
+    ap.add_argument("--far-premise-m", type=float, default=80.0,
+                    help="report spans whose midpoint is this far from any premise")
+    ap.add_argument("--keep-orphans", action="store_true",
+                    help="keep span groups that reach no anchor (default: prune)")
     args = ap.parse_args(argv)
 
     cfg = {
@@ -1528,6 +1931,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "crossing_merge_m": args.crossing_merge,
         "crossing_dedupe_m": args.crossing_dedupe,
         "pull_backbone_m": args.pull_backbone, "pull_dist_m": args.pull_dist,
+        "street_avoid_scale": args.street_avoid_scale,
+        "far_premise_m": args.far_premise_m,
+        "prune_dangling": not args.keep_orphans,
     }
     design(cfg)
     return 0

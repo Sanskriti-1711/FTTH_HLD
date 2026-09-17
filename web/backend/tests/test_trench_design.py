@@ -13,6 +13,7 @@ Run from the engine backend dir:
 """
 
 import math
+import os
 import pathlib
 import sys
 
@@ -124,6 +125,44 @@ def test_backbone_prefers_footway_over_carriageway():
     # every chosen edge is tagged with the walkable class
     for ek in edges:
         assert sg.G.edges[ek[0], ek[1]]["cls"] == "footway"
+
+
+def test_carriageway_is_only_a_last_resort_carrier():
+    """A longer footway detour must win over a short residential shortcut."""
+    walk = [([(0, 0), (0, 300)], "footway"), ([(0, 300), (300, 300)], "footway"),
+            ([(300, 300), (300, 0)], "footway"), ([(0, 0), (300, 0)], "residential")]
+    p = td.Params()
+    sg = td.build_street_graph(walk, p)
+    edges = td.design_backbone(sg, {"x": 0.0, "y": 0.0},
+                               [{"x": 300.0, "y": 0.0, "PDP_ID": "PDP-1"}],
+                               p, lambda m: None)
+    classes = {sg.G.edges[e[0], e[1]]["cls"] for e in edges}
+    assert classes == {"footway"}      # 900 m of footway vs a 300 m street
+    assert td.CARRIAGE_FACTOR >= 4.0   # the dial that makes that true
+
+
+def test_bridge_and_tunnel_segments_are_never_carriers(tmp_path=None):
+    """A trench cannot be dug on a bridge deck or through a tunnel."""
+    import json as _json
+    import tempfile
+
+    fc = {"type": "FeatureCollection", "features": [
+        {"type": "Feature", "properties": {"fclass": "footway"},
+         "geometry": {"type": "LineString", "coordinates": [[13.4, 52.5], [13.401, 52.5]]}},
+        {"type": "Feature", "properties": {"fclass": "footway", "bridge": "T"},
+         "geometry": {"type": "LineString", "coordinates": [[13.402, 52.5], [13.403, 52.5]]}},
+        {"type": "Feature", "properties": {"fclass": "service", "tunnel": "T"},
+         "geometry": {"type": "LineString", "coordinates": [[13.404, 52.5], [13.405, 52.5]]}},
+    ]}
+    path = os.path.join(tempfile.mkdtemp(), "roads.geojson")
+    with open(path, "w", encoding="utf-8") as fh:
+        _json.dump(fc, fh)
+    walk, veh = td._read_road_parts(path, 25833)
+    assert len(walk) == 1 and walk[0][1] == "footway"
+    # both excluded parts stay crossable (they are still roads)
+    assert len(veh) == 2
+    classes = sorted(c for _coords, c in veh)
+    assert classes == ["footway", "service"]
 
 
 def test_runs_from_edges_yields_one_continuous_run():
@@ -432,3 +471,193 @@ def test_aerial_legs_are_never_trench_types():
     assert td.FIELD_LINE  # sanity: trench fields unchanged
     assert all(name != "TRENCH_TYPE" or True
                for name, _t in td.FIELD_AERIAL)
+
+
+# ── street avoidance: the carriageway cost ladder ────────────────────────────
+
+def test_footways_are_the_cheapest_carrier():
+    p = td.Params()
+    assert td._class_factor("footway", 1.0) == 1.0
+    assert td._class_factor("service", 1.0) < td._class_factor("residential", 1.0)
+    assert td._class_factor("cycleway", 1.0) < td._class_factor("residential", 1.0)
+
+
+def test_ladder_is_ordered_by_road_size():
+    """A bigger road costs strictly more to dig along."""
+    order = ["residential", "tertiary", "secondary", "primary"]
+    costs = [td._class_factor(c, 1.0) for c in order]
+    assert costs == sorted(costs), costs
+    assert costs[0] < costs[-1]
+
+
+def test_tertiary_is_a_last_resort_not_a_cheap_carrier():
+    """Regression: tertiary used to sit at NON_CARRIER_FACTOR (3.0), i.e. *cheaper*
+    than residential (8.0), so the router preferred district roads."""
+    assert td._class_factor("tertiary", 1.0) > td._class_factor("residential", 1.0)
+
+
+def test_street_avoid_scale_dials_the_penalty_without_reordering():
+    base = [td._class_factor(c, 1.0) for c in ("residential", "tertiary", "secondary")]
+    scaled = [td._class_factor(c, 2.0) for c in ("residential", "tertiary", "secondary")]
+    assert scaled == [2 * b for b in base]
+    assert scaled == sorted(scaled)
+    assert td._class_factor("footway", 2.0) == 1.0      # footways stay cheap
+
+
+def test_class_factor_never_goes_below_one():
+    assert td._class_factor("residential", 0.0) == 1.0
+
+
+def test_router_picks_the_smaller_street_when_a_street_is_unavoidable():
+    """Two parallel street corridors, one residential one tertiary, equal length:
+    the route must take the residential one."""
+    walkable = [
+        ([(0.0, 0.0), (0.0, 100.0)], "residential"),
+        ([(50.0, 0.0), (50.0, 100.0)], "tertiary"),
+        ([(0.0, 0.0), (50.0, 0.0)], "footway"),
+        ([(0.0, 100.0), (50.0, 100.0)], "footway"),
+    ]
+    sg = td.build_street_graph(walkable, td.Params())
+    a = sg.nearest_node(0.0, 0.0, 5.0)
+    b = sg.nearest_node(50.0, 100.0, 5.0)
+    path = td._route(sg.G, a, b)
+    classes = [sg.G.edges[(path[i], path[i + 1])]["cls"] for i in range(len(path) - 1)]
+    assert "residential" in classes
+    assert "tertiary" not in classes, classes
+
+
+def test_router_walks_a_long_footway_detour_to_stay_off_a_street():
+    """A 200 m residential shortcut loses to a 600 m footway detour."""
+    walkable = [
+        ([(0.0, 0.0), (0.0, 100.0), (0.0, 200.0)], "residential"),   # straight
+        ([(0.0, 0.0), (300.0, 0.0), (300.0, 200.0), (0.0, 200.0)], "footway"),
+    ]
+    sg = td.build_street_graph(walkable, td.Params())
+    a = sg.nearest_node(0.0, 0.0, 5.0)
+    b = sg.nearest_node(0.0, 200.0, 5.0)
+    path = td._route(sg.G, a, b)
+    classes = {sg.G.edges[(path[i], path[i + 1])]["cls"] for i in range(len(path) - 1)}
+    assert classes == {"footway"}, classes
+
+
+# ── anchored network: no trench to nowhere ──────────────────────────────────
+
+def _span(tid, coords, run="RUN-00001", tier="Feeder", src="street-graph"):
+    """A span row as the designer publishes it (geometry in ``geom``, not
+    ``coords`` — the prune pass reads what the layer writer reads)."""
+    return {"TRENCH_ID": tid, "RUN_ID": run,
+            "geom": td._make_multiline([list(coords)]),
+            "TRENCH_TYPE": "Open Cut", "TRENCH_TIER": tier, "SRC": src,
+            "length_m": td._coords_len(coords)}
+
+
+def test_span_coords_reads_the_published_geometry():
+    assert td._span_coords(_span("TR-1", [(0, 0), (10, 5)])) == [(0.0, 0.0), (10.0, 5.0)]
+    assert td._span_coords({"TRENCH_ID": "x"}) == []
+
+
+def test_anchored_chain_is_never_pruned():
+    spans = [_span("TR-1", [(0, 0), (10, 0)]), _span("TR-2", [(10, 0), (20, 0)])]
+    keep, pruned = td.prune_unanchored_spans(spans, [(0.0, 0.0), (20.0, 0.0)],
+                                             td.Params(), lambda m: None)
+    assert len(keep) == 2 and not pruned
+
+
+def test_unanchored_group_is_pruned_and_reported():
+    spans = [_span("TR-1", [(0, 0), (10, 0)]), _span("TR-2", [(10, 0), (20, 0)]),
+             _span("TR-9", [(500, 500), (510, 500)])]
+    msgs = []
+    keep, pruned = td.prune_unanchored_spans(spans, [(0.0, 0.0), (20.0, 0.0)],
+                                             td.Params(), msgs.append)
+    assert [s["TRENCH_ID"] for s in keep] == ["TR-1", "TR-2"]
+    assert [s["TRENCH_ID"] for s in pruned] == ["TR-9"]
+    assert "trench to nowhere" in " ".join(msgs)
+
+
+def test_house_drop_span_is_anchored_even_far_from_the_point_list():
+    """A garden leg is anchored by its own SRC, not by a coordinate lookup."""
+    spans = [_span("TR-1", [(0, 0), (10, 0)]), _span("TR-2", [(10, 0), (25, 0)])]
+    keep, pruned = td.prune_unanchored_spans(spans, [(0.0, 0.0)], td.Params(),
+                                             lambda m: None)
+    assert len(keep) == 2, "an org-free street chain anchored at one end must stay"
+    assert not pruned
+
+
+def test_distribution_run_is_protected_by_a_drop_leg_hanging_off_it():
+    """Regression: a service run whose end stops at the street node nearest the
+    house (not at the house itself) reaches no anchor on its own. It *is* the
+    mains the drop leg hangs off, so pruning it orphans that house. Group
+    connectivity must be geometric (T-join), not shared-endpoint only."""
+    spans = [_span("TR-1", [(0, 0), (40, 0)]),
+             _span("TR-2", [(40, 0), (60, 0)]),
+             # the leg starts mid-span on TR-1 and ends at its house
+             _span("TR-3", [(20, 0), (20, -12)], src="house-drop")]
+    anchors = [(20.0, -12.0)]      # only the house; no anchor near TR-1/TR-2
+    keep, pruned = td.prune_unanchored_spans(spans, anchors, td.Params(),
+                                             lambda m: None)
+    assert not pruned, [s["TRENCH_ID"] for s in pruned]
+    assert len(keep) == 3
+
+
+def test_truly_stray_fragment_is_still_pruned():
+    """A fragment far from every anchor and from every drop leg does go."""
+    spans = [_span("TR-1", [(0, 0), (40, 0)]),
+             _span("TR-2", [(40, 0), (60, 0)]),
+             _span("TR-3", [(20, 0), (20, -12)], src="house-drop"),
+             _span("TR-8", [(900, 900), (940, 900)]),
+             _span("TR-9", [(940, 900), (980, 900)])]
+    keep, pruned = td.prune_unanchored_spans(spans, [(20.0, -12.0)], td.Params(),
+                                             lambda m: None)
+    assert sorted(s["TRENCH_ID"] for s in pruned) == ["TR-8", "TR-9"]
+    assert len(keep) == 3
+
+
+def test_prune_can_be_switched_off():
+    spans = [_span("TR-9", [(500, 500), (510, 500)])]
+    keep, pruned = td.prune_unanchored_spans(spans, [(0.0, 0.0)],
+                                             td.Params(prune_dangling=False),
+                                             lambda m: None)
+    assert len(keep) == 1 and not pruned
+
+
+def test_pruning_never_removes_a_span_out_of_a_live_chain():
+    """Only whole groups go: a mid-chain span can never be picked out."""
+    spans = [_span("TR-%d" % i, [(i * 10.0, 0), ((i + 1) * 10.0, 0)]) for i in range(6)]
+    keep, pruned = td.prune_unanchored_spans(spans, [(0.0, 0.0), (60.0, 0.0)],
+                                             td.Params(), lambda m: None)
+    assert len(keep) == 6 and not pruned
+
+
+def test_dangling_end_is_reported_but_not_removed():
+    spans = [_span("TR-1", [(0, 0), (50, 0)]), _span("TR-2", [(50, 0), (100, 0)])]
+    loose = td.dangling_ends(spans, [(0.0, 0.0)], td.Params())
+    assert [d["TRENCH_ID"] for d in loose] == ["TR-2"]
+    assert loose[0]["which"] == "end"
+
+
+def test_t_join_counts_as_connected_for_the_loose_end_check():
+    """A run starting mid-span on another run is joined, not loose.
+
+    The far end of this stub reaches no anchor, so it *is* reported — the
+    point is that the T-joined end is not.
+    """
+    spans = [_span("TR-1", [(0, 0), (100, 0)]),
+             _span("TR-2", [(50, 0), (50, -20)])]
+    loose = td.dangling_ends(spans, [(0.0, 0.0), (100.0, 0.0)], td.Params())
+    assert [(d["TRENCH_ID"], d["which"]) for d in loose] == [("TR-2", "end")]
+
+
+def test_house_drop_is_exempt_from_the_loose_end_check():
+    """A garden leg ends at its premise by construction — never flagged."""
+    spans = [_span("TR-1", [(0, 0), (100, 0)]),
+             _span("TR-2", [(50, 0), (50, -20)], src="house-drop")]
+    loose = td.dangling_ends(spans, [(0.0, 0.0), (100.0, 0.0)], td.Params())
+    assert loose == []
+
+
+def test_junction_end_is_not_a_loose_end():
+    spans = [_span("TR-1", [(0, 0), (50, 0)]), _span("TR-2", [(50, 0), (100, 0)]),
+             _span("TR-3", [(50, 0), (50, 40)])]
+    loose = td.dangling_ends(spans, [(0.0, 0.0), (100.0, 0.0), (50.0, 40.0)],
+                             td.Params())
+    assert [d["TRENCH_ID"] for d in loose] == [], loose
