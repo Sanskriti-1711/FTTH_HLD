@@ -573,6 +573,7 @@ def _run_pipeline(
                 runner="qgis_process",
                 output_dir=str(output_dir),
                 downloads=downloads,
+                progress=100,
             )
     except Exception as exc:
         task.update({"status": "failed", "error": str(exc), "updated_at": _now()})
@@ -864,6 +865,12 @@ def projects(limit: int = 50) -> List[Dict[str, Any]]:
         for row in rows:
             live = tasks.get(row.get("project_id"))
             if not live:
+                # No live task (engine restart) — the stored row is the truth,
+                # but rows written before the progress column was persisted
+                # carry the 0 % default, which made a finished run list as
+                # "completed · 0 %". Derive it from the terminal status.
+                if row.get("status") == "completed" and not row.get("progress"):
+                    row["progress"] = 100
                 continue
             # A live in-memory task is always the more recent truth — it also
             # covers the window where the pipeline has finished but its final

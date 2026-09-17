@@ -342,7 +342,15 @@ def upsert_project(
     error: Optional[str] = None,
     output_dir: Optional[str] = None,
     downloads: Optional[List[Dict[str, Any]]] = None,
+    progress: Optional[int] = None,
 ) -> None:
+    """Insert/update a project row (shared with Django's ftth_projects).
+
+    ``progress`` is persisted when supplied: the platform's project list and
+    dashboard read this column (the engine's live in-memory progress only
+    exists while it is serving the run), so a finished run must not sit at the
+    column default of 0 %.
+    """
     conn = get_conn()
     with conn.cursor() as cur:
         cur.execute(
@@ -350,11 +358,12 @@ def upsert_project(
                 """
                 INSERT INTO {projects} (
                     project_id, status, roads_filename, runner, qgis_version,
-                    error, output_dir, downloads, created_at, updated_at
+                    error, output_dir, downloads, progress, created_at, updated_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now(), now())
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s, 0), now(), now())
                 ON CONFLICT (project_id) DO UPDATE SET
                     status = EXCLUDED.status,
+                    progress = COALESCE(%s, {projects}.progress),
                     roads_filename = COALESCE(
                         EXCLUDED.roads_filename, {projects}.roads_filename
                     ),
@@ -381,6 +390,8 @@ def upsert_project(
                 error,
                 output_dir,
                 Json(downloads or []),
+                progress,
+                progress,
             ),
         )
 
