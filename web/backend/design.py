@@ -415,12 +415,22 @@ def payload(project_id: str, include_layers: bool = True) -> Dict[str, Any]:
                 continue
             layers[name] = {"label": label, "geojson": data}
             counts[name] = len(data.get("features") or [])
+    # The design is written in the project CRS (metres), which a browser map
+    # cannot draw. Publish the CRS with the payload so the gateway can
+    # reproject to WGS84 for the map without guessing.
+    crs = "EPSG:25833"
+    if isinstance(report, dict):
+        try:
+            crs = "EPSG:%d" % int((report.get("params") or {}).get("target_epsg", 25833))
+        except (TypeError, ValueError):
+            crs = "EPSG:25833"
     return {
         "project_id": project_id,
         "status": status.get("status", "missing"),
         "stage": status.get("stage"),
         "error": status.get("error"),
         "updated_at": status.get("updated_at"),
+        "crs": crs,
         "report": report,
         "counts": counts,
         "layers": layers,
