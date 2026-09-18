@@ -373,6 +373,10 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
     # explicitly passes INPUT_AERIAL_ZONES; absent otherwise so existing runs
     # keep burying long-drop garden trenches exactly as before.
     P_AERIAL_ZONES = "INPUT_AERIAL_ZONES"
+    # Aerial legs the stage classifies (a drop leg inside an aerial zone, or
+    # longer than the UG drop limit) are NOT trenches: they are published here
+    # so the map, BOQ and LLD see them as a construction type of their own.
+    O_AERIAL_DROPS = "OUT_AERIAL_DROPS"
     P_HH_PDP = "HH_PDP_FIELD"       # Households: PDP ID field (optional, for strict Distribution)
     P_HH_HHS = "HH_HHS_FIELD"       # optional: household size/count
 
@@ -521,6 +525,16 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(QgsProcessingParameterFeatureSink(self.O_S1_AOI_OUTLINE,  _tr("Buffered outline (lines)")))
         self.addParameter(QgsProcessingParameterFeatureSink(self.O_S1_ROADS_NEAR,   _tr("Roads near polygon (within buffer)")))
         self.addParameter(QgsProcessingParameterFeatureSink(self.O_S1_ROADS_FILTERED, _tr("Filtered roads (by expression)"), optional=True))
+        # Opt-in aerial integration: declared so the pipeline CAN pass zones
+        # (the legacy stage already consults them when present) and so the legs
+        # that cannot be dug have somewhere to be published.
+        self.addParameter(QgsProcessingParameterVectorLayer(
+            self.P_AERIAL_ZONES,
+            _tr("Aerial zones [polygons] (blank = every leg is trenched)"),
+            [QgsProcessing.TypeVectorPolygon], optional=True))
+        self.addParameter(QgsProcessingParameterFeatureSink(
+            self.O_AERIAL_DROPS,
+            _tr("Aerial Drops (classified, never excavated)"), optional=True))
 
 
     def segmentize_network(self, all_layers, context, feedback):

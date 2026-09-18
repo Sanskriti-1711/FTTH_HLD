@@ -149,6 +149,27 @@ _DRILL_FIELDS: Tuple[Tuple[str, object], ...] = (
     ("INFRA_STATUS", QMetaType.Type.QString),
 )
 
+# Aerial legs the designer classified: not trenches, so they are published on
+# their own layer with the reason they were not dug. ``TRENCH_TYPE`` is
+# "Aerial" and ``TRENCH_TIER`` stays "Garden" — an aerial leg takes the place
+# of the garden drop it replaces, it just is not excavated.
+_AERIAL_FIELDS: Tuple[Tuple[str, object], ...] = (
+    ("id", QMetaType.Type.QString),
+    ("DROP_ID", QMetaType.Type.QString),
+    ("POLYGON_ID", QMetaType.Type.QString),
+    ("PDP_ID", QMetaType.Type.QString),
+    ("addr_id", QMetaType.Type.QString),
+    ("HH", QMetaType.Type.Double),
+    ("TRENCH_TIER", QMetaType.Type.QString),
+    ("TRENCH_TYPE", QMetaType.Type.QString),
+    ("length_m", QMetaType.Type.Double),
+    ("AERIAL_REASON", QMetaType.Type.QString),
+    ("INFRA_STATUS", QMetaType.Type.QString),
+    ("VERIFY_STATUS", QMetaType.Type.QString),
+    ("EXCAVATION", QMetaType.Type.Int),
+    ("SRC", QMetaType.Type.QString),
+)
+
 _PSEUDO_FIELDS: Tuple[Tuple[str, object], ...] = (
     ("pdp_pol_id", QMetaType.Type.QString),
     ("addr_id", QMetaType.Type.QString),
@@ -297,11 +318,26 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
                 "The trench designer could not be loaded (needs networkx + "
                 "osgeo): {0}").format(exc))
 
+        # Aerial zones are opt-in, exactly like the pole/aerial stages: with
+        # zones supplied the designer classifies the drop legs that cannot be
+        # dug (inside a zone, longer than `aerial_max_leg_m`, or branching off
+        # an aerial leg) and emits them on `Aerial_Drops` instead of trenching
+        # them; it also flags any span running THROUGH a zone with
+        # `AERIAL`/`AERIAL_REASON`.  Without zones nothing changes.
+        aerial_dst = None
+        zones = self._layer(parameters, self.P_AERIAL_ZONES, context)
+        if zones is not None and zones.featureCount() > 0:
+            aerial_dst = self._dump(zones, os.path.join(work, "Aerial_Zones.gpkg"),
+                                    context, feedback)
+            feedback.pushInfo(_tr(
+                "Aerial zones: {0} polygon(s) → the designer classifies the "
+                "drop legs that cannot be dug.").format(zones.featureCount()))
+
         out_dir = os.path.join(work, "design")
         cfg = {
             "mfg": src["mfg"], "pdps": src["pdps"], "objects": src["objects"],
             "polygons": src["polygons"], "roads": src["roads"], "out": out_dir,
-            "aerial": None, "target_epsg": int(target_epsg),
+            "aerial": aerial_dst, "target_epsg": int(target_epsg),
         }
         feedback.pushInfo(_tr("Running the civil trench designer …"))
         report = run_design(cfg) or {}
@@ -440,6 +476,10 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
                 sinks[self.O_FINAL_TAN] = self._write_rows(
                     parameters, context, self.O_FINAL_TAN, drill_rows,
                     _DRILL_FIELDS, QgsWkbTypes.LineString, target_epsg, feedback)
+
+        # ── the legs that are NOT dug (aerial classification)
+        self._publish_aerial_drops(parameters, context, work, out_dir,
+                                   target_epsg, feedback)
 
         # ── derived layers
         pseudo_rows = self._pseudo_rows(final_rows)
@@ -1525,6 +1565,78 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
                 "_geom": QgsGeometry.fromPolylineXY([pt, QgsPointXY(q.x(), q.y())]),
             })
         return rows
+
+    def _publish_aerial_drops(self, parameters, context, work: str, out_dir: str,
+                              target_epsg: int, feedback) -> int:
+        """Publish the designer's aerial legs on the stage's own layer.
+
+        These legs are classified, not dug: they are the ones that are inside
+        an aerial zone, longer than the UG drop limit, or branching off another
+        aerial leg.  Publishing them separately is what lets the map show them
+        as a construction type (`TRENCH_TYPE = "Aerial"`, the colour the legend
+        reserves), the BOQ leave their excavation out and charge aerial fibre,
+        and the LLD carry them as aerial instead of underground.
+        """
+        if self.O_AERIAL_DROPS not in parameters:
+            return 0
+        path = os.path.join(out_dir, "Aerial_Drops.gpkg")
+        layer = self._read_gpkg(path, "Aerial_Drops") if os.path.exists(path) else None
+        if layer is None or layer.featureCount() == 0:
+            feedback.pushInfo(_tr(
+                "Aerial drops: none — every drop leg could be trenched."))
+            return 0
+        names = layer.fields().names()
+
+        def g(f, name, default=None):
+            return f[name] if name in names and f[name] is not None else default
+
+        rows: List[dict] = []
+        for i, f in enumerate(layer.getFeatures(), 1):
+            geom = f.geometry()
+            if geom is None or geom.isEmpty():
+                continue
+            length = g(f, "length_m")
+            if length is None:
+                length = round(geom.length(), 2)
+            rows.append({
+                "id": g(f, "DROP_ID"),
+                "DROP_ID": g(f, "DROP_ID"),
+                "POLYGON_ID": g(f, "POLYGON_ID"),
+                # The designer's aerial legs carry the address, not the splitter
+                # (they leave the network on the pole line); the platform joins
+                # the PDP from the polygon when it needs it.
+                "PDP_ID": g(f, "PDP_ID"),
+                "addr_id": g(f, "ADDR_ID"),
+                "HH": g(f, "HH"),
+                "TRENCH_TIER": g(f, "TRENCH_TIER", "Garden") or "Garden",
+                "TRENCH_TYPE": g(f, "TRENCH_TYPE", "Aerial") or "Aerial",
+                "length_m": round(float(length or 0.0), 2),
+                "AERIAL_REASON": g(f, "AERIAL_REASON"),
+                "INFRA_STATUS": g(f, "INFRA_STATUS", "New") or "New",
+                "VERIFY_STATUS": "Designed",
+                # Nothing is dug for an aerial leg — the flag is the contract
+                # the BOQ and the platform read instead of inferring it from
+                # the type string.
+                "EXCAVATION": 0,
+                "SRC": "trench-designer:aerial",
+                "_geom": geom,
+            })
+        if not rows:
+            return 0
+        self._write_rows(parameters, context, self.O_AERIAL_DROPS, rows,
+                         _AERIAL_FIELDS, QgsWkbTypes.MultiLineString,
+                         target_epsg, feedback)
+        total = sum(float(r["length_m"] or 0.0) for r in rows) / 1000.0
+        reasons: Dict[str, int] = {}
+        for r in rows:
+            key = str(r.get("AERIAL_REASON") or "?")
+            reasons[key] = reasons.get(key, 0) + 1
+        feedback.pushInfo(_tr(
+            "Aerial drops published: {0} leg(s), {1:,.2f} km NOT excavated "
+            "({2}).").format(
+                len(rows), total,
+                ", ".join("%s=%d" % (k, v) for k, v in sorted(reasons.items()))))
+        return len(rows)
 
     @staticmethod
     def _drill_rows(drills: QgsVectorLayer) -> List[dict]:

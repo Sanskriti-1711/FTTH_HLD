@@ -23,6 +23,11 @@ from qgis.core import (
     QgsProcessingFeedback,
     QgsProcessingUtils,
     QgsWkbTypes,
+    QgsVectorLayer,
+    QgsFeature,
+    QgsFields,
+    QgsField,
+    QgsPointXY,
     QgsCoordinateReferenceSystem,
     QgsVectorFileWriter,
     QgsMapLayer,
@@ -242,6 +247,11 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         "OUT_GARDEN_TRENCHES", "OUT_FINAL_TRENCHES", "OUT_FINAL_TANGENT_TRENCHES",
     )
     _TR_DIST_LINES, _TR_DIST_DISS = "OUT_DISTRIBUTION_LINES", "OUT_DISTRIBUTION_DISS"
+    # Aerial zones are an INPUT to the trench stage (the designer classifies
+    # drop legs on the pole line and publishes Aerial_Drops) and the aerial
+    # legs it classifies come out of the trench stage.
+    _TR_AERIAL_IN = "INPUT_AERIAL_ZONES"
+    _TR_AERIAL_DROPS = "OUT_AERIAL_DROPS"
     _TR_ALL_OUTPUTS = (
         "OUT_SIDEWALK_LEFT", "OUT_SIDEWALK_RIGHT", "OUT_SIDEWALK_MERGED",
         "OUT_SIDEWALK_BUFFERED_LEFT", "OUT_SIDEWALK_BUFFERED_RIGHT",
@@ -252,6 +262,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         "OUT_FINAL_TANGENT_TRENCHES", "OUT_FEEDER_FINAL", "OUT_FINAL_TRENCHES",
         "OUT_S1_AOI_BUFFER_DISSOLVED", "OUT_S1_AOI_OUTLINE_LINES",
         "OUT_S1_ROADS_NEAR", "OUT_S1_ROADS_FILTERED",
+        "OUT_AERIAL_DROPS",
     )
 
     _CB_FEEDER, _CB_GARDEN, _CB_DISTR = (
@@ -906,6 +917,17 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             params[self._TR_MFG_KEY] = results["mfg"]
         if buildings is not None:
             params[self._TR_BLDG] = buildings
+        # Opt-in, exactly like the pole/aerial stages: without zones the trench
+        # stage behaves as before (every drop leg is trenched). With zones the
+        # designer classifies the legs that cannot be dug and publishes them as
+        # Aerial_Drops, so the map, BOQ and LLD can see them as non-excavation.
+        zones = self.parameterAsVectorLayer(parameters, self.P_AERIAL_ZONES, context)
+        if zones is not None and zones.isValid() and zones.featureCount() > 0:
+            params[self._TR_AERIAL_IN] = zones
+            feedback.pushInfo(self.tr(
+                "Trench stage: aerial zones supplied ({0} polygon(s)) — drop "
+                "legs that cannot be dug are classified Aerial.").format(
+                    zones.featureCount()))
         engine, invalid = TRENCH_ENGINE.resolve()
         if invalid:
             feedback.pushWarning(self.tr(
@@ -1030,10 +1052,87 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         return processing.run(ALG.POLE, params, context=context, feedback=feedback,
                               is_child_algorithm=True)
 
+    def _classified_aerial_premises(self, results, context, feedback):
+        """Premises the trench stage classified as aerial → stage 08b input.
+
+        Stage 08b only builds drops for premises flagged ``aerial_required``.
+        That flag normally comes from the field (the survey app) or from a
+        planner flagging a long drop by hand — but the trench stage ALSO knows:
+        it just classified the legs it could not dig and named their addresses
+        on ``Aerial_Drops``. Turning that classification into the flag is what
+        keeps one pipeline run self-consistent (classified aerial → built
+        aerial) instead of needing a second, manual pass.
+
+        Returns a memory layer of the flagged points, or None when there is
+        nothing to flag.
+        """
+        drops, objects = results.get("aerial_drops"), results.get("objects")
+        if not drops or not objects:
+            return None
+        try:
+            dl = QgsVectorLayer(str(drops), "aerial_drops", "ogr")
+            if not dl.isValid():
+                return None
+            addrs = set()
+            for f in dl.getFeatures():
+                for name in ("addr_id", "ADDR_ID"):
+                    if name in dl.fields().names():
+                        v = f[name]
+                        if v not in (None, ""):
+                            addrs.add(str(v).strip())
+                        break
+            if not addrs:
+                return None
+            src = QgsVectorLayer(str(objects), "objects", "ogr")
+            if not src.isValid():
+                return None
+        except Exception:
+            return None
+        names = src.fields().names()
+        f_addr = next((n for n in ("ADDR_ID", "addr_id", "obj_id", "OBJECT_ID")
+                       if n in names), None)
+        if f_addr is None:
+            return None
+        mem = QgsVectorLayer(
+            "Point?crs=%s&field=aerial_required:integer&field=addr_id:string"
+            % src.crs().authid(), "premises_aerial", "memory")
+        mem.startEditing()
+        n = 0
+        for f in src.getFeatures():
+            v = f[f_addr]
+            if v is None or str(v).strip() not in addrs:
+                continue
+            g = f.geometry()
+            if g is None or g.isEmpty():
+                continue
+            pt = g.asPoint() if not g.isMultipart() else g.asMultiPoint()[0]
+            nf = QgsFeature(mem.fields())
+            nf.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(pt.x(), pt.y())))
+            nf["aerial_required"] = 1
+            nf["addr_id"] = str(v).strip()
+            mem.addFeature(nf)
+            n += 1
+        mem.commitChanges()
+        if not n:
+            return None
+        feedback.pushInfo(self.tr(
+            "Aerial Drop Layer: {0} premise(s) flagged from the trench "
+            "stage's aerial classification.").format(n))
+        return mem
+
     def run_aerial_drop_layer(self, parameters, results, context, feedback):
         """Stage 8b: route aerial drop trenches from poles to flagged premises.
         Opt-in: without aerial zones (or poles) there is nothing to route."""
         premises = self.parameterAsVectorLayer(parameters, self.P_PREMISES, context)
+        if premises is None or not premises.isValid() or premises.featureCount() == 0:
+            # No explicit premises input: fall back to the legs the trench
+            # stage just classified, so the pipeline builds what it classified.
+            premises = self._classified_aerial_premises(results, context, feedback)
+        if premises is None or not premises.isValid() or premises.featureCount() == 0:
+            feedback.pushInfo(self.tr(
+                "Aerial Drop Layer: no premise flagged aerial_required — "
+                "nothing to build."))
+            return None
         poles = results.get("poles")
         bf_poles = self.parameterAsVectorLayer(parameters, self.P_BF_POLES, context)
         zones = self.parameterAsVectorLayer(parameters, self.P_AERIAL_ZONES, context)
@@ -1420,6 +1519,12 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             results["pseudo_hh"], "Pseudo_HH.gpkg", out_dir, context, feedback)
         results["tangents_used"] = self._save_layer_to_gpkg(
             results["tangents_used"], "Tangent_Crossings.gpkg", out_dir, context, feedback)
+        # Aerial legs the trench stage classified: published so the map shows
+        # them as a construction type (never dug), the BOQ excludes their
+        # excavation and the LLD carries them as aerial rather than UG.
+        results["aerial_drops"] = self._save_layer_to_gpkg(
+            tr.get(self._TR_AERIAL_DROPS), "Aerial_Drops.gpkg", out_dir,
+            context, feedback)
 
         if feedback.isCanceled():
             return {}

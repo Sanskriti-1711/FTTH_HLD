@@ -67,6 +67,10 @@ ONECLICK_OUTPUTS: List[Tuple[str, str, str]] = [
     ("coupleurs", "Coupleurs.gpkg", "Coupleurs.geojson"),
     ("chambers", "Chambers.gpkg", "Chambers.geojson"),
     ("poles", "Poles.gpkg", "Poles.geojson"),
+    # Aerial legs the trench stage classified: NOT excavated, so they are not
+    # part of Final_Trenches. Their own layer carries TRENCH_TYPE="Aerial",
+    # AERIAL_REASON (zone / length / chain) and EXCAVATION=0.
+    ("aerial_drops", "Aerial_Drops.gpkg", "Aerial_Drops.geojson"),
     ("brownfield", "Existing_Infrastructure.gpkg", "Existing_Infrastructure.geojson"),
     ("brownfield", "Existing_Infrastructure_Points.gpkg", "Existing_Infrastructure_Points.geojson"),
     # NOTE: the duct/cable occupancy registry is derived by occupancy.store()
@@ -955,7 +959,7 @@ LLD_LAYER_ORDER = [
     "feeder_ducts", "distribution_ducts", "drop_ducts",
     "coupleurs",
     "chambers", "poles",
-    "aerial_drop_trenches",
+    "aerial_drop_trenches", "aerial_drops",
     "existing_infrastructure", "existing_infrastructure_points",
     "brownfield",
 ]
@@ -2677,6 +2681,7 @@ _REPLAN_OUTPUT_MAP = [
     ("Feeder_Cable", "feeder_cable"),
     ("Distribution_Cable", "distribution_cable"),
     ("Aerial_Drop_Trenches", "aerial_drop_trenches"),
+    ("Aerial_Drops", "aerial_drops"),
     ("Aerial_Cable", "aerial_cable"),
     ("Feeder_Ducts", "feeder_ducts"),
     ("Distribution_Ducts", "distribution_ducts"),

@@ -58,6 +58,10 @@ LAYER_TABLES: Dict[str, str] = {
     "brownfield": "brownfield",
     "aerial_drop_trenches": "aerial_drop_trench_layer",
     "aerial_trenches": "aerial_drop_trench_layer",
+    # Aerial legs CLASSIFIED by the trench stage (never excavated) — their own
+    # table, because they are a design decision, not the aerial drop the
+    # pole/aerial stage BUILDS (which lands in aerial_drop_trench_layer).
+    "aerial_drops": "aerial_drops",
     # Occupancy registry (derived from the duct/cable layers each run).
     "duct_occupancy": "duct_occupancy",
     "cable_occupancy": "cable_occupancy",
