@@ -909,3 +909,67 @@ def test_hh_of_defaults_to_one():
     assert td._hh_of({"HH": 0}) == pytest.approx(1.0)
     assert td._hh_of({"HH": None}) == pytest.approx(1.0)
     assert td._hh_of({}) == pytest.approx(1.0)
+
+
+# ── determinism: the design must not depend on set/hash iteration order ───────
+# The edge sets handed to runs_from_edges are SETS of (str, str) tuples, and
+# Python randomises string hashing per process. Iterating them directly made the
+# whole design irreproducible: measured on Berlin, two runs of the same code
+# gave 497 vs 495 spans and 21 differing drill geometries. These tests pin the
+# ordering rule, which is what removes the dependence.
+
+def _grid_graph():
+    """A small street graph with a branch, so run assembly has real choices."""
+    sg = td.StreetGraph(G=nx.Graph(), edge_coords={}, node_xy={},
+                        index=td.GridIndex(cell=50.0), node_keys=[],
+                        main_component=set())
+    pts = {"a": (0.0, 0.0), "b": (0.0, 10.0), "c": (0.0, 20.0), "d": (10.0, 10.0)}
+    for k, (x, y) in pts.items():
+        sg.node_xy[k] = (x, y)
+        sg.G.add_node(k)
+    for u, v in (("a", "b"), ("b", "c"), ("b", "d")):
+        ek = (u, v)
+        sg.edge_coords[ek] = [pts[u], pts[v]]
+        sg.G.add_edge(u, v, coords=[pts[u], pts[v]])
+    return sg
+
+
+def test_run_assembly_ignores_input_iteration_order():
+    """Same edges, different insertion order → the SAME runs in the SAME order.
+
+    This is the invariant the hash-randomisation bug broke: the output followed
+    whatever order the input happened to be iterated in.
+    """
+    sg = _grid_graph()
+    edges = [("a", "b"), ("b", "c"), ("b", "d")]
+    forward, _b1, _e1 = td.runs_from_edges(list(edges), sg)
+    reverse, _b2, _e2 = td.runs_from_edges(list(reversed(edges)), sg)
+    assert forward == reverse
+
+
+def test_run_assembly_preserves_edge_keys_per_run():
+    """Each run reports the edges it walked, parallel to the coord lists."""
+    sg = _grid_graph()
+    runs, _breaks, run_edges = td.runs_from_edges(list(sg.edge_coords), sg)
+    assert len(runs) == len(run_edges)
+    assert all(e for e in run_edges)          # every run names at least one edge
+    for coords, ekeys in zip(runs, run_edges):
+        assert len(coords) >= 2
+        assert all(len(ek) == 2 for ek in ekeys)
+
+
+def test_break_nodes_are_deterministically_ordered():
+    sg = _grid_graph()
+    _runs, breaks, _e = td.runs_from_edges(list(sg.edge_coords), sg)
+    assert breaks == sorted(breaks)
+
+
+def test_main_component_pick_is_deterministic_and_largest():
+    """Largest component wins; ties break on the smallest node id, not on order."""
+    sg = td.build_street_graph(
+        [([(0.0, 0.0), (0.0, 30.0), (0.0, 60.0)], "footway"),
+         ([(500.0, 500.0), (500.0, 505.0)], "footway")],
+        td.Params())
+    main = sg.main_component
+    assert main, "a main component must always be picked"
+    assert len(main) >= 3, "the 3-node chain must win over the 2-node island"

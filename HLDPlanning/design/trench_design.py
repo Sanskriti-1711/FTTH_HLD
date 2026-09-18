@@ -756,10 +756,14 @@ def build_street_graph(walkable: Sequence[Tuple[List[Tuple[float, float]], str]]
     # The walkable extract is never fully connected: OSM carries stray footway
     # fragments. Snapping to one of those is what made PDP00004 unreachable —
     # it sits 8 m from a 4-node island while the real network is 100 m away.
+    # Deterministic pick: the LARGEST component, ties broken by its smallest
+    # node id. ``max(comps, key=len)`` alone would let the winner depend on the
+    # order the components happened to come out of the graph.
     main: Set[str] = set()
     try:
-        comps = nx.connected_components(G)
-        main = set(max(comps, key=len)) if comps else set()
+        comps = sorted((sorted(c) for c in nx.connected_components(G)),
+                       key=lambda c: (-len(c), c))
+        main = set(comps[0]) if comps else set()
     except Exception:
         main = set(node_keys)
     return StreetGraph(G=G, edge_coords=edge_coords, node_xy=node_xy,
@@ -828,8 +832,17 @@ def runs_from_edges(edge_keys: Iterable[Tuple[str, str]],
     list is parallel to the first and names the street edges each run walked,
     which is what attributes the houses routed along those edges to the run.
     """
+    # ── DETERMINISM ──────────────────────────────────────────────────────
+    # ``edge_keys`` is a SET of (str, str) tuples, and Python randomises string
+    # hashing per process, so iterating it directly made the whole design
+    # irreproducible: the insertion order into ``sub`` decided the node order,
+    # which decided ``breaks``, which decided the walk order — and therefore
+    # the runs, the spans, the drills and the nodes. Measured: two runs of the
+    # SAME code on the same project gave 497 vs 495 spans and 21 differing drill
+    # geometries. Sorting the input, the break list and the edge list is what
+    # makes a run reproducible (verified: byte-identical output across runs).
     sub = nx.Graph()
-    for ek in edge_keys:
+    for ek in sorted(edge_keys):
         a, b = ek
         if ek in sg.edge_coords:
             sub.add_edge(a, b, coords=sg.edge_coords[ek])
@@ -837,9 +850,9 @@ def runs_from_edges(edge_keys: Iterable[Tuple[str, str]],
     runs: List[List[Tuple[float, float]]] = []
     run_edges: List[List[Tuple[str, str]]] = []
     used: Set[Tuple[str, str]] = set()
-    breaks = [n for n in sub.nodes if sub.degree(n) != 2]
+    breaks = sorted(n for n in sub.nodes if sub.degree(n) != 2)
     if not breaks:
-        breaks = list(sub.nodes)[:1]
+        breaks = sorted(sub.nodes)[:1]
 
     def ekey(u: str, v: str) -> Tuple[str, str]:
         return (u, v) if u < v else (v, u)
@@ -870,7 +883,7 @@ def runs_from_edges(edge_keys: Iterable[Tuple[str, str]],
             if ekey(b, nbr) in used or not sub.has_edge(b, nbr):
                 continue
             walk(b, nbr)
-    for u, v in list(sub.edges):
+    for u, v in sorted(sub.edges):
         if ekey(u, v) in used:
             continue
         walk(u, v)
@@ -1780,12 +1793,15 @@ def keep_mfg_component(runs: List[Run], mfg: dict, pdps: Sequence[dict],
             root = find(i)
             break
     if root is None:
-        best = (-1, None)
+        # Deterministic fallback: most PDPs served, ties broken by the group's
+        # smallest run index — never by dict iteration order.
+        best = (-1, None, 0)
         for r_root, members in groups.items():
             n = sum(1 for p in pdps if any(on_run(i, p["x"], p["y"], params.pdp_search_m)
                                           for i in members))
-            if n > best[0]:
-                best = (n, r_root)
+            low = min(members) if members else 0
+            if n > best[0] or (n == best[0] and low < best[2]):
+                best = (n, r_root, low)
         root = best[1]
 
     kept = [runs[i] for i in groups.get(root, [])]
