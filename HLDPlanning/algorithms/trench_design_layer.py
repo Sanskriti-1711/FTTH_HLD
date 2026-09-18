@@ -479,7 +479,7 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
 
         # ── the legs that are NOT dug (aerial classification)
         self._publish_aerial_drops(parameters, context, work, out_dir,
-                                   target_epsg, feedback)
+                                   target_epsg, feedback, sinks)
 
         # ── derived layers
         pseudo_rows = self._pseudo_rows(final_rows)
@@ -1567,7 +1567,7 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
         return rows
 
     def _publish_aerial_drops(self, parameters, context, work: str, out_dir: str,
-                              target_epsg: int, feedback) -> int:
+                              target_epsg: int, feedback, sinks: Dict) -> int:
         """Publish the designer's aerial legs on the stage's own layer.
 
         These legs are classified, not dug: they are the ones that are inside
@@ -1623,9 +1623,13 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
             })
         if not rows:
             return 0
-        self._write_rows(parameters, context, self.O_AERIAL_DROPS, rows,
-                         _AERIAL_FIELDS, QgsWkbTypes.MultiLineString,
-                         target_epsg, feedback)
+        # Register the sink id: the pipeline saves the layer by looking this
+        # output up in the stage's result dict, so discarding it means the
+        # classification is written to a temporary layer and never published.
+        sinks[self.O_AERIAL_DROPS] = self._write_rows(
+            parameters, context, self.O_AERIAL_DROPS, rows,
+            _AERIAL_FIELDS, QgsWkbTypes.MultiLineString,
+            target_epsg, feedback)
         total = sum(float(r["length_m"] or 0.0) for r in rows) / 1000.0
         reasons: Dict[str, int] = {}
         for r in rows:

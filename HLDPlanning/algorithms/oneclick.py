@@ -27,6 +27,7 @@ from qgis.core import (
     QgsFeature,
     QgsFields,
     QgsField,
+    QgsGeometry,
     QgsPointXY,
     QgsCoordinateReferenceSystem,
     QgsVectorFileWriter,
