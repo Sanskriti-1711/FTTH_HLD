@@ -868,7 +868,7 @@ def _chamber_at(pts, x, y, tol_m=6.0):
 
 
 def _segment_layer_at_chambers(path, chambers, feedback=None, label="layer",
-                               snap_tol_m=5.0):
+                               snap_tol_m=5.0, span_len_fields=()):
     """Break every line feature of ``path`` at its chamber anchors.
 
     Publishes ONE FEATURE PER CHAMBER-TO-CHAMBER SPAN: each feature starts at a
@@ -878,6 +878,12 @@ def _segment_layer_at_chambers(path, chambers, feedback=None, label="layer",
     capacity flags — and the span's own length is written to ``length_m`` /
     ``SPAN_LEN_M`` (BOQ and permits sum these per feature). Features the
     chambers do not touch keep their geometry. Returns the number of spans.
+
+    ``span_len_fields`` names extra fields that must also be rewritten with the
+    span's own length. Published ducts pass ``("BUNDLE_LEN_M",)``: each
+    published duct row IS one duct, so its bundle metres are its own metres —
+    inheriting the pre-cut run's figure onto every span would multiply the
+    billed material by the number of chambers on the run.
     """
     ds, lyr = _open_lyr(path)
     if lyr is None:
@@ -901,6 +907,8 @@ def _segment_layer_at_chambers(path, chambers, feedback=None, label="layer",
     i_run = defn.GetFieldIndex("RUN_ID")
     i_kind = defn.GetFieldIndex("SPAN_KIND")
     i_lm = defn.GetFieldIndex("length_m")
+    i_span_len = [defn.GetFieldIndex(nm) for nm in span_len_fields]
+    i_span_len = [i for i in i_span_len if i >= 0]
 
     def _mk_coords(coords):
         ls = ogr.Geometry(ogr.wkbLineString)
@@ -928,6 +936,8 @@ def _segment_layer_at_chambers(path, chambers, feedback=None, label="layer",
         feat.SetField(i_run, run_id)
         if i_lm >= 0:
             feat.SetField(i_lm, length)
+        for i_f in i_span_len:
+            feat.SetField(i_f, length)
 
     planned = []
     runs = 0
@@ -1059,7 +1069,8 @@ def segment_ducts_at_chambers(feeder_path, dist_path, chamber_path,
     total = 0
     for path, label in ((feeder_path, "Feeder ducts"), (dist_path, "Distribution ducts")):
         total += _segment_layer_at_chambers(
-            path, chambers, feedback, label, snap_tol_m)
+            path, chambers, feedback, label, snap_tol_m,
+            span_len_fields=("BUNDLE_LEN_M",))
     return total
 
 
@@ -1396,15 +1407,29 @@ def enrich_all(out_dir, feedback=None, roads_lyr=None):
     # feature is one selective sequence (START_CHAMBER -> END_CHAMBER). This
     # replaces the old chamber *splicing* pass, which kept one long corridor
     # and carried a 50-chamber chain in SECTION_CHAIN / SECTIONS_JSON as text.
-    # Ducts keep their routed corridors for now (they carry per-feature
-    # capacity/PDP attributes) — `segment_ducts_at_chambers` applies the same
-    # span model to them when that is wanted.
+    # Ducts get the same treatment right after (see below): each published
+    # duct row is one duct, cut chamber to chamber.
     try:
         segment_trenches_at_chambers(
             p("Final_Trenches.gpkg"), p("Chambers.gpkg"), feedback)
     except Exception as exc:
         if feedback:
             feedback.pushInfo(f"  [segment] Trench segmentation skipped: {exc}")
+
+    # Ducts are pulled chamber to chamber exactly like the trench: the
+    # published feeder/distribution duct layers now carry ONE row per duct
+    # (duct_layer publishes the bins, not a per-tier clubbed corridor), so
+    # cutting them at the chambers gives the selective sequence actually
+    # installed. `enrich_ducts` then stamps the catalogue attributes and the
+    # endpoint chambers on every span.  Drop ducts are one-per-premise legs —
+    # they stay whole.
+    try:
+        segment_ducts_at_chambers(
+            p("Feeder_Ducts.gpkg"), p("Distribution_Ducts.gpkg"),
+            p("Chambers.gpkg"), feedback)
+    except Exception as exc:
+        if feedback:
+            feedback.pushInfo(f"  [segment] Duct segmentation skipped: {exc}")
 
     n += enrich_trenches(p("Final_Trenches.gpkg"), feedback, roads_lyr=roads_lyr)
     n += enrich_trench_sublayers(out_dir, feedback)

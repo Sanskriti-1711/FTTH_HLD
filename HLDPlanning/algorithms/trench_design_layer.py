@@ -333,14 +333,35 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
         # Last write before the sinks: close the sub-metre gaps the designer's
         # own anchor pass cannot see (it runs on the runs, before the spans are
         # cut at nodes and the HDD bores replace their Open Cut segment).
+        # ── Splitters belong ON the open-cut backbone ────────────────────
+        # Run this BEFORE the weld: a cabinet that is moved onto its own
+        # trench needs no spur, no relabel and no bridge — the feeder simply
+        # passes through it. The guards in the snap (short move, stay with the
+        # served polygon) mean an anchor that cannot be moved honestly is left
+        # where the designer put it, and the weld/reach passes still cover it.
+        anchors = self._anchor_points(pdps, mfg, target_epsg, context, feedback)
+        snapped: Dict[str, Tuple[float, float]] = {}
+        pdp_axes = self._pdp_anchor_rows(pdps, target_epsg, context, feedback)
+        if self._snap_pdps_to_backbone(pdp_axes, final_rows, polys,
+                                       target_epsg, context, feedback):
+            for a in pdp_axes:
+                if a["x"] != a["x0"] or a["y"] != a["y0"]:
+                    snapped[str(a["id"])] = (a["x"], a["y"])
+            anchors = [(lb, aid, snapped.get(str(aid), (ax, ay))[0],
+                        snapped.get(str(aid), (ax, ay))[1])
+                       for (lb, aid, ax, ay) in anchors]
         weld = self._weld_network(
-            final_rows, self._anchor_points(pdps, mfg, target_epsg, context, feedback),
-            feedback)
+            final_rows, anchors, feedback)
         if weld["welded"] or weld["connectors"] or weld["stitched"]:
             feedback.pushInfo(_tr(
                 "Network weld: {0} anchor endpoint(s) snapped, {1} anchor "
                 "connector(s), {2} span(s) stitched").format(
                     weld["welded"], weld["connectors"], weld["stitched"]))
+        # The FEEDER (Open Cut) backbone must run from the MFG to every PDP.
+        # The weld above guarantees the geometry touches the anchors; this
+        # guarantees the *tier* does too, so Feeder_Trench / the feeder cable /
+        # the feeder duct all reach every splitter.
+        self._ensure_backbone_reach(final_rows, anchors, feedback)
         feedback.pushInfo(_tr(
             "Designer spans: {0} total, {1} with an address, {2} HDD, "
             "{3} Garden, {4} node(s), {5} drill(s)").format(
@@ -428,7 +449,8 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
         feedback.pushInfo(_tr("  pseudo objects on the footway: {0}").format(
             len(pseudo_rows)))
 
-        proj_rows = self._pdp_projection_rows(pdps_t, final, target_epsg)
+        proj_rows = self._pdp_projection_rows(pdps_t, final, target_epsg,
+                                              snapped=snapped)
         sinks[self.O_PDP_PROJ] = self._write_rows(
             parameters, context, self.O_PDP_PROJ, proj_rows, _PROJ_FIELDS,
             QgsWkbTypes.LineString, target_epsg, feedback)
@@ -527,6 +549,15 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
     # write before the sinks.
     _WELD_MAX_M = 1.0     # largest anchor gap worth closing
     _WELD_MOVE_M = 0.5    # move an existing endpoint when it is this close...
+    _BACKBONE_TOL_M = 1.0  # a PDP is "on the backbone" when a feeder span is
+    #                       this close (see _ensure_backbone_reach)
+    # A splitter belongs ON the open-cut backbone — it is a cabinet dug into the
+    # same trench, not a point in a garden. So the anchor is snapped onto the
+    # nearest Feeder (Open Cut) span, under two guards that keep the placement
+    # honest: the move stays short, and the cabinet must remain with the polygon
+    # it serves (never inside a neighbour's).
+    _PDP_SNAP_MAX_M = 30.0     # never drag a cabinet further than this
+    _PDP_SNAP_POLY_M = 15.0    # ...and never more than this off its own polygon
     _STITCH_M = 0.5       # ...otherwise add a connector; same tolerance welds
     #                       span endpoints that stop just short of each other
     #                       (the designer's straightening leaves 15 spans in
@@ -705,6 +736,253 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
             rows[i]["length_m"] = round(total, 2)
             rows[i]["SPAN_LEN_M"] = round(total, 2)
         return stats
+
+    def _pdp_anchor_rows(self, pdps, epsg: int, context, feedback) -> List[dict]:
+        """PDP features as anchors carrying their served polygon.
+
+        Same points ``_anchor_points`` produces, plus ``POLYGON_ID`` — the
+        guard in ``_snap_pdps_to_backbone`` needs to know which premises each
+        splitter was placed for.
+        """
+        out: List[dict] = []
+        if pdps is None:
+            return out
+        t = self._reproject(pdps, epsg, context, feedback) or pdps
+        names = t.fields().names()
+        f_pdp = _pick_field(t, ["PDP_ID", "pdp_id", "pdp"])
+        f_poly = _pick_field(t, ["POLYGON_ID", "polygon_id"])
+        f_mfg = _pick_field(t, ["MFG_ID", "mfg_id"])
+        for f in t.getFeatures():
+            g = f.geometry()
+            if g is None or g.isEmpty():
+                continue
+            pt = g.asPoint() if not g.isMultipart() else g.asMultiPoint()[0]
+            aid = str(f[f_pdp]) if (f_pdp in names and f[f_pdp]) else "?"
+            poly = str(f[f_poly]) if (f_poly in names and f[f_poly]) else ""
+            out.append({"label": "PDP", "id": aid, "polygon_id": poly,
+                        "mfg_id": str(f[f_mfg]) if (f_mfg in names and f[f_mfg]) else "",
+                        "x": pt.x(), "y": pt.y(),
+                        "x0": pt.x(), "y0": pt.y()})
+        return out
+
+    def _snap_pdps_to_backbone(self, anchors: List[dict], rows: List[dict],
+                               polys, epsg: int, context, feedback) -> int:
+        """Put every PDP ON the open-cut backbone, near the polygon it serves.
+
+        The designer tiers a run by what it serves and snaps anchors to the
+        street graph, so a splitter can end up a metre or two off the feeder
+        alignment — and a cabinet that is not on the trench is what makes the
+        feeder cable/duct look disconnected on the map, whatever the routing
+        does afterwards.
+
+        Rather than relabel or re-route around that, move the anchor itself:
+        project it onto the nearest **Feeder (Open Cut)** span (its own trench
+        is Feeder by construction after ``_ensure_backbone_reach``), subject to
+
+        * shift <= ``_PDP_SNAP_MAX_M`` — a cabinet is never dragged across the
+          street just to touch the backbone, and
+        * the snapped point stays with its own polygon (inside it, or within
+          ``_PDP_SNAP_POLY_M`` of it) and inside no other polygon — the PDP
+          must keep serving the premises it was placed for.
+
+        Returns how many anchors moved.
+        """
+        if not anchors or not rows:
+            return 0
+        feeder = [r["_geom"] for r in rows
+                  if str(r.get("TRENCH_TIER") or "") == "Feeder"
+                  and r.get("_geom") is not None]
+        if not feeder:
+            return 0
+        own: Dict[str, object] = {}
+        others: List[object] = []
+        if polys is not None:
+            t = self._reproject(polys, epsg, context, feedback) or polys
+            names = t.fields().names()
+            f_poly = _pick_field(t, ["POLYGON_ID", "polygon_id", "id"])
+            for pf in t.getFeatures():
+                pg = pf.geometry()
+                if pg is None or pg.isEmpty():
+                    continue
+                if f_poly in names and pf[f_poly]:
+                    own[str(pf[f_poly])] = pg
+                    others.append(pg)
+                else:
+                    others.append(pg)
+        moved = 0
+        worst = 0.0
+        for a in anchors:
+            if a["label"] != "PDP":
+                continue
+            pt = QgsGeometry.fromPointXY(QgsPointXY(a["x"], a["y"]))
+            best, best_d = None, float("inf")
+            for g in feeder:
+                d = g.distance(pt)
+                if d < best_d:
+                    best_d, best = d, g
+            if best is None or best_d <= 0.05:
+                continue                       # already on the backbone
+            if best_d > self._PDP_SNAP_MAX_M:
+                continue                       # too far — leave the cabinet put
+            proj = best.nearestPoint(pt)
+            if proj is None or proj.isEmpty():
+                continue
+            q = proj.asPoint()
+            cand = QgsGeometry.fromPointXY(QgsPointXY(q.x(), q.y()))
+            pid = str(a.get("polygon_id") or "")
+            g_own = own.get(pid) if pid else None
+            if g_own is not None:
+                inside_own = g_own.contains(cand)
+                if not inside_own and g_own.distance(cand) > self._PDP_SNAP_POLY_M:
+                    continue                   # would stray off the served polygon
+                if any(o is not g_own and o.contains(cand) for o in others):
+                    continue                   # would land in a neighbour's polygon
+            a["x"], a["y"] = q.x(), q.y()
+            moved += 1
+            worst = max(worst, best_d)
+        if moved and feedback:
+            feedback.pushInfo(_tr(
+                "PDP snap: {0} splitter(s) moved onto the open-cut backbone "
+                "(max {1:.2f} m, guards: <= {2:g} m shift, own polygon +- "
+                "{3:g} m).").format(moved, worst, self._PDP_SNAP_MAX_M,
+                                    self._PDP_SNAP_POLY_M))
+        return moved
+
+    def _span_adjacency(self, rows: List[dict], tol: float = 0.05):
+        """Neighbour lists over the WELDED spans (spans that touch).
+
+        Uses a coarse grid on the span bounding boxes so the O(n²) distance
+        tests only run between spans that could possibly touch (542 spans on
+        Berlin), then keeps pairs whose geometries come within ``tol``.
+        """
+        cell = 25.0
+        bboxes, grid = [], {}
+        for i, r in enumerate(rows):
+            g = r.get("_geom")
+            bb = g.boundingBox() if g is not None else None
+            bboxes.append(bb)
+            if bb is None:
+                continue
+            for cx in range(int(bb.xMinimum() // cell) - 1,
+                            int(bb.xMaximum() // cell) + 2):
+                for cy in range(int(bb.yMinimum() // cell) - 1,
+                                int(bb.yMaximum() // cell) + 2):
+                    grid.setdefault((cx, cy), []).append(i)
+        adj = {i: set() for i in range(len(rows))}
+        tested = set()
+        for i, r in enumerate(rows):
+            bb = bboxes[i]
+            g = r.get("_geom")
+            if bb is None or g is None:
+                continue
+            cand = set()
+            for cx in range(int(bb.xMinimum() // cell) - 1,
+                            int(bb.xMaximum() // cell) + 2):
+                for cy in range(int(bb.yMinimum() // cell) - 1,
+                                int(bb.yMaximum() // cell) + 2):
+                    cand.update(grid.get((cx, cy), ()))
+            for j in cand:
+                if j == i or (min(i, j), max(i, j)) in tested:
+                    continue
+                tested.add((min(i, j), max(i, j)))
+                bj = bboxes[j]
+                gj = rows[j].get("_geom")
+                if bj is None or gj is None:
+                    continue
+                if (bb.xMaximum() + tol < bj.xMinimum()
+                        or bj.xMaximum() + tol < bb.xMinimum()
+                        or bb.yMaximum() + tol < bj.yMinimum()
+                        or bj.yMaximum() + tol < bb.yMinimum()):
+                    continue
+                if g.distance(gj) <= tol:
+                    adj[i].add(j)
+                    adj[j].add(i)
+        return adj
+
+    def _ensure_backbone_reach(self, rows: List[dict], anchors,
+                               feedback=None) -> int:
+        """Make the FEEDER trench run MFG → every PDP (relabel, don't re-cut).
+
+        The designer tiers a run by what it serves, so a splitter whose
+        connector leaves a distribution run can end up a couple of metres off
+        the feeder network (Berlin PDP00017: nearest feeder span 3.14 m away,
+        nearest distribution span 0.00 m).  The published network is welded
+        before this runs, so the path from such a PDP to the nearest feeder
+        span is real trench that is simply labelled Distribution.
+
+        This walks that path on the welded span graph and relabels it Feeder
+        (Open Cut legs only — a Garden leg is a premise drop and stays Garden).
+        ``enrich_trench_sublayers`` then publishes those spans in
+        ``Feeder_Trench``, so the Open Cut backbone reaches every splitter
+        without any new geometry.
+        """
+        if not rows or not anchors:
+            return 0
+        feeder = {i for i, r in enumerate(rows)
+                  if str(r.get("TRENCH_TIER") or "") == "Feeder"}
+        if not feeder:
+            return 0
+        adj = self._span_adjacency(rows)
+        promoted = 0
+        for label, aid, x, y in anchors:
+            pt = QgsGeometry.fromPointXY(QgsPointXY(x, y))
+            # Nearest span to the anchor, and whether the backbone already
+            # reaches it.
+            start, best = None, float("inf")
+            fed = False
+            for i, r in enumerate(rows):
+                g = r.get("_geom")
+                if g is None:
+                    continue
+                d = g.distance(pt)
+                if d < best:
+                    best, start = d, i
+                if i in feeder and d <= self._BACKBONE_TOL_M:
+                    fed = True
+                    break
+            if fed or start is None:
+                continue
+            # BFS from the anchor's span to the closest feeder span.
+            prev = {start: None}
+            queue = [start]
+            hit = None
+            while queue and hit is None:
+                nxt = []
+                for n in queue:
+                    for m in adj.get(n, ()):
+                        if m in prev:
+                            continue
+                        prev[m] = n
+                        if m in feeder:
+                            hit = m
+                            break
+                        nxt.append(m)
+                    if hit is not None:
+                        break
+                queue = nxt
+            if hit is None:
+                if feedback:
+                    feedback.pushWarning(_tr(
+                        "Backbone reach: {0} {1} is {2:.1f} m off the feeder "
+                        "network with no welded path to it.").format(
+                            label, aid, best))
+                continue
+            chain, node = [], hit
+            while node is not None:
+                chain.append(node)
+                node = prev[node]
+            for i in chain:
+                if str(rows[i].get("TRENCH_TIER") or "") == "Garden":
+                    continue
+                if rows[i].get("TRENCH_TIER") != "Feeder":
+                    rows[i]["TRENCH_TIER"] = "Feeder"
+                    feeder.add(i)
+                    promoted += 1
+        if promoted and feedback:
+            feedback.pushInfo(_tr(
+                "Backbone reach: {0} span(s) relabelled Feeder so the MFG → "
+                "every PDP path exists on the published trench.").format(promoted))
+        return promoted
 
     def _final_rows(self, final: QgsVectorLayer) -> List[dict]:
         """Designer span rows → the pipeline's Final_Trenches contract."""
@@ -1192,12 +1470,18 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
     @staticmethod
     def _pdp_projection_rows(pdps: QgsVectorLayer,
                              final: QgsVectorLayer,
-                             epsg: int) -> List[dict]:
+                             epsg: int,
+                             snapped: Dict[str, Tuple[float, float]] = None) -> List[dict]:
         """PDP → nearest point on the designed network, as a short line.
 
         ``cable_layer`` prepends this to the drop cable when the cabinet sits
         back from the street (PDP → pseudo-PDP → footway → object).
+
+        ``snapped`` overrides the cabinet position with the one the backbone
+        snap chose; the published connector then runs from the splitter that is
+        ON the open-cut trench, not from the plan point it was moved off.
         """
+        snapped = snapped or {}
         idx = QgsSpatialIndex(final.getFeatures())
         pdp_names = pdps.fields().names()
         f_pdp = _pick_field(pdps, ["PDP_ID", "pdp_id", "pdp"])
@@ -1215,6 +1499,10 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
             if g is None or g.isEmpty():
                 continue
             pt = g.asPoint()
+            _aid = value(f, f_pdp)
+            if _aid and str(_aid) in snapped:
+                sx, sy = snapped[str(_aid)]
+                pt = QgsPointXY(sx, sy)
             near = idx.nearestNeighbor(pt, 1)
             if not near:
                 continue

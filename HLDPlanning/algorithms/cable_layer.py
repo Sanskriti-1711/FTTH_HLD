@@ -530,6 +530,40 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
 
         snap_tol, node_tol, end_eps, int_eps = (self.SNAP_TOL, self.NODE_TOL,
                                                 self.END_EPS, self.INT_EPS)
+
+        # ── Endpoint T-nodes ───────────────────────────────────────────────
+        # `native:lineintersections` reports CROSSINGS; a span whose END lands
+        # exactly on another span's interior (the shape the trench stage's
+        # weld/stitch pass creates when a cabinet taps a passing trench) is not
+        # reliably returned.  With no break there, the route tree sees two
+        # unrelated components and the feeder is judged "not reachable from any
+        # MFG" even though the published trench is one welded network — that is
+        # exactly what left PDP00017 and PDP00031 without a feeder cable on the
+        # Berlin run.  Add a break at every endpoint that touches another span,
+        # so the graph matches the geometry it was built from.
+        for fid, geom in fid_to_geom.items():
+            L0 = fid_to_len.get(fid, 0.0)
+            if L0 <= 0 or geom is None:
+                continue
+            for arc_key in (0.0, L0):
+                xy = fid_break_xy[fid].get(arc_key)
+                if xy is None:
+                    continue
+                pg = QgsGeometry.fromPointXY(QgsPointXY(xy[0], xy[1]))
+                rect = pg.buffer(int_eps + node_tol, 8).boundingBox()
+                for other in seg_index.intersects(rect):
+                    if other == fid:
+                        continue
+                    og = fid_to_geom.get(other)
+                    if not og or og.distance(pg) > int_eps:
+                        continue
+                    d = og.lineLocatePoint(pg)
+                    oL = fid_to_len.get(other, 0.0)
+                    if d <= 1e-6 or (oL - d) <= 1e-6:
+                        continue
+                    fid_breaks[other].append(d)
+                    fid_break_xy[other][d] = (xy[0], xy[1])
+
         for fp in inter.getFeatures():
             pg = fp.geometry()
             if not pg or pg.isEmpty():

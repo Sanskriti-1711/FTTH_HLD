@@ -1604,72 +1604,71 @@ class DuctLayer(QgsProcessingAlgorithm):
                 if n_cab > ways:
                     flag_cnt += 1
 
-        # ── ONE component per tier, ducts on similar routes CLUBBED ───────
-        # The bins above are parallel ducts along the SAME streets: a corridor
-        # with more cables than the profile holds is built as several {ways}-way
-        # ducts laid side by side.  Published as laid, the same street would be
-        # drawn many times over (measured on the Berlin run: 87% of the
-        # distribution duct metres sit within 1 m of another duct — 148 runs
-        # covering a 6.3 km corridor).  The component therefore carries the
-        # CLUBBED corridor: every duct on the same route dissolved into ONE
-        # line per street.
+        # ── ONE FEATURE PER DUCT ──────────────────────────────────────────
+        # The bins above are the ducts actually laid: a route carrying more
+        # cables than the profile holds is built as several {ways}-way ducts
+        # side by side.  Each bin is published as its OWN feature — that is the
+        # unit the field installs, it carries its own cable list, its own
+        # ways/capacity (so a 4-way feeder duct never reports the aggregate of
+        # every feeder duct in the tier), and it is what the chamber pass
+        # afterwards pulls chamber-to-chamber.
         #
-        # Nothing is lost: the material quantity — the sum of the parallel
-        # runs actually laid — is kept in BUNDLE_LEN_M (the BOQ bills that),
-        # N_DUCTS says how many parallel ducts a corridor needs, WAYS_TOTAL
-        # how many ways they provide, and CLUBS how many distinct routes were
-        # clubbed.  Chambers do not split the component: they are spliced into
-        # it afterwards and the chamber-bounded sections are recorded in
-        # SECTIONS_JSON.
+        # Material quantity stays exact: BUNDLE_LEN_M on each row is that
+        # duct's own length, so the BOQ sum is unchanged from the clubbed
+        # corridor figure (verified on the Berlin run).  N_DUCTS=1 (this row
+        # IS one duct), WAYS_TOTAL = the profile ways, CLUBS = how many
+        # parallel ducts share this route group (a routing/viewing hint, not
+        # material).
         from ..utils.geometry_ops import unary_union_geoms as _uug_club
-        agg_len = 0.0          # sum of the parallel runs = material metres
+        agg_len = 0.0          # sum of the ducts laid = material metres
         corridor_len = 0.0
         agg_used = 0
         agg_cables, agg_pdps, agg_polys = [], [], []
         bin_geoms = []
-        for ug, cable_ids, pdp_set, poly_set, n_cab in bins:
+        for i_bin, (ug, cable_ids, pdp_set, poly_set, n_cab) in enumerate(bins, 1):
             bin_geoms.append(ug)
             try:
-                agg_len += float(ug.length())
+                bin_len = round(float(ug.length()), 2)
             except Exception:
-                pass
+                bin_len = 0.0
+            agg_len += bin_len
             agg_used += n_cab
             agg_cables.extend(cable_ids)
             agg_pdps.extend(pdp_set)
             agg_polys.extend(poly_set)
+            nf = QgsFeature(fields)
+            nf.setGeometry(ug)
+            nf["DUCT_TYPE"] = prof.get("duct_type", "4-Way HDPE" if profile_key == "Feeder" else "2-Way HDPE")
+            nf["capacity_total"] = ways
+            nf["ways_used"] = int(n_cab)
+            nf["cables_carried"] = ",".join(cable_ids)
+            nf["pdp_ids"] = ",".join(dict.fromkeys(pdp_set))
+            nf["POLYGON_ID"] = ",".join(dict.fromkeys(poly_set))
+            nf["length_m"] = bin_len
+            nf["BUNDLE_LEN_M"] = bin_len
+            nf["N_DUCTS"] = 1
+            nf["WAYS_TOTAL"] = int(ways)
+            nf["CLUBS"] = len(bins)
+            nf["REVIEW"] = 1 if n_cab > ways else 0
+            nf["INFRA_STATUS"] = "Proposed"
+            nf["DUCT_ID"] = f"{profile_key.upper()}-DUCT-{i_bin:03d}"
+            sink.addFeature(nf, QgsFeatureSink.FastInsert)
 
         club_geom = _uug_club(bin_geoms) if bin_geoms else None
         if club_geom is not None and not club_geom.isEmpty():
             corridor_len = float(club_geom.length())
-            nf = QgsFeature(fields)
-            nf.setGeometry(club_geom)
-            nf["DUCT_TYPE"] = prof.get("duct_type", "4-Way HDPE" if profile_key == "Feeder" else "2-Way HDPE")
-            nf["capacity_total"] = ways
-            nf["ways_used"] = int(agg_used)
-            nf["cables_carried"] = ",".join(agg_cables)
-            nf["pdp_ids"] = ",".join(dict.fromkeys(agg_pdps))
-            nf["POLYGON_ID"] = ",".join(dict.fromkeys(agg_polys))
-            nf["length_m"] = round(corridor_len, 2)
-            nf["BUNDLE_LEN_M"] = round(agg_len, 2)
-            nf["N_DUCTS"] = len(bins)
-            nf["WAYS_TOTAL"] = int(ways) * len(bins)
-            nf["CLUBS"] = len(groups)
-            nf["REVIEW"] = 1 if flag_cnt else 0
-            nf["INFRA_STATUS"] = "Proposed"
-            nf["DUCT_ID"] = f"{profile_key.upper()}-DUCT-001"
-            sink.addFeature(nf, QgsFeatureSink.FastInsert)
 
         if sink:
             del sink
         if runs_sink:
             del runs_sink
         feedback.pushInfo(
-            f"✅ Route ducts ({profile_key}): {made} x {ways}-way duct run(s) from "
+            f"✅ Route ducts ({profile_key}): {made} x {ways}-way duct(s) from "
             f"{len(feats)} cables over {len(groups)} route group(s) "
-            f"(cables split into {ways}-way ducts, {flag_cnt} oversized) → clubbed "
-            f"into ONE {corridor_len:,.1f} m corridor component "
-            f"({len(groups)} route(s), {len(bins)} parallel run(s), "
-            f"{int(ways) * len(bins)} ways, {agg_len:,.1f} m of duct material).")
+            f"(cables split into {ways}-way ducts, {flag_cnt} oversized) → "
+            f"{len(bins)} duct feature(s) spanning a {corridor_len:,.1f} m "
+            f"corridor, {agg_len:,.1f} m of duct material "
+            f"({int(ways)} ways each, {agg_used} ways used).")
         return out_id
 
     @staticmethod
