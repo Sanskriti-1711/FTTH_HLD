@@ -26,6 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 
 import design
+import occupancy
 import postgis
 
 
@@ -68,6 +69,14 @@ ONECLICK_OUTPUTS: List[Tuple[str, str, str]] = [
     ("poles", "Poles.gpkg", "Poles.geojson"),
     ("brownfield", "Existing_Infrastructure.gpkg", "Existing_Infrastructure.geojson"),
     ("brownfield", "Existing_Infrastructure_Points.gpkg", "Existing_Infrastructure_Points.geojson"),
+    # Occupancy registry — derived from the duct/cable layers by
+    # occupancy.publish(): how many ways each duct provides/takes and how many
+    # fibres each cable provides/uses. Stored (project + PostGIS) so a re-run
+    # or the LLD can consume existing spare ways instead of laying new duct.
+    # The field names match the brownfield loader's capacity_field /
+    # capacity_used_field, so this layer can be fed straight back in as BF_DUCTS.
+    ("duct_occupancy", "Duct_Occupancy.gpkg", "Duct_Occupancy.geojson"),
+    ("cable_occupancy", "Cable_Occupancy.gpkg", "Cable_Occupancy.geojson"),
     # NOTE: BOQ.xlsx / BOM.xlsx are intentionally NOT listed here as layers —
     # they surface in the Downloads section via _register_downloads() instead.
 ]
@@ -372,6 +381,23 @@ def _restore_task_from_disk(project_id: str) -> Optional[Dict[str, Any]]:
 
 
 def _ingest_outputs(project_id: str, output_dir: Path) -> List[Dict[str, Any]]:
+    # Derive the occupancy registry from the duct/cable layers BEFORE ingest so
+    # the run stores duct ways-total/used/spare and cable fibres-used/free
+    # alongside its design layers. Best-effort: a missing derivation must never
+    # fail a completed run.
+    try:
+        occ = occupancy.publish(output_dir)
+        if occ.get("ducts") or occ.get("cables"):
+            _append(
+                project_id,
+                "info",
+                "Occupancy registry: "
+                f"{occ.get('ducts', 0)} duct row(s), "
+                f"{occ.get('cables', 0)} cable row(s).",
+            )
+    except Exception as exc:  # noqa: BLE001
+        _append(project_id, "warning", f"Occupancy registry skipped: {exc}")
+
     has_postgis = postgis.is_available()
     if has_postgis:
         postgis.init_schema()

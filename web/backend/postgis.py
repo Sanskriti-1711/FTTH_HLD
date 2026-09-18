@@ -58,6 +58,9 @@ LAYER_TABLES: Dict[str, str] = {
     "brownfield": "brownfield",
     "aerial_drop_trenches": "aerial_drop_trench_layer",
     "aerial_trenches": "aerial_drop_trench_layer",
+    # Occupancy registry (derived from the duct/cable layers each run).
+    "duct_occupancy": "duct_occupancy",
+    "cable_occupancy": "cable_occupancy",
     # Backward-compatible aliases
     "object": "object_layer",
     "object_layer": "object_layer",
@@ -99,6 +102,8 @@ TABLE_TO_PUBLIC_NAME = {
     "poles": "poles",
     "brownfield": "brownfield",
     "aerial_drop_trench_layer": "aerial_drop_trenches",
+    "duct_occupancy": "duct_occupancy",
+    "cable_occupancy": "cable_occupancy",
 }
 
 _TABLES = tuple(TABLE_TO_PUBLIC_NAME.keys())
