@@ -163,6 +163,14 @@ class Params:
     prune_dangling: bool = True
     prune_anchor_m: float = 3.0      # how close an end must be to "reach" an anchor
     prune_join_m: float = 3.0        # how close an end must be to join another span
+    # Every anchor (MFG, PDP) must END ON the network, not merely near it: a
+    # trench that stops 1-2 m short of the splitter looks unconnected on the map
+    # and, because the duct/cable stages club geometry within 0.5 m, the service
+    # inherits the gap. This is the physical tolerance for "touching" — the same
+    # one the downstream stages use — so the anchor-termination pass closes
+    # anything above it with a connector instead of deferring to the 10 m
+    # chamber-separation heuristic (params.min_node_sep_m).
+    anchor_touch_m: float = 0.05
     # Diagnostic only: a span whose midpoint is further than this from every
     # premise/anchor is reported (never silently removed).
     far_premise_m: float = 80.0
@@ -1882,6 +1890,49 @@ def connect_unreached_pdps(runs: List[Run], pdps: Sequence[dict],
                  "gap_m": round(gap_m, 1)}
 
 
+def connect_unreached_mfg(runs: List[Run], mfg: dict, params: Params,
+                          log) -> Tuple[List[Run], Dict[str, float]]:
+    """Reach the MFG: the feeder network starts at the cabinet.
+
+    Same defect ``connect_unreached_pdps`` exists for, on the other end of the
+    feeder: the router snaps the MFG onto the nearest routable street node, so
+    the designed run can end beside the cabinet rather than on it. Measured on
+    Berlin: the nearest trench was **1.91 m** from the MFG, and the feeder cable
+    and duct inherited that gap. A connector from the nearest network point to
+    the MFG closes it, so the feeder trunk physically starts at the cabinet.
+
+    Returns the runs plus ``{"mfg_connected": 0|1, "mfg_gap_m": d}``.
+    """
+    if not runs or not mfg:
+        return list(runs), {"mfg_connected": 0, "mfg_gap_m": 0.0}
+    x, y = mfg["x"], mfg["y"]
+    segs = [(r.coords[j], r.coords[j + 1])
+            for r in runs for j in range(len(r.coords) - 1)]
+    best = (float("inf"), None)
+    for a, b in segs:
+        d = _point_seg_dist(x, y, a, b)
+        if d < best[0]:
+            dx, dy = b[0] - a[0], b[1] - a[1]
+            if dx == 0.0 and dy == 0.0:
+                q = a
+            else:
+                t = max(0.0, min(1.0, ((x - a[0]) * dx + (y - a[1]) * dy)
+                                      / (dx * dx + dy * dy)))
+                q = (a[0] + t * dx, a[1] + t * dy)
+            best = (d, q)
+    d, q = best
+    if q is None or d <= params.anchor_touch_m:
+        return list(runs), {"mfg_connected": 1 if q is not None else 0,
+                            "mfg_gap_m": round(d, 2) if q is not None else 0.0}
+    out = list(runs)
+    out.append(Run(coords=[q, (x, y)], tier="Feeder",
+                   pdp="", polygon=None, src="mfg-connector",
+                   mfg=(runs[0].mfg if runs else None)))
+    log("mfg connector: MFG was %.2f m off the network - connected "
+        "(tolerance %.2f m)" % (d, params.anchor_touch_m))
+    return out, {"mfg_connected": 1, "mfg_gap_m": round(d, 2)}
+
+
 def trim_unserved_tails(mains: List[Run], legs: Sequence[Run],
                         anchors_pts: Sequence[Tuple[float, float]],
                         params: Params, log) -> Tuple[List[Run], Dict[str, float]]:
@@ -2310,8 +2361,17 @@ def design(cfg: dict) -> dict:
     runs, conn_stats = keep_mfg_component(runs, mfgs[0], pdps, params, log)
     if before != len(runs):
         log("runs after connectivity filter: %d" % len(runs))
-    # every PDP must end up ON a trench, or its splitter cannot be cabled
-    runs, spur_stats = connect_unreached_pdps(runs, pdps, params, log)
+    # Every PDP must end up ON a trench, or its splitter cannot be cabled.
+    # ANCHOR-EXACT: the tolerance is the physical "touching" distance, not the
+    # chamber-separation heuristic. With the default gap a splitter 1.9 m off
+    # the network was left alone (<= min_node_sep_m = 10 m), so the trench — and
+    # every duct and cable laid in it — stopped short of the splitter: measured
+    # on Berlin, MFG 1.91 m and 10 of 31 PDPs 1.2-1.9 m off the trench.
+    runs, spur_stats = connect_unreached_pdps(
+        runs, pdps, params, log, max_gap_m=params.anchor_touch_m)
+    # The MFG is the root of the whole design (feeder cables originate there),
+    # so it gets the same treatment as a splitter.
+    runs, mfg_conn = connect_unreached_mfg(runs, mfgs[0], params, log)
 
     # attach the pre-straighten network for garden-leg snapping
     network_parts = [r.coords for r in runs]
@@ -2366,16 +2426,25 @@ def design(cfg: dict) -> dict:
     mains_only, tail_stats = trim_unserved_tails(
         mains_only, drops_only, _anchor_points(pdps, [], mfgs), params, log)
 
-    # ── re-establish "every PDP on a trench" on the FINAL run set ──────────
+    # ── re-establish "every ANCHOR on a trench" on the FINAL run set ────────
     # The trim cuts a run back to its own supports, so a PDP that was 8 m from
     # the network (closer than ``min_node_sep_m``, hence no spur) can end up
     # beside it with nothing touching — measured on Berlin: PDP00019 left
     # **17.77 m** from the nearest trench, a cabinet that cannot be cabled.
     # The first pass runs before the trim, so the guarantee has to be remade
-    # here, with a tight tolerance: after trimming the question is no longer
-    # "is another chamber worth it" but "is this cabinet on a trench".
+    # here.
+    #
+    # TOLERANCE: this used to be 2.0 m, which is why the published network
+    # stopped 1.2-1.9 m short of its anchors (MFG 1.91 m, 10 of 31 PDPs) — a
+    # "close enough for a chamber" heuristic applied to a question that is
+    # really "does the trench touch the cabinet". The tolerance is now the
+    # physical touching distance the duct and cable stages club at (0.05 m),
+    # so a splitter or cabinet that is 1.9 m off gets a 1.9 m connector and the
+    # feeder/distribution trunk physically starts on it.
     mains_only, pdp_spur_stats = connect_unreached_pdps(
-        mains_only, pdps, params, log, max_gap_m=2.0)
+        mains_only, pdps, params, log, max_gap_m=params.anchor_touch_m)
+    # The MFG is the root of the feeder: same guarantee, same tolerance.
+    mains_only, mfg_conn = connect_unreached_mfg(mains_only, mfgs[0], params, log)
     runs = mains_only + drops_only
     log("runs after trimming: %d (%d feeder, %d distribution, %d garden)"
         % (len(runs), sum(1 for r in runs if r.tier == "Feeder"),
@@ -2613,6 +2682,7 @@ def design(cfg: dict) -> dict:
         "connectivity": conn_stats,
         "pdp_spurs": spur_stats,
         "pdp_spurs_after_trim": pdp_spur_stats,
+        "mfg_connected": mfg_conn,
         "loose_ends": len(dangling),
         "spans_far_from_premise": len(far_spans),
         "elapsed_s": round(time.time() - t0, 1),

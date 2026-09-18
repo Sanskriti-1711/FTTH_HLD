@@ -586,6 +586,61 @@ def test_pdp_spur_gap_threshold_is_how_far_a_cabinet_may_float():
     assert stats["max_spur_m"] == pytest.approx(5.0)
 
 
+def test_anchor_touch_tolerance_closes_a_two_metre_gap():
+    """The published trench must TOUCH its anchors (Berlin: MFG 1.91 m, 10 PDPs 1.2-1.9 m).
+
+    A 2 m tolerance left every cabinet up to 2 m off the network, which reads
+    as "the trenches do not connect the MFG and the PDPs" on the map and is
+    inherited by the feeder/distribution duct and cable (they club at 0.5 m).
+    ``anchor_touch_m`` is the physical touching distance, so the same 1.9 m gap
+    that used to be tolerated now gets a connector.
+    """
+    p = td.Params()
+    assert p.anchor_touch_m <= 0.5, "must not exceed the duct/cable club tolerance"
+    mains = [td.Run(coords=[(0.0, 0.0), (0.0, 100.0)], tier="Distribution")]
+    pdp = {"PDP_ID": "P9", "x": 1.9, "y": 50.0}
+
+    # old behaviour (2 m): tolerated, trench stays 1.9 m off the splitter
+    out_old, old = td.connect_unreached_pdps(list(mains), [pdp], p,
+                                             lambda m: None, max_gap_m=2.0)
+    assert old["pdp_spurs"] == 0 and len(out_old) == 1
+
+    # new behaviour: connector added, and it ends exactly on the splitter
+    out, stats = td.connect_unreached_pdps(
+        list(mains), [pdp], p, lambda m: None, max_gap_m=p.anchor_touch_m)
+    assert stats["pdp_spurs"] == 1
+    spur = out[-1]
+    assert spur.coords[-1] == (1.9, 50.0)
+    assert td._coords_len(spur.coords) == pytest.approx(1.9, abs=0.01)
+
+
+def test_mfg_connector_closes_a_gap_and_is_idempotent():
+    """The MFG is the root of the feeder: it gets the same guarantee as a PDP."""
+    p = td.Params()
+    runs = [td.Run(coords=[(0.0, 0.0), (0.0, 100.0)], tier="Feeder")]
+    mfg = {"MFG_ID": "MFG00001", "x": 1.91, "y": 50.0}
+
+    out, stats = td.connect_unreached_mfg(list(runs), mfg, p, lambda m: None)
+    assert stats["mfg_connected"] == 1
+    assert stats["mfg_gap_m"] == pytest.approx(1.91, abs=0.01)
+    conn = out[-1]
+    assert conn.src == "mfg-connector"
+    assert conn.coords[-1] == (1.91, 50.0)
+
+    # A second pass sees the connector already touching the MFG: no duplicate.
+    out2, stats2 = td.connect_unreached_mfg(list(out), mfg, p, lambda m: None)
+    assert len(out2) == len(out)
+    assert stats2["mfg_connected"] == 1
+
+
+def test_mfg_connector_skipped_when_already_touching():
+    p = td.Params()
+    runs = [td.Run(coords=[(0.0, 0.0), (0.0, 100.0)], tier="Feeder")]
+    out, stats = td.connect_unreached_mfg(
+        list(runs), {"MFG_ID": "M", "x": 0.0, "y": 40.0}, p, lambda m: None)
+    assert len(out) == 1 and stats["mfg_gap_m"] == pytest.approx(0.0)
+
+
 def test_pdp_already_on_the_trench_gets_no_spur():
     p = td.Params()
     mains = [td.Run(coords=[(0.0, 0.0), (0.0, 100.0)], tier="Feeder")]
