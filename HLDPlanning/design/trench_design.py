@@ -426,6 +426,7 @@ def _read_points(path: str, target_epsg: int, bbox=None) -> List[dict]:
                 "POLYGON_ID": _value(f, "POLYGON_ID"),
                 "ADDR_ID": _value(f, "ADDR_ID") or _value(f, "SRC_ID"),
                 "HH": _value(f, "HH"),
+                "MFG_ID": _value(f, "MFG_ID"),
                 "fclass": _value(f, "fclass"),
             })
     ds = None
@@ -916,6 +917,10 @@ class Run:
     # routing or node placement.
     addr: Optional[str] = None
     hh: Optional[float] = None
+    # The origin this network belongs to. ``cable_layer`` reads MFG_ID on the
+    # feeder and garden layers (it plans the shared feeder from the MFG down),
+    # so every span carries it rather than only the backbone.
+    mfg: Optional[str] = None
 
 
 def _snap_anchor(sg: StreetGraph, x: float, y: float, tol: float,
@@ -1417,6 +1422,7 @@ def split_spans(run: Run, nodes: Sequence[dict], params: Params,
             "infra": run.infra,
             "addr": getattr(run, "addr", None),
             "hh": getattr(run, "hh", None),
+            "mfg": getattr(run, "mfg", None),
             "run_id": getattr(run, "run_id", "RUN-00000"),
         })
     return spans
@@ -1440,6 +1446,8 @@ FIELD_LINE = (
     # their household count. "" when the span serves no premise (pure
     # backbone), so a blank value means "not attributed", not "one house".
     ("ADDR_ID", ogr.OFTString), ("HH", ogr.OFTReal),
+    # Origin of the network: cable_layer plans the shared feeder from it.
+    ("MFG_ID", ogr.OFTString),
     # AERIAL: the span runs through an aerial zone (restricted land). The span
     # stays an excavated trench span here — the flag tells the planner/BOQ the
     # corridor is restricted, so a re-route or an aerial span is expected.
@@ -1862,7 +1870,8 @@ def connect_unreached_pdps(runs: List[Run], pdps: Sequence[dict],
             continue
         out.append(Run(coords=[q, (p["x"], p["y"])], tier="Feeder",
                        pdp=str(p.get("PDP_ID") or ""), polygon=None,
-                       src="pdp-spur"))
+                       src="pdp-spur",
+                       mfg=(runs[0].mfg if runs else None)))
         segs.append(((q[0], q[1]), (p["x"], p["y"])))
         spurs += 1
         longest = max(longest, d)
@@ -1958,7 +1967,7 @@ def trim_unserved_tails(mains: List[Run], legs: Sequence[Run],
                 trimmed += 1
                 keep.append(Run(coords=piece, tier=r.tier, pdp=r.pdp,
                                 polygon=r.polygon, src=r.src,
-                                addr=r.addr, hh=r.hh))
+                                addr=r.addr, hh=r.hh, mfg=r.mfg))
                 continue
         # no support, or supported at a single point: the whole run is unused
         if any(on_network(p, [(r.coords[j], r.coords[j + 1])
@@ -2015,7 +2024,7 @@ def trim_unserved_tails(mains: List[Run], legs: Sequence[Run],
             changed = True
             survivors.append(Run(coords=piece, tier=r.tier, pdp=r.pdp,
                                  polygon=r.polygon, src=r.src,
-                                 addr=r.addr, hh=r.hh))
+                                 addr=r.addr, hh=r.hh, mfg=r.mfg))
         keep = survivors
         if not changed:
             break
@@ -2255,6 +2264,10 @@ def design(cfg: dict) -> dict:
     dist_only = dist_keys - feeder_keys
 
     runs: List[Run] = []
+    # The origin every span belongs to. ``cable_layer`` reads MFG_ID on the
+    # feeder and garden layers to plan the shared feeder from the MFG down, so
+    # it is stamped on the whole network rather than only on the backbone.
+    mfg_id = mfgs[0].get("MFG_ID") or mfgs[0].get("SRC_ID") or None
     pdp_by_key = {}
     for p in pdps:
         k = _snap_anchor(sg, p["x"], p["y"], params.pdp_search_m)
@@ -2273,7 +2286,7 @@ def design(cfg: dict) -> dict:
             addr, hh = houses_on_edges(ekeys, edge_houses, houses)
             runs.append(Run(coords=straight, tier=tier, pdp=pid,
                             polygon=None, src="street-graph",
-                            addr=addr, hh=hh))
+                            addr=addr, hh=hh, mfg=mfg_id))
     carrier_mix = _edge_class_lengths(sg, feeder_keys | dist_keys)
     log("carriers: " + ", ".join(
         "%s %.0f m" % (k, v)
@@ -2323,12 +2336,24 @@ def design(cfg: dict) -> dict:
                ", ".join(f"{k}: {v}" for k, v in sorted(by_reason.items()))))
     for leg in legs:
         _house = leg["house"]
-        r = Run(coords=leg["coords"], tier="Garden", pdp=None,
+        # ── orientation ─────────────────────────────────────────────────
+        # The designer builds a leg footway → house (the projection onto the
+        # mains is computed first and is the natural start). The published
+        # drop trench must run **object → footway**, because ``cable_layer``
+        # identifies the shared footway end as the line's LAST point: it groups
+        # garden rows by ``coords[-1]`` and matches each one to the
+        # distribution row ending at the same footway point. Publishing the
+        # house-last order silently made every house its own group, so the
+        # shared-trunk logic never fired. The internal working copy stays
+        # footway-first (it is what ``_split_drop_legs`` samples), only the
+        # published line is reversed.
+        r = Run(coords=list(reversed(leg["coords"])), tier="Garden", pdp=None,
                 polygon=(_house.get("POLYGON_ID") or None),
                 src="house-drop",
                 # A drop leg exists for exactly one premise.
-                addr=_addr_of(_house), hh=_hh_of(_house))
+                addr=_addr_of(_house), hh=_hh_of(_house), mfg=mfg_id)
         r.tier_type = leg["type"]          # type decided by leg length
+        r.footway_pt = leg["coords"][0]    # the mains-side end (authoritative)
         runs.append(r)
         # NOTE: legs are NOT added to ``network_parts`` — a later house must
         # snap to the designed mains, never to another house's drop leg.
@@ -2416,6 +2441,7 @@ def design(cfg: dict) -> dict:
             # span was dug for. A drop leg names one address; a shared spine
             # span names every address that rides it (comma-joined).
             "ADDR_ID": sp.get("addr"), "HH": sp.get("hh"),
+            "MFG_ID": sp.get("mfg"),
             "SRC": sp["src"],
             "AERIAL": 1 if aerial_reason else 0,
             "AERIAL_REASON": aerial_reason or None,

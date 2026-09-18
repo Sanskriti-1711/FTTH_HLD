@@ -31,7 +31,7 @@ from qgis.core import (
 )
 from qgis import processing
 
-from ..utils.params import ALG, LAYERNAMES
+from ..utils.params import ALG, LAYERNAMES, TRENCH_ENGINE
 from ..utils import attr_enrich
 from ..utils.style_utils import apply_simple_line_style
 
@@ -864,6 +864,32 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         return processing.run(ALG.NETWORK, params, context=context, feedback=feedback,
                               is_child_algorithm=True)
 
+    # ------------------------------------------------------------------
+    # Trench engine selection
+    #
+    # Two engines answer the same trench-stage contract (same parameters in,
+    # same layers out), so the stage can be swapped without touching any other
+    # stage:
+    #   legacy  — sidewalk/graph derived trenches (04_trench_layer)
+    #   design  — the civil trench designer (04_trench_design_layer), which
+    #             routes the plan over the street graph and emits node-to-node
+    #             spans typed Open Cut / HDD / Garden
+    #
+    # The default is "design": the designer was diffed against a legacy run of
+    # the same project first — every watched layer produced, every downstream
+    # stage built its features, no distribution cable shorter than 1 m.  legacy
+    # stays reachable so a run that goes wrong is switched back by changing one
+    # environment variable rather than reverting code.  See
+    # utils.params.TRENCH_ENGINE for the resolution rules.
+    # ------------------------------------------------------------------
+    TRENCH_ENGINE_ENV = TRENCH_ENGINE.ENV
+    TRENCH_ENGINES = TRENCH_ENGINE.ENGINES
+    TRENCH_ENGINE_DEFAULT = TRENCH_ENGINE.DEFAULT
+
+    @classmethod
+    def _trench_engine(cls) -> str:
+        return TRENCH_ENGINE.resolve()[0]
+
     def run_trench_layer(self, parameters, results, context, feedback):
         roads = self.parameterAsVectorLayer(parameters, self.P_TR_ROADS, context)
         if roads is None:
@@ -880,7 +906,17 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             params[self._TR_MFG_KEY] = results["mfg"]
         if buildings is not None:
             params[self._TR_BLDG] = buildings
-        return processing.run(ALG.TRENCH, params, context=context, feedback=feedback,
+        engine, invalid = TRENCH_ENGINE.resolve()
+        if invalid:
+            feedback.pushWarning(self.tr(
+                "{0}={1} is not a trench engine ({2}) — using {3}").format(
+                    TRENCH_ENGINE.ENV, invalid,
+                    "/".join(TRENCH_ENGINE.ENGINES), engine))
+        alg_id = TRENCH_ENGINE.algorithm_id(engine)
+        feedback.pushInfo(self.tr("Trench engine: {0}").format(
+            "designer (civil trench designer)" if engine == TRENCH_ENGINE.DESIGN
+            else "legacy (sidewalk/graph)"))
+        return processing.run(alg_id, params, context=context, feedback=feedback,
                               is_child_algorithm=True)
 
     def run_cable_layer(self, parameters, results, context, feedback):
