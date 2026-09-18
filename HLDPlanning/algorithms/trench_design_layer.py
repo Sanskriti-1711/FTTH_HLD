@@ -330,6 +330,17 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
         if not final_rows:
             raise QgsProcessingException(_tr(
                 "The trench designer produced no usable spans."))
+        # Last write before the sinks: close the sub-metre gaps the designer's
+        # own anchor pass cannot see (it runs on the runs, before the spans are
+        # cut at nodes and the HDD bores replace their Open Cut segment).
+        weld = self._weld_network(
+            final_rows, self._anchor_points(pdps, mfg, target_epsg, context, feedback),
+            feedback)
+        if weld["welded"] or weld["connectors"] or weld["stitched"]:
+            feedback.pushInfo(_tr(
+                "Network weld: {0} anchor endpoint(s) snapped, {1} anchor "
+                "connector(s), {2} span(s) stitched").format(
+                    weld["welded"], weld["connectors"], weld["stitched"]))
         feedback.pushInfo(_tr(
             "Designer spans: {0} total, {1} with an address, {2} HDD, "
             "{3} Garden, {4} node(s), {5} drill(s)").format(
@@ -505,6 +516,196 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
         return lyr if lyr.featureCount() > 0 else None
 
     # ---- row building ---------------------------------------------------
+    # ── final geometry repairs ──────────────────────────────────────────
+    # The designer's own anchor pass (``connect_unreached_pdps`` /
+    # ``connect_unreached_mfg``) runs on the RUNS, before the spans are cut at
+    # structural nodes and before each HDD bore replaces its Open Cut segment.
+    # Whatever it closed can therefore reopen: measured on Berlin
+    # `0dc85304…`, 28 of 31 PDPs sit exactly on the published trench and 3 end
+    # 0.07-0.40 m short, which reads as an unconnected splitter on the map.
+    # These thresholds are applied to the geometry that SHIPS, as the last
+    # write before the sinks.
+    _WELD_MAX_M = 1.0     # largest anchor gap worth closing
+    _WELD_MOVE_M = 0.5    # move an existing endpoint when it is this close...
+    _STITCH_M = 0.5       # ...otherwise add a connector; same tolerance welds
+    #                       span endpoints that stop just short of each other
+    #                       (the designer's straightening leaves 15 spans in
+    #                       0.05-0.5 m islands on Berlin)
+
+    def _anchor_points(self, pdps, mfg, epsg: int, context, feedback):
+        """Every PDP + MFG in the project CRS, as (label, id, x, y)."""
+        out: List[Tuple[str, str, float, float]] = []
+        for lyr, label, idfield in ((pdps, "PDP", "PDP_ID"),
+                                    (mfg, "MFG", "MFG_ID")):
+            if lyr is None:
+                continue
+            t = self._reproject(lyr, epsg, context, feedback) or lyr
+            names = t.fields().names()
+            for f in t.getFeatures():
+                g = f.geometry()
+                if g is None or g.isEmpty():
+                    continue
+                msg = g.asPoint() if not g.isMultipart() else g.asMultiPoint()[0]
+                aid = str(f[idfield]) if idfield in names and f[idfield] else "?"
+                out.append((label, aid, msg.x(), msg.y()))
+        return out
+
+    def _weld_network(self, rows: List[dict], anchors, feedback=None) -> Dict[str, int]:
+        """Close the last metres between the published network and its anchors.
+
+        Two repairs, both on the final span geometry:
+
+        1. **Anchor weld** — a PDP/MFG within ``_WELD_MAX_M`` of a span is
+           connected: the span endpoint is moved onto it when it is within
+           ``_WELD_MOVE_M`` (no extra feature, the trench simply terminates on
+           the cabinet), otherwise a short connector span is appended (the
+           cabinet taps a passing trench).
+        2. **Span stitch** — a span endpoint within ``_STITCH_M`` of another
+           span is moved onto that span, so the published network is ONE
+           connected graph instead of a main network plus sub-metre islands.
+
+        Only geometry that was already within a metre is touched, and the
+        derived lengths are recomputed so the attributes keep agreeing with the
+        geometry.
+        """
+        stats = {"welded": 0, "connectors": 0, "stitched": 0}
+        if not rows:
+            return stats
+
+        paths: Dict[int, List[Tuple[float, float]]] = {}
+        for i, r in enumerate(rows):
+            line = _first_line(r.get("_geom"))
+            if line is None:
+                continue
+            pts = [(p.x(), p.y()) for p in line.asPolyline()]
+            if len(pts) >= 2:
+                paths[i] = pts
+        if not paths:
+            return stats
+        touched = set()
+        # A point welded onto an anchor is FINAL. The stitch pass below would
+        # otherwise pull it onto whatever span happens to pass nearby and undo
+        # the weld - measured on Berlin, that is exactly how PDP00009 went back
+        # to being 0.398 m off after it had been snapped on.
+        locked = set()
+
+        def _dist(ax, ay, bx, by):
+            return ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
+
+        for label, aid, ax, ay in (anchors or []):
+            best_end = (float("inf"), None, None)
+            best_seg = (float("inf"), None)
+            for i, pts in paths.items():
+                dd = _dist(pts[0][0], pts[0][1], ax, ay)
+                if dd < best_end[0]:
+                    best_end = (dd, i, 0)
+                dd = _dist(pts[-1][0], pts[-1][1], ax, ay)
+                if dd < best_end[0]:
+                    best_end = (dd, i, len(pts) - 1)
+                d_seg = rows[i]["_geom"].distance(QgsGeometry.fromPointXY(QgsPointXY(ax, ay)))
+                if d_seg < best_seg[0]:
+                    best_seg = (d_seg, i)
+            if best_seg[1] is None or best_seg[0] > self._WELD_MAX_M:
+                continue
+            if best_end[0] <= self._WELD_MOVE_M:
+                _, i, which = best_end
+                pts = list(paths[i])
+                pts[which] = (ax, ay)
+                paths[i] = pts
+                touched.add(i)
+                locked.add((i, which))
+                stats["welded"] += 1
+                if feedback:
+                    feedback.pushInfo(_tr(
+                        "  weld: {0} {1} was {2:.2f} m off the trench - "
+                        "endpoint snapped on").format(label, aid, best_end[0]))
+                continue
+            i = best_seg[1]
+            src = rows[i]
+            near = src["_geom"].nearestPoint(QgsGeometry.fromPointXY(QgsPointXY(ax, ay)))
+            q = near.asPoint() if near is not None and not near.isEmpty() else QgsPointXY(ax, ay)
+            conn = dict(src)
+            conn["_geom"] = QgsGeometry.fromPolylineXY([q, QgsPointXY(ax, ay)])
+            span = _dist(q.x(), q.y(), ax, ay)
+            conn["length_m"] = round(span, 2)
+            conn["SPAN_LEN_M"] = round(span, 2)
+            conn["SRC"] = "anchor-connector"
+            conn["START_CHAMBER"] = None
+            conn["END_CHAMBER"] = None
+            conn["SPAN_KIND"] = "Unchambered"
+            rows.append(conn)
+            stats["connectors"] += 1
+            if feedback:
+                feedback.pushInfo(_tr(
+                    "  connector: {0} {1} tapped the trench {2:.2f} m from it"
+                    ).format(label, aid, span))
+
+        # Span stitch: weld endpoints that stop just short of another span.
+        tol = self._STITCH_M
+        cell = max(tol * 4.0, 2.0)
+        grid: Dict[Tuple[int, int], List[int]] = {}
+        boxes = {}
+        for i, r in enumerate(rows):
+            g = r.get("_geom")
+            if g is None:
+                continue
+            env = g.boundingBox()
+            boxes[i] = (env.xMinimum(), env.xMaximum(), env.yMinimum(), env.yMaximum())
+            for cx in range(int(env.xMinimum() / cell), int(env.xMaximum() / cell) + 1):
+                for cy in range(int(env.yMinimum() / cell), int(env.yMaximum() / cell) + 1):
+                    grid.setdefault((cx, cy), []).append(i)
+        for i in list(paths.keys()):
+            pts = paths[i]
+            for which in (0, len(pts) - 1):
+                if (i, which) in locked:
+                    continue
+                px, py = pts[which]
+                x0, y0 = px - tol, py - tol
+                cands = set()
+                for cx in range(int(x0 / cell), int((px + tol) / cell) + 1):
+                    for cy in range(int(y0 / cell), int((py + tol) / cell) + 1):
+                        cands.update(grid.get((cx, cy), []))
+                best = (float("inf"), None)
+                for j in cands:
+                    if j == i:
+                        continue
+                    bb = boxes.get(j)
+                    if bb is None:
+                        continue
+                    if (px < bb[0] - tol or px > bb[1] + tol
+                            or py < bb[2] - tol or py > bb[3] + tol):
+                        continue
+                    d = rows[j]["_geom"].distance(
+                        QgsGeometry.fromPointXY(QgsPointXY(px, py)))
+                    if d < best[0]:
+                        best = (d, j)
+                if best[1] is None or best[0] <= 0.0 or best[0] > tol:
+                    continue
+                near = rows[best[1]]["_geom"].nearestPoint(
+                    QgsGeometry.fromPointXY(QgsPointXY(px, py)))
+                if near is None or near.isEmpty():
+                    continue
+                q = near.asPoint()
+                # Refuse a weld that would collapse the span.
+                other = pts[-1] if which == 0 else pts[0]
+                if _dist(q.x(), q.y(), other[0], other[1]) < 0.1:
+                    continue
+                pts = list(pts)
+                pts[which] = (q.x(), q.y())
+                paths[i] = pts
+                touched.add(i)
+                stats["stitched"] += 1
+
+        for i in touched:
+            pts = paths[i]
+            rows[i]["_geom"] = QgsGeometry.fromPolylineXY(
+                [QgsPointXY(x, y) for x, y in pts])
+            total = sum(_dist(pts[k][0], pts[k][1], pts[k + 1][0], pts[k + 1][1])
+                        for k in range(len(pts) - 1))
+            rows[i]["length_m"] = round(total, 2)
+            rows[i]["SPAN_LEN_M"] = round(total, 2)
+        return stats
+
     def _final_rows(self, final: QgsVectorLayer) -> List[dict]:
         """Designer span rows → the pipeline's Final_Trenches contract."""
         names = final.fields().names()
