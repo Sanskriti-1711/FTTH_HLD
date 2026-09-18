@@ -1235,13 +1235,32 @@ def enrich_cables(feeder_path, dist_path, objects_path, mfg_path, feedback=None)
         ])
         prof = CABLE_PROFILE["Distribution"]
         for f in lyr:
-            f.SetField("CABLE_TYPE", "Distribution")
-            f.SetField("FIBER_COUNT", prof["fiber_count"])
+            # The distribution layer carries the shared spine trunks AND the
+            # one-per-premise garden-leg drop cables. A drop is a 12F garden
+            # cable (docs/stages/HLD.md §Duct & cable rules), so it must not
+            # be restamped with the 48F distribution catalogue profile — the
+            # cable stage already sized both classes from the real household
+            # counts, exactly as the feeder branch above preserves the shared
+            # planner's FIBER_COUNT.
+            conn = str(_get(lyr, f, "CONNECTION_TYPE") or "")
+            is_drop = conn.lower().startswith("drop") or \
+                str(_get(lyr, f, "CABLE_TYPE") or "").strip().lower() == "drop"
+            if is_drop:
+                own = _num(lyr, f, "FIBER_COUNT", 0)
+                fc = int(own) if own else 12
+                f.SetField("CABLE_TYPE", "Drop")
+            else:
+                own = _num(lyr, f, "FIBER_COUNT", 0)
+                fc = int(own) if own else prof["fiber_count"]
+                f.SetField("CABLE_TYPE", "Distribution")
+            f.SetField("FIBER_COUNT", fc)
             f.SetField("LENGTH_M", round(_geom_len_m(f), 1))
             pid = str(_get(lyr, f, "pdp_id") or _get(lyr, f, "PDP_ID") or "").upper()
             f.SetField("SOURCE_NODE", pid)
-            hh = hh_by_pdp.get(pid, 0)
-            util = min(100.0, (hh / prof["fiber_count"]) * 100.0)
+            # Utilisation for a drop is its own fibre count (one premise); the
+            # PDP-wide household total is meaningless there.
+            hh = _num(lyr, f, "HH_COUNT", 0) if is_drop else hh_by_pdp.get(pid, 0)
+            util = min(100.0, (hh / fc) * 100.0) if fc else 0.0
             f.SetField("UTIL_PCT", round(util, 1))
             f.SetField("INFRA_STATUS", "Proposed")
             lyr.SetFeature(f)

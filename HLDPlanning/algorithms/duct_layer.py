@@ -1346,7 +1346,8 @@ class DuctLayer(QgsProcessingAlgorithm):
         return out_id, c_id
 
     def _build_route_ducts(self, cables_lyr, out_uri, profile_key, crs,
-                           context, feedback, subtract_lyr=None, runs_uri=None):
+                           context, feedback, subtract_lyr=None, runs_uri=None,
+                           skip_cable_types=()):
         """Build ONE duct per connected route from a cable layer.
 
         Cables that co-route (spatially touch within a small tolerance) are
@@ -1359,6 +1360,15 @@ class DuctLayer(QgsProcessingAlgorithm):
         Trenches, which are covered by the separate Drop_Ducts layer) are NOT
         duplicated inside the distribution duct. The duct then stops at the
         footway and carries only the route trunk.
+
+        ``skip_cable_types`` (optional): cable rows whose ``CABLE_TYPE`` is in
+        this set never enter the clubber. Distribution passes ``("Drop",)``:
+        a garden-leg drop cable is a one-premise arm that TAPS the trunk, so
+        the 0.5 m clubbing tolerance would otherwise club it into the trunk's
+        duct and drag the whole drop leg into the distribution duct. This is
+        the tier-level equivalent of the historical garden subtract pass (and
+        replaces the geometric subtraction under per-span publishing) — the
+        drop legs are carried by the separate ``Drop_Ducts`` layer.
 
         Returns the output layer id (or None when there is nothing to write).
         """
@@ -1423,13 +1433,29 @@ class DuctLayer(QgsProcessingAlgorithm):
         feats = []          # list of QgsFeature (valid geometry only)
         fid_to_idx = {}
         idx = QgsSpatialIndex()
+        fld_ctype = (first_field_case_insensitive(cables_lyr, ["CABLE_TYPE", "cable_type"])
+                     if skip_cable_types else None)
+        skipped = 0
         for f in cables_lyr.getFeatures():
             g = f.geometry()
             if not g or g.isEmpty():
                 continue
+            if fld_ctype is not None:
+                ct = f[fld_ctype]
+                if ct is not None and str(ct).strip() in skip_cable_types:
+                    skipped += 1
+                    continue
             fid_to_idx[f.id()] = len(feats)
             feats.append(f)
             idx.addFeature(f)
+        if skipped:
+            try:
+                feedback.pushInfo(
+                    f"{profile_key} route ducts: skipped {skipped} "
+                    f"{'/'.join(skip_cable_types)} cable(s) — carried by "
+                    f"Drop_Ducts, not the route duct.")
+            except Exception:
+                pass
         if not feats:
             return None
 
@@ -1974,19 +2000,19 @@ class DuctLayer(QgsProcessingAlgorithm):
         if dist_cables is not None and dist_cables.featureCount() > 0:
             try:
                 # The distribution trunk cables are laid ON the spine spans
-                # (the trench geometry itself), so no subtraction is needed:
-                # the garden drop legs are separate geometries that merely
-                # TOUCH the trunk at the footway point, and the clubber's
-                # 0.5 m tolerance would otherwise see a trunk span and the
-                # drop cables tapping it as one club, mixing drop legs into
-                # the distribution duct. (Historically the subtract pass
-                # removed per-house corridors that no longer exist.)
+                # (the trench geometry itself). The garden-leg DROP cables
+                # (CABLE_TYPE = "Drop") merely TAP the trunk at the footway
+                # point, so the clubber's 0.5 m tolerance would club them into
+                # the trunk's duct and pull the whole drop leg into the
+                # distribution duct — the rule is that drop legs live only in
+                # Drop_Ducts, so the drops are excluded by tier.
                 _rid = self._build_route_ducts(
                     dist_cables, out_distr_uri, "Distribution",
                     QgsCoordinateReferenceSystem(self.DEFAULT_CRS_AUTHID),
                     context, feedback,
                     subtract_lyr=None,
-                    runs_uri=runs_dist_uri)
+                    runs_uri=runs_dist_uri,
+                    skip_cable_types=("Drop", "Garden"))
                 dist_route_done = _rid is not None
             except Exception as e:
                 try:

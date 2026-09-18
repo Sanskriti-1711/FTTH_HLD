@@ -230,6 +230,18 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
     DEFAULT_DIST_WIDTH = 0.8
     SAME_FOOTWAY_TOL_M = 0.5
     RESERVED_SPARE_FIBERS = 2
+    # Distribution sizing (docs/stages/HLD.md §Duct & cable rules): the shared
+    # trunk is sized from the households riding it (never below the 48F
+    # distribution floor); the one-to-one garden-leg DROP cable is a 12F
+    # cable, because it serves exactly one premise.
+    DIST_FIBER_MIN    = 48
+    GARDEN_FIBER_COUNT = 12
+    # Connection-type values written on the layer and read back by the duct
+    # stage to keep the drop legs out of the distribution duct.
+    CONN_TRUNK = "Trunk on spine span"
+    CONN_DROP  = "Drop (garden leg)"
+    CABLE_TYPE_TRUNK = "Distribution"
+    CABLE_TYPE_DROP  = "Drop"
 
     # --- Shared feeder-cable planning (three-trunk policy) ---
     FEEDER_LADDER = (12, 24, 48, 72, 96, 144, 288)
@@ -879,6 +891,7 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
         out_fields.append(QgsField("RESERVED_SPARE_FIBERS", QMetaType.Type.Int))
         out_fields.append(QgsField("AVAILABLE_FIBERS", QMetaType.Type.Int))
         out_fields.append(QgsField("CONNECTION_TYPE", QMetaType.Type.QString))
+        out_fields.append(QgsField("CABLE_TYPE", QMetaType.Type.QString))
         out_fields.append(QgsField("length_m",   QMetaType.Type.Double))
         out_fields.append(QgsField("POLYGON_ID", QMetaType.Type.QString))
         out_fields.append(QgsField("PDP_ID",     QMetaType.Type.QString))
@@ -906,6 +919,8 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
                     proj_by_pdp.setdefault(pid, []).append(f.geometry())
 
         made = 0
+        made_trunks = 0
+        made_drops = 0
         # ── trunk cables: ONE per distribution (spine) span ───────────────
         # The adapter publishes the fanned rows (one row per address, same
         # span geometry) for the addr_id lookup, so trunks must be grouped by
@@ -959,10 +974,11 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
             of["ADDR_IDS"]   = ",".join(trunk_addrs)
             of["hhs"]        = str(hh_count)
             of["HH_COUNT"]   = hh_count
-            of["FIBER_COUNT"] = max(48, hh_count + self.RESERVED_SPARE_FIBERS)
+            of["FIBER_COUNT"] = max(self.DIST_FIBER_MIN, hh_count + self.RESERVED_SPARE_FIBERS)
             of["RESERVED_SPARE_FIBERS"] = self.RESERVED_SPARE_FIBERS
             of["AVAILABLE_FIBERS"] = max(0, of["FIBER_COUNT"] - self.RESERVED_SPARE_FIBERS - hh_count)
-            of["CONNECTION_TYPE"] = "Trunk on spine span"
+            of["CONNECTION_TYPE"] = self.CONN_TRUNK
+            of["CABLE_TYPE"] = self.CABLE_TYPE_TRUNK
             of["length_m"]   = round(of.geometry().length(), 2)
             of["POLYGON_ID"] = (str(df["POLYGON_ID"])
                                  if "POLYGON_ID" in df.fields().names() else None)
@@ -970,6 +986,7 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
             of["MFG_ID"]     = str(df["MFG_ID"]) if "MFG_ID" in df.fields().names() else None
             sinkD.addFeature(of, QgsFeatureSink.FastInsert)
             made += 1
+            made_trunks += 1
 
         # ── drop cables: ONE per premise along its garden leg ────────────
         # The garden leg already runs footway → house; the drop cable is that
@@ -1009,16 +1026,20 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
             of["ADDR_IDS"]   = addr or ""
             of["hhs"]        = str(hh_count)
             of["HH_COUNT"]   = hh_count
-            of["FIBER_COUNT"] = max(48, hh_count + self.RESERVED_SPARE_FIBERS)
+            # A drop cable serves exactly one premise: the Garden sizing rule
+            # (12F) applies instead of the 48F distribution floor.
+            of["FIBER_COUNT"] = max(self.GARDEN_FIBER_COUNT, hh_count + self.RESERVED_SPARE_FIBERS)
             of["RESERVED_SPARE_FIBERS"] = self.RESERVED_SPARE_FIBERS
             of["AVAILABLE_FIBERS"] = max(0, of["FIBER_COUNT"] - self.RESERVED_SPARE_FIBERS - hh_count)
-            of["CONNECTION_TYPE"] = "Drop (garden leg)"
+            of["CONNECTION_TYPE"] = self.CONN_DROP
+            of["CABLE_TYPE"] = self.CABLE_TYPE_DROP
             of["length_m"]   = round(of.geometry().length(), 2)
             of["POLYGON_ID"] = str(gf[fld_g_poly]) if fld_g_poly else None
             of["PDP_ID"]     = pid or None
             of["MFG_ID"]     = str(gf[fld_g_mfg]) if fld_g_mfg else None
             sinkD.addFeature(of, QgsFeatureSink.FastInsert)
             made += 1
+            made_drops += 1
 
         # Style output
         out_layer = QgsProcessingUtils.mapLayerFromString(outDistId, context)
@@ -1029,7 +1050,11 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
             except Exception: pass
             out_layer.renderer().setSymbol(sym)
 
-        feedback.pushInfo(f"Distribution: grouped branched cables={made} (same-footway groups, tolerance={self.SAME_FOOTWAY_TOL_M} m)")
+        feedback.pushInfo(
+            f"Distribution: {made_trunks} spine trunk cable(s) (48F floor, "
+            f"households + {self.RESERVED_SPARE_FIBERS} spare) + "
+            f"{made_drops} drop cable(s) ({self.GARDEN_FIBER_COUNT}F garden "
+            f"leg) = {made} total")
         return {
             self.O_FEEDER: outFeederId,
             self.O_DIST: outDistId,
