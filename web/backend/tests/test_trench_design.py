@@ -168,7 +168,7 @@ def test_bridge_and_tunnel_segments_are_never_carriers(tmp_path=None):
 def test_runs_from_edges_yields_one_continuous_run():
     sg = td.build_street_graph(_cross_walkable(), td.Params())
     keys = list(sg.edge_coords.keys())
-    runs, _breaks = td.runs_from_edges(keys, sg)
+    runs, _breaks, _edges = td.runs_from_edges(keys, sg)
     assert len(runs) == 1
     coords = runs[0]
     assert coords[0] == (0.0, 0.0) and coords[-1] == (50.0, 100.0)
@@ -181,7 +181,7 @@ def test_runs_from_edges_break_at_branch():
              ([(50, 0), (100, 0)], "footway"),
              ([(50, 0), (50, 50)], "footway")]
     sg = td.build_street_graph(parts, td.Params())
-    runs, breaks = td.runs_from_edges(list(sg.edge_coords.keys()), sg)
+    runs, breaks, _edges = td.runs_from_edges(list(sg.edge_coords.keys()), sg)
     assert len(runs) == 3
     assert len([n for n in breaks if sg.G.degree(n) >= 3]) == 1
 
@@ -794,3 +794,118 @@ def test_junction_end_is_not_a_loose_end():
     loose = td.dangling_ends(spans, [(0.0, 0.0), (100.0, 0.0), (50.0, 40.0)],
                              td.Params())
     assert [d["TRENCH_ID"] for d in loose] == [], loose
+
+
+# ── premise attribution: which house(s) a span was dug for ───────────────────
+# The cabling stage indexes its distribution input BY ADDRESS and matches each
+# garden row to it, so a trench that does not name its premises is a trench
+# nothing can be cabled through. These tests pin the identity, not the geometry.
+
+def _house(addr, x, y, hh=1, pid="P1", poly="POLY1"):
+    return {"ADDR_ID": addr, "HH": hh, "x": x, "y": y,
+            "PDP_ID": pid, "POLYGON_ID": poly}
+
+
+def test_houses_on_edges_names_every_premise_riding_a_shared_run():
+    """A shared spine span names ALL the premises it serves, not just one.
+
+    Several houses route over the same street edges, and that shared trunk is
+    exactly what the design exists to exploit — so the span has to be able to
+    say whose drops it carries.
+    """
+    houses = [_house("A1", 0, 0, hh=2), _house("A2", 10, 0, hh=3),
+              _house("A3", 20, 0, hh=1)]
+    edge_houses = {("n1", "n2"): {0, 1, 2}}
+    addr, hh = td.houses_on_edges([("n1", "n2")], edge_houses, houses)
+    assert addr == "A1,A2,A3"
+    assert hh == pytest.approx(6.0)
+
+
+def test_houses_on_edges_is_none_when_no_house_rides_the_span():
+    """A pure backbone span states it serves nobody — not a misleading 1."""
+    houses = [_house("A1", 0, 0)]
+    edge_houses = {("n1", "n2"): {0}}
+    addr, hh = td.houses_on_edges([("n9", "n9b")], edge_houses, houses)
+    assert addr is None and hh is None
+
+
+def test_houses_on_edges_unions_across_the_edges_of_one_run():
+    houses = [_house("A1", 0, 0, hh=2), _house("A2", 0, 0, hh=1)]
+    edge_houses = {("a", "b"): {0}, ("b", "c"): {1}}
+    addr, hh = td.houses_on_edges([("a", "b"), ("b", "c")], edge_houses, houses)
+    assert addr == "A1,A2" and hh == pytest.approx(3.0)
+
+
+def test_houses_on_edges_defaults_a_missing_household_count_to_one():
+    houses = [{"ADDR_ID": "A1", "HH": None}, {"ADDR_ID": "A2"}]
+    addr, hh = td.houses_on_edges([("e", "f")], {("e", "f"): {0, 1}}, houses)
+    assert addr == "A1,A2" and hh == pytest.approx(2.0)
+
+
+def test_houses_on_edges_dedupes_an_address_but_still_counts_its_houses():
+    houses = [_house("A1", 0, 0, hh=2), _house("A1", 1, 0, hh=2),
+              {"ADDR_ID": None, "HH": 1}]
+    addr, hh = td.houses_on_edges([("e", "f")], {("e", "f"): {0, 1, 2}}, houses)
+    assert addr == "A1"            # one address, listed once
+    assert hh == pytest.approx(5.0)  # a NULL-address premise still carries HH
+
+
+def test_spans_carry_the_premise_attribution():
+    """split_spans hands the run's address(es) and HH to every span it cuts."""
+    run = td.Run(coords=[(0.0, 0.0), (100.0, 0.0)], tier="Distribution",
+                 addr="A1,A2", hh=5.0)
+    spans = td.split_spans(
+        run, [{"x": 50.0, "y": 0.0, "NODE_TYPE": "JUNCTION", "NODE_ID": "TN-1"}],
+        td.Params())
+    assert len(spans) == 2
+    assert all(s["addr"] == "A1,A2" and s["hh"] == pytest.approx(5.0)
+               for s in spans)
+
+
+def test_garden_leg_span_names_exactly_one_premise():
+    """A drop leg exists for one house, so its address is that house's."""
+    run = td.Run(coords=[(0.0, 0.0), (0.0, 20.0)], tier="Garden",
+                 src="house-drop", addr="A7", hh=4.0)
+    spans = td.split_spans(run, [], td.Params())
+    assert len(spans) == 1
+    assert spans[0]["addr"] == "A7" and spans[0]["hh"] == pytest.approx(4.0)
+
+
+def test_trimming_a_run_keeps_its_premise_attribution():
+    """The tail trimmer rebuilds runs — the identity must survive the rebuild.
+
+    ``trim_unserved_tails`` cuts a run back to its supports and constructs a
+    NEW Run, so attribute propagation is easy to lose silently: the map would
+    look right while the cabling stage quietly built nothing.
+    """
+    mains = [td.Run(coords=[(0.0, 0.0), (0.0, 100.0)], tier="Feeder",
+                    addr="A1", hh=2.0)]
+    leg = td.Run(coords=[(0.0, 50.0), (30.0, 50.0)], tier="Garden",
+                 src="house-drop", addr="A1", hh=2.0)
+    kept, _stats = td.trim_unserved_tails(mains, [leg], [(0.0, 0.0)],
+                                          td.Params(), lambda m: None)
+    assert kept, "the supported part of the run must survive"
+    assert all(r.addr == "A1" and r.hh == pytest.approx(2.0) for r in kept)
+
+
+def test_trench_and_aerial_fields_publish_the_premise_attribution():
+    line = [n for n, _t in td.FIELD_LINE]
+    assert "ADDR_ID" in line and "HH" in line
+    aerial = [n for n, _t in td.FIELD_AERIAL]
+    assert "ADDR_ID" in aerial and "HH" in aerial
+
+
+def test_addr_of_normalises_blank_null_and_missing():
+    assert td._addr_of({"ADDR_ID": "  A1 "}) == "A1"
+    assert td._addr_of({"ADDR_ID": 3008521}) == "3008521"
+    assert td._addr_of({"ADDR_ID": ""}) is None
+    assert td._addr_of({"ADDR_ID": "NULL"}) is None
+    assert td._addr_of({}) is None
+
+
+def test_hh_of_defaults_to_one():
+    assert td._hh_of({"HH": 3}) == pytest.approx(3.0)
+    assert td._hh_of({"HH": "2.5"}) == pytest.approx(2.5)
+    assert td._hh_of({"HH": 0}) == pytest.approx(1.0)
+    assert td._hh_of({"HH": None}) == pytest.approx(1.0)
+    assert td._hh_of({}) == pytest.approx(1.0)

@@ -432,6 +432,53 @@ def _read_points(path: str, target_epsg: int, bbox=None) -> List[dict]:
     return out
 
 
+def _addr_of(pt: dict) -> Optional[str]:
+    """The premise id carried onto a trench span (``None`` when unknown)."""
+    v = pt.get("ADDR_ID")
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s if s and s.upper() != "NULL" else None
+
+
+def _hh_of(pt: dict) -> float:
+    """Household count of a premise (1.0 when the plan does not state one)."""
+    try:
+        hh = float(pt.get("HH"))
+    except (TypeError, ValueError):
+        return 1.0
+    return hh if hh > 0 else 1.0
+
+
+def houses_on_edges(edge_keys: Iterable[Tuple[str, str]],
+                    edge_houses: Dict[Tuple[str, str], Set[int]],
+                    houses: Sequence[dict]) -> Tuple[Optional[str], Optional[float]]:
+    """``(addr, hh)`` for every house whose spine path rides ``edge_keys``.
+
+    Returns ``(None, None)`` for a span no house is routed along (a pure
+    backbone span, or a PDP spur), so the published attribute states honestly
+    that the span serves no premise instead of carrying a misleading ``1``.
+    """
+    idxs: Set[int] = set()
+    for ek in edge_keys:
+        idxs.update(edge_houses.get(ek, ()))
+    if not idxs:
+        return None, None
+    seen: Set[str] = set()
+    addrs: List[str] = []
+    total = 0.0
+    for i in sorted(idxs):
+        if i < 0 or i >= len(houses):
+            continue
+        h = houses[i]
+        a = _addr_of(h)
+        if a and a not in seen:
+            seen.add(a)
+            addrs.append(a)
+        total += _hh_of(h)
+    return (",".join(addrs) if addrs else None), total
+
+
 def _rect_in_layer_crs(bbox, src_epsg: int, layer_srs
                        ) -> Optional[Tuple[float, float, float, float]]:
     """bbox (in ``src_epsg``) expressed in the layer's own CRS.
@@ -772,8 +819,15 @@ def _orient(seg: Sequence[Tuple[float, float]], ref: Tuple[float, float]
 
 
 def runs_from_edges(edge_keys: Iterable[Tuple[str, str]],
-                    sg: StreetGraph) -> Tuple[List[List[Tuple[float, float]]], List[str]]:
-    """Assemble continuous runs; return (run coord lists, break node ids)."""
+                    sg: StreetGraph
+                    ) -> Tuple[List[List[Tuple[float, float]]], List[str],
+                               List[List[Tuple[str, str]]]]:
+    """Assemble continuous runs.
+
+    Returns ``(run coord lists, break node ids, run edge keys)`` — the third
+    list is parallel to the first and names the street edges each run walked,
+    which is what attributes the houses routed along those edges to the run.
+    """
     sub = nx.Graph()
     for ek in edge_keys:
         a, b = ek
@@ -781,6 +835,7 @@ def runs_from_edges(edge_keys: Iterable[Tuple[str, str]],
             sub.add_edge(a, b, coords=sg.edge_coords[ek])
 
     runs: List[List[Tuple[float, float]]] = []
+    run_edges: List[List[Tuple[str, str]]] = []
     used: Set[Tuple[str, str]] = set()
     breaks = [n for n in sub.nodes if sub.degree(n) != 2]
     if not breaks:
@@ -792,6 +847,7 @@ def runs_from_edges(edge_keys: Iterable[Tuple[str, str]],
     def walk(start: str, first: str) -> None:
         coords = _orient(sub.edges[start, first]["coords"], sg.node_xy[start])
         used.add(ekey(start, first))
+        walked: List[Tuple[str, str]] = [ekey(start, first)]
         prev, cur = start, first
         while True:
             if sub.degree(cur) != 2:
@@ -801,10 +857,13 @@ def runs_from_edges(edge_keys: Iterable[Tuple[str, str]],
                 break
             seg = _orient(sub.edges[cur, nxt[0]]["coords"], coords[-1])
             coords.extend(seg[1:])
-            used.add(ekey(cur, nxt[0]))
+            ek = ekey(cur, nxt[0])
+            used.add(ek)
+            walked.append(ek)
             prev, cur = cur, nxt[0]
         if len(coords) >= 2:
             runs.append(coords)
+            run_edges.append(walked)
 
     for b in breaks:
         for nbr in list(sub.neighbors(b)):
@@ -815,7 +874,7 @@ def runs_from_edges(edge_keys: Iterable[Tuple[str, str]],
         if ekey(u, v) in used:
             continue
         walk(u, v)
-    return runs, breaks
+    return runs, breaks, run_edges
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -830,6 +889,20 @@ class Run:
     polygon: Optional[str] = None
     src: str = "design"
     infra: str = "New"
+    # ── premise attribution ──────────────────────────────────────────────
+    # WHICH HOUSES THIS TRENCH EXISTS FOR. A Garden leg serves exactly one
+    # house, but a distribution/feeder spine span is SHARED: one span on a
+    # street carries the drops of every house routed along it. Without this
+    # link a trench span is just a line — nothing records that it was dug for
+    # specific premises, and the cabling stage (which indexes its distribution
+    # input BY ADDRESS) has no way to connect the two.
+    #
+    # ``addr`` is the comma-joined ``ADDR_ID`` of every house served (the
+    # single value when only one house rides the span); ``hh`` is their summed
+    # household count. Both are attributes only — they never affect geometry,
+    # routing or node placement.
+    addr: Optional[str] = None
+    hh: Optional[float] = None
 
 
 def _snap_anchor(sg: StreetGraph, x: float, y: float, tol: float,
@@ -875,15 +948,27 @@ def design_backbone(sg: StreetGraph, mfg: dict, pdps: Sequence[dict],
 
 
 def design_spine(sg: StreetGraph, pdps: Sequence[dict], houses: Sequence[dict],
-                 params: Params, log) -> Dict[str, Set[Tuple[str, str]]]:
-    """Per-PDP shortest-path tree to its houses (shared corridors merge)."""
+                 params: Params, log
+                 ) -> Tuple[Dict[str, Set[Tuple[str, str]]],
+                            Dict[Tuple[str, str], Set[int]]]:
+    """Per-PDP shortest-path tree to its houses (shared corridors merge).
+
+    Returns ``(per_pdp_edge_sets, edge_houses)``. The second map records, for
+    every street edge, the indices of the houses whose PDP→house path walks
+    that edge — so a run assembled from those edges can state exactly which
+    premises it was dug for (``Run.addr`` / ``Run.hh``). Several houses usually
+    share one edge, which is precisely the case a shared trunk exists for.
+    """
     by_pdp: Dict[str, List[dict]] = defaultdict(list)
     for h in houses:
         pid = h.get("PDP_ID")
         if pid:
             by_pdp[str(pid)].append(h)
 
+    hidx = {id(h): i for i, h in enumerate(houses)}
+    edge_houses: Dict[Tuple[str, str], Set[int]] = defaultdict(set)
     per_pdp: Dict[str, Set[Tuple[str, str]]] = {}
+    served = 0
     for p in pdps:
         pid = str(p.get("PDP_ID") or "")
         src = _snap_anchor(sg, p["x"], p["y"], params.pdp_search_m)
@@ -893,7 +978,7 @@ def design_spine(sg: StreetGraph, pdps: Sequence[dict], houses: Sequence[dict],
         for h in by_pdp.get(pid, []):
             k = _snap_anchor(sg, h["x"], h["y"], params.house_search_m)
             if k is not None:
-                targets.append(k)
+                targets.append((h, k))
         if not targets:
             continue
         try:
@@ -901,9 +986,10 @@ def design_spine(sg: StreetGraph, pdps: Sequence[dict], houses: Sequence[dict],
         except Exception:
             continue
         edges: Set[Tuple[str, str]] = set()
-        for t in targets:
+        for h, t in targets:
             if t not in dist:
                 continue
+            hi = hidx.get(id(h))
             node = t
             guard = 0
             while node != src and guard < 10000:
@@ -912,12 +998,17 @@ def design_spine(sg: StreetGraph, pdps: Sequence[dict], houses: Sequence[dict],
                 if not preds:
                     break
                 pnode = preds[0]
-                edges.add((node, pnode) if node < pnode else (pnode, node))
+                ek = (node, pnode) if node < pnode else (pnode, node)
+                edges.add(ek)
+                if hi is not None:
+                    edge_houses[ek].add(hi)
                 node = pnode
+            served += 1
         per_pdp[pid] = edges
     paths = {pid: len(e) for pid, e in per_pdp.items()}
-    log(f"spine: {sum(paths.values())} street edge(s) across {len(paths)} PDP(s)")
-    return per_pdp
+    log(f"spine: {sum(paths.values())} street edge(s) across {len(paths)} PDP(s), "
+        f"{served} house(s) routed (edge→house attribution kept)")
+    return per_pdp, dict(edge_houses)
 
 
 def design_garden_legs(network_parts: Sequence[List[Tuple[float, float]]],
@@ -1311,6 +1402,8 @@ def split_spans(run: Run, nodes: Sequence[dict], params: Params,
             "length": length, "type": ttype, "tier": run.tier,
             "pdp": run.pdp, "polygon": run.polygon, "src": run.src,
             "infra": run.infra,
+            "addr": getattr(run, "addr", None),
+            "hh": getattr(run, "hh", None),
             "run_id": getattr(run, "run_id", "RUN-00000"),
         })
     return spans
@@ -1330,6 +1423,10 @@ FIELD_LINE = (
     ("VERIFY_STATUS", ogr.OFTString), ("SURFACE", ogr.OFTString),
     ("REINSTATE", ogr.OFTString), ("PDP_ID", ogr.OFTString),
     ("POLYGON_ID", ogr.OFTString), ("SRC", ogr.OFTString),
+    # Premise attribution (see Run.addr): the address(es) the span serves and
+    # their household count. "" when the span serves no premise (pure
+    # backbone), so a blank value means "not attributed", not "one house".
+    ("ADDR_ID", ogr.OFTString), ("HH", ogr.OFTReal),
     # AERIAL: the span runs through an aerial zone (restricted land). The span
     # stays an excavated trench span here — the flag tells the planner/BOQ the
     # corridor is restricted, so a re-route or an aerial span is expected.
@@ -1337,6 +1434,7 @@ FIELD_LINE = (
 )
 FIELD_AERIAL = (
     ("DROP_ID", ogr.OFTString), ("POLYGON_ID", ogr.OFTString),
+    ("ADDR_ID", ogr.OFTString), ("HH", ogr.OFTReal),
     ("TRENCH_TIER", ogr.OFTString), ("TRENCH_TYPE", ogr.OFTString),
     ("length_m", ogr.OFTReal), ("AERIAL_REASON", ogr.OFTString),
     ("INFRA_STATUS", ogr.OFTString),
@@ -1843,7 +1941,8 @@ def trim_unserved_tails(mains: List[Run], legs: Sequence[Run],
                 removed_len += total - _coords_len(piece)
                 trimmed += 1
                 keep.append(Run(coords=piece, tier=r.tier, pdp=r.pdp,
-                                polygon=r.polygon, src=r.src))
+                                polygon=r.polygon, src=r.src,
+                                addr=r.addr, hh=r.hh))
                 continue
         # no support, or supported at a single point: the whole run is unused
         if any(on_network(p, [(r.coords[j], r.coords[j + 1])
@@ -1899,7 +1998,8 @@ def trim_unserved_tails(mains: List[Run], legs: Sequence[Run],
             trimmed += 1
             changed = True
             survivors.append(Run(coords=piece, tier=r.tier, pdp=r.pdp,
-                                 polygon=r.polygon, src=r.src))
+                                 polygon=r.polygon, src=r.src,
+                                 addr=r.addr, hh=r.hh))
         keep = survivors
         if not changed:
             break
@@ -2131,7 +2231,7 @@ def design(cfg: dict) -> dict:
     log(f"street graph: {sg.G.number_of_nodes()} node(s), {sg.G.number_of_edges()} edge(s)")
 
     backbone_edges = design_backbone(sg, mfgs[0], pdps, params, log)
-    spine_edges = design_spine(sg, pdps, houses, params, log)
+    spine_edges, edge_houses = design_spine(sg, pdps, houses, params, log)
 
     # ── assemble runs (Feeder wins over Distribution where they overlap) ──
     feeder_keys = set(backbone_edges)
@@ -2147,11 +2247,17 @@ def design(cfg: dict) -> dict:
     for keys, tier, pid in ((feeder_keys, "Feeder", None), (dist_only, "Distribution", None)):
         if not keys:
             continue
-        raw_runs, breaks = runs_from_edges(keys, sg)
-        for coords in raw_runs:
+        raw_runs, breaks, run_edge_keys = runs_from_edges(keys, sg)
+        for coords, ekeys in zip(raw_runs, run_edge_keys):
             straight = _straighten(coords, params)
+            # Attach the premises this run was dug for. A shared street run
+            # often carries several houses' drops, so the value is the whole
+            # set — that is the truth about the span, and it is what lets the
+            # cabling stage fan the shared trunk back out per address.
+            addr, hh = houses_on_edges(ekeys, edge_houses, houses)
             runs.append(Run(coords=straight, tier=tier, pdp=pid,
-                            polygon=None, src="street-graph"))
+                            polygon=None, src="street-graph",
+                            addr=addr, hh=hh))
     carrier_mix = _edge_class_lengths(sg, feeder_keys | dist_keys)
     log("carriers: " + ", ".join(
         "%s %.0f m" % (k, v)
@@ -2200,9 +2306,12 @@ def design(cfg: dict) -> dict:
             % (len(aerial_legs), sum(leg["length"] for leg in aerial_legs),
                ", ".join(f"{k}: {v}" for k, v in sorted(by_reason.items()))))
     for leg in legs:
+        _house = leg["house"]
         r = Run(coords=leg["coords"], tier="Garden", pdp=None,
-                polygon=(leg["house"].get("POLYGON_ID") or None),
-                src="house-drop")
+                polygon=(_house.get("POLYGON_ID") or None),
+                src="house-drop",
+                # A drop leg exists for exactly one premise.
+                addr=_addr_of(_house), hh=_hh_of(_house))
         r.tier_type = leg["type"]          # type decided by leg length
         runs.append(r)
         # NOTE: legs are NOT added to ``network_parts`` — a later house must
@@ -2287,6 +2396,10 @@ def design(cfg: dict) -> dict:
             "INFRA_STATUS": sp["infra"], "VERIFY_STATUS": "Designed",
             "SURFACE": surf, "REINSTATE": reinstate,
             "PDP_ID": sp["pdp"], "POLYGON_ID": sp["polygon"],
+            # Premise attribution — which house(s) this chamber-to-chamber
+            # span was dug for. A drop leg names one address; a shared spine
+            # span names every address that rides it (comma-joined).
+            "ADDR_ID": sp.get("addr"), "HH": sp.get("hh"),
             "SRC": sp["src"],
             "AERIAL": 1 if aerial_reason else 0,
             "AERIAL_REASON": aerial_reason or None,
@@ -2333,6 +2446,26 @@ def design(cfg: dict) -> dict:
             "the ends are loose" % (len(far_spans),
                                     sum(s["length_m"] for s in far_spans)))
 
+    # ── premise attribution check ───────────────────────────────────────
+    # Every house the design spans should be reachable through a trench that
+    # NAMES it: the drop leg carries the address, and the shared spines above
+    # it carry the addresses of everything routed along them. A span with no
+    # address at all is either a pure backbone connector (legitimate) or a
+    # house the attribution pass missed (a bug) — the two are told apart by
+    # whether any house drop depends on it, so the count is reported instead
+    # of assumed.
+    _attributed = [r for r in span_rows if r.get("ADDR_ID")]
+    _garden_unattributed = [r for r in span_rows
+                            if r["TRENCH_TIER"] == "Garden"
+                            and not r.get("ADDR_ID")]
+    _hh_billed = sum(float(r.get("HH") or 0.0)
+                     for r in span_rows if r["TRENCH_TIER"] == "Garden")
+    log("premise attribution: %d/%d span(s) name the address(es) they serve "
+        "(%d Garden span(s) without an address, %.0f household(s) on the "
+        "drop legs)"
+        % (len(_attributed), len(span_rows), len(_garden_unattributed),
+           _hh_billed))
+
     # per-run span indexing
     _index_spans(span_rows)
 
@@ -2376,6 +2509,7 @@ def design(cfg: dict) -> dict:
         aerial_rows.append({
             "DROP_ID": "AD-%05d" % (i + 1),
             "POLYGON_ID": leg["house"].get("POLYGON_ID") or None,
+            "ADDR_ID": _addr_of(leg["house"]), "HH": _hh_of(leg["house"]),
             "TRENCH_TIER": "Garden", "TRENCH_TYPE": "Aerial",
             "length_m": round(leg["length"], 2),
             "AERIAL_REASON": leg["aerial_reason"],
@@ -2416,6 +2550,16 @@ def design(cfg: dict) -> dict:
         "carriageway_carrier_m": round(carriage_m, 1),
         "drills": len(drills),
         "garden_legs": len(legs),
+        # Which premises each span was dug for (see Run.addr). Reported so a
+        # regression in the attribution is visible in the run log rather than
+        # only downstream, where the cabling stage silently builds no cable.
+        "premise_attribution": {
+            "spans_with_address": len(_attributed),
+            "spans_total": len(span_rows),
+            "garden_spans_without_address": len(_garden_unattributed),
+            "garden_legs": len(legs),
+            "households_on_drop_legs": round(_hh_billed, 1),
+        },
         "aerial_legs": len(aerial_rows),
         "aerial_length_m": round(sum(r["length_m"] for r in aerial_rows), 1),
         "aerial_by_reason": _count_by(
