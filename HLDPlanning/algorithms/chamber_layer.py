@@ -66,6 +66,11 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
     JUNCTION_RADIUS_M = 1.5     # how close two DISTINCT ducts must pass to count as a junction
     JUNCTION_MIN_DUCTS = 3      # distinct ducts required for a junction chamber (rule 2)
     JUNCTION_SPACING_M = 40.0   # min spacing between junction-derived Manholes/Handholes
+    # Rule 9 — chambers where TRENCHES meet. Rule 2 only sees ducts, so a
+    # junction where the trench network branches but fewer than three distinct
+    # ducts pass (an HDD crossing meeting the open cut, a garden leg meeting the
+    # mains) used to get no civil structure at all.
+    TRENCH_JUNCTION_MIN = 3     # distinct trench runs meeting at one point
     HANDHOLE_SPACING_M = 40.0   # min spacing for distribution-level handholes
     CHAMBER_SPACING_M = 2.0     # legacy default (superseded by the rules below)
     # ── Structure separation (HLD review: no two chambers side by side) ──
@@ -281,7 +286,9 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
     # Rule order mirrors the 8-rule spec: splitter locations first, then
     # branching junctions, HDD pits, drop transitions, direction changes,
     # and finally intermediate pull structures.  A higher-ranked rule always
-    # beats a lower one at the same spot, regardless of raw weight.
+    # beats a lower one at the same spot, regardless of raw weight. Trench
+    # intersections (rule 9) sit with the duct junctions: the duct-based
+    # branching rule wins a tie, since it is the stronger evidence.
     RULE_ORDER = {
         # HDD entry/exit pits are placed FIRST (priority 3 = PDP level, weight
         # 1000 beats the PDP's 999) so the drill openings are never dropped and
@@ -290,9 +297,10 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
         "HDD pit": 0,
         "Splitter/F2D (PDP)": 1,
         "Branching junction": 2,
-        "Drop transition": 3,
-        "Direction change": 4,
-        "Pull point": 5,
+        "Trench intersection": 3,
+        "Drop transition": 4,
+        "Direction change": 5,
+        "Pull point": 6,
     }
 
     def _rule_rank(self, cand):
@@ -809,6 +817,22 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
             if w >= self.JUNCTION_MIN_DUCTS:
                 candidates.append((x, y, 1, "Handhole", "", w,
                                    self.HANDHOLE_SPACING_M, "Branching junction"))
+
+        # Rule 9 — Trench intersections ("chambers at the intersections").
+        # Rule 2 above only counts DUCTS, so a point where the trench network
+        # genuinely branches but fewer than three distinct ducts pass got no
+        # structure. Any point where >= TRENCH_JUNCTION_MIN distinct trench runs
+        # meet gets a Handhole, or a Manhole when the junction is dense enough
+        # (>= 4 runs) — an HDD crossing meeting the open cut, a garden leg
+        # meeting the mains, a distribution spine leaving the backbone.
+        # The structure is snapped onto the trench path in the constraint pass,
+        # so it lands exactly on the intersection.
+        for x, y, w in self._junction_points(trenches, self.JUNCTION_RADIUS_M):
+            if w >= self.TRENCH_JUNCTION_MIN:
+                ctype = "Manhole" if w >= self.TRENCH_JUNCTION_MIN + 1 else "Handhole"
+                candidates.append((x, y, 2, ctype, "", w,
+                                   self.JUNCTION_SPACING_M,
+                                   "Trench intersection"))
 
         # Rule 4 — Distribution→Drop transition: Handhole only where a
         # cluster of drop ducts taps off (>= DROP_TRANSITION_MIN_DROPS within

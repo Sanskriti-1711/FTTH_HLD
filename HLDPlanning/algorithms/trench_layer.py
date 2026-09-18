@@ -181,6 +181,139 @@ def _make_tangent_trench(center: QgsPointXY, direction, radius_m: float, length_
     return QgsGeometry.fromPolylineXY([p1, p2])
 
 
+def _intersection_points(g) -> List[QgsPointXY]:
+    """Vertices of an intersection result — points and line ends alike."""
+    out: List[QgsPointXY] = []
+    if g is None or g.isEmpty():
+        return out
+    try:
+        if g.isMultipart():
+            for sub in g.asGeometryCollection():
+                out.extend(_intersection_points(sub))
+            return out
+        kind = QgsWkbTypes.geometryType(g.wkbType())
+        if kind == QgsWkbTypes.PointGeometry:
+            out.append(g.asPoint())
+        elif kind == QgsWkbTypes.LineGeometry:
+            out.extend(g.asPolyline())
+    except Exception:
+        return out
+    return out
+
+
+def _nearest_point_on(geom: QgsGeometry, pt_geom: QgsGeometry):
+    """Point ON ``geom`` closest to ``pt_geom``, plus the distance between them.
+
+    ``QgsGeometry.nearestPoint(other)`` returns the nearest point on *this*
+    geometry, and the shared ``nearest_point_and_distance`` wrapper inherits
+    that direction, which is the wrong way round for the call below.
+    """
+    try:
+        if geom is None or geom.isEmpty() or pt_geom is None or pt_geom.isEmpty():
+            return None, None
+        np = geom.nearestPoint(pt_geom)
+        if np is None or np.isEmpty() or \
+                QgsWkbTypes.geometryType(np.wkbType()) != QgsWkbTypes.PointGeometry:
+            return None, None
+        p = np.asMultiPoint()[0] if QgsWkbTypes.isMultiType(np.wkbType()) else np.asPoint()
+        return QgsPointXY(p), float(np.distance(pt_geom))
+    except Exception:
+        return None, None
+
+
+def _weld_crossing_to_network(line_geom: QgsGeometry, ref_geom: QgsGeometry,
+                              snap_m: float = 45.0):
+    """Move both ends of a crossing onto ``ref_geom`` so it leaves no stub.
+
+    Second-chance path for a crossing whose line the open cut does not cross on
+    both sides of its midpoint (the junction it was cut from may sit at one
+    end of the drill rather than under its middle). Each end is projected onto
+    the nearest point of the open-cut network, so the HDD still meets the open
+    cut directly and at the angle the two lines actually form, instead of
+    stopping short by the footway offset.
+
+    Returns ``(geometry, welded)``; an end further than ``snap_m`` from the
+    network leaves the geometry untouched and reports False, so the caller
+    publishes the crossing exactly as designed instead of distorting it.
+    """
+    if not _geom_ok(line_geom) or not _geom_ok(ref_geom):
+        return line_geom, False
+    try:
+        pl = line_geom.asPolyline()
+    except Exception:
+        return line_geom, False
+    if len(pl) < 2:
+        return line_geom, False
+    p0, d0 = _nearest_point_on(ref_geom, QgsGeometry.fromPointXY(pl[0]))
+    p1, d1 = _nearest_point_on(ref_geom, QgsGeometry.fromPointXY(pl[-1]))
+    if p0 is None or p1 is None or max(d0, d1) > snap_m:
+        return line_geom, False
+    pts = [p0] + (list(pl[1:-1]) if len(pl) > 2 else []) + [p1]
+    out = QgsGeometry.fromPolylineXY(pts)
+    if not _geom_ok(out) or out.length() <= 0:
+        return line_geom, False
+    return out, True
+
+
+def _crossing_between_contacts(line_geom: QgsGeometry, ref_geom: QgsGeometry,
+                               reach_m: float = 60.0, min_len_m: float = 2.0):
+    """Trim/extend a crossing drill to meet ``ref_geom`` on BOTH sides.
+
+    A drill is generated at a fixed length offset from a junction, so it never
+    matched the routed trench: every used crossing on Berlin ended 10-33 m off
+    the network and a cable could not be run through one. The crossing is
+    instead the stretch of the drill's own line BETWEEN the outermost places
+    the routed open cut crosses it — one on each side of the drill's midpoint,
+    which is the road centre. The line is extended by ``reach_m`` in both
+    directions first, so a crossing shorter than the road it spans is grown out
+    to the open cut rather than left short; the extension only lengthens the
+    line the drill already defines, so the joint angle is unchanged.
+
+    Returns ``(geometry, ok)``; ``ok`` is False when the network does not cross
+    the line on both sides, and the caller then keeps the drill as designed.
+    """
+    if not _geom_ok(line_geom) or not _geom_ok(ref_geom):
+        return line_geom, False
+    try:
+        pl = line_geom.asPolyline()
+    except Exception:
+        return line_geom, False
+    if len(pl) < 2:
+        return line_geom, False
+    a, b = pl[0], pl[-1]
+    dx, dy = b.x() - a.x(), b.y() - a.y()
+    L = math.hypot(dx, dy)
+    if L <= 0:
+        return line_geom, False
+    ux, uy = dx / L, dy / L
+    ext_a = QgsPointXY(a.x() - ux * reach_m, a.y() - uy * reach_m)
+    ext_b = QgsPointXY(b.x() + ux * reach_m, b.y() + uy * reach_m)
+    ext = QgsGeometry.fromPolylineXY([ext_a, ext_b])
+    try:
+        hits = _intersection_points(ext.intersection(ref_geom))
+    except Exception:
+        return line_geom, False
+    ts = []
+    for p in hits:
+        t = ((p.x() - a.x()) * dx + (p.y() - a.y()) * dy) / (L * L)
+        if -reach_m / L <= t <= 1.0 + reach_m / L:
+            ts.append(t)
+    left = [t for t in ts if t <= 0.5]
+    right = [t for t in ts if t >= 0.5]
+    if not left or not right:
+        return line_geom, False
+    t0, t1 = max(left), min(right)
+    if (t1 - t0) * L < min_len_m:
+        return line_geom, False
+    out = QgsGeometry.fromPolylineXY([
+        QgsPointXY(a.x() + dx * t0, a.y() + dy * t0),
+        QgsPointXY(a.x() + dx * t1, a.y() + dy * t1),
+    ])
+    if not _geom_ok(out):
+        return line_geom, False
+    return out, True
+
+
 # ------------------------------------------------------------
 # Schema safety: GPKG (SQLite/OGR) treats column names
 # case-INSENSITIVELY for uniqueness, so ``pdp_id`` and ``PDP_ID``
@@ -1123,6 +1256,8 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
         feedback.pushInfo(
             f"Sidewalks: left={left_sw.featureCount()} feats, right={right_sw.featureCount()} feats"
         )
+
+
         
         # 3) Write sinks (Left/Right lines always; merged + debug only if connected)
         # Keep this (single creation)
@@ -2705,15 +2840,23 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                             tuple(_ids_of(near, club_poly_src)),
                             len(near), near[0][1]))
 
-                    # Per-piece construction class FIRST: a piece lying on a
-                    # used drill crossing is HDD; assembled corridors never
-                    # mix classes. (Overlap test, not proximity — a route
-                    # must never inherit HDD from a single crossing.)
+                    # Construction class of the routed network is ALWAYS Open
+                    # Cut — HDD now means exactly "road crossing" and is
+                    # published as its own welded feature further down (see
+                    # "HDD crossings ARE part of the final trench network").
+                    # A route piece that happens to ride along a crossing used
+                    # to be typed HDD as well, which published both the crossing
+                    # and a scattering of 1-3 m HDD slivers for the same road;
+                    # those slivers then confused the chamber layer's HDD
+                    # entry/exit rule, because two sliver ends within 2 m of
+                    # each other read as an interior joint.
                     def _on_drill(pg):
                         for dg in _drill_geoms:
                             if dg.distance(pg) <= 0.5 and pg.buffer(0.25, 8).intersects(dg):
                                 return True
                         return False
+
+                    _riding = sum(1 for pg in _oc_pieces if _on_drill(pg))
 
                     # ── Assemble whole corridors via degree-2 chain merging ──
                     # Two exploded pieces belong to the same physical trench
@@ -2745,7 +2888,7 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                     _end_nodes = defaultdict(list)   # node key -> [piece idx]
                     _end_dir = {}                    # (node key, piece idx) -> unit dir away from that end
                     _pdps = [set(a[0]) for a in _piece_attrs]
-                    _tts = ["HDD" if _on_drill(pg) else "Open Cut" for pg in _oc_pieces]
+                    _tts = ["Open Cut"] * len(_oc_pieces)
                     for i, pg in enumerate(_oc_pieces):
                         try:
                             pts = pg.asPolyline() or []
@@ -2828,6 +2971,65 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                              poly_l[0] if poly_l else None,
                              ",".join(poly_l) if poly_l else None,
                              len(idxs), src_ft)
+                        )
+
+                    # ── HDD crossings ARE part of the final trench network ──
+                    # A used drill crossing used to be published only on its own
+                    # Tangent_Crossings layer, so Final_Trenches contained almost
+                    # no HDD and the crossing floated free of the trench (both
+                    # ends 10-33 m off the network, so no cable could be pulled
+                    # through it). Every used crossing is now published INSIDE
+                    # Final_Trenches typed HDD, with both ends welded onto the
+                    # open-cut network, so the HDD meets the open cut directly
+                    # and at whatever angle the two actually form instead of via
+                    # a footway-offset stub.
+                    _hdd_welded = 0
+                    _hdd_kept = 0
+                    for _dg in _drill_geoms:
+                        _dbx = _dg.boundingBox()
+                        _dbx.grow(8.0)
+                        _near = [
+                            _src_geoms[i] for i in range(len(_src_geoms))
+                            if not (_dbx.xMaximum() < _src_bboxes[i].xMinimum()
+                                    or _dbx.xMinimum() > _src_bboxes[i].xMaximum()
+                                    or _dbx.yMaximum() < _src_bboxes[i].yMinimum()
+                                    or _dbx.yMinimum() > _src_bboxes[i].yMaximum())
+                        ]
+                        if not _near:
+                            continue
+                        _net = (_unary_union_geoms(_near)
+                                if len(_near) > 1 else _near[0])
+                        _cross, _welded = _crossing_between_contacts(_dg, _net)
+                        if not _welded:
+                            # Second chance: the open cut may cross the drill on
+                            # only one side of its midpoint (the junction sits
+                            # at one end of the drill). Pull both ends onto the
+                            # open cut instead, so the crossing still joins it
+                            # directly rather than floating.
+                            _cross, _welded = _weld_crossing_to_network(_dg, _net)
+                        if not _welded:
+                            # Nothing to attach to — publish the crossing as
+                            # designed rather than silently dropping it.
+                            _cross = _dg
+                            _hdd_kept += 1
+                        else:
+                            _hdd_welded += 1
+                        _j = min(range(len(_oc_pieces)),
+                                 key=lambda i: _oc_pieces[i].distance(_cross))
+                        _a = _piece_attrs[_j]
+                        clubbed_features.append((
+                            _cross, "HDD",
+                            _a[0][0] if _a[0] else None,
+                            ",".join(_a[0]) if _a[0] else None,
+                            _a[1][0] if _a[1] else None,
+                            ",".join(_a[1]) if _a[1] else None,
+                            1, _a[3]))
+                    if _drill_geoms:
+                        feedback.pushInfo(
+                            f"✅ HDD crossings inside Final_Trenches: "
+                            f"{len(_drill_geoms)} ({_hdd_welded} welded onto the open cut, "
+                            f"{_hdd_kept} published as designed); "
+                            f"{_riding} routed piece(s) ride a crossing and stay Open Cut."
                         )
 
                 # Garden drop legs pass through as their own features (one per
