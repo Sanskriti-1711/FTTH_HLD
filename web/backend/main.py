@@ -69,14 +69,10 @@ ONECLICK_OUTPUTS: List[Tuple[str, str, str]] = [
     ("poles", "Poles.gpkg", "Poles.geojson"),
     ("brownfield", "Existing_Infrastructure.gpkg", "Existing_Infrastructure.geojson"),
     ("brownfield", "Existing_Infrastructure_Points.gpkg", "Existing_Infrastructure_Points.geojson"),
-    # Occupancy registry — derived from the duct/cable layers by
-    # occupancy.publish(): how many ways each duct provides/takes and how many
-    # fibres each cable provides/uses. Stored (project + PostGIS) so a re-run
-    # or the LLD can consume existing spare ways instead of laying new duct.
-    # The field names match the brownfield loader's capacity_field /
-    # capacity_used_field, so this layer can be fed straight back in as BF_DUCTS.
-    ("duct_occupancy", "Duct_Occupancy.gpkg", "Duct_Occupancy.geojson"),
-    ("cable_occupancy", "Cable_Occupancy.gpkg", "Cable_Occupancy.geojson"),
+    # NOTE: the duct/cable occupancy registry is derived by occupancy.store()
+    # during ingest and lives ONLY in the gis.duct_occupancy / gis.cable_occupancy
+    # tables (brownfield-capacity read-back for a re-run / the LLD). It is not a
+    # design layer, so it is not published as one — no map toggle, no download.
     # NOTE: BOQ.xlsx / BOM.xlsx are intentionally NOT listed here as layers —
     # they surface in the Downloads section via _register_downloads() instead.
 ]
@@ -381,17 +377,17 @@ def _restore_task_from_disk(project_id: str) -> Optional[Dict[str, Any]]:
 
 
 def _ingest_outputs(project_id: str, output_dir: Path) -> List[Dict[str, Any]]:
-    # Derive the occupancy registry from the duct/cable layers BEFORE ingest so
-    # the run stores duct ways-total/used/spare and cable fibres-used/free
-    # alongside its design layers. Best-effort: a missing derivation must never
-    # fail a completed run.
+    # Store the occupancy registry in PostGIS BEFORE layer ingest so the run
+    # keeps duct ways-total/used/spare and cable fibres-used/free for read-back
+    # (brownfield capacity for a re-run / the LLD). DB-only: no map layers, no
+    # downloads. Best-effort: a missing registry must never fail a completed run.
     try:
-        occ = occupancy.publish(output_dir)
+        occ = occupancy.store(output_dir, project_id)
         if occ.get("ducts") or occ.get("cables"):
             _append(
                 project_id,
                 "info",
-                "Occupancy registry: "
+                "Occupancy registry stored: "
                 f"{occ.get('ducts', 0)} duct row(s), "
                 f"{occ.get('cables', 0)} cable row(s).",
             )

@@ -56,6 +56,8 @@ class COMMON_FIELDS:
     # HLD_attr.docx chamber / pole catalogue
     STRUCT_ID = "STRUCT_ID"             # MH-0001 / CH-0001 / HH-0001
     CHAMBER_TYPE = "CHAMBER_TYPE"       # Manhole | Chamber | Handhole
+    SUBTYPE = "SUBTYPE"                # Bore | Handhole | Manhole (civil sub-category)
+    REASON = "REASON"                  # why this structure exists (rule that placed it)
     CONN_DUCTS = "CONN_DUCTS"
     SIZE = "SIZE"
     EQUIPMENT = "EQUIPMENT"             # associated equipment id (PDP/FAT)
@@ -110,6 +112,8 @@ THIN_PROFILES = {
     "CHAMBER": [
         COMMON_FIELDS.STRUCT_ID,
         COMMON_FIELDS.CHAMBER_TYPE,
+        COMMON_FIELDS.SUBTYPE,
+        COMMON_FIELDS.REASON,
         COMMON_FIELDS.PARENT_TRENCH,
         COMMON_FIELDS.CONN_DUCTS,
         COMMON_FIELDS.SIZE,

@@ -268,27 +268,53 @@ def cable_rows(output_dir: Path) -> List[Dict[str, Any]]:
 
 
 def publish(output_dir: Path) -> Dict[str, int]:
-    """Write ``Duct_Occupancy.geojson`` / ``Cable_Occupancy.geojson``.
+    """Derive the occupancy rows for this run.
 
-    Returns the row counts written.  Never raises: an occupancy layer that
-    cannot be derived must not fail a completed pipeline run.
+    Returns ``{"ducts": n, "cables": m}`` row counts. The rows are NOT written
+    as map layers — they are stored in the ``gis.duct_occupancy`` /
+    ``gis.cable_occupancy`` tables by the engine's ingest (see ``store``).
+    Never raises: an occupancy derivation that fails must not fail a completed
+    pipeline run.
     """
     summary = {"ducts": 0, "cables": 0}
     try:
-        ducts = duct_rows(output_dir)
-        if ducts:
-            _write(output_dir / "Duct_Occupancy.geojson", ducts)
-            summary["ducts"] = len(ducts)
+        summary["ducts"] = len(duct_rows(output_dir))
     except Exception:  # noqa: BLE001 - derived artefact, never fatal
         pass
     try:
-        cables = cable_rows(output_dir)
-        if cables:
-            _write(output_dir / "Cable_Occupancy.geojson", cables)
-            summary["cables"] = len(cables)
+        summary["cables"] = len(cable_rows(output_dir))
     except Exception:  # noqa: BLE001
         pass
     return summary
+
+
+def store(output_dir: Path, project_id: str) -> Dict[str, int]:
+    """Derive the occupancy rows and load them into PostGIS (no map layers).
+
+    The registry is data for the next run / the LLD (brownfield capacity
+    read-back), not a design layer, so it goes straight to the database and
+    does not appear on the results map or in the downloads.
+    Returns the row counts stored; ``{}`` when PostGIS is unavailable.
+    Never raises.
+    """
+    from . import postgis  # local import: occupancy is also usable standalone
+
+    try:
+        if not postgis.is_available():
+            return {}
+        postgis.init_schema()
+        stored = {"ducts": 0, "cables": 0}
+        ducts = duct_rows(output_dir)
+        if ducts:
+            stored["ducts"] = postgis.store_occupancy(
+                project_id, "duct_occupancy", ducts)
+        cables = cable_rows(output_dir)
+        if cables:
+            stored["cables"] = postgis.store_occupancy(
+                project_id, "cable_occupancy", cables)
+        return stored
+    except Exception:  # noqa: BLE001 - derived artefact, never fatal
+        return {}
 
 
 def publish_for_project(output_dir: Path) -> Dict[str, int]:

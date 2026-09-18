@@ -349,15 +349,14 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
 
         # ── tier mirrors
         # Feeder and Garden publish the designer's spans as-is. Distribution
-        # does NOT: cable_layer joins a drop leg to its distribution corridor
-        # by requiring the two polylines to SHARE the footway endpoint
-        # (``dist_points + reversed(garden_points)[1:]``), while the designer's
-        # distribution tier is a shared spine whose ends are structural nodes
-        # and whose houses attach mid-span. So the distribution layer is
-        # materialised as what cable_layer is written for — one corridor per
-        # address, from that address's splitter down to its footway point — and
-        # it is derived by routing along the designer's own attributed spans
-        # rather than replaced by straight lines.
+        # publishes the SHARED SPINE, one row per span — the ducts and cables
+        # are laid IN the trench, so their geometry must be a subset of the
+        # trench geometry. (Historically this layer was one routed corridor
+        # per house, which duplicated the spine once per premise: ~25 km of
+        # drawn distribution cable for ~1.4 km of unique geometry on Berlin.)
+        # cable_layer's per-address join is served by ``addr_id`` holding
+        # every premise the span serves, comma-joined — see _fan_out_per_address
+        # kept for the pipeline runs that still index that way.
         for tier, key in (("Feeder", self.O_FEEDER_FINAL),
                           ("Garden", self.O_GARDEN)):
             rows = [r for r in final_rows if r["TRENCH_TIER"] == tier]
@@ -366,30 +365,30 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
                 _TIER_GEOM[tier], target_epsg, feedback)
             feedback.pushInfo(_tr("  {0} trench: {1} feature(s)").format(tier, len(rows)))
 
-        # The splitter's own coordinates anchor every distribution route; the
-        # plan layers arrive as WGS84 in some runs, so the PDP layer is put in
-        # the project CRS first.
+        # The splitter's own coordinates anchor the PDP projections; the plan
+        # layers arrive as WGS84 in some runs, so the PDP layer is put in the
+        # project CRS first.
         pdps_t = self._reproject(pdps, target_epsg, context, feedback) or pdps
         spine_rows = [r for r in final_rows if r["TRENCH_TIER"] == "Distribution"]
-        dist_rows = self._distribution_routes(
-            final_rows, self._pdp_points(pdps_t), feedback)
-        if not dist_rows:
-            # Routing found no path for anything (unexpected): fall back to the
-            # shared spine fanned out per address so the stage still publishes
-            # a distribution corridor for every addressed house.
-            feedback.pushWarning(_tr(
-                "Per-address distribution routing produced nothing; falling "
-                "back to the shared spine."))
-            dist_rows = self._fan_out_per_address(spine_rows)
-        sinks[self.O_DIST_LINES] = self._write_rows(
-            parameters, context, self.O_DIST_LINES, dist_rows, _FINAL_FIELDS,
-            QgsWkbTypes.LineString, target_epsg, feedback)
+        # cable_layer resolves a premise's trunk span by indexing the
+        # distribution layer on addr_id and looking the address up — which a
+        # comma-joined value never matches. The fanned rows (one row per
+        # address, same span geometry) go to the lines output the cable stage
+        # reads. The duplication is bookkeeping only: identical geometry
+        # unions back into one corridor in the duct clubber, and the trunk
+        # cable build groups by span identity (SPAN_INDEX + tier), so one
+        # trunk cable is still published per span.
+        if spine_rows:
+            fan_rows = self._fan_out_per_address(spine_rows)
+            sinks[self.O_DIST_LINES] = self._write_rows(
+                parameters, context, self.O_DIST_LINES, fan_rows, _FINAL_FIELDS,
+                QgsWkbTypes.LineString, target_epsg, feedback)
         feedback.pushInfo(_tr(
-            "  Distribution trench: {0} route(s) for {1} addressed premise(s) "
-            "({2} shared-spine span(s))").format(
-                len(dist_rows),
-                len({r["addr_id"] for r in dist_rows if r.get("addr_id")}),
-                len(spine_rows)))
+            "  Distribution trench: {0} shared spine span(s) ({1} m) for {2} "
+            "addressed premise(s)").format(
+                len(spine_rows),
+                round(sum(r.get("SPAN_LEN_M") or 0 for r in spine_rows)),
+                len(self._fan_out_per_address(spine_rows)) if spine_rows else 0))
 
         # ── Distribution dissolved (cable_layer's fallback input)
         if spine_rows:
@@ -587,17 +586,16 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
 
     def _distribution_routes(self, final_rows: List[dict], pdp_xy, feedback
                              ) -> List[dict]:
-        """One distribution corridor per addressed premise.
+        """RETAINED FOR FALLBACK USE — currently unused by processAlgorithm.
 
-        The corridor runs from the premise's splitter (PDP) along the designer's
-        own spans to that premise's footway attachment point — the contract
-        ``cable_layer`` needs, because it builds the drop cable as
-        ``distribution + reversed(garden)`` and the two polylines must meet.
-
-        The path only uses spans the designer attributed to that address, so a
-        cable can never take a shortcut along somebody else's corridor.
-        ``heapq`` Dijkstra rather than networkx: ``trench_layer`` already treats
-        networkx as optional and this stage must not start requiring it.
+        The per-address routing this method implements was the historic way to
+        satisfy cable_layer's shared-footway-endpoint join: one corridor per
+        addressed premise, routed along the designer's spans from the premise's
+        splitter to its footway attachment point. It duplicated the spine once
+        per house (25 km drawn for ~1.4 km of unique geometry on Berlin), which
+        is why the stage now publishes the shared spine and cable_layer groups
+        trunk cables per span instead. Kept, documented and reachable so a run
+        that must reproduce the old per-house corridors can call it directly.
         """
         import heapq
 

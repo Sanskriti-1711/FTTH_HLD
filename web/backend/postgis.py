@@ -625,6 +625,63 @@ def load_geojson_file(
         )
 
 
+def store_occupancy(project_id: str, table: str, features: List[Dict[str, Any]]) -> int:
+    """Load occupancy registry rows into ``gis.<table>`` (no map layer).
+
+    The occupancy tables reuse the generic GIS table shape (project_id +
+    geometry + JSONB properties). They are data for the next run / the LLD —
+    brownfield capacity read-back — not design layers, so they are never
+    returned by ``list_project_layers`` and never reach the results map or
+    the downloads.
+    """
+    if table not in ("duct_occupancy", "cable_occupancy"):
+        raise ValueError(f"unknown occupancy table: {table}")
+    conn = get_conn()
+    rows = []
+    for fid, feature in enumerate(features):
+        if not isinstance(feature, dict):
+            continue
+        props = feature.get("properties") or {}
+        geom = feature.get("geometry")
+        rows.append(
+            (
+                project_id,
+                fid,
+                json.dumps(geom) if geom else None,
+                _pick_prop(props, "PDP_ID"),
+                _pick_prop(props, "SRC_ID"),
+                Json(props),
+            )
+        )
+    if not rows:
+        return 0
+    with conn.cursor() as cur:
+        # One registry per project per run: refresh, never append.
+        cur.execute(
+            sql.SQL("DELETE FROM {table} WHERE project_id = %s").format(
+                table=_gis_ident(table)
+            ),
+            (project_id,),
+        )
+        cur.executemany(
+            sql.SQL(
+                """
+                INSERT INTO {table} (
+                    project_id, fid, geom, "PDP_ID", "SRC_ID", properties
+                )
+                VALUES (
+                    %s, %s,
+                    CASE WHEN %s IS NULL THEN NULL
+                         ELSE ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326) END,
+                    %s, %s, %s
+                )
+                """
+            ).format(table=_gis_ident(table)),
+            rows,
+        )
+    return len(rows)
+
+
 # ---------------------------------------------------------------------------
 # Layer querying
 # ---------------------------------------------------------------------------

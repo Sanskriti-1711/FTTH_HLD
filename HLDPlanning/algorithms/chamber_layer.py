@@ -125,6 +125,14 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
         "Pull point": "HH",
     }
 
+    # Civil sub-category, from the catalogue code:
+    #   "Bore"     = the entry/exit opening of an HDD (directional-drill)
+    #                crossing — access to the bore, at the drill ends, never
+    #                mid-carriageway;
+    #   "Manhole"  = MH (1200x1200, walk-in, feeder);
+    #   "Handhole" = DHH / HH (hand-access, distribution & drop).
+    SUBTYPE_BY_CODE = {"MH": "Manhole", "DHH": "Handhole", "HH": "Handhole"}
+
     def tr(self, s):
         return QCoreApplication.translate("ChamberLayerAlgorithm", s)
 
@@ -971,6 +979,7 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
             code = self.REASON_TYPE.get(reason, "HH")
             if reason == "Branching junction" and prio < 2:
                 code = "HH"  # distribution-level junctions stay handholes
+            subtype = "Bore" if reason == "HDD pit" else self.SUBTYPE_BY_CODE.get(code, "Handhole")
             type_name, size_str = self.CHAMBER_CATALOGUE[code]
             counters[code] += 1
             reason_counts[reason] = reason_counts.get(reason, 0) + 1
@@ -983,6 +992,8 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
             feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(x, y)))
             feat[COMMON_FIELDS.STRUCT_ID] = struct_id
             feat[COMMON_FIELDS.CHAMBER_TYPE] = code  # HH | DHH | MH
+            feat[COMMON_FIELDS.SUBTYPE] = subtype    # Bore | Handhole | Manhole
+            feat[COMMON_FIELDS.REASON] = reason
             feat[COMMON_FIELDS.PARENT_TRENCH] = self._nearest_trench(
                 trenches, x, y, self.TRENCH_JOIN_M)
             feat[COMMON_FIELDS.CONN_DUCTS] = conn

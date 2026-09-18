@@ -1973,14 +1973,19 @@ class DuctLayer(QgsProcessingAlgorithm):
                                     fallback_names=["Distribution_Cable", "Distribution_Cables"])
         if dist_cables is not None and dist_cables.featureCount() > 0:
             try:
-                # Subtract the Garden Trenches (drop legs, footway → object)
-                # from the distribution ducts: those segments are covered by
-                # the separate Drop_Ducts layer and must not be duplicated.
+                # The distribution trunk cables are laid ON the spine spans
+                # (the trench geometry itself), so no subtraction is needed:
+                # the garden drop legs are separate geometries that merely
+                # TOUCH the trunk at the footway point, and the clubber's
+                # 0.5 m tolerance would otherwise see a trunk span and the
+                # drop cables tapping it as one club, mixing drop legs into
+                # the distribution duct. (Historically the subtract pass
+                # removed per-house corridors that no longer exist.)
                 _rid = self._build_route_ducts(
                     dist_cables, out_distr_uri, "Distribution",
                     QgsCoordinateReferenceSystem(self.DEFAULT_CRS_AUTHID),
                     context, feedback,
-                    subtract_lyr=garden_lyr,
+                    subtract_lyr=None,
                     runs_uri=runs_dist_uri)
                 dist_route_done = _rid is not None
             except Exception as e:
