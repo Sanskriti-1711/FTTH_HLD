@@ -297,7 +297,13 @@ def store(output_dir: Path, project_id: str) -> Dict[str, int]:
     Returns the row counts stored; ``{}`` when PostGIS is unavailable.
     Never raises.
     """
-    from . import postgis  # local import: occupancy is also usable standalone
+    # Local import (never a circular module-level import): the engine's main.py
+    # imports this module TOP-LEVEL (`import occupancy`), so a plain relative
+    # import would raise "attempted relative import with no known parent".
+    try:
+        from . import postgis  # package context
+    except ImportError:
+        import postgis  # type: ignore  # top-level engine context
 
     try:
         if not postgis.is_available():

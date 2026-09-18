@@ -377,23 +377,6 @@ def _restore_task_from_disk(project_id: str) -> Optional[Dict[str, Any]]:
 
 
 def _ingest_outputs(project_id: str, output_dir: Path) -> List[Dict[str, Any]]:
-    # Store the occupancy registry in PostGIS BEFORE layer ingest so the run
-    # keeps duct ways-total/used/spare and cable fibres-used/free for read-back
-    # (brownfield capacity for a re-run / the LLD). DB-only: no map layers, no
-    # downloads. Best-effort: a missing registry must never fail a completed run.
-    try:
-        occ = occupancy.store(output_dir, project_id)
-        if occ.get("ducts") or occ.get("cables"):
-            _append(
-                project_id,
-                "info",
-                "Occupancy registry stored: "
-                f"{occ.get('ducts', 0)} duct row(s), "
-                f"{occ.get('cables', 0)} cable row(s).",
-            )
-    except Exception as exc:  # noqa: BLE001
-        _append(project_id, "warning", f"Occupancy registry skipped: {exc}")
-
     has_postgis = postgis.is_available()
     if has_postgis:
         postgis.init_schema()
@@ -444,6 +427,24 @@ def _ingest_outputs(project_id: str, output_dir: Path) -> List[Dict[str, Any]]:
                 _append(project_id, "info", f"Loaded {inserted} features into {public_layer}.")
         elif gpkg_path.exists():
             layer_files.setdefault(public_layer, []).append(str(gpkg_path))
+
+    # ── occupancy registry (DB-only, after the layers are on disk) ────────
+    # Stored at the END: the registry is derived from the duct/cable outputs,
+    # and the loop above is what turns each stage's GeoPackage into the GeoJSON
+    # the derivation reads — running it first found no files and stored 0 rows.
+    # Best-effort: a missing registry must never fail a completed run.
+    try:
+        occ = occupancy.store(output_dir, project_id)
+        if occ.get("ducts") or occ.get("cables"):
+            _append(
+                project_id,
+                "info",
+                "Occupancy registry stored: "
+                f"{occ.get('ducts', 0)} duct row(s), "
+                f"{occ.get('cables', 0)} cable row(s).",
+            )
+    except Exception as exc:  # noqa: BLE001
+        _append(project_id, "warning", f"Occupancy registry skipped: {exc}")
 
     task = _task(project_id)
     task["files"] = layer_files

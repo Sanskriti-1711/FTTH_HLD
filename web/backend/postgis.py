@@ -108,6 +108,11 @@ TABLE_TO_PUBLIC_NAME = {
 
 _TABLES = tuple(TABLE_TO_PUBLIC_NAME.keys())
 
+# Registry tables that are DATA, not design layers: stored for read-back
+# (brownfield capacity for a re-run / the LLD) and deliberately never listed
+# as public layers, so they stay off the results map and out of the downloads.
+DB_ONLY_TABLES = frozenset({"duct_occupancy", "cable_occupancy"})
+
 # Tables created before cables/ducts were unified (kept only for clearing
 # stale rows on re-runs against an upgraded database).
 LEGACY_TABLES = (
@@ -643,11 +648,16 @@ def store_occupancy(project_id: str, table: str, features: List[Dict[str, Any]])
             continue
         props = feature.get("properties") or {}
         geom = feature.get("geometry")
+        geom_json = json.dumps(geom) if geom else None
         rows.append(
             (
                 project_id,
                 fid,
-                json.dumps(geom) if geom else None,
+                # geom appears twice: the CASE tests it for NULL and then
+                # parses it, so the placeholder count is one more than the
+                # number of distinct values.
+                geom_json,
+                geom_json,
                 _pick_prop(props, "PDP_ID"),
                 _pick_prop(props, "SRC_ID"),
                 Json(props),
@@ -766,6 +776,8 @@ def list_project_layers(project_id: str) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         for table, public_name in TABLE_TO_PUBLIC_NAME.items():
+            if table in DB_ONLY_TABLES:
+                continue
             # Skip tables that don't exist yet (added after the schema was
             # first created — e.g. chambers/poles/brownfield) so a stale DB
             # never 500s the results endpoint.
