@@ -34,6 +34,20 @@ def _same_footway(a: List[float], b: List[float], tolerance: float) -> bool:
     return _point_distance(a, b) <= tolerance
 
 
+def _is_drop(props: Dict[str, Any]) -> bool:
+    """True for the one-per-premise garden-leg cable of a distribution layer.
+
+    A drop is not a co-routed trunk: it TAPS the spine at the footway, so its
+    end coordinate is within the grouping tolerance of the trunk span it hangs
+    off. Grouping it would fold a 12F drop into the trunk and relabel it as a
+    shared trunk cable, which is exactly the sizing error
+    ``regroup_distribution_cables`` exists to avoid elsewhere.
+    """
+    cable_type = str(props.get("CABLE_TYPE") or "").strip().lower()
+    connection = str(props.get("CONNECTION_TYPE") or "").strip().lower()
+    return cable_type == "drop" or connection.startswith("drop")
+
+
 def regroup_distribution_cables(
     features: List[Dict[str, Any]],
     *,
@@ -42,7 +56,8 @@ def regroup_distribution_cables(
     """Group eligible cable features in-place by PDP, polygon and footway end.
 
     A feature is eligible when it has a distribution cable geometry and a
-    member address. Existing non-cable features are ignored. The first feature
+    member address. Existing non-cable features and garden-leg drops are
+    ignored (they pass through untouched, see ``_is_drop``). The first feature
     in each group receives a MultiLineString containing the original trunk/arm
     components; subsequent group members are removed. This preserves geometry
     exactly while eliminating duplicated grouped records.
@@ -57,7 +72,7 @@ def regroup_distribution_cables(
         props = feature.setdefault("properties", {})
         members = [x.strip() for x in str(props.get("ADDR_IDS") or props.get("addr_id") or "").split(",") if x.strip()]
         lines = _lines(feature.get("geometry"))
-        if not lines or not members:
+        if not lines or not members or _is_drop(props):
             passthrough.append(feature)
             continue
         end = lines[0][-1] if lines[0] else None
@@ -99,7 +114,9 @@ def regroup_distribution_cables(
         base_props["ADDR_IDS"] = ",".join(members)
         base_props["HH_COUNT"] = hh_count
         base_props["hhs"] = str(hh_count)
-        base_props["FIBER_COUNT"] = DISTRIBUTION_FIBERS
+        # Same rule as the HLD cable stage: a shared trunk is sized from the
+        # households riding it, never below the 48F distribution floor.
+        base_props["FIBER_COUNT"] = max(DISTRIBUTION_FIBERS, hh_count + RESERVED_SPARE_FIBERS)
         base_props["RESERVED_SPARE_FIBERS"] = RESERVED_SPARE_FIBERS
         base_props["ACTIVE_FIBERS"] = hh_count
         base_props["AVAILABLE_FIBERS"] = max(0, DISTRIBUTION_FIBERS - RESERVED_SPARE_FIBERS - hh_count)
