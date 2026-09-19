@@ -71,6 +71,12 @@ ONECLICK_OUTPUTS: List[Tuple[str, str, str]] = [
     # part of Final_Trenches. Their own layer carries TRENCH_TYPE="Aerial",
     # AERIAL_REASON (zone / length / chain) and EXCAVATION=0.
     ("aerial_drops", "Aerial_Drops.gpkg", "Aerial_Drops.geojson"),
+    # The trench designer's STRUCTURAL NODES: the points where the network
+    # changes tier or construction method (HDD drill openings, junctions,
+    # splitter locations, bends, pull points). The chamber stage places its
+    # civil structures on them, so they are served here as the evidence behind
+    # every chamber — and visible on the map next to the chambers they produce.
+    ("trench_nodes", "Trench_Nodes.gpkg", "Trench_Nodes.geojson"),
     ("brownfield", "Existing_Infrastructure.gpkg", "Existing_Infrastructure.geojson"),
     ("brownfield", "Existing_Infrastructure_Points.gpkg", "Existing_Infrastructure_Points.geojson"),
     # NOTE: the duct/cable occupancy registry is derived by occupancy.store()
@@ -958,7 +964,7 @@ LLD_LAYER_ORDER = [
     "feeder_cable", "distribution_cable", "aerial_cable",
     "feeder_ducts", "distribution_ducts", "drop_ducts",
     "coupleurs",
-    "chambers", "poles",
+    "chambers", "poles", "trench_nodes",
     "aerial_drop_trenches", "aerial_drops",
     "existing_infrastructure", "existing_infrastructure_points",
     "brownfield",
@@ -1765,10 +1771,17 @@ _TRENCH_CLASS_KEYS = ("trench_type", "USAGE_TYPE", "CONSTRUCT")
 
 
 def _canonical_trench_class(value: Any) -> Optional[str]:
-    """Map any historical trench label onto Open Cut / HDD / Garden."""
+    """Map any historical trench label onto Open Cut / HDD / Garden / Aerial."""
     s = str(value or "").strip().lower()
     if not s:
         return None
+    # AERIAL IS TESTED FIRST. It used to fall through to the Open Cut default,
+    # so every aerial span the LLD republished was labelled as excavated civil
+    # work — billed and permitted as a trench it is not. "Aerial_Drop" and
+    # "Aerial Drop" additionally contain "drop", which the garden branch below
+    # would otherwise claim as Garden, so the order matters twice over.
+    if "aerial" in s or "overhead" in s:
+        return "Aerial"
     if "garden" in s or "drop" in s:
         return "Garden"
     if "hdd" in s or "drill" in s or "bore" in s or "trenchless" in s:
@@ -1776,6 +1789,25 @@ def _canonical_trench_class(value: Any) -> Optional[str]:
     # Feeder / Distribution / Open Cut / micro-trench / anything else is civil
     # open-cut excavation.
     return "Open Cut"
+
+
+def _is_aerial_props(props: Dict[str, Any]) -> bool:
+    """True when a feature's own attributes already say it is aerial.
+
+    Two independent signals, because a published aerial row may carry either:
+    ``EXCAVATION = 0`` (the contract the BOQ reads) or an aerial construction
+    class. Mirrors ``utils/attr_enrich.is_aerial_row`` on the backend side.
+    """
+    for key in ("EXCAVATION",):
+        v = str(props.get(key) if props.get(key) is not None else "").strip().lower()
+        if v in ("0", "false", "no"):
+            return True
+    for key in ("trench_type", "TRENCH_TYPE", "CONSTRUCT", "USAGE_TYPE",
+                "CONSTRUCTION_METHOD"):
+        v = str(props.get(key) or "").strip().lower()
+        if v and ("aerial" in v or "overhead" in v):
+            return True
+    return False
 
 
 def _normalize_trench_construction_class(
@@ -1845,6 +1877,10 @@ def _inherit_trench_sub_layer_attributes(by_layer: Dict[str, List[Dict[str, Any]
         props = tf.setdefault("properties", {})
         if props.get("trench_type"):
             continue  # already carries the component attribute
+        # An aerial span is never re-classified as an excavated class by
+        # inheriting from a neighbouring trench it happens to ride over.
+        if _is_aerial_props(props):
+            continue
         lines = _line_strings(tf.get("geometry"))
         if not lines:
             continue
@@ -1868,13 +1904,16 @@ def _inherit_trench_sub_layer_attributes(by_layer: Dict[str, List[Dict[str, Any]
                     "VERIFY_STATUS"):
             if key in props or best.get(key) is None:
                 continue
-            # The construction class is a CLOSED 3-value set (Open Cut / HDD /
-            # Garden). Sub-layers carry legacy tier labels (Feeder /
+            # The construction class is a CLOSED set (Open Cut / HDD / Garden /
+            # Aerial). Sub-layers carry legacy tier labels (Feeder /
             # Distribution) — inheriting one of those would corrupt the
             # classification the engineer and BOQ rely on, so only the
-            # canonical values are accepted.
+            # canonical values are accepted. Aerial belongs in the list: it was
+            # missing, so an aerial span could not inherit "Aerial" and any
+            # neighbour offering "Open Cut" won instead.
             if key in ("trench_type", "USAGE_TYPE", "CONSTRUCT"):
-                if str(best.get(key)).strip() not in ("Open Cut", "HDD", "Garden"):
+                if str(best.get(key)).strip() not in ("Open Cut", "HDD", "Garden",
+                                                      "Aerial"):
                     continue
             props[key] = best[key]
         props["lld_attr_source"] = "inherited from sub-layer"
@@ -2689,6 +2728,7 @@ _REPLAN_OUTPUT_MAP = [
     ("Coupleurs", "coupleurs"),
     ("Chambers", "chambers"),
     ("Poles", "poles"),
+    ("Trench_Nodes", "trench_nodes"),
     ("Existing_Infrastructure", "existing_infrastructure"),
     ("Existing_Infrastructure_Points", "existing_infrastructure_points"),
 ]

@@ -136,8 +136,13 @@ _FINAL_FIELDS: Tuple[Tuple[str, object], ...] = (
     ("WIDTH_MM", QMetaType.Type.Int),
     ("DEPTH_MM", QMetaType.Type.Int),
     ("SRC", QMetaType.Type.QString),
-    ("AERIAL", QMetaType.Type.Int),
-    ("AERIAL_REASON", QMetaType.Type.QString),
+    # AERIAL_ZONE is corridor-restriction EVIDENCE (the span crosses land where
+    # underground is not permitted) and never a construction class: feeder and
+    # distribution are UG-only, aerial is a drop-stage decision, so a mains span
+    # keeps Open Cut / HDD / Garden here. The Aerial class lives on the
+    # Aerial_Drops layer (TRENCH_TYPE = "Aerial", EXCAVATION = 0).
+    ("AERIAL_ZONE", QMetaType.Type.Int),
+    ("AERIAL_ZONE_REASON", QMetaType.Type.QString),
 )
 
 _DRILL_FIELDS: Tuple[Tuple[str, object], ...] = (
@@ -162,11 +167,40 @@ _AERIAL_FIELDS: Tuple[Tuple[str, object], ...] = (
     ("HH", QMetaType.Type.Double),
     ("TRENCH_TIER", QMetaType.Type.QString),
     ("TRENCH_TYPE", QMetaType.Type.QString),
+    # Aerial is a METHOD: Overhead, never excavated. All the fields are carried
+    # so the BOQ / platform / LLD never have to infer it from the type string.
+    ("CONSTRUCTION_METHOD", QMetaType.Type.QString),
+    # The three construction-class aliases every consumer reads (docs/stages/
+    # AERIAL.md §2). Without them the layer only had TRENCH_TYPE, so a consumer
+    # reading CONSTRUCT/USAGE_TYPE — the BOQ, the permit TMP rules, the platform
+    # attribute table — saw an aerial span with no class at all.
+    ("USAGE_TYPE", QMetaType.Type.QString),
+    ("CONSTRUCT", QMetaType.Type.QString),
+    # No section: an aerial span is not excavated, so a width/depth would be a
+    # fabricated trench. 0 = not applicable, never billed as a section.
+    ("WIDTH_MM", QMetaType.Type.Int),
+    ("DEPTH_MM", QMetaType.Type.Int),
     ("length_m", QMetaType.Type.Double),
     ("AERIAL_REASON", QMetaType.Type.QString),
     ("INFRA_STATUS", QMetaType.Type.QString),
     ("VERIFY_STATUS", QMetaType.Type.QString),
     ("EXCAVATION", QMetaType.Type.Int),
+    ("SRC", QMetaType.Type.QString),
+)
+
+# Structural nodes the designer placed (Trench_Nodes): the points where the
+# network changes tier or construction method. Published so the chamber stage
+# places its structures on real structure — HDD pit → bore, junction →
+# manhole/handhole, PDP → splitter chamber, bend / pull point → handhole —
+# instead of guessing them from wherever duct geometries happen to touch.
+_NODE_FIELDS: Tuple[Tuple[str, object], ...] = (
+    ("id", QMetaType.Type.QString),
+    ("NODE_ID", QMetaType.Type.QString),
+    ("NODE_TYPE", QMetaType.Type.QString),
+    ("PRIORITY", QMetaType.Type.Int),
+    ("PDP_ID", QMetaType.Type.QString),
+    ("X", QMetaType.Type.Double),
+    ("Y", QMetaType.Type.Double),
     ("SRC", QMetaType.Type.QString),
 )
 
@@ -323,7 +357,8 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
         # dug (inside a zone, longer than `aerial_max_leg_m`, or branching off
         # an aerial leg) and emits them on `Aerial_Drops` instead of trenching
         # them; it also flags any span running THROUGH a zone with
-        # `AERIAL`/`AERIAL_REASON`.  Without zones nothing changes.
+        # `AERIAL_ZONE`/`AERIAL_ZONE_REASON` (a corridor RESTRICTION — the span
+        # itself stays Open Cut / HDD / Garden).  Without zones nothing changes.
         aerial_dst = None
         zones = self._layer(parameters, self.P_AERIAL_ZONES, context)
         if zones is not None and zones.featureCount() > 0:
@@ -479,6 +514,11 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
 
         # ── the legs that are NOT dug (aerial classification)
         self._publish_aerial_drops(parameters, context, work, out_dir,
+                                   target_epsg, feedback, sinks)
+
+        # ── the structural nodes (HDD pits, junctions, bends, pulls) — the
+        #    chamber stage's primary candidate source
+        self._publish_trench_nodes(parameters, context, out_dir,
                                    target_epsg, feedback, sinks)
 
         # ── derived layers
@@ -1080,8 +1120,8 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
                 "WIDTH_MM": TRENCH_WIDTH_MM.get(ttype, 300),
                 "DEPTH_MM": TRENCH_DEPTH_MM.get(ttype, 900),
                 "SRC": g(f, "SRC", "trench-designer") or "trench-designer",
-                "AERIAL": _as_int(g(f, "AERIAL")) or 0,
-                "AERIAL_REASON": g(f, "AERIAL_REASON"),
+                "AERIAL_ZONE": _as_int(g(f, "AERIAL_ZONE")) or 0,
+                "AERIAL_ZONE_REASON": g(f, "AERIAL_ZONE_REASON"),
             })
         return rows
 
@@ -1602,14 +1642,28 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
                 "id": g(f, "DROP_ID"),
                 "DROP_ID": g(f, "DROP_ID"),
                 "POLYGON_ID": g(f, "POLYGON_ID"),
+                # Aerial is a METHOD, not an inferred label: the published row
+                # carries Overhead + EXCAVATION = 0 so the BOQ, the map and the
+                # LLD never have to guess "not dug" from the type string.
+                "CONSTRUCTION_METHOD": "Overhead",
                 # The designer's aerial legs carry the address, not the splitter
                 # (they leave the network on the pole line); the platform joins
                 # the PDP from the polygon when it needs it.
                 "PDP_ID": g(f, "PDP_ID"),
                 "addr_id": g(f, "ADDR_ID"),
                 "HH": g(f, "HH"),
-                "TRENCH_TIER": g(f, "TRENCH_TIER", "Garden") or "Garden",
+                # Tier: the drop leg this aerial span replaces ("Drop"), never
+                # "Garden" — Garden is the excavated micro-trench class.
+                "TRENCH_TIER": g(f, "TRENCH_TIER", "Drop") or "Drop",
                 "TRENCH_TYPE": g(f, "TRENCH_TYPE", "Aerial") or "Aerial",
+                "CONSTRUCTION_METHOD": (g(f, "CONSTRUCTION_METHOD", "Overhead")
+                                       or "Overhead"),
+                # All three class aliases read Aerial and the section is 0, so
+                # nothing downstream can fold this span back into Open Cut.
+                "USAGE_TYPE": "Aerial",
+                "CONSTRUCT": "Aerial",
+                "WIDTH_MM": 0,
+                "DEPTH_MM": 0,
                 "length_m": round(float(length or 0.0), 2),
                 "AERIAL_REASON": g(f, "AERIAL_REASON"),
                 "INFRA_STATUS": g(f, "INFRA_STATUS", "New") or "New",
@@ -1640,6 +1694,65 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
             "({2}).").format(
                 len(rows), total,
                 ", ".join("%s=%d" % (k, v) for k, v in sorted(reasons.items()))))
+        return len(rows)
+
+    def _publish_trench_nodes(self, parameters, context, out_dir: str,
+                              target_epsg: int, feedback, sinks: Dict) -> int:
+        """Publish the designer's structural nodes (``Trench_Nodes``).
+
+        The designer decides these from the geometry it builds — HDD drill
+        openings, tier-change junctions, splitter locations, direction changes
+        and the ~250 m pull points — and already separates them by
+        ``min_node_sep_m`` / ``hdd_pit_keepout_m``. They are the chamber
+        stage's primary candidates: a chamber IS the opening of the trench at
+        a structural node, so deriving structures from duct junctions (the
+        legacy route) placed them wherever ducts happened to cross rather than
+        where the network changes tier.
+        """
+        if self.O_TRENCH_NODES not in parameters:
+            return 0
+        layer = self._read_gpkg(os.path.join(out_dir, "Trench_Nodes.gpkg"),
+                               "Trench_Nodes")
+        if layer is None or layer.featureCount() == 0:
+            feedback.pushInfo(_tr("Trench nodes: none placed by the designer."))
+            return 0
+        names = layer.fields().names()
+
+        def g(f, name, default=None):
+            return f[name] if name in names and f[name] is not None else default
+
+        rows: List[dict] = []
+        for f in layer.getFeatures():
+            geom = f.geometry()
+            if geom is None or geom.isEmpty():
+                continue
+            rows.append({
+                "id": g(f, "NODE_ID"),
+                "NODE_ID": g(f, "NODE_ID"),
+                "NODE_TYPE": g(f, "NODE_TYPE"),
+                "PRIORITY": int(_as_float(g(f, "PRIORITY")) or 0),
+                "PDP_ID": g(f, "PDP_ID"),
+                "X": _as_float(g(f, "X")),
+                "Y": _as_float(g(f, "Y")),
+                "SRC": "trench-designer:node",
+                "_geom": geom,
+            })
+        if not rows:
+            return 0
+        # Register the sink id: the pipeline saves the layer by looking this
+        # output up in the stage's result dict, so discarding it means the
+        # nodes never reach the chamber stage.
+        sinks[self.O_TRENCH_NODES] = self._write_rows(
+            parameters, context, self.O_TRENCH_NODES, rows, _NODE_FIELDS,
+            QgsWkbTypes.Point, target_epsg, feedback)
+        kinds: Dict[str, int] = {}
+        for r in rows:
+            key = str(r.get("NODE_TYPE") or "?")
+            kinds[key] = kinds.get(key, 0) + 1
+        feedback.pushInfo(_tr(
+            "Trench nodes published: {0} structural node(s) ({1}) — the "
+            "chamber stage places its structures on them.").format(
+                len(rows), ", ".join("%s=%d" % (k, v) for k, v in sorted(kinds.items()))))
         return len(rows)
 
     @staticmethod

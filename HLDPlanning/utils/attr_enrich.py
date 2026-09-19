@@ -35,12 +35,21 @@ except Exception:  # pragma: no cover
 # ── Catalogue defaults (per-deployment tuning points) ───────────────────────
 
 TRENCH_CONSTRUCT = {
-    # Construction classes (user spec): the trench network carries ONLY
-    # Open Cut / HDD / Garden — the fibre tier (feeder/distribution/drop)
-    # is a duct+cable attribute, not a trench property.
+    # Construction classes: Open Cut / HDD / Garden / **Aerial** — the fibre
+    # tier (feeder/distribution/drop) is a duct+cable attribute, not a trench
+    # property.
     "Open Cut": "Open Cut",
     "HDD": "HDD",
     "Garden": "Garden",     # Micro-Trenching for pseudo-object → object legs
+    # Aerial is a construction class of its OWN (docs/aerial planning.docx):
+    # the fibre runs on poles and NOTHING is excavated. These keys are load
+    # bearing — without them an aerial row fell through the canonicalisation
+    # allow-list below and was stamped "Open Cut", so an aerial drop/duct
+    # showed up as an open-cut trench carrying the feeder/distribution tier.
+    "Aerial": "Aerial",
+    "Aerial Drop": "Aerial",
+    "Aerial_Drop": "Aerial",
+    "Overhead": "Aerial",
     # Legacy tier tags map onto the construction catalogue so outputs from
     # earlier runs still enrich correctly when re-processed.
     "Feeder": "Open Cut",
@@ -48,10 +57,46 @@ TRENCH_CONSTRUCT = {
     "Drop": "Garden",
     "Hdd": "HDD",
 }
+# The closed set of construction classes. Anything outside it is canonicalised
+# through TRENCH_CONSTRUCT (and an aerial row is forced onto Aerial).
+CONSTRUCT_CLASSES = ("Open Cut", "HDD", "Garden", "Aerial")
+# Cross-sections. Aerial has NONE — it is not excavated, so a width/depth would
+# be a fabricated trench. 0 = "not applicable", never billed as a section.
 TRENCH_WIDTH_MM = {"Open Cut": 300, "HDD": 300, "Garden": 150,
+                   "Aerial": 0,
                    "Feeder": 300, "Distribution": 300, "Drop": 150}
 TRENCH_DEPTH_MM = {"Open Cut": 900, "HDD": 900, "Garden": 450,
+                   "Aerial": 0,
                    "Feeder": 900, "Distribution": 900, "Drop": 450}
+
+
+def is_aerial_row(feature) -> bool:
+    """True when an already-classified row is an AERIAL span.
+
+    Two independent pieces of evidence, because either can be the only one
+    present depending on the stage that wrote the row:
+      * ``EXCAVATION = 0`` — the contract the BOQ and the platform read
+        instead of inferring the method from the type string;
+      * a construction type / method that says aerial (``TRENCH_TYPE``,
+        ``CONSTRUCT``, ``USAGE_TYPE``, ``CONSTRUCTION_METHOD``).
+    """
+    for name in ("EXCAVATION",):
+        v = str(feature.GetField(name) if feature.GetFieldIndex(name) >= 0
+                else "").strip().lower()
+        if v in ("0", "false", "no"):
+            return True
+    for name in ("TRENCH_TYPE", "CONSTRUCT", "USAGE_TYPE",
+                 "CONSTRUCTION_METHOD"):
+        if feature.GetFieldIndex(name) < 0:
+            continue
+        v = str(feature.GetField(name) or "").strip().lower()
+        if v.replace("_", " ").replace("-", " ").strip() == "aerial":
+            return True
+        if v.startswith("aerial"):
+            return True
+        if v == "overhead":
+            return True
+    return False
 
 DUCT_PROFILE = {
     "Feeder": {"ways": 4, "diameter_mm": 110, "occupied": 1, "duct_type": "4-Way HDPE"},
@@ -223,8 +268,32 @@ def enrich_trench_sublayers(out_dir, feedback=None):
             ("CONSTRUCT", ogr.OFTString, 24),
         ])
         for f in lyr:
-            f.SetField("USAGE_TYPE", usage)
-            f.SetField("CONSTRUCT", TRENCH_CONSTRUCT.get(usage, "Open Cut"))
+            if is_aerial_row(f):
+                # Aerial legs are never excavated: they keep the Aerial class
+                # even when they are read out of a per-tier sub-layer file.
+                f.SetField("USAGE_TYPE", "Aerial")
+                f.SetField("CONSTRUCT", "Aerial")
+                lyr.SetFeature(f)
+                total += 1
+                continue
+            # The per-FILE constant is a FALLBACK, not the answer. It used to be
+            # stamped unconditionally, so an HDD drill crossing that happens to
+            # sit in Feeder_Trench.gpkg was published as Open Cut and one in
+            # Garden_Trench.gpkg as Garden — an excavation method it is not, and
+            # both the rate card and the permit/TMP rules key off this field.
+            # Measured on Berlin: 141 sub-trench rows were mislabelled (36
+            # feeder + 92 distribution + 13 garden, all HDD).
+            own = ""
+            for key in ("trench_type", "TRENCH_TYPE", "USAGE_TYPE", "CONSTRUCT"):
+                v = _get(lyr, f, key)
+                if v not in (None, ""):
+                    own = str(v).strip()
+                    break
+            cls = TRENCH_CONSTRUCT.get(own.title(), None) if own else None
+            if cls not in CONSTRUCT_CLASSES:
+                cls = usage
+            f.SetField("USAGE_TYPE", cls)
+            f.SetField("CONSTRUCT", TRENCH_CONSTRUCT.get(cls, "Open Cut"))
             lyr.SetFeature(f)
             total += 1
         ds = None
@@ -508,8 +577,12 @@ def enrich_trenches(trench_path, feedback=None, roads_lyr=None):
         tt_canon = tt.strip().title()
         if tt_canon == "Hdd":
             tt_canon = "HDD"
-        if tt_canon not in ("Open Cut", "HDD", "Garden"):
+        if tt_canon not in CONSTRUCT_CLASSES:
             tt_canon = TRENCH_CONSTRUCT.get(tt_canon, "Open Cut")
+        # Defence in depth: a row the pipeline already classified as aerial is
+        # NEVER re-stamped as an excavated class, whatever its tier says.
+        if tt_canon != "Aerial" and is_aerial_row(f):
+            tt_canon = "Aerial"
         # ``sidewalk`` is a STRING field in the delivered GPKG, so the literal
         # "false"/"0" are truthy in Python — that silently flipped every
         # reinstatement to Footpath/Sidewalk. Normalise it explicitly.
@@ -1175,6 +1248,432 @@ def enrich_ducts(feeder_path, dist_path, drop_path, trench_path, chamber_path, f
     return total
 
 
+# ── Duct tier rules (operator spec, 2026-09-19) ──────────────────────────────
+#
+# FEEDER       MFG → every PDP, laid ONCE; one duct per chamber pair, with the
+#              capacity-balanced trunk CABLES riding inside it. The cables are
+#              what is plural, not the duct.
+# DISTRIBUTION PDP → the pseudo-object points of the same POLYGON_ID / PDP_ID;
+#              one duct, or 2–3 of them, depending on splitter capacity and the
+#              profile (2-Way / 4-Way). Multiple per corridor is CORRECT here,
+#              so distribution ducts are never folded.
+# DROP         one 1-Way duct per premise (unchanged).
+# COUPLER      the joint where a drop duct leaves a distribution duct: it must
+#              name BOTH ducts, the polygon and the premise.
+
+# Smallest profile that can carry n cables. 4-Way is the feeder default.
+_DUCT_WAYS_LADDER = (1, 2, 4, 6, 12)
+
+
+def _duct_ways_for(n_cables, default=4):
+    for w in _DUCT_WAYS_LADDER:
+        if w >= n_cables:
+            return w
+    return _DUCT_WAYS_LADDER[-1]
+
+
+def _split_list(value):
+    """Comma-separated attribute → ordered unique list, case preserved."""
+    out = []
+    for item in str(value or "").split(","):
+        item = item.strip()
+        if item and item not in out:
+            out.append(item)
+    return out
+
+
+def merge_ducts_per_chamber_span(path, feedback=None, label="Feeder ducts"):
+    """Fold every duct sharing a chamber pair into ONE duct.
+
+    Operator rule: *"the feeders … will only follow the path once … one chamber
+    to another only one feeder duct will be present."* The route builder emits
+    one duct per trunk cable and the trunks share a corridor, so a chamber pair
+    carried up to **5** parallel rows (Berlin ``DHH-0017``); tiny segmentation
+    fragments whose both ends snap to the same chamber added more.
+
+    One duct is pulled between two chambers and the trunks ride inside it, so
+    each group collapses onto its **longest** row (the most complete path
+    between the two structures — the others only contributed cables) and the
+    ``cables_carried`` / ``pdp_ids`` become the union. Capacity is recomputed
+    from the distinct cables actually inside, and ``REVIEW`` is raised when they
+    no longer fit the 4-Way profile.
+
+    Applied to the feeder tier only — the operator spec allows distribution
+    ducts to be one or several per corridor.
+    """
+    ds, lyr = _open_lyr(path)
+    if lyr is None:
+        return 0
+    _create_fields(lyr, [
+        ("capacity_used", ogr.OFTReal),
+        ("capacity_spare", ogr.OFTReal),
+        ("DUCTS_MERGED", ogr.OFTInteger),
+    ])
+    groups: Dict[Tuple[str, str], List] = {}
+    order: List[Tuple[str, str]] = []
+    for f in lyr:
+        sc = str(_get(lyr, f, "START_CHAMBER") or "").strip()
+        ec = str(_get(lyr, f, "END_CHAMBER") or "").strip()
+        if not sc and not ec:
+            continue
+        key = (sc, ec)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(f)
+
+    merged = 0
+    dropped = 0
+    for key in order:
+        feats = groups[key]
+        if len(feats) < 2:
+            continue
+        feats.sort(key=lambda f: _geom_len_m(f), reverse=True)
+        keep = feats[0]
+        cables: List[str] = []
+        pdps: List[str] = []
+        for f in feats:
+            for c in _split_list(_get(lyr, f, "cables_carried")):
+                if c not in cables:
+                    cables.append(c)
+            for pdp in _split_list(_get(lyr, f, "pdp_ids")):
+                if pdp not in pdps:
+                    pdps.append(pdp)
+        n_cables = len(cables)
+        ways = _duct_ways_for(n_cables, 4)
+        over = n_cables > ways
+        keep.SetField("cables_carried", ",".join(cables))
+        keep.SetField("pdp_ids", ",".join(pdps))
+        keep.SetField("N_DUCTS", 1)
+        keep.SetField("capacity_total", ways)
+        keep.SetField("capacity_used", n_cables)
+        keep.SetField("capacity_spare", max(0, ways - n_cables))
+        keep.SetField("ways_used", n_cables)
+        keep.SetField("WAYS_TOTAL", ways)
+        keep.SetField("WAYS", ways)
+        keep.SetField("REVIEW", 1 if over else 0)
+        keep.SetField("DUCTS_MERGED", len(feats))
+        occ = (n_cables / ways) * 100.0 if ways else 100.0
+        keep.SetField("OCCUPANCY_PCT", round(min(occ, 100.0), 1))
+        keep.SetField("SPARE_PCT", round(max(0.0, 100.0 - occ), 1))
+        lyr.SetFeature(keep)
+        for f in feats[1:]:
+            lyr.DeleteFeature(f.GetFID())
+            dropped += 1
+        merged += 1
+    ds = None
+    if feedback and merged:
+        feedback.pushInfo(
+            f"  [enrich] {label}: {merged} chamber pair(s) folded to ONE duct "
+            f"({dropped} parallel row(s) removed — trunks ride inside).")
+    return merged
+
+
+def _min_line_dist(geom_a, geom_b):
+    """Smallest distance between two line geometries, part by part."""
+    pa, pb = _geom_parts(geom_a), _geom_parts(geom_b)
+    best = float("inf")
+    for a in pa:
+        for b in pb:
+            for i in range(len(a) - 1):
+                for j in range(len(b) - 1):
+                    d = min(_dist_point_seg(a[i][0], a[i][1], b[j][0], b[j][1],
+                                            b[j + 1][0], b[j + 1][1]),
+                            _dist_point_seg(a[i + 1][0], a[i + 1][1],
+                                            b[j][0], b[j][1],
+                                            b[j + 1][0], b[j + 1][1]))
+                    if d < best:
+                        best = d
+    return best
+
+
+def absorb_chamber_stubs(path, feedback=None,
+                         label="Feeder ducts", mode="absorb"):
+    """Remove ducts that begin and end at the SAME chamber.
+
+    A duct is pulled *between two structures*, so a component whose two ends
+    snap to one chamber is not a span — it is a fragment the segmenter left at a
+    junction. Measured on Berlin: **16 of the 87 feeder ducts** were these
+    stubs, 2.7–14.7 m long, and they were what inflated the capacity profile
+    (a 12-Way duct was being chosen for a 7 m stub, because the stub's
+    ``cables_carried`` is the union of every fragment that snapped there).
+
+    Each stub's cables and PDPs are handed to the nearest REAL span touching
+    that same chamber — its cables have to continue somewhere, and that span is
+    where they physically do — then the stub is deleted.    A stub with no real
+    span to absorb it is kept but flagged (``REVIEW = 1``, ``SPAN_KIND =
+    "Chamber stub"``) rather than silently dropped, so it shows up instead of
+    disappearing.
+
+    ``mode="flag"`` marks stubs without deleting anything. Used for the
+    DISTRIBUTION tier: it carried 85 of 202 stubs, and absorbing them moves the
+    duct out from under the couplers that tap it — it dropped 8 coupler joints
+    from 292 to 284. The operator spec allows distribution ducts to be several
+    per corridor and to run to the pseudo-object points, so their topology is
+    left alone and the stubs are surfaced for a decision instead.
+    """
+    ds, lyr = _open_lyr(path)
+    if lyr is None:
+        return 0
+    _create_fields(lyr, [
+        ("STUB_ABSORBED", ogr.OFTInteger),
+        # Not present on the distribution layer (the merge creates them on the
+        # feeder) — without these, SetField fails with "Invalid index : -1".
+        ("capacity_used", ogr.OFTReal),
+        ("capacity_spare", ogr.OFTReal),
+    ])
+    flag_only = str(mode).lower() == "flag"
+    rows = []
+    for f in lyr:
+        sc = str(_get(lyr, f, "START_CHAMBER") or "").strip()
+        ec = str(_get(lyr, f, "END_CHAMBER") or "").strip()
+        rows.append({
+            "f": f,
+            "sc": sc, "ec": ec,
+            "stub": bool(sc) and sc == ec,
+            "cables": _split_list(_get(lyr, f, "cables_carried")),
+            "pdps": _split_list(_get(lyr, f, "pdp_ids")),
+            "geom": f.geometry(),
+        })
+
+    real = [r for r in rows if not r["stub"] and (r["sc"] or r["ec"])]
+    absorbed = 0
+    kept_unabsorbed = 0
+    for r in rows:
+        if not r["stub"]:
+            continue
+        if flag_only:
+            f = r["f"]
+            f.SetField("REVIEW", 1)
+            f.SetField("SPAN_KIND", "Chamber stub")
+            lyr.SetFeature(f)
+            kept_unabsorbed += 1
+            continue
+        chamber = r["sc"]
+        # Only spans that actually touch this chamber may take the cables on.
+        candidates = [x for x in real
+                      if x["sc"] == chamber or x["ec"] == chamber]
+        if not candidates:
+            f = r["f"]
+            f.SetField("REVIEW", 1)
+            f.SetField("SPAN_KIND", "Chamber stub")
+            lyr.SetFeature(f)
+            kept_unabsorbed += 1
+            continue
+        best, best_d = None, float("inf")
+        for x in candidates:
+            if r["geom"] is None or x["geom"] is None:
+                continue
+            d = _min_line_dist(r["geom"], x["geom"])
+            if d < best_d:
+                best_d, best = d, x
+        if best is None:
+            continue
+        # Hand the stub's cables over, then recompute the receiver's capacity:
+        # one duct still leaves that chamber, it just carries these too.
+        cables = list(best["cables"])
+        for c in r["cables"]:
+            if c not in cables:
+                cables.append(c)
+        pdps = list(best["pdps"])
+        for pdp in r["pdps"]:
+            if pdp not in pdps:
+                pdps.append(pdp)
+        best["cables"], best["pdps"] = cables, pdps
+        ways = _duct_ways_for(len(cables), 4)
+        bf = best["f"]
+        bf.SetField("cables_carried", ",".join(cables))
+        bf.SetField("pdp_ids", ",".join(pdps))
+        bf.SetField("capacity_total", ways)
+        bf.SetField("capacity_used", len(cables))
+        bf.SetField("capacity_spare", max(0, ways - len(cables)))
+        bf.SetField("ways_used", len(cables))
+        bf.SetField("WAYS_TOTAL", ways)
+        bf.SetField("WAYS", ways)
+        bf.SetField("REVIEW", 1 if len(cables) > ways else 0)
+        occ = (len(cables) / ways) * 100.0 if ways else 100.0
+        bf.SetField("OCCUPANCY_PCT", round(min(occ, 100.0), 1))
+        bf.SetField("SPARE_PCT", round(max(0.0, 100.0 - occ), 1))
+        lyr.SetFeature(bf)
+        sf = r["f"]
+        sf.SetField("STUB_ABSORBED", 1)
+        lyr.DeleteFeature(sf.GetFID())
+        absorbed += 1
+
+    ds = None
+    if feedback and (absorbed or kept_unabsorbed):
+        if flag_only:
+            feedback.pushInfo(
+                f"  [enrich] {label}: {kept_unabsorbed} chamber stub(s) FLAGGED "
+                f"(REVIEW=1, SPAN_KIND='Chamber stub') — topology left alone.")
+        else:
+            feedback.pushInfo(
+                f"  [enrich] {label}: {absorbed} chamber stub(s) absorbed into "
+                f"the adjacent span, {kept_unabsorbed} kept with REVIEW=1 (no "
+                f"real span touches their chamber).")
+    return absorbed
+
+
+def propagate_duct_pdp_id(path, feedback=None, label="Distribution ducts"):
+    """Give every duct its owning splitter, so POLYGON_ID *and* PDP_ID resolve.
+
+    A distribution duct is defined as running *"from the pdps to the pseudo obj
+    points in that particular polygon (same POLYGON_ID or PDP_ID)"*. The route
+    builder already records the splitters it serves in ``pdp_ids`` (lowercase),
+    but nothing copied it onto the published ``PDP_ID`` — measured 202/202 blank
+    on Berlin, so the duct and the coupler that joins it to a drop duct could
+    not be matched from the duct side.
+    """
+    ds, lyr = _open_lyr(path)
+    if lyr is None:
+        return 0
+    _create_fields(lyr, [("PDP_ID", ogr.OFTString, 32)])
+    n = 0
+    for f in lyr:
+        if str(_get(lyr, f, "PDP_ID") or "").strip():
+            continue
+        src = _split_list(_get(lyr, f, "pdp_ids"))
+        if not src:
+            continue
+        # The duct layers use uppercase PDP ids (PDP00007); pdp_ids is
+        # lowercase, so normalise rather than publish two spellings.
+        f.SetField("PDP_ID", src[0].upper())
+        lyr.SetFeature(f)
+        n += 1
+    ds = None
+    if feedback and n:
+        feedback.pushInfo(f"  [enrich] {label}: PDP_ID resolved on {n} duct(s).")
+    return n
+
+
+def _geom_parts(geom):
+    """Point lists of a geometry — ONE LIST PER PART.
+
+    ``_line_points`` flattens a MultiLineString into a single sequence, which
+    silently joins the end of one part to the start of the next and creates a
+    segment that is not in the data. Measuring against that reported distances
+    to geometry that does not exist (a coupler 147 m away from the duct it was
+    matched to). Anything doing distance work must use this instead.
+    """
+    if geom is None or geom.IsEmpty():
+        return []
+    out = []
+    try:
+        n = geom.GetGeometryCount()
+        if n:
+            for i in range(n):
+                part = geom.GetGeometryRef(i)
+                if part is None:
+                    continue
+                out.append([(part.GetX(j), part.GetY(j))
+                            for j in range(part.GetPointCount())])
+        else:
+            out.append([(geom.GetX(j), geom.GetY(j))
+                        for j in range(geom.GetPointCount())])
+    except Exception:
+        return out
+    return [p for p in out if len(p) >= 2]
+
+
+def _dist_point_seg(px, py, ax, ay, bx, by):
+    """Distance from (px,py) to the segment (ax,ay)-(bx,by)."""
+    dx, dy = bx - ax, by - ay
+    if dx == 0.0 and dy == 0.0:
+        return math.hypot(px - ax, py - ay)
+    t = ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)
+    t = max(0.0, min(1.0, t))
+    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+
+def link_couplers_to_ducts(coupler_path, dist_path, drop_path,
+                           feedback=None, tol_m=5.0):
+    """Name BOTH ducts on every coupler: the distribution and the drop side.
+
+    The coupler is created while the drop ducts are built, before the
+    distribution network exists, so it could only ever carry the drop duct's
+    ``DUCT_UID`` — measured Berlin: all 291 ids a subset of
+    ``Drop_Ducts.DUCT_UID``, with no distribution reference at all. Now that
+    both tiers are published, each coupler is joined to the distribution duct it
+    sits on (same ``POLYGON_ID`` preferred, nearest geometry otherwise) and the
+    drop side is renamed explicitly.
+    """
+    dl, dlyr = _open_lyr(dist_path)
+    if dlyr is None:
+        return 0
+    # One entry PER PART (a duct is published as a MultiLineString): measuring
+    # across parts would invent segments that are not in the data.
+    ducts = []
+    for f in dlyr:
+        did = str(_get(dlyr, f, "DUCT_ID") or "").strip()
+        dpoly = str(_get(dlyr, f, "POLYGON_ID") or "").strip()
+        for part in _geom_parts(f.geometry()):
+            ducts.append({"id": did, "poly": dpoly, "pts": part})
+    dl = None
+    if not ducts:
+        return 0
+
+    ds, lyr = _open_lyr(coupler_path)
+    if lyr is None:
+        return 0
+    _create_fields(lyr, [
+        ("DIST_DUCT_ID", ogr.OFTString, 32),
+        ("DIST_DUCT_SAME_POLY", ogr.OFTInteger),
+        ("DROP_DUCT_UID", ogr.OFTInteger),
+        ("PREMISE_ID", ogr.OFTString, 32),
+    ])
+    n = 0
+    for f in lyr:
+        # OGR geometry API (not the QGIS one): IsEmpty(), and GetX()/GetY()
+        # on a point — asPoint()/isEmpty() belong to QgsGeometry and raise here.
+        geom = f.geometry()
+        if geom is None or geom.IsEmpty() or geom.GetGeometryType() != ogr.wkbPoint:
+            continue
+        px, py = geom.GetX(), geom.GetY()
+        drop_uid = _get(lyr, f, "DUCT_UID")
+        if drop_uid is not None:
+            f.SetField("DROP_DUCT_UID", int(drop_uid))
+        premise = str(_get(lyr, f, "ADDR_ID") or "").strip()
+        if premise:
+            f.SetField("PREMISE_ID", premise)
+        poly = str(_get(lyr, f, "POLYGON_ID") or "").strip().upper()
+        best_id, best_d, best_same = "", float("inf"), 0
+        best_score = float("inf")
+        for d in ducts:
+            pts = d["pts"]
+            dist = min(_dist_point_seg(px, py, pts[i][0], pts[i][1],
+                                       pts[i + 1][0], pts[i + 1][1])
+                       for i in range(len(pts) - 1))
+            # The SERVICE POLYGON IS A TIE-BREAK, NOT A FILTER. A coupler
+            # usually sits at 0.00 m from several ducts at once (it is at a
+            # junction), so the own-polygon duct is preferred only when the
+            # geometry is equally close. Folding the preference into the value
+            # that is then thresholded rejected ducts sitting exactly ON the
+            # coupler, which is how 133 joints were wrongly reported as
+            # unreachable (measured: all 292 are <= 0.25 m, worst 0.00 m).
+            same_poly = bool(poly) and d["poly"].upper() == poly
+            score = dist - (1e-6 if same_poly else 0.0)
+            if score < best_score:
+                best_score, best_d, best_id, best_same = score, dist, d["id"], int(same_poly)
+        if best_id and best_d <= tol_m:
+            f.SetField("DIST_DUCT_ID", best_id)
+            # Recorded explicitly: a drop tapping a duct planned for ANOTHER
+            # service polygon is normal in the street (the duct runs past both
+            # sides), but it means that duct carries drops its own polygon did
+            # not account for — the splitter capacity has to see it.
+            f.SetField("DIST_DUCT_SAME_POLY", best_same)
+            n += 1
+        # Written unconditionally: the drop side and the premise belong on
+        # EVERY coupler, including the ones whose distribution duct is not in
+        # reach (those stay flagged by a blank DIST_DUCT_ID).
+        lyr.SetFeature(f)
+    ds = None
+    if feedback and n:
+        feedback.pushInfo(
+            f"  [enrich] Couplers: {n} joint(s) linked to their distribution "
+            f"duct (drop side kept in DROP_DUCT_UID).")
+    return n
+
+
 # ── Cable enrichment ─────────────────────────────────────────────────────────
 
 def _hh_per_pdp(objects_path):
@@ -1436,6 +1935,30 @@ def enrich_all(out_dir, feedback=None, roads_lyr=None):
     n += enrich_ducts(
         p("Feeder_Ducts.gpkg"), p("Distribution_Ducts.gpkg"), p("Drop_Ducts.gpkg"),
         p("Final_Trenches.gpkg"), p("Chambers.gpkg"), feedback,
+    )
+
+    # ── Duct tier rules, applied AFTER the catalogue attributes exist ────
+    # ONE feeder duct per chamber pair (the trunk cables ride inside it) —
+    # the operator rule is "one chamber to another only one feeder duct will
+    # be present". Distribution ducts are deliberately left as published:
+    # several per corridor is correct there (splitter capacity / profile).
+    n += merge_ducts_per_chamber_span(p("Feeder_Ducts.gpkg"), feedback)
+    # A component that starts and ends at one chamber is not a span — absorb it
+    # into the real span leaving that chamber. Both tiers get this: the operator
+    # spec cuts distribution ducts at chambers too (it only allows SEVERAL of
+    # them per corridor, which is why duplicates are folded for feeder only).
+    n += absorb_chamber_stubs(p("Feeder_Ducts.gpkg"), feedback, "Feeder ducts")
+    # Distribution keeps its topology (several ducts per corridor is allowed and
+    # the couplers tap it) — its stubs are flagged, not folded.
+    n += absorb_chamber_stubs(p("Distribution_Ducts.gpkg"), feedback,
+                              "Distribution ducts", mode="flag")
+    n += propagate_duct_pdp_id(p("Distribution_Ducts.gpkg"), feedback)
+    # The coupler is the joint between the distribution and the drop duct, so
+    # it has to name both — it could only carry the drop side when it was
+    # created, before the distribution network existed.
+    n += link_couplers_to_ducts(
+        p("Coupleurs.gpkg"), p("Distribution_Ducts.gpkg"),
+        p("Drop_Ducts.gpkg"), feedback,
     )
     n += enrich_cables(
         p("Feeder_Cable.gpkg"), p("Distribution_Cable.gpkg"),
