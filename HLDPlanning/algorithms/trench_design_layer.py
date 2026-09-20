@@ -638,6 +638,15 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
     # it serves (never inside a neighbour's).
     _PDP_SNAP_MAX_M = 30.0     # never drag a cabinet further than this
     _PDP_SNAP_POLY_M = 15.0    # ...and never more than this off its own polygon
+    _PDP_SNAP_MOVE_M = 2.0     # a snap is a NUDGE, not a relocation. A cabinet
+    #                            further than this off the backbone is left
+    #                            where the platform publishes it and gets a real
+    #                            SPUR instead (_ensure_backbone_reach). Moving
+    #                            it further only the DESIGN's copy of the anchor
+    #                            (the PDP layer is published before this stage)
+    #                            left the map showing a cabinet 13 m off the
+    #                            trench it was supposedly welded onto.
+    _FEEDER_BRIDGE_MAX_M = 30.0  # longest spur worth digging back to the backbone
     _STITCH_M = 0.5       # ...otherwise add a connector; same tolerance welds
     #                       span endpoints that stop just short of each other
     #                       (the designer's straightening leaves 15 spans in
@@ -859,8 +868,10 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
         project it onto the nearest **Feeder (Open Cut)** span (its own trench
         is Feeder by construction after ``_ensure_backbone_reach``), subject to
 
-        * shift <= ``_PDP_SNAP_MAX_M`` — a cabinet is never dragged across the
-          street just to touch the backbone, and
+        * shift <= ``_PDP_SNAP_MOVE_M`` — a cabinet is only nudged (the weld
+          below finishes the job). A larger gap is NOT a snap: the cabinet is
+          left where the platform publishes it and ``_ensure_backbone_reach``
+          digs a spur to it, so the point on the map and the trench agree, and
         * the snapped point stays with its own polygon (inside it, or within
           ``_PDP_SNAP_POLY_M`` of it) and inside no other polygon — the PDP
           must keep serving the premises it was placed for.
@@ -902,8 +913,8 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
                     best_d, best = d, g
             if best is None or best_d <= 0.05:
                 continue                       # already on the backbone
-            if best_d > self._PDP_SNAP_MAX_M:
-                continue                       # too far — leave the cabinet put
+            if best_d > self._PDP_SNAP_MOVE_M:
+                continue                       # a spur, not a snap — see below
             proj = best.nearestPoint(pt)
             if proj is None or proj.isEmpty():
                 continue
@@ -922,10 +933,11 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
             worst = max(worst, best_d)
         if moved and feedback:
             feedback.pushInfo(_tr(
-                "PDP snap: {0} splitter(s) moved onto the open-cut backbone "
+                "PDP snap: {0} splitter(s) nudged onto the open-cut backbone "
                 "(max {1:.2f} m, guards: <= {2:g} m shift, own polygon +- "
-                "{3:g} m).").format(moved, worst, self._PDP_SNAP_MAX_M,
-                                    self._PDP_SNAP_POLY_M))
+                "{3:g} m). Anything further gets a feeder spur instead."
+            ).format(moved, worst, self._PDP_SNAP_MOVE_M,
+                     self._PDP_SNAP_POLY_M))
         return moved
 
     def _span_adjacency(self, rows: List[dict], tol: float = 0.05):
@@ -981,20 +993,31 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
 
     def _ensure_backbone_reach(self, rows: List[dict], anchors,
                                feedback=None) -> int:
-        """Make the FEEDER trench run MFG → every PDP (relabel, don't re-cut).
+        """Guarantee the FEEDER trench physically runs MFG → every PDP.
 
-        The designer tiers a run by what it serves, so a splitter whose
-        connector leaves a distribution run can end up a couple of metres off
-        the feeder network (Berlin PDP00017: nearest feeder span 3.14 m away,
-        nearest distribution span 0.00 m).  The published network is welded
-        before this runs, so the path from such a PDP to the nearest feeder
-        span is real trench that is simply labelled Distribution.
+        The old test asked the wrong question — *"is a Feeder span within
+        ``_BACKBONE_TOL_M`` of this PDP?"* — which a **detached** Feeder
+        fragment answers yes to. Measured on Berlin run ``ductfix2``: 11 of the
+        31 PDPs sat on a 0.6-8.0 m feeder fragment that no corridor reaches
+        (still 10 islands at a 2 m weld tolerance), and this pass reported
+        *nothing* because every one of them looked fed. Two more splitters were
+        13.01 m and 3.14 m off any feeder span at all.
 
-        This walks that path on the welded span graph and relabels it Feeder
-        (Open Cut legs only — a Garden leg is a premise drop and stays Garden).
-        ``enrich_trench_sublayers`` then publishes those spans in
-        ``Feeder_Trench``, so the Open Cut backbone reaches every splitter
-        without any new geometry.
+        This version asks the real question — is the PDP joined to the MFG? —
+        and repairs the two ways it can fail:
+
+        * **relabel** — the PDP touches the MFG's welded component but only
+          through Distribution spans: that path is promoted to Feeder (no new
+          geometry, as before). A Garden leg is a premise drop and stays
+          Garden.
+        * **spur** — the PDP only touches a detached island: ONE Feeder/Open Cut
+          span is emitted from the nearest backbone point to the cabinet. That
+          is how it is built in the field (a spur off the main trench to the
+          splitter) and it is what makes "MFG → every PDP" true by construction
+          instead of by a guard.
+
+        Anything further than ``_FEEDER_BRIDGE_MAX_M`` is reported, never
+        silently bridged.
         """
         if not rows or not anchors:
             return 0
@@ -1003,66 +1026,237 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
         if not feeder:
             return 0
         adj = self._span_adjacency(rows)
-        promoted = 0
-        for label, aid, x, y in anchors:
-            pt = QgsGeometry.fromPointXY(QgsPointXY(x, y))
-            # Nearest span to the anchor, and whether the backbone already
-            # reaches it.
-            start, best = None, float("inf")
-            fed = False
+
+        def _pt(x, y):
+            return QgsGeometry.fromPointXY(QgsPointXY(x, y))
+
+        def _near(x, y, only=None):
+            """(distance, index) of the nearest span, optionally within a set."""
+            best, best_i = float("inf"), None
+            p = _pt(x, y)
             for i, r in enumerate(rows):
+                if only is not None and i not in only:
+                    continue
                 g = r.get("_geom")
                 if g is None:
                     continue
-                d = g.distance(pt)
+                d = g.distance(p)
                 if d < best:
-                    best, start = d, i
-                if i in feeder and d <= self._BACKBONE_TOL_M:
-                    fed = True
-                    break
-            if fed or start is None:
-                continue
-            # BFS from the anchor's span to the closest feeder span.
-            prev = {start: None}
-            queue = [start]
-            hit = None
-            while queue and hit is None:
+                    best, best_i = d, i
+            return best, best_i
+
+        # ── Ground truth: the component the MFG actually sits on ────────
+        mfg = next((a for a in anchors if str(a[0]).upper() == "MFG"), None)
+        if mfg is None:
+            return 0
+        _, mfg_i = _near(mfg[2], mfg[3], only=feeder)
+        if mfg_i is None:
+            _, mfg_i = _near(mfg[2], mfg[3])
+        if mfg_i is None:
+            return 0
+
+        # A Garden leg is a premise drop, NOT a route: the backbone must be
+        # reachable without walking down one. This is the piece that hid the
+        # 11 stubs — they DO join the network, but only through the garden leg
+        # that taps the street, so a walk that allowed Garden spans called them
+        # connected while the feeder tier stayed in 12 islands.
+        def _walkable(i):
+            return str(rows[i].get("TRENCH_TIER") or "") != "Garden"
+
+        comp = {mfg_i}
+        queue = [mfg_i]
+        while queue:
+            nxt = []
+            for n in queue:
+                if not _walkable(n):
+                    continue
+                for m in adj.get(n, ()):
+                    if m not in comp and _walkable(m):
+                        comp.add(m)
+                        nxt.append(m)
+            queue = nxt
+        # The backbone is the FEEDER sub-network the MFG can reach *through
+        # feeder spans only*. Taking "every Feeder span in the component" was
+        # self-defeating: a 0.6-8.0 m feeder stub that hangs off a
+        # DISTRIBUTION span (which is what all 11 Berlin stubs turned out to
+        # be — measured 0.00 m to a distribution trench, 0.5-12.9 m to the
+        # real backbone) is itself a Feeder span in the component, so it was
+        # counted as its own backbone and the pass did nothing.
+        if mfg_i in feeder:
+            backbone = {mfg_i}
+            walk = [mfg_i]
+            while walk:
                 nxt = []
-                for n in queue:
+                for n in walk:
                     for m in adj.get(n, ()):
-                        if m in prev:
+                        if m in backbone or m not in feeder or not _walkable(m):
+                            continue
+                        backbone.add(m)
+                        nxt.append(m)
+                walk = nxt
+        else:
+            backbone = {i for i in comp if i in feeder} or set(comp)
+        promoted = 0
+        spurs = 0
+        far = []
+
+        def _promote(start):
+            """Relabel the welded path start → backbone as Feeder."""
+            prev = {start: None}
+            queue2, hit = [start], None
+            while queue2 and hit is None:
+                nxt = []
+                for n in queue2:
+                    if not _walkable(n):
+                        continue
+                    for m in adj.get(n, ()):
+                        if m in prev or not _walkable(m):
                             continue
                         prev[m] = n
-                        if m in feeder:
+                        if m in backbone:
                             hit = m
                             break
                         nxt.append(m)
                     if hit is not None:
                         break
-                queue = nxt
+                queue2 = nxt
             if hit is None:
-                if feedback:
-                    feedback.pushWarning(_tr(
-                        "Backbone reach: {0} {1} is {2:.1f} m off the feeder "
-                        "network with no welded path to it.").format(
-                            label, aid, best))
-                continue
-            chain, node = [], hit
+                return 0
+            node, n_added = hit, 0
             while node is not None:
-                chain.append(node)
+                if (node not in backbone
+                        and str(rows[node].get("TRENCH_TIER") or "") != "Garden"):
+                    rows[node]["TRENCH_TIER"] = "Feeder"
+                    backbone.add(node)
+                    comp.add(node)
+                    feeder.add(node)
+                    n_added += 1
                 node = prev[node]
-            for i in chain:
-                if str(rows[i].get("TRENCH_TIER") or "") == "Garden":
+            return n_added
+
+        def _spur(src_i, x, y):
+            """ONE Feeder/Open Cut spur from the backbone to the cabinet."""
+            best, tx, ty, tgt = float("inf"), None, None, None
+            p = _pt(x, y)
+            for i in backbone:
+                g = rows[i].get("_geom")
+                if g is None:
                     continue
-                if rows[i].get("TRENCH_TIER") != "Feeder":
-                    rows[i]["TRENCH_TIER"] = "Feeder"
-                    feeder.add(i)
-                    promoted += 1
+                near = g.nearestPoint(p)
+                if near is None or near.isEmpty():
+                    continue
+                q = near.asPoint()
+                d = ((q.x() - x) ** 2 + (q.y() - y) ** 2) ** 0.5
+                if d < best:
+                    best, tx, ty, tgt = d, q.x(), q.y(), i
+            if tgt is None or best > self._FEEDER_BRIDGE_MAX_M or best <= 0.05:
+                return False
+            # Leave the spur from the trench that is actually there (the
+            # detached island the PDP sits on), not from thin air.
+            sx, sy = x, y
+            sg = rows[src_i].get("_geom") if src_i is not None else None
+            if sg is not None:
+                snear = sg.nearestPoint(_pt(tx, ty))
+                if snear is not None and not snear.isEmpty():
+                    sq = snear.asPoint()
+                    sx, sy = sq.x(), sq.y()
+            if ((tx - sx) ** 2 + (ty - sy) ** 2) ** 0.5 <= 0.05:
+                return False
+            cls = str(rows[tgt].get("trench_type") or "Open Cut")
+            if cls not in TRENCH_WIDTH_MM:
+                cls = "Open Cut"
+            spur_id = "FEEDER-SPUR-%03d" % (spurs + 1)
+            geom = QgsGeometry.fromPolylineXY(
+                [QgsPointXY(sx, sy), QgsPointXY(tx, ty)])
+            row = dict(rows[tgt])          # same street / surface context
+            row.update({
+                "_geom": QgsGeometry.fromMultiPolylineXY(
+                    [[QgsPointXY(sx, sy), QgsPointXY(tx, ty)]]),
+                "TRENCH_ID": spur_id,
+                "RUN_ID": spur_id,
+                "TRENCH_TIER": "Feeder",
+                "trench_type": cls,
+                "USAGE_TYPE": cls,
+                "CONSTRUCT": cls,
+                "addr_id": None, "obj_id": None,
+                "hhs": None, "HH": None,
+                "START_CHAMBER": None, "END_CHAMBER": None,
+                "length_m": round(geom.length(), 2),
+                "SPAN_LEN_M": round(geom.length(), 2),
+                "SPAN_INDEX": 1, "SPAN_COUNT": 1,
+                "SPAN_KIND": "Unchambered",
+                "INFRA_STATUS": "New",
+                "VERIFY_STATUS": "Designed",
+                "WIDTH_MM": TRENCH_WIDTH_MM.get(cls, 300),
+                "DEPTH_MM": TRENCH_DEPTH_MM.get(cls, 900),
+                "SRC": "feeder-reach",
+                "method": "designed",
+            })
+            idx = len(rows)
+            rows.append(row)
+            adj.setdefault(idx, set()).add(tgt)
+            adj.setdefault(tgt, set()).add(idx)
+            comp.add(idx)
+            backbone.add(idx)
+            feeder.add(idx)
+            return True
+
+        non_garden = None
+        for label, aid, x, y in anchors:
+            if x is None or y is None:
+                continue
+            d_any, start = _near(x, y)
+            if start is None:
+                continue
+            if not _walkable(start):
+                # The splitter's own trench is not the drop leg it happens to
+                # sit next to — work from the nearest non-Garden span.
+                if non_garden is None:
+                    non_garden = {i for i in range(len(rows)) if _walkable(i)}
+                _dg, alt = _near(x, y, only=non_garden)
+                if alt is not None:
+                    start = alt
+            if start in comp:
+                # Welded to the MFG — only the TIER can be wrong.
+                d_back, back_i = _near(x, y, only=backbone)
+                if back_i is None or d_back > self._BACKBONE_TOL_M:
+                    promoted += _promote(start)
+                continue
+            # Detached island: the PDP is on trench that no corridor reaches.
+            if _spur(start, x, y):
+                spurs += 1
+                # The spur just joined the whole island to the backbone, so a
+                # second PDP sitting on it needs no spur of its own.
+                island = {start}
+                q3 = [start]
+                while q3:
+                    nxt = []
+                    for n in q3:
+                        for m in adj.get(n, ()):
+                            if m not in island and m not in comp:
+                                island.add(m)
+                                nxt.append(m)
+                    q3 = nxt
+                comp |= island
+                backbone |= {i for i in island if i in feeder}
+            else:
+                far.append((label, aid, round(d_any, 1)))
+
         if promoted and feedback:
             feedback.pushInfo(_tr(
                 "Backbone reach: {0} span(s) relabelled Feeder so the MFG → "
                 "every PDP path exists on the published trench.").format(promoted))
-        return promoted
+        if spurs and feedback:
+            feedback.pushInfo(_tr(
+                "Backbone reach: {0} feeder spur(s) added — a splitter that had "
+                "no welded path to the backbone now has one.").format(spurs))
+        if far and feedback:
+            feedback.pushWarning(_tr(
+                "Backbone reach: {0} anchor(s) could not be joined to the MFG "
+                "within {1:g} m: {2}").format(
+                    len(far), self._FEEDER_BRIDGE_MAX_M,
+                    ", ".join("{0} {1} ({2} m)".format(*f) for f in far[:8])))
+        return promoted + spurs
 
     def _final_rows(self, final: QgsVectorLayer) -> List[dict]:
         """Designer span rows → the pipeline's Final_Trenches contract."""

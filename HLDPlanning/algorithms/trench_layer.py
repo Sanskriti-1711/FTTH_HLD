@@ -377,6 +377,12 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
     # longer than the UG drop limit) are NOT trenches: they are published here
     # so the map, BOQ and LLD see them as a construction type of their own.
     O_AERIAL_DROPS = "OUT_AERIAL_DROPS"
+    # The designer's STRUCTURAL NODES (Trench_Nodes: HDD pits, junctions,
+    # PDPs, bends, pull points). These are the points where the network
+    # changes tier or method, computed from the designed geometry itself —
+    # publishing them is what lets the chamber stage place its structures on
+    # real structural nodes instead of guessing them from duct junctions.
+    O_TRENCH_NODES = "OUT_TRENCH_NODES"
     P_HH_PDP = "HH_PDP_FIELD"       # Households: PDP ID field (optional, for strict Distribution)
     P_HH_HHS = "HH_HHS_FIELD"       # optional: household size/count
 
@@ -535,6 +541,11 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(QgsProcessingParameterFeatureSink(
             self.O_AERIAL_DROPS,
             _tr("Aerial Drops (classified, never excavated)"), optional=True))
+        # Structural nodes (designer): the chamber stage's primary candidates.
+        self.addParameter(QgsProcessingParameterFeatureSink(
+            self.O_TRENCH_NODES,
+            _tr("Trench Nodes (structural nodes: pits, junctions, bends)"),
+            optional=True))
 
 
     def segmentize_network(self, all_layers, context, feedback):

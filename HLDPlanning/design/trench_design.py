@@ -1456,15 +1456,26 @@ FIELD_LINE = (
     ("ADDR_ID", ogr.OFTString), ("HH", ogr.OFTReal),
     # Origin of the network: cable_layer plans the shared feeder from it.
     ("MFG_ID", ogr.OFTString),
-    # AERIAL: the span runs through an aerial zone (restricted land). The span
-    # stays an excavated trench span here — the flag tells the planner/BOQ the
-    # corridor is restricted, so a re-route or an aerial span is expected.
-    ("AERIAL", ogr.OFTInteger), ("AERIAL_REASON", ogr.OFTString),
+    # AERIAL_ZONE: the span runs through an aerial zone (restricted land where
+    # underground is not permitted). This is a CORRIDOR RESTRICTION, not a
+    # construction class: per docs/aerial planning.docx feeder and distribution
+    # are UG-only (allow_aerial_feeder/distribution = false) and aerial is a
+    # DROP-stage decision, so a mains span stays an excavated trench span (its
+    # TRENCH_TYPE keeps the real class) and the zone is recorded as evidence for
+    # the permit/reroute review. It is deliberately NOT called AERIAL: that name
+    # belongs to the construction class on the Aerial_Drops layer, and stamping
+    # a feeder span with it is what made an aerial item read as an open-cut
+    # feeder trench.
+    ("AERIAL_ZONE", ogr.OFTInteger), ("AERIAL_ZONE_REASON", ogr.OFTString),
 )
 FIELD_AERIAL = (
     ("DROP_ID", ogr.OFTString), ("POLYGON_ID", ogr.OFTString),
     ("ADDR_ID", ogr.OFTString), ("HH", ogr.OFTReal),
     ("TRENCH_TIER", ogr.OFTString), ("TRENCH_TYPE", ogr.OFTString),
+    # Aerial is a METHOD, not just a type string: ``CONSTRUCTION_METHOD =
+    # "Overhead"`` and ``EXCAVATION = 0`` are what the BOQ, the platform and
+    # the LLD read instead of inferring "not dug" from the label.
+    ("CONSTRUCTION_METHOD", ogr.OFTString), ("EXCAVATION", ogr.OFTInteger),
     ("length_m", ogr.OFTReal), ("AERIAL_REASON", ogr.OFTString),
     ("INFRA_STATUS", ogr.OFTString),
 )
@@ -2512,8 +2523,10 @@ def design(cfg: dict) -> dict:
             "ADDR_ID": sp.get("addr"), "HH": sp.get("hh"),
             "MFG_ID": sp.get("mfg"),
             "SRC": sp["src"],
-            "AERIAL": 1 if aerial_reason else 0,
-            "AERIAL_REASON": aerial_reason or None,
+            # Corridor restriction evidence (NOT a construction class — see
+            # FIELD_LINE): the span is still Open Cut / HDD / Garden.
+            "AERIAL_ZONE": 1 if aerial_reason else 0,
+            "AERIAL_ZONE_REASON": aerial_reason or None,
             # The published trench layers are MULTILINESTRING (what the map,
             # LLD and BOQ readers expect) — one part per span.
             "geom": _make_multiline([sp["coords"]]),
@@ -2621,7 +2634,15 @@ def design(cfg: dict) -> dict:
             "DROP_ID": "AD-%05d" % (i + 1),
             "POLYGON_ID": leg["house"].get("POLYGON_ID") or None,
             "ADDR_ID": _addr_of(leg["house"]), "HH": _hh_of(leg["house"]),
-            "TRENCH_TIER": "Garden", "TRENCH_TYPE": "Aerial",
+            # An aerial leg replaces the DROP leg it would have been dug as
+            # (docs/aerial planning.docx: aerial is only ever evaluated at the
+            # customer-connection stage), so its tier is the Drop network —
+            # not Garden, which is the excavated micro-trench class.
+            "TRENCH_TIER": "Drop", "TRENCH_TYPE": "Aerial",
+            # The construction METHOD, so no consumer has to infer "not dug"
+            # from the type string alone.
+            "CONSTRUCTION_METHOD": "Overhead",
+            "EXCAVATION": 0,
             "length_m": round(leg["length"], 2),
             "AERIAL_REASON": leg["aerial_reason"],
             "INFRA_STATUS": "New",
@@ -2675,7 +2696,11 @@ def design(cfg: dict) -> dict:
         "aerial_length_m": round(sum(r["length_m"] for r in aerial_rows), 1),
         "aerial_by_reason": _count_by(
             [{"r": r["AERIAL_REASON"]} for r in aerial_rows], "r"),
-        "trench_spans_in_aerial_zone": sum(1 for r in span_rows if r["AERIAL"]),
+        # Corridor restriction count: spans crossing land where underground is
+        # not permitted. They are still excavated spans (feeder/distribution are
+        # UG-only per docs/aerial planning.docx) — this is permit evidence, not
+        # an aerial classification.
+        "trench_spans_in_aerial_zone": sum(1 for r in span_rows if r["AERIAL_ZONE"]),
         "pruned_spans": len(pruned_rows),
         "pruned_length_m": round(sum(s["length_m"] for s in pruned_rows), 1),
         "tails": tail_stats,
