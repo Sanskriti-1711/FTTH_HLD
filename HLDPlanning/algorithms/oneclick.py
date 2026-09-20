@@ -253,6 +253,9 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
     # legs it classifies come out of the trench stage.
     _TR_AERIAL_IN = "INPUT_AERIAL_ZONES"
     _TR_AERIAL_DROPS = "OUT_AERIAL_DROPS"
+    # The designer's structural nodes: published by the trench stage and
+    # consumed by the chamber stage as its primary candidates.
+    _TR_TRENCH_NODES = "OUT_TRENCH_NODES"
     _TR_ALL_OUTPUTS = (
         "OUT_SIDEWALK_LEFT", "OUT_SIDEWALK_RIGHT", "OUT_SIDEWALK_MERGED",
         "OUT_SIDEWALK_BUFFERED_LEFT", "OUT_SIDEWALK_BUFFERED_RIGHT",
@@ -264,6 +267,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         "OUT_S1_AOI_BUFFER_DISSOLVED", "OUT_S1_AOI_OUTLINE_LINES",
         "OUT_S1_ROADS_NEAR", "OUT_S1_ROADS_FILTERED",
         "OUT_AERIAL_DROPS",
+        "OUT_TRENCH_NODES",
     )
 
     _CB_FEEDER, _CB_GARDEN, _CB_DISTR = (
@@ -1030,6 +1034,12 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             "INPUT_PDP": results.get("pdp"),
             "INPUT_TANGENT_CROSSINGS": tangents,
             "INPUT_TRENCHES": results.get("trenches"),
+            # The designer's structural nodes (HDD pits / junctions / PDPs /
+            # bends / pulls): the primary candidate source when present, so
+            # chambers land on the points where the network actually changes
+            # tier or method instead of on duct-junction guesses.
+            "INPUT_TRENCH_NODES": self._fast_resolve(
+                results.get("trench_nodes"), context),
             "INPUT_AOI": self._fast_resolve(results.get("aoi"), context),
             "INPUT_BUILDINGS": self.parameterAsVectorLayer(parameters, self.P_BUILDINGS, context),
             "OUT_CHAMBERS": self._dest(parameters, self.OUT_CHAMBERS, context),
@@ -1525,6 +1535,11 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         # excavation and the LLD carries them as aerial rather than UG.
         results["aerial_drops"] = self._save_layer_to_gpkg(
             tr.get(self._TR_AERIAL_DROPS), "Aerial_Drops.gpkg", out_dir,
+            context, feedback)
+        # The structural nodes the designer placed: the chamber stage's
+        # primary candidate source (a chamber is the opening at a node).
+        results["trench_nodes"] = self._save_layer_to_gpkg(
+            tr.get(self._TR_TRENCH_NODES), "Trench_Nodes.gpkg", out_dir,
             context, feedback)
 
         if feedback.isCanceled():

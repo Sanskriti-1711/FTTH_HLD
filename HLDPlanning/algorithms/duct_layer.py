@@ -92,6 +92,12 @@ def _ensure_output_parent_dir(out_spec):
 # ======================================================================
 # (Only tiny edits: keep class/name; no provider IDs.)
 
+# A distribution duct is laid in the region's TRENCH corridor. Selecting the
+# corridor by POLYGON_ID can pick up a mis-tagged run, so the corridor is only
+# accepted while it is still near the cables that ride it (see _corridor_for).
+_CORRIDOR_SNAP_TOL_M = 25.0
+
+
 class AlgFeederDuctsNoSplit(QgsProcessingAlgorithm):
     def shortHelpString(self):
         return 'Runs the {} algorithm.'.format(self.displayName())
@@ -1345,9 +1351,183 @@ class DuctLayer(QgsProcessingAlgorithm):
             del c_sink
         return out_id, c_id
 
+    def _corridor_for(self, corridor_lyr, poly_ids, fallback_geom, tol_m=0.5,
+                      tap_lyr=None, tap_cap_m=25.0, feedback=None):
+        """The TRENCH corridor a distribution duct is laid in.
+
+        A distribution duct is built *in the trench*, so its geometry has to be
+        the trench the drop legs actually tap, not the cable's merged spine: the
+        spine stops short of the footway points, which is why only 102 of 292
+        pseudo-HH points (the couplers) sat on a distribution duct.
+
+        Selects the corridor features carrying the same POLYGON_ID(s) and unions
+        them; when the selection is empty (or the layer carries no polygon tag)
+        it falls back to the cable geometry, and when it is merely far from the
+        cables (a mis-tagged run) the fallback wins too — a duct must stay on
+        the route its cables are on.
+        """
+        if corridor_lyr is None or corridor_lyr.featureCount() == 0:
+            return fallback_geom
+        names = corridor_lyr.fields().names()
+        f_poly = next((n for n in ("POLYGON_ID", "polygon_id") if n in names), None)
+        f_tier = next((n for n in ("TRENCH_TIER", "trench_tier") if n in names), None)
+        wanted = {str(v).strip().upper() for v in (poly_ids or []) if str(v).strip()}
+        if not wanted or f_poly is None:
+            return fallback_geom
+        cand = []
+        for cf in corridor_lyr.getFeatures():
+            pv = str(cf[f_poly] or "").strip().upper()
+            if pv not in wanted:
+                continue
+            if f_tier is not None:
+                # Garden legs are the drop ducts' own corridor — a distribution
+                # duct must not absorb them (that is the old duplicate path).
+                tier = str(cf[f_tier] or "").strip().lower()
+                if tier and "garden" in tier:
+                    continue
+            g = cf.geometry()
+            if g is not None and not g.isEmpty():
+                cand.append(g)
+        if not cand:
+            return fallback_geom
+
+        # Keep the corridor the duct is actually built in — NOT the region's
+        # whole distribution trench (that tripled the duct material: 2.4 km of
+        # spine became 8.6 km of duct). Two kinds of span qualify:
+        #   (a) the span the region's cable rides (the duct must contain its
+        #       own cable), and
+        #   (b) the span a drop taps, i.e. the nearest span to each pseudo-HH
+        #       point of the region (that is where a coupler joins it).
+        picked = []
+        for g in cand:
+            if fallback_geom is None or fallback_geom.isEmpty():
+                continue
+            try:
+                if g.distance(fallback_geom) <= tol_m:
+                    picked.append(g)
+            except Exception:
+                continue
+        taps = 0
+        if tap_lyr is not None:
+            names_t = tap_lyr.fields().names()
+            t_poly = next((n for n in ("POLYGON_ID", "polygon_id") if n in names_t), None)
+            for pf in tap_lyr.getFeatures():
+                pg = pf.geometry()
+                if pg is None or pg.isEmpty():
+                    continue
+                if t_poly is not None:
+                    tv = str(pf[t_poly] or "").strip().upper()
+                    if tv and tv not in wanted:
+                        continue
+                best = None
+                for g in cand:
+                    try:
+                        d = g.distance(pg)
+                    except Exception:
+                        continue
+                    if best is None or d < best[0]:
+                        best = (d, g)
+                if best is not None and best[0] <= tap_cap_m:
+                    if best[1] not in picked:
+                        picked.append(best[1])
+                    taps += 1
+        if not picked:
+            return fallback_geom
+        if feedback is not None:
+            feedback.pushInfo(
+                "  distribution duct corridor: %d of %d region span(s) "
+                "(%d drop tap(s) bound)." % (len(picked), len(cand), taps))
+        try:
+            from ..utils.geometry_ops import unary_union_geoms as _uug_corr
+            corr = _uug_corr(picked)
+        except Exception:
+            return fallback_geom
+        if corr is None or corr.isEmpty():
+            return fallback_geom
+        # Sanity: the corridor must still be the one the cables ride.
+        if fallback_geom is not None and not fallback_geom.isEmpty():
+            try:
+                if corr.distance(fallback_geom) > _CORRIDOR_SNAP_TOL_M:
+                    return fallback_geom
+            except Exception:
+                pass
+        return corr
+
+    def _attach_taps(self, duct_geom, tap_lyr, poly_ids, tol_m, feedback):
+        """Extend a distribution duct so it REACHES every pseudo-HH (coupler).
+
+        A coupler is the joint where a drop duct leaves the distribution duct
+        (HLD review), so the distribution duct must physically pass through it.
+        Building the duct from the trunk cables alone left it merely *near* the
+        footway points (Berlin: only 102 of 292 couplers sat on a distribution
+        duct, some 40 m away), because the spine does not run down every street
+        the drop legs start on.
+
+        For every pseudo point in the duct's own region that is farther than
+        ``tol_m``, a straight spur from the nearest point on the duct to the
+        point is added. That spur may run along the FEEDER corridor — allowed
+        on purpose: the distribution duct is not required to keep off the
+        feeder path, it is only required to reach the drop joints.
+        """
+        if tap_lyr is None or duct_geom is None or duct_geom.isEmpty():
+            return duct_geom
+        names = tap_lyr.fields().names()
+        f_poly = next((n for n in ("POLYGON_ID", "polygon_id")
+                       if n in names), None)
+        wanted = {str(v).strip().upper() for v in (poly_ids or []) if str(v).strip()}
+        spurs = []
+        reached = 0
+        for pf in tap_lyr.getFeatures():
+            pg = pf.geometry()
+            if pg is None or pg.isEmpty():
+                continue
+            if wanted and f_poly is not None:
+                pv = str(pf[f_poly] or "").strip().upper()
+                # A point with no region tag follows its own duct; one tagged
+                # with a DIFFERENT region is served by that region's duct.
+                if pv and pv not in wanted:
+                    continue
+            try:
+                pt = pg.asPoint() if not pg.isMultipart() else pg.centroid().asPoint()
+            except Exception:
+                continue
+            pgeom = QgsGeometry.fromPointXY(QgsPointXY(pt.x(), pt.y()))
+            if duct_geom.distance(pgeom) <= tol_m:
+                reached += 1
+                continue
+            try:
+                near = duct_geom.nearestPoint(pgeom)
+            except Exception:
+                continue
+            if near is None or near.isEmpty():
+                continue
+            try:
+                npt = near.asPoint()
+            except Exception:
+                continue
+            if npt == pt:
+                continue
+            spurs.append(QgsGeometry.fromPolylineXY(
+                [QgsPointXY(npt.x(), npt.y()), QgsPointXY(pt.x(), pt.y())]))
+        if not spurs:
+            return duct_geom
+        try:
+            from ..utils.geometry_ops import unary_union_geoms as _uug_tap
+            merged = _uug_tap([duct_geom] + spurs)
+            if merged is not None and not merged.isEmpty():
+                feedback.pushInfo(
+                    f"  distribution duct spurs: {len(spurs)} tap(s) added so "
+                    f"every pseudo-HH/coupler sits on a duct "
+                    f"({reached} already on it).")
+                return merged
+        except Exception:
+            pass
+        return duct_geom
+
     def _build_route_ducts(self, cables_lyr, out_uri, profile_key, crs,
                            context, feedback, subtract_lyr=None, runs_uri=None,
-                           skip_cable_types=()):
+                           skip_cable_types=(), tap_lyr=None, tap_tol_m=0.5,
+                           corridor_lyr=None):
         """Build ONE duct per connected route from a cable layer.
 
         Cables that co-route (spatially touch within a small tolerance) are
@@ -1543,6 +1723,7 @@ class DuctLayer(QgsProcessingAlgorithm):
         bins = []            # (geom, cable_ids, pdp_ids, poly_ids, n_cables)
         made = 0
         flag_cnt = 0
+        uncovered = 0        # pseudo points no duct reached (see the pass below)
         for members in groups.values():
             # A corridor may carry more cables than the duct has ways: emit
             # several {ways}-way ducts along the same route, keeping cables
@@ -1585,6 +1766,16 @@ class DuctLayer(QgsProcessingAlgorithm):
                             ug = ug_trimmed
                     except Exception:
                         pass
+                # Distribution: lay the duct in the region's TRENCH corridor
+                # (that is where the drop legs tap it), not in the cable's
+                # merged spine — then make sure it reaches every pseudo-HH
+                # (coupler): see _corridor_for / _attach_taps.
+                if corridor_lyr is not None:
+                    ug = self._corridor_for(corridor_lyr, poly_set, ug, tap_tol_m,
+                                            tap_lyr=tap_lyr, feedback=feedback)
+                if tap_lyr is not None:
+                    ug = self._attach_taps(ug, tap_lyr, poly_set, tap_tol_m,
+                                           feedback)
                 n_cab = len(cable_ids)
                 bins.append((ug, cable_ids, pdp_set, poly_set, n_cab))
                 if runs_sink is not None:
@@ -1603,6 +1794,60 @@ class DuctLayer(QgsProcessingAlgorithm):
                 made += 1
                 if n_cab > ways:
                     flag_cnt += 1
+
+        # ── FINAL COVERAGE: every pseudo-HH must sit on SOME duct ─────────
+        # The per-region pass above only attaches a point to the duct carrying
+        # its own POLYGON_ID, so a point whose tag disagrees with the cable's
+        # (or a region with no duct at all) stayed disconnected — Berlin: 264
+        # of 292 couplers on a duct. A coupler is the drop duct's joint, so a
+        # leftover point is attached to the NEAREST duct instead of none.
+        if tap_lyr is not None and bins:
+            names_t = tap_lyr.fields().names()
+            t_poly = next((n for n in ("POLYGON_ID", "polygon_id") if n in names_t), None)
+            for pf in tap_lyr.getFeatures():
+                pg = pf.geometry()
+                if pg is None or pg.isEmpty():
+                    continue
+                tag = ""
+                if t_poly is not None:
+                    tag = str(pf[t_poly] or "").strip().upper()
+                best = None
+                for i_b, (bg, _ci, _pd, _po, _nc) in enumerate(bins):
+                    try:
+                        d = bg.distance(pg)
+                    except Exception:
+                        continue
+                    if best is None or d < best[0]:
+                        best = (d, i_b)
+                if best is None or best[0] <= tap_tol_m:
+                    continue
+                try:
+                    near = bins[best[1]][0].nearestPoint(pg)
+                    npt = near.asPoint()
+                    pt = pg.asPoint()
+                except Exception:
+                    continue
+                bg, ci, pd, po, nc = bins[best[1]]
+                try:
+                    from ..utils.geometry_ops import unary_union_geoms as _uug_cov
+                    merged = _uug_cov([
+                        bg,
+                        QgsGeometry.fromPolylineXY(
+                            [QgsPointXY(npt.x(), npt.y()), QgsPointXY(pt.x(), pt.y())]),
+                    ])
+                    if merged is not None and not merged.isEmpty():
+                        bins[best[1]] = (merged, ci, pd, po, nc)
+                        uncovered += 1
+                        if tag:
+                            po = list(po) + [tag]
+                            bins[best[1]] = (merged, ci, pd, po, nc)
+                except Exception:
+                    continue
+            if uncovered:
+                feedback.pushInfo(
+                    "  distribution duct coverage: %d pseudo-HH point(s) had no "
+                    "duct in their own region and were attached to the nearest "
+                    "one (a coupler must sit on a duct)." % uncovered)
 
         # ── ONE FEATURE PER DUCT ──────────────────────────────────────────
         # The bins above are the ducts actually laid: a route carrying more
@@ -2011,7 +2256,14 @@ class DuctLayer(QgsProcessingAlgorithm):
                     context, feedback,
                     subtract_lyr=None,
                     runs_uri=runs_dist_uri,
-                    skip_cable_types=("Drop", "Garden"))
+                    skip_cable_types=("Drop", "Garden"),
+                    # Every pseudo-HH point (where a coupler joins the drop
+                    # duct) must sit ON the distribution duct, and the duct is
+                    # free to co-route on the feeder path to get there.
+                    tap_lyr=pseudo_lyr, tap_tol_m=0.5,
+                    # ...and the duct is laid in the region's trench corridor,
+                    # which is the surface the couplers sit on.
+                    corridor_lyr=net_lyr)
                 dist_route_done = _rid is not None
             except Exception as e:
                 try:

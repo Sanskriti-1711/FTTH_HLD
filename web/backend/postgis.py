@@ -56,6 +56,10 @@ LAYER_TABLES: Dict[str, str] = {
     "coupleurs": "coupleur_layer",
     "poles": "poles",
     "brownfield": "brownfield",
+    # Designer structural nodes (HDD pits / junctions / PDPs / bends / pulls):
+    # the evidence behind every planned chamber, in its own table so the
+    # platform serves them next to the chambers they produced.
+    "trench_nodes": "trench_nodes",
     "aerial_drop_trenches": "aerial_drop_trench_layer",
     "aerial_trenches": "aerial_drop_trench_layer",
     # Aerial legs CLASSIFIED by the trench stage (never excavated) — their own
@@ -104,6 +108,7 @@ TABLE_TO_PUBLIC_NAME = {
     "chambers": "chambers",
     "coupleur_layer": "coupleurs",
     "poles": "poles",
+    "trench_nodes": "trench_nodes",
     "brownfield": "brownfield",
     "aerial_drop_trench_layer": "aerial_drop_trenches",
     "duct_occupancy": "duct_occupancy",

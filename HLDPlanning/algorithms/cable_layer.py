@@ -44,6 +44,7 @@ from ..utils.geom import (
     round_key_xy, geom_substring, path_len, lcp_len, edges_to_geom,
     merge_contiguous_runs,
 )
+from ..utils.geometry_ops import unary_union_geoms
 from ..utils.graph import add_edge, dijkstra_with_parents, reconstruct_path
 from ..utils.snap import snap_point_create_virtual
 
@@ -980,9 +981,40 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
                 key = "W:" + dg.asWkt(2)
             span_groups.setdefault(key, []).append(df)
 
+        # ── ONE region cable, not one per spine span ───────────────────────
+        # The span grouping above exists to collapse the adapter's fanned rows
+        # (one row per served address, same geometry) — but publishing a trunk
+        # per SPAN still split a single region into up to 14 cables (78 trunks
+        # across 31 regions on Berlin), each sized 48F for a handful of
+        # households. The result reads as a thicket of parallel cables over one
+        # area, and the duct stage then lays one 2-way duct per fragment.
+        # Grouping by REGION (the polygon served by a PDP) publishes ONE cable
+        # that covers the region and is sized from the region's real household
+        # count — which is also what lets the duct stage build one distribution
+        # duct per region instead of one per fragment.
+        region_groups = {}
+        for members in span_groups.values():
+            df0 = members[0]
+            names0 = df0.fields().names()
+            poly0 = (str(df0["POLYGON_ID"])
+                     if "POLYGON_ID" in names0 and df0["POLYGON_ID"] not in (None, "")
+                     else "")
+            pdp0 = normalize_key(df0[fld_d_pdp]) if fld_d_pdp else ""
+            region_groups.setdefault(f"{poly0}|{pdp0}", []).extend(members)
+        span_groups = region_groups
+
         for members in span_groups.values():
             df = members[0]
             dg = df.geometry()
+            region_geoms = [m.geometry() for m in members
+                            if m.geometry() and not m.geometry().isEmpty()]
+            if region_geoms:
+                # The region cable is the union of its spine spans (a tree
+                # rooted at the PDP), not one arbitrary span of it.
+                try:
+                    dg = unary_union_geoms(region_geoms)
+                except Exception:
+                    dg = region_geoms[0]
             trunk_addrs = []
             for m in members:
                 trunk_addrs.extend(

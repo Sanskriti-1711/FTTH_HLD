@@ -4,6 +4,14 @@ Chamber Layer — generate planned civil chambers for the HLD.
 
 Implements the 8-rule chamber placement logic:
 
+  0. Designer structural nodes     → PRIMARY source when the trench stage
+                                     publishes Trench_Nodes (OUT_TRENCH_NODES):
+                                     HDD drill openings, tier-change junctions,
+                                     splitter locations, bends and pull points.
+                                     A chamber IS the opening of the trench at
+                                     a structural node, so the derived rules
+                                     below fill the gaps rather than guess
+                                     every structure from duct geometry.
   1. Splitter locations            → Chamber at every PDP (FAT/FDT/FDH/PFP point)
   2. Branching points              → Manhole/Handhole where >= 3 distinct ducts
                                      converge (feeder / distribution junction)
@@ -59,6 +67,12 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
     P_PDP = "INPUT_PDP"
     P_TANGENTS = "INPUT_TANGENT_CROSSINGS"
     P_TRENCHES = "INPUT_TRENCHES"
+    # The designer's structural nodes (Trench_Nodes: HDD pits / junctions /
+    # PDPs / bends / pulls). When supplied they are the PRIMARY candidate
+    # source — a chamber IS the opening of the trench at a structural node —
+    # and the duct/trench rules below become the fallback that fills the gaps
+    # (and supplies the duct-count evidence).
+    P_NODES = "INPUT_TRENCH_NODES"
     P_AOI = "INPUT_AOI"                 # design boundary (dissolved AOI polygon)
     P_BUILDINGS = "INPUT_BUILDINGS"     # building footprints (chamber exclusion)
     OUT_CHAMBERS = "OUT_CHAMBERS"
@@ -123,6 +137,13 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
         "Drop transition": "HH",
         "Direction change": "HH",
         "Pull point": "HH",
+        # Designer structural nodes: the same catalogue codes as the
+        # corresponding derived rule, since the structure is the same — only
+        # the evidence differs (designer node instead of a geometric guess).
+        "Designer HDD pit": "DHH",
+        "Designer junction": "MH",
+        "Designer bend": "HH",
+        "Designer pull point": "HH",
     }
 
     # Civil sub-category, from the catalogue code:
@@ -187,6 +208,12 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(QgsProcessingParameterVectorLayer(
             self.P_TRENCHES, self.tr("Final Trenches [lines] (optional; for parent id)"),
             [QgsProcessing.TypeVectorLine], optional=True,
+        ))
+        self.addParameter(QgsProcessingParameterVectorLayer(
+            self.P_NODES,
+            self.tr("Trench Nodes [points] (optional; designer structural "
+                    "nodes — primary candidates)"),
+            [QgsProcessing.TypeVectorPoint], optional=True,
         ))
         self.addParameter(QgsProcessingParameterVectorLayer(
             self.P_AOI, self.tr("Design boundary / AOI [polygons] (optional; chambers kept inside)"),
@@ -298,17 +325,26 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
     # intersections (rule 9) sit with the duct junctions: the duct-based
     # branching rule wins a tie, since it is the stronger evidence.
     RULE_ORDER = {
-        # HDD entry/exit pits are placed FIRST (priority 3 = PDP level, weight
-        # 1000 beats the PDP's 999) so the drill openings are never dropped and
-        # always reserve HDD_PIT_SPACING_M around them. Everything else is then
-        # fitted around them.
-        "HDD pit": 0,
-        "Splitter/F2D (PDP)": 1,
-        "Branching junction": 2,
-        "Trench intersection": 3,
-        "Drop transition": 4,
-        "Direction change": 5,
-        "Pull point": 6,
+        # The designer's structural nodes come first: they are the points
+        # where the network demonstrably changes tier (MFG→feeder→
+        # distribution→drop) or construction method (open cut→HDD→aerial),
+        # and the designer has already separated them by min_node_sep_m /
+        # hdd_pit_keepout_m. The derived rules then fill whatever the designer
+        # did not place (no node layer, or a run the node pass does not cover).
+        "Designer HDD pit": 0,
+        # HDD entry/exit pits (derived) are placed next (priority 3 = PDP
+        # level, weight 1000 beats the PDP's 999) so the drill openings are
+        # never dropped and always reserve HDD_PIT_SPACING_M around them.
+        "HDD pit": 1,
+        "Splitter/F2D (PDP)": 2,
+        "Designer junction": 3,
+        "Branching junction": 4,
+        "Trench intersection": 5,
+        "Designer bend": 6,
+        "Designer pull point": 7,
+        "Drop transition": 8,
+        "Direction change": 9,
+        "Pull point": 10,
     }
 
     def _rule_rank(self, cand):
@@ -355,7 +391,7 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
             sp = cand[6] if len(cand) > 6 else self.CHAMBER_SPACING_M
             # Global floor: no two planned structures closer than this.
             sp = max(sp, self.MIN_STRUCTURE_SEPARATION_M)
-            if reason == "Pull point":
+            if reason in ("Pull point", "Designer pull point"):
                 # Only blocked by a structure essentially at the same spot;
                 # spacing against *other* pull points is their own 250 m.
                 cl = max(self.PULL_CLEARANCE_M, self.MIN_STRUCTURE_SEPARATION_M)
@@ -375,7 +411,8 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
                 # A splitter location must always own a chamber — if the
                 # blocking structure is an HDD pit, upgrade the pit into the
                 # PDP/F2D chamber instead of stacking two structures here.
-                if reason == "Splitter/F2D (PDP)" and breason == "HDD pit" \
+                if reason == "Splitter/F2D (PDP)" \
+                        and breason in ("HDD pit", "Designer HDD pit") \
                         and (x - bx) ** 2 + (y - by) ** 2 <= self.MANDATORY_MERGE_M ** 2:
                     bk = list(kept[bid])
                     tag = ("PDP:" + str(equip)) if equip else "PDP"
@@ -699,9 +736,10 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
         trenches = self._layer(params, self.P_TRENCHES, context)
         aoi_lyr = self._layer(params, self.P_AOI, context)
         bldg_lyr = self._layer(params, self.P_BUILDINGS, context)
+        nodes_lyr = self._layer(params, self.P_NODES, context)
 
         crs = None
-        for lyr in (feeder, dist, drop, pdp_lyr, tangents, trenches):
+        for lyr in (feeder, dist, drop, pdp_lyr, tangents, trenches, nodes_lyr):
             if lyr is not None and lyr.isValid():
                 crs = lyr.crs()
                 break
@@ -713,6 +751,93 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
         candidates = []
         # Tuples: (x, y, priority, type, equipment, weight, min_spacing_m, reason)
         # Priority: Chamber=3 > Manhole=2 > Handhole=1 (denser junctions win)
+
+        # Duct spatial indexes — built HERE (not at the output stage) because
+        # the node candidates need them: a designer junction's weight is how
+        # many distinct ducts pass it, and whether it sits on the FEEDER
+        # network decides Manhole vs Handhole (the HLD rule "Manhole = Feeder,
+        # Handhole = Distribution + Garden").
+        # NOTE: feature ids are NOT unique across the two layers (both start
+        # at 1), so the index key has to be our own counter — otherwise a
+        # feeder feature and a distribution feature collide in duct_geoms and
+        # CONN_DUCTS counts the wrong geometry.
+        duct_index = QgsSpatialIndex()
+        duct_geoms = {}
+        feeder_index = QgsSpatialIndex()
+        feeder_geoms = {}
+        next_uid = 0
+        for lyr in (feeder, dist):
+            if lyr is None:
+                continue
+            for f in lyr.getFeatures():
+                g = f.geometry()
+                if g is None or g.isEmpty():
+                    continue
+                next_uid += 1
+                feat = QgsFeature(f)
+                feat.setId(next_uid)
+                duct_index.addFeature(feat)
+                duct_geoms[next_uid] = g
+                if lyr is feeder:
+                    feeder_index.addFeature(feat)
+                    feeder_geoms[next_uid] = g
+
+        # Rule 0 — the designer's structural nodes (primary source). Every
+        # node the designer placed is a candidate: HDD drill openings, tier
+        # change junctions, splitter locations, direction changes and the
+        # ~250 m pull points. They are what the network is actually made of,
+        # so the chamber that opens the trench belongs on them.
+        node_count = 0
+        if nodes_lyr is not None and nodes_lyr.isValid():
+            n_names = nodes_lyr.fields().names()
+            n_type = "NODE_TYPE" if "NODE_TYPE" in n_names else None
+            n_pdp = "PDP_ID" if "PDP_ID" in n_names else None
+            for f in nodes_lyr.getFeatures():
+                g = f.geometry()
+                if g is None or g.isEmpty():
+                    continue
+                try:
+                    npt = g.asPoint()
+                except Exception:
+                    continue
+                ntype = str(f[n_type] or "").strip().upper() if n_type else ""
+                px, py = npt.x(), npt.y()
+                if ntype == "HDD_PIT":
+                    candidates.append((px, py, 3, "Chamber", "", 1000,
+                                       self.HDD_PIT_SPACING_M,
+                                       "Designer HDD pit"))
+                elif ntype == "JUNCTION":
+                    # Feeder-side junction → Manhole, distribution/garden →
+                    # Handhole, exactly like the derived branching rule.
+                    on_feeder = self._count_ducts_near(
+                        feeder_index, feeder_geoms, px, py,
+                        self.CONN_RADIUS_M) > 0
+                    w = self._count_ducts_near(
+                        duct_index, duct_geoms, px, py, self.CONN_RADIUS_M)
+                    candidates.append((
+                        px, py, 2 if on_feeder else 1,
+                        "Manhole" if on_feeder else "Handhole", "", max(w, 1),
+                        self.JUNCTION_SPACING_M, "Designer junction"))
+                elif ntype == "PDP":
+                    # Only needed when the PDP layer was not supplied: the PDP
+                    # rule below is authoritative (it carries the id and the
+                    # mandatory-merge behaviour).
+                    if pdp_lyr is None:
+                        pid = str(f[n_pdp] or "") if n_pdp else ""
+                        candidates.append((
+                            px, py, 3, "Chamber", pid, 999,
+                            self.MIN_STRUCTURE_SEPARATION_M,
+                            "Splitter/F2D (PDP)"))
+                elif ntype == "BEND":
+                    candidates.append((px, py, 2, "Manhole", "", 1,
+                                       self.BEND_SPACING_M, "Designer bend"))
+                elif ntype == "PULL":
+                    candidates.append((px, py, 2, "Manhole", "", 1,
+                                       self.PULL_SPACING_M,
+                                       "Designer pull point"))
+                else:
+                    continue
+                node_count += 1
 
         # Rule 1 + 3 — Chamber at every PDP (splitter location; feeder and
         # distribution meet there, so it doubles as the F2D transition point).
@@ -913,7 +1038,8 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
             # line, which sits mid-road while the trench follows the footway —
             # they get a wider snap cap so they still end up ON the path.
             reason0 = cand[7] if len(cand) > 7 else ""
-            cap = self.HDD_SNAP_M if reason0 == "HDD pit" else None
+            cap = (self.HDD_SNAP_M
+                   if reason0 in ("HDD pit", "Designer HDD pit") else None)
             # Rule: snap ONTO the trench path first — the chamber is the
             # opening of the UG trench and must lie on it.
             if trench_lines:
@@ -948,19 +1074,8 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
         # ── collapse duplicates (highest priority, densest first) ────────
         kept = self._place_structures(candidates)
 
-        # ── build spatial index of all ducts for CONN_DUCTS ─────────────
-        duct_index = QgsSpatialIndex()
-        duct_geoms = {}
-        for lyr in (feeder, dist):
-            if lyr is None:
-                continue
-            for f in lyr.getFeatures():
-                g = f.geometry()
-                if g is None or g.isEmpty():
-                    continue
-                fid = f.id()
-                duct_index.addFeature(f)
-                duct_geoms[fid] = g
+        # NOTE: the duct spatial indexes (feeder + distribution, plus the
+        # feeder-only one) were built while gathering candidates above.
 
         # ── output ───────────────────────────────────────────────────────
         out_fields = build_fields(THIN_PROFILES["CHAMBER"])
@@ -977,9 +1092,10 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
             reason = cand[7] if len(cand) > 7 else ""
             # ── Standard catalogue: HH / DHH / MH (fixed sizes) ──
             code = self.REASON_TYPE.get(reason, "HH")
-            if reason == "Branching junction" and prio < 2:
+            if reason in ("Branching junction", "Designer junction") and prio < 2:
                 code = "HH"  # distribution-level junctions stay handholes
-            subtype = "Bore" if reason == "HDD pit" else self.SUBTYPE_BY_CODE.get(code, "Handhole")
+            subtype = ("Bore" if reason in ("HDD pit", "Designer HDD pit")
+                       else self.SUBTYPE_BY_CODE.get(code, "Handhole"))
             type_name, size_str = self.CHAMBER_CATALOGUE[code]
             counters[code] += 1
             reason_counts[reason] = reason_counts.get(reason, 0) + 1
@@ -1014,6 +1130,9 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
             f"Chamber layer: {written} planned structures "
             f"(MH: {counters['MH']}, DHH: {counters['DHH']}, HH: {counters['HH']}).\n"
             f"  Placement reasons: {rc or 'none'}\n"
+            f"  Structural nodes: {node_count} designer node(s) offered as "
+            f"candidates (the duct/trench heuristics fill whatever the designer "
+            f"did not place).\n"
             f"  Separation: {stats.get('blocked_close', 0)} candidate(s) dropped inside an "
             f"existing keep-out (floor {self.MIN_STRUCTURE_SEPARATION_M:g} m, "
             f"HDD pit keep-out {self.HDD_PIT_SPACING_M:g} m); "
