@@ -1418,8 +1418,78 @@ def _split_list(value):
     return out
 
 
+# ── Duplicate detection (coverage conservation) ─────────────────────────────
+# A dedupe passes only ever deletes a row whose geometry the receiving row
+# ALREADY covers. Two rows can name the same chamber pair and still be two
+# different paths between those chambers (the duct builder clubs by cable
+# proximity, so two clubs can both run A->B on different corridors) — folding
+# those onto one row deleted duct the field has to build, and on Berlin the
+# feeder layer came out as 7 disconnected pieces with 11 PDPs stranded
+# (measured: `merge` dropped 8 rows whose kept row covered 5-50 % of them,
+# `absorb` dropped 28 whose span covered 7-13 %).
+#
+# ``_DBL_COVER_M`` is what counts as "the same corridor" (the clubbing
+# tolerance of the duct builder) and ``_DBL_COVER_SHARE`` how much of the row
+# must lie on the receiver before deleting it costs no coverage.
+_DBL_COVER_M = 0.5
+_DBL_COVER_SHARE = 0.95
+
+
+def _covered_share(geom_a, geom_b, tol_m=_DBL_COVER_M):
+    """Share of ``geom_a``'s length lying within ``tol_m`` of ``geom_b``.
+
+    GEOS first (buffer + intersection, exact for the polyline/polyline case
+    that matters here); a pure-Python vertex walk is the fallback so a GEOS
+    error can never turn a geometry question into a silent delete.
+    """
+    if geom_a is None or geom_b is None:
+        return 0.0
+    try:
+        la = geom_a.Length()
+    except Exception:
+        return 0.0
+    if la <= 0:
+        return 1.0
+    try:
+        buf = geom_b.Buffer(tol_m, 8)
+        inter = geom_a.Intersection(buf)
+        if inter is not None:
+            return max(0.0, min(1.0, inter.Length() / la))
+    except Exception:
+        pass
+    parts_a = _geom_parts(geom_a)
+    parts_b = _geom_parts(geom_b)
+    if not parts_a or not parts_b:
+        return 0.0
+    total = 0.0
+    covered = 0.0
+    for xy in parts_a:
+        for i in range(len(xy) - 1):
+            seg = math.hypot(xy[i + 1][0] - xy[i][0], xy[i + 1][1] - xy[i][1])
+            if seg <= 0:
+                continue
+            total += seg
+            n = max(2, int(seg) + 1)
+            inside = 0
+            for k in range(n):
+                t = k / (n - 1)
+                px = xy[i][0] + t * (xy[i + 1][0] - xy[i][0])
+                py = xy[i][1] + t * (xy[i + 1][1] - xy[i][1])
+                best = float("inf")
+                for by in parts_b:
+                    for j in range(len(by) - 1):
+                        d = _dist_point_seg(px, py, by[j][0], by[j][1],
+                                            by[j + 1][0], by[j + 1][1])
+                        if d < best:
+                            best = d
+                if best <= tol_m:
+                    inside += 1
+            covered += seg * (inside / n)
+    return covered / total if total > 0 else 1.0
+
+
 def merge_ducts_per_chamber_span(path, feedback=None, label="Feeder ducts"):
-    """Fold every duct sharing a chamber pair into ONE duct.
+    """Fold the ducts that ride the SAME corridor of a chamber pair into ONE.
 
     Operator rule: *"the feeders … will only follow the path once … one chamber
     to another only one feeder duct will be present."* The route builder emits
@@ -1433,6 +1503,13 @@ def merge_ducts_per_chamber_span(path, feedback=None, label="Feeder ducts"):
     ``cables_carried`` / ``pdp_ids`` become the union. Capacity is recomputed
     from the distinct cables actually inside, and ``REVIEW`` is raised when they
     no longer fit the 4-Way profile.
+
+    **A chamber pair can legitimately carry several ducts when they are
+    different paths** — the rule is one duct per *corridor*, not one per
+    chamber pair across the project — so a row is only folded when the row
+    that would keep it actually covers its geometry (``_covered_share``).
+    Rows that stand off keep their geometry as their own duct; they are
+    reported in the log so a reviewer can see the pair carries two paths.
 
     Applied to the feeder tier only — the operator spec allows distribution
     ducts to be one or several per corridor.
@@ -1461,50 +1538,89 @@ def merge_ducts_per_chamber_span(path, feedback=None, label="Feeder ducts"):
 
     merged = 0
     dropped = 0
+    split_pairs = 0
+    kept_paths = 0
     for key in order:
         feats = groups[key]
         if len(feats) < 2:
             continue
         feats.sort(key=lambda f: _geom_len_m(f), reverse=True)
-        keep = feats[0]
-        cables: List[str] = []
-        pdps: List[str] = []
+        # Cluster the group by geometry: fold a row only into a representative
+        # that already carries its corridor.
+        clusters: List[Tuple[Any, List[Any]]] = []
         for f in feats:
-            for c in _split_list(_get(lyr, f, "cables_carried")):
-                if c not in cables:
-                    cables.append(c)
-            for pdp in _split_list(_get(lyr, f, "pdp_ids")):
-                if pdp not in pdps:
-                    pdps.append(pdp)
-        n_cables = len(cables)
-        ways = _duct_ways_for(n_cables, 4)
-        over = n_cables > ways
-        keep.SetField("cables_carried", ",".join(cables))
-        keep.SetField("pdp_ids", ",".join(pdps))
-        keep.SetField("N_DUCTS", 1)
-        keep.SetField("capacity_total", ways)
-        keep.SetField("capacity_used", n_cables)
-        keep.SetField("capacity_spare", max(0, ways - n_cables))
-        keep.SetField("ways_used", n_cables)
-        keep.SetField("WAYS_TOTAL", ways)
-        keep.SetField("WAYS", ways)
-        keep.SetField("REVIEW", 1 if over else 0)
-        keep.SetField("DUCTS_MERGED", len(feats))
-        occ = (n_cables / ways) * 100.0 if ways else 100.0
-        keep.SetField("OCCUPANCY_PCT", round(min(occ, 100.0), 1))
-        keep.SetField("SPARE_PCT", round(max(0.0, 100.0 - occ), 1))
-        lyr.SetFeature(keep)
-        for f in feats[1:]:
-            lyr.DeleteFeature(f.GetFID())
-            dropped += 1
-        merged += 1
+            g = f.geometry()
+            host = None
+            for rep, _mem in clusters:
+                rg = rep.geometry()
+                if g is None or rg is None:
+                    continue
+                if _covered_share(g, rg) >= _DBL_COVER_SHARE:
+                    host = rep
+                    break
+            if host is None:
+                clusters.append((f, [f]))
+            else:
+                for entry in clusters:
+                    if entry[0] is host:
+                        entry[1].append(f)
+                        break
+        if len(clusters) > 1:
+            split_pairs += 1
+            kept_paths += len(clusters)
+        for keep, members in clusters:
+            if len(members) < 2:
+                # Its own corridor between the same two chambers — nothing to
+                # fold, and deleting it would remove duct no other row has.
+                continue
+            _fold_duct_group(lyr, keep, members)
+            for f in members[1:]:
+                lyr.DeleteFeature(f.GetFID())
+                dropped += 1
+            merged += 1
     lyr.CommitTransaction()
     ds = None
     if feedback and merged:
         feedback.pushInfo(
-            f"  [enrich] {label}: {merged} chamber pair(s) folded to ONE duct "
-            f"({dropped} parallel row(s) removed — trunks ride inside).")
+            f"  [enrich] {label}: {merged} chamber pair corridor(s) folded to ONE "
+            f"duct ({dropped} parallel row(s) removed — trunks ride inside).")
+    if feedback and split_pairs:
+        feedback.pushInfo(
+            f"  [enrich] {label}: {split_pairs} chamber pair(s) carry "
+            f"{kept_paths} ducts — the rows are different paths (not "
+            f"duplicates), so every one keeps its geometry.")
     return merged
+
+
+def _fold_duct_group(lyr, keep, members):
+    """Fold ``members`` into ``keep``: union the cables, re-size the profile."""
+    cables: List[str] = []
+    pdps: List[str] = []
+    for f in members:
+        for c in _split_list(_get(lyr, f, "cables_carried")):
+            if c not in cables:
+                cables.append(c)
+        for pdp in _split_list(_get(lyr, f, "pdp_ids")):
+            if pdp not in pdps:
+                pdps.append(pdp)
+    n_cables = len(cables)
+    ways = _duct_ways_for(n_cables, 4)
+    over = n_cables > ways
+    keep.SetField("cables_carried", ",".join(cables))
+    keep.SetField("pdp_ids", ",".join(pdps))
+    keep.SetField("N_DUCTS", 1)
+    keep.SetField("capacity_total", ways)
+    keep.SetField("capacity_used", n_cables)
+    keep.SetField("capacity_spare", max(0, ways - n_cables))
+    keep.SetField("ways_used", n_cables)
+    keep.SetField("WAYS_TOTAL", ways)
+    keep.SetField("WAYS", ways)
+    keep.SetField("REVIEW", 1 if over else 0)
+    keep.SetField("DUCTS_MERGED", len(members))
+    occ = (n_cables / ways) * 100.0 if ways else 100.0
+    keep.SetField("OCCUPANCY_PCT", round(min(occ, 100.0), 1))
+    keep.SetField("SPARE_PCT", round(max(0.0, 100.0 - occ), 1))
+    lyr.SetFeature(keep)
 
 
 def _min_line_dist(geom_a, geom_b):
@@ -1559,6 +1675,13 @@ def absorb_chamber_stubs(path, feedback=None,
     ``Duct tap``, so no published duct claims to leave a chamber and come back
     to it. ``mode="flag"`` was the old answer here and left Berlin with 90 of
     188 distribution ducts reading ``START == END``.
+
+    The absorb mode (feeder) applies the same coverage test before deleting:
+    a stub whose geometry the receiving span does **not** cover keeps its
+    geometry as a ``Duct tail``. Deleting those unconditionally removed 28 real
+    pieces on Berlin and broke the feeder duct chain into 7 disconnected parts
+    (11 PDPs stranded), so the rule now is *delete only what the receiver
+    already carries*.
 
     ``floor`` is the minimum profile for this tier (4-Way feeder / 2-Way
     distribution) — see ``_duct_ways_for``.
@@ -1636,6 +1759,22 @@ def absorb_chamber_stubs(path, feedback=None,
             lyr.SetFeature(sf)
             relabelled += 1
             continue
+        if not coincident_only and r["geom"] is not None and best["geom"] is not None:
+            # Same conservation rule as the merge: hand the cables over only
+            # when the receiving span already carries this geometry. A stub
+            # the span does NOT cover is duct nothing else has (a tail running
+            # out of the chamber and back, or a branch), and deleting it left
+            # the Berlin feeder layer in 7 disconnected pieces. Keep it, stop
+            # it claiming to be a chamber-to-chamber span, flag it for review.
+            if _covered_share(r["geom"], best["geom"], _STUB_COINCIDENT_M) < _DBL_COVER_SHARE:
+                sf = r["f"]
+                if i_end >= 0:
+                    sf.SetField(i_end, "")
+                sf.SetField("SPAN_KIND", "Duct tail")
+                sf.SetField("REVIEW", 1)
+                lyr.SetFeature(sf)
+                relabelled += 1
+                continue
         # Hand the stub's cables over, then recompute the receiver's capacity:
         # one duct still leaves that chamber, it just carries these too.
         cables = list(best["cables"])
@@ -1672,8 +1811,9 @@ def absorb_chamber_stubs(path, feedback=None,
     if feedback and relabelled:
         feedback.pushInfo(
             f"  [enrich] {label}: {relabelled} stood-off stub(s) kept as 'Duct "
-            f"tap' (END_CHAMBER cleared) — a tap is not a chamber-to-chamber "
-            f"span.")
+            f"tap'/'Duct tail' (END_CHAMBER cleared) — a tap is not a "
+            f"chamber-to-chamber span, and its geometry is not covered by the "
+            f"span that would have inherited it.")
     if feedback and (absorbed or kept_unabsorbed):
         if flag_only:
             feedback.pushInfo(
@@ -2066,6 +2206,177 @@ def enrich_equipment(pdp_path, mfg_path, feedback=None):
 
 # ── Combined entry point ─────────────────────────────────────────────────────
 
+# ── Duct continuity check ───────────────────────────────────────────────────
+#
+# A duct is laid along a trench, so the feeder network is one continuous chain
+# from the MFG to every PDP and the distribution network has to reach the
+# couplers that tap it. Both facts are cheap to test on the published layers
+# and expensive to notice by eye, so every run now states them in its log —
+# the dedupe passes above were silently deleting duct until this check existed.
+_DUCT_SNAP_M = 0.5
+
+
+def _is_empty(geom) -> bool:
+    """OGR spells this ``IsEmpty``; QGIS wraps it as ``isEmpty``."""
+    if geom is None:
+        return True
+    for attr in ("IsEmpty", "isEmpty"):
+        fn = getattr(geom, attr, None)
+        if callable(fn):
+            try:
+                return bool(fn())
+            except Exception:
+                continue
+    return False
+
+
+def _line_segments(path, feedback=None):
+    """Every polyline segment of a GPKG layer as ((x0,y0),(x1,y1))."""
+    ds, lyr = _open_lyr(path)
+    if lyr is None:
+        return []
+    out = []
+    for f in lyr:
+        g = f.geometry()
+        if _is_empty(g):
+            continue
+        for xy in _geom_parts(g):
+            for i in range(len(xy) - 1):
+                out.append((xy[i], xy[i + 1]))
+    return out
+
+
+def _point_xy(path, id_fields=("SRC_ID", "PDP_ID", "MFG_ID", "id")):
+    ds, lyr = _open_lyr(path)
+    if lyr is None:
+        return []
+    names = [lyr.GetLayerDefn().GetFieldDefn(i).GetName()
+             for i in range(lyr.GetLayerDefn().GetFieldCount())]
+    idf = next((n for n in id_fields if n in names), None)
+    out = []
+    for f in lyr:
+        g = f.geometry()
+        if _is_empty(g):
+            continue
+        try:
+            c = g.centroid().asPoint()
+            x, y = c.x(), c.y()
+        except Exception:
+            # A point layer: read the vertex itself (``centroid`` is a QGIS
+            # spelling and this layer can hand back a bare OGR point).
+            try:
+                x, y = g.GetX(0), g.GetY(0)
+            except Exception:
+                continue
+        out.append(((x, y), str(f.GetField(idf)) if idf else str(f.GetFID())))
+    return out
+
+
+def _components(segments, snap_m=_DUCT_SNAP_M):
+    """Union-find over segment endpoints snapped within ``snap_m``."""
+    nodes: List[Tuple[float, float]] = []
+    parent: Dict[int, int] = {}
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    def node_at(pt):
+        for i, q in enumerate(nodes):
+            if math.hypot(pt[0] - q[0], pt[1] - q[1]) <= snap_m:
+                return i
+        nodes.append(pt)
+        parent[len(nodes) - 1] = len(nodes) - 1
+        return len(nodes) - 1
+
+    for a, b in segments:
+        ia, ib = node_at(a), node_at(b)
+        if ia != ib:
+            union(ia, ib)
+    groups: Dict[int, List[int]] = {}
+    for i in range(len(nodes)):
+        groups.setdefault(find(i), []).append(i)
+    return nodes, groups
+
+
+def verify_duct_continuity(out_dir, feedback=None):
+    """Log the feeder chain and the distribution/coupler reach of a run.
+
+    Returns a dict with the numbers (also useful to tests): ``feeder_parts``,
+    ``pdp_reached``, ``pdp_total``, ``couplers_off``, ``coupler_total``.
+    """
+    p = lambda n: os.path.join(out_dir, n)  # noqa: E731
+    report = {}
+    mfg = _point_xy(p("MFG.gpkg"))
+    pdps = _point_xy(p("PDPs.gpkg"))
+    segs = _line_segments(p("Feeder_Ducts.gpkg"), feedback)
+    if mfg and pdps and segs:
+        nodes, groups = _components(segs)
+        mi = min(range(len(nodes)),
+                 key=lambda i: math.hypot(mfg[0][0][0] - nodes[i][0],
+                                          mfg[0][0][1] - nodes[i][1]))
+        parent_root = next(r for r, mem in groups.items() if mi in mem)
+        reached, stranded = 0, []
+        for pt, pid in pdps:
+            pi = min(range(len(nodes)),
+                     key=lambda i: math.hypot(pt[0] - nodes[i][0],
+                                              pt[1] - nodes[i][1]))
+            rr = next((r for r, mem in groups.items() if pi in mem), None)
+            if rr == parent_root:
+                reached += 1
+            else:
+                stranded.append(pid)
+        report["feeder_parts"] = len(groups)
+        report["pdp_reached"] = reached
+        report["pdp_total"] = len(pdps)
+        report["pdp_stranded"] = stranded
+        if feedback:
+            feedback.pushInfo(
+                f"  [verify] Feeder ducts: {len(groups)} connected part(s), "
+                f"MFG reaches {reached}/{len(pdps)} PDP(s).")
+            if stranded:
+                feedback.pushWarning(
+                    "  [verify] Feeder ducts: %d PDP(s) are on a duct network the "
+                    "MFG does not reach (%s) — the chain is broken, check the "
+                    "chamber-to-chamber spans." % (len(stranded),
+                                                   ", ".join(stranded[:8])))
+    couplers = _point_xy(p("Coupleurs.gpkg"), ("DUCT_UID", "SRC_ID", "id"))
+    dsegs = _line_segments(p("Distribution_Ducts.gpkg"), feedback)
+    if couplers and dsegs:
+        off, worst = 0, 0.0
+        for pt, _cid in couplers:
+            best = float("inf")
+            for a, b in dsegs:
+                d = _dist_point_seg(pt[0], pt[1], a[0], a[1], b[0], b[1])
+                if d < best:
+                    best = d
+                    if best <= 1.0:
+                        break
+            if best > 1.0:
+                off += 1
+            worst = max(worst, best)
+        report["couplers_off"] = off
+        report["coupler_total"] = len(couplers)
+        report["coupler_worst_m"] = round(worst, 2)
+        if feedback:
+            feedback.pushInfo(
+                f"  [verify] Distribution ducts: {off}/{len(couplers)} coupler(s) "
+                f"are >1 m off the duct line (worst {worst:.2f} m) — a coupler is "
+                f"the joint on that duct.")
+            if off:
+                feedback.pushWarning(
+                    "  [verify] %d coupler(s) do not sit on the distribution "
+                    "duct — the joint layer and the duct layer disagree." % off)
+    return report
+
+
 def enrich_all(out_dir, feedback=None, roads_lyr=None):
     """Enrich every pipeline GPKG inside out_dir (no-op when out_dir is empty).
 
@@ -2144,6 +2455,9 @@ def enrich_all(out_dir, feedback=None, roads_lyr=None):
     n += absorb_chamber_stubs(p("Distribution_Ducts.gpkg"), feedback,
                               "Distribution ducts", mode="coincident", floor=2)
     n += propagate_duct_pdp_id(p("Distribution_Ducts.gpkg"), feedback)
+    # Every run states whether the ducts actually flow: one feeder chain from
+    # the MFG to every PDP, and couplers sitting on the distribution duct.
+    verify_duct_continuity(out_dir, feedback)
     # The coupler is the joint between the distribution and the drop duct, so
     # it has to name both — it could only carry the drop side when it was
     # created, before the distribution network existed.
