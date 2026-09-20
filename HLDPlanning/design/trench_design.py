@@ -1295,9 +1295,48 @@ def place_nodes(network: List[Run], drills: Sequence[dict],
     for pt in junction_points:
         add(pt[0], pt[1], "JUNCTION", 2)
 
-    # 3 — splitters
+    # 3 — splitters. A splitter location OWNS its position: the cabinet must
+    #     stand on the chamber where the feeder and the distribution meet. When
+    #     the location falls inside another structure's keep-out — an HDD pit
+    #     reserves the widest one (hdd_pit_keepout_m, 15 m), so a splitter beside
+    #     a drill entry is the common case — that structure MOVES onto the
+    #     splitter instead of the splitter being absorbed. The generic dedupe
+    #     above used to drop the PDP node here, and the chamber stage's merge
+    #     rule then folded the splitter INTO the pit: Berlin PDP00019 ended up
+    #     4.50 m from the single chamber built for it, with no duct entering the
+    #     cabinet. This is the splitter's civil reality either way — the drill
+    #     keeps its bore geometry (the crossing is anchored by the drill spans,
+    #     not by the node), only the structure at the bore end nudges along the
+    #     trench. The structure keeps its own NODE_TYPE, so the BORE / junction
+    #     evidence and the chamber sub-category survive, and records the splitter
+    #     it now serves in `ref`.
+    #
+    #     Two splitters are never merged into each other: a splitter always gets
+    #     a node of its own and the chamber rules separate them. Measured on
+    #     Berlin: 31 splitters, 31 nodes — 16 placed as their own node, 15
+    #     taking over a structure (10 junctions, 5 HDD pits), and no pair of
+    #     splitters closer than min_node_sep_m.
+    pdp_takeovers = 0
     for p in pdps:
-        add(p["x"], p["y"], "PDP", 3, ref=str(p.get("PDP_ID") or ""))
+        px, py = p["x"], p["y"]
+        pid = str(p.get("PDP_ID") or "")
+        host = None
+        host_d = None
+        for n in nodes:
+            if n["NODE_TYPE"] == "PDP":
+                continue                      # never merge two splitters
+            sep = (params.hdd_pit_keepout_m if n["NODE_TYPE"] == "HDD_PIT"
+                   else params.min_node_sep_m)
+            d = math.hypot(n["x"] - px, n["y"] - py)
+            if d < sep and (host_d is None or d < host_d):
+                host, host_d = n, d
+        if host is not None:
+            host["x"], host["y"] = px, py
+            if pid:
+                host["ref"] = pid
+            pdp_takeovers += 1
+            continue
+        add(px, py, "PDP", 3, ref=pid)
 
     # 4 — sharp bends
     for run in network:
@@ -1347,6 +1386,12 @@ def place_nodes(network: List[Run], drills: Sequence[dict],
         for n in nodes:
             counts[n["NODE_TYPE"]] += 1
         log("nodes: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
+        n_pdp = sum(1 for n in nodes if n["NODE_TYPE"] == "PDP")
+        if pdp_takeovers or n_pdp != len(pdps):
+            log("splitter nodes: %d for %d splitter(s) "
+                "(%d took over a nearby structure, %d placed as their own "
+                "node)" % (pdp_takeovers + n_pdp, len(pdps), pdp_takeovers,
+                           n_pdp))
     return nodes
 
 
@@ -2677,6 +2722,17 @@ def design(cfg: dict) -> dict:
         "length_by_type_m": {k: round(v, 1) for k, v in sorted(by_type.items())},
         "length_by_tier_m": {k: round(v, 1) for k, v in sorted(by_tier.items())},
         "nodes": {k: v for k, v in _count_by(nodes, "NODE_TYPE").items()},
+        # Splitter coverage: every splitter must own a node (and therefore a
+        # chamber) — either its own, or by taking over the structure that sat
+        # inside its keep-out. Reported so a regression cannot hide, since the
+        # failure mode (cabinet left off the chamber, no duct entering it) is
+        # invisible in the span counts.
+        "splitters": {
+            "total": len(pdps),
+            "own_node": sum(1 for n in nodes if n["NODE_TYPE"] == "PDP"),
+            "took_over_structure": sum(
+                1 for n in nodes if n.get("ref") and n["NODE_TYPE"] != "PDP"),
+        },
         "carrier_length_by_class_m": {k: round(v, 1)
                                      for k, v in sorted(carrier_mix.items())},
         "carriageway_carrier_m": round(carriage_m, 1),
