@@ -62,6 +62,7 @@ LAYER_TABLES: Dict[str, str] = {
     "trench_nodes": "trench_nodes",
     "aerial_drop_trenches": "aerial_drop_trench_layer",
     "aerial_trenches": "aerial_drop_trench_layer",
+    "aerial_cable": "aerial_cable_layer",
     # Aerial legs CLASSIFIED by the trench stage (never excavated) — their own
     # table, because they are a design decision, not the aerial drop the
     # pole/aerial stage BUILDS (which lands in aerial_drop_trench_layer).
@@ -111,6 +112,13 @@ TABLE_TO_PUBLIC_NAME = {
     "trench_nodes": "trench_nodes",
     "brownfield": "brownfield",
     "aerial_drop_trench_layer": "aerial_drop_trenches",
+    "aerial_cable_layer": "aerial_cable",
+    # NOTE: this map is also the list init_schema() creates tables from, so a
+    # table named only in LAYER_TABLES is never created — publishing
+    # `aerial_drops` without it here raised
+    # `relation "gis.aerial_drops" does not exist` and failed the whole
+    # ingest of every run that carried the aerial layer.
+    "aerial_drops": "aerial_drops",
     "duct_occupancy": "duct_occupancy",
     "cable_occupancy": "cable_occupancy",
 }

@@ -25,6 +25,7 @@ from qgis.core import (
     QgsPointXY,
     QgsSpatialIndex,
     QgsCoordinateTransform,
+    QgsProject,
 )
 from qgis.PyQt.QtCore import QMetaType
 
@@ -38,6 +39,7 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
     P_PREMISES = "INPUT_PREMISES"
     P_POLES = "INPUT_POLES"
     P_AERIAL_ZONES = "INPUT_AERIAL_ZONES"
+    P_LEGS = "INPUT_AERIAL_LEGS"
     P_ROADS = "INPUT_ROADS"
     P_BF_POLES = "INPUT_BF_POLES"
     P_SPACING = "POLE_SPACING_M"
@@ -50,6 +52,10 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
     MAX_DROP_DISTANCE_M = 70.0       # max aerial drop span
     MAX_POLE_SEARCH_M = 100.0        # search radius for nearest pole
     DEFAULT_SPACING = 50.0           # pole spacing fallback
+    MIN_SPAN_M = 1.0                 # a pole standing on the premise is not a
+                                     # drop anchor — it yields a 0.0 m span
+    LEG_MATCH_M = 5.0                # how close a premise must sit to the
+                                     # classified aerial leg it belongs to
 
     # ── QGIS Processing boilerplate ──────────────────────────────────────────
 
@@ -76,8 +82,12 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
             "Routes aerial drop trenches from poles to premises that were "
             "flagged as aerial_required=True by the trench evaluation stage. "
             "Produces Aerial_Drop_Trenches and Aerial_Cable layers.\n\n"
-            "Premises without aerial_required are ignored.  Only premises "
-            "inside aerial zones (or explicitly flagged) are connected."
+            "Premises without aerial_required are ignored.  A premise is "
+            "connected when the trench stage **classified its leg aerial** "
+            "(supplied as INPUT_AERIAL_LEGS), or, failing that, when it sits "
+            "inside an aerial zone.  The zone polygon cannot be the only "
+            "gate: the trench stage also classifies a leg aerial by the "
+            "chain/length rules, and those legs have no zone to test against."
         )
 
     # ── Parameter definitions ─────────────────────────────────────────────────
@@ -98,6 +108,12 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
             self.tr("Aerial Zones [polygons] (blank = no restriction)"),
             [QgsProcessing.TypeVectorPolygon],
             optional=True,
+        ))
+        self.addParameter(QgsProcessingParameterVectorLayer(
+            self.P_LEGS, self.tr(
+                "Aerial legs [lines] (classified by the trench stage; "
+                "authoritative over the zone test)"),
+            [QgsProcessing.TypeVectorLine], optional=True,
         ))
         self.addParameter(QgsProcessingParameterVectorLayer(
             self.P_ROADS,
@@ -140,6 +156,7 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
         premises = self.parameterAsVectorLayer(parameters, self.P_PREMISES, context)
         poles = self.parameterAsVectorLayer(parameters, self.P_POLES, context)
         zones = self.parameterAsVectorLayer(parameters, self.P_AERIAL_ZONES, context)
+        legs = self.parameterAsVectorLayer(parameters, self.P_LEGS, context)
         roads = self.parameterAsVectorLayer(parameters, self.P_ROADS, context)
         bf_poles = self.parameterAsVectorLayer(parameters, self.P_BF_POLES, context)
         spacing = self.parameterAsDouble(parameters, self.P_SPACING, context)
@@ -218,6 +235,45 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
                 if g and not g.isEmpty():
                     zone_geoms.append(g)
 
+        # The legs the trench stage already classified as aerial.  This is the
+        # authoritative classification: the trench stage fires on the zone rule
+        # **and** on the chain/length rules, so a 'chain' leg is aerial with no
+        # zone anywhere near it.  Testing such a premise against zone polygons
+        # alone is what published Aerial_Drops = 3 but Aerial_Cable = 0 (Berlin
+        # AD-00001/02 zone, AD-00003 chain — all three counted 'outside zones').
+        leg_addr = set()
+        leg_geoms = []
+        leg_reason = {}
+        if legs is not None and legs.isValid() and legs.featureCount() > 0:
+            _xform = None
+            try:
+                if legs.crs() and legs.crs().isValid() and legs.crs() != crs:
+                    _xform = QgsCoordinateTransform(
+                        legs.crs(), crs, QgsProject.instance())
+            except Exception:
+                _xform = None
+            leg_addr_field = first_field_case_insensitive(
+                legs, ["addr_id", "ADDR_ID", "TO_PREMISE"])
+            leg_reason_field = first_field_case_insensitive(
+                legs, ["AERIAL_REASON", "aerial_reason"])
+            for lf in legs.getFeatures():
+                if leg_addr_field:
+                    v = lf[leg_addr_field]
+                    if v is not None and str(v).strip():
+                        key = str(v).strip()
+                        leg_addr.add(key)
+                        if leg_reason_field:
+                            rv = lf[leg_reason_field]
+                            if rv is not None and str(rv).strip():
+                                leg_reason[key] = str(rv).strip()
+                g = lf.geometry()
+                if g is None or g.isEmpty():
+                    continue
+                if _xform is not None:
+                    g = QgsGeometry(g)
+                    g.transform(_xform)
+                leg_geoms.append(g)
+
         # ── Helper: find nearest pole ───────────────────────────────────────────
 
         def _nearest_pole(pt: QgsPointXY):
@@ -246,12 +302,31 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
             if not candidates:
                 return None
             candidates.sort(key=lambda x: x[0])
-            d, feat, g = candidates[0]
+            # Never anchor a drop to a pole that stands on the premise itself:
+            # that is a 0.0 m "span" and it is how aerial trenches were
+            # published with no length at all.  Fall through to the next pole.
+            usable = [c for c in candidates if c[0] > self.MIN_SPAN_M]
+            if not usable:
+                return None
+            d, feat, g = usable[0]
             pid = str(feat[COMMON_FIELDS.POLE_ID] or feat["POLE_ID"] or feat["pole_id"] or "")
             return pid, g, d
 
         def _approx_meters(p1, p2):
-            """Equirectangular approximation in metres."""
+            """Distance between two points in **metres**.
+
+            The planner runs in whatever CRS the premises arrive in, and Berlin
+            arrives in EPSG:25833 — where the old equirectangular formula
+            (degrees × 111 320) turned a 20 m drop into 1.7 million metres.  The
+            max-span guard then skipped **every** aerial drop, which is why this
+            stage could classify legs and still publish nothing.  A projected
+            CRS is already metric, so use it directly; only a geographic CRS
+            needs the degree formula.
+            """
+            if crs is not None and crs.isValid() and not crs.isGeographic():
+                dx = p2.x() - p1.x()
+                dy = p2.y() - p1.y()
+                return (dx * dx + dy * dy) ** 0.5
             dx = (p2.x() - p1.x()) * 111_320.0 * max(0.1, math.cos(math.radians((p1.y() + p2.y()) / 2)))
             dy = (p2.y() - p1.y()) * 111_320.0
             return (dx * dx + dy * dy) ** 0.5
@@ -262,6 +337,17 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
             for zg in zone_geoms:
                 if zg.contains(pt):
                     return True
+            return False
+
+        def _on_aerial_leg(pt, addr):
+            """Was this premise's leg classified aerial by the trench stage?"""
+            if addr and addr in leg_addr:
+                return True
+            if leg_geoms:
+                pg = QgsGeometry.fromPointXY(pt)
+                for lg in leg_geoms:
+                    if float(lg.distance(pg)) <= self.LEG_MATCH_M:
+                        return True
             return False
 
         def _snap_to_road(pt, max_snap_m=15.0):
@@ -292,9 +378,13 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
         skipped_no_flag = 0
         skipped_no_zone = 0
         skipped_no_pole = 0
+        from_leg = 0
 
         aerial_field = first_field_case_insensitive(
             premises, ["aerial_required", "AERIAL_REQUIRED", "aerial", "AERIAL"]
+        )
+        addr_field = first_field_case_insensitive(
+            premises, ["ADDR_ID", "addr_id", "SRC_ID"]
         )
 
         for f in premises.getFeatures():
@@ -322,7 +412,19 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
                 skipped_no_flag += 1
                 continue
 
-            if not _point_in_zone(QgsGeometry.fromPointXY(pt)):
+            addr = ""
+            if addr_field:
+                v = f[addr_field]
+                if v is not None:
+                    addr = str(v).strip()
+
+            # The trench stage's classification wins.  A 'chain' or 'length'
+            # leg is aerial with no zone polygon to satisfy, so the zone test
+            # only applies to premises the trench stage did not classify.
+            classified = _on_aerial_leg(pt, addr)
+            if classified:
+                from_leg += 1
+            elif not _point_in_zone(QgsGeometry.fromPointXY(pt)):
                 skipped_no_zone += 1
                 continue
 
@@ -335,7 +437,8 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
             aerial_premises.append((f, pt, pole_id, pole_geom, pole_dist))
 
         feedback.pushInfo(self.tr(
-            f"Aerial drop planner: {len(aerial_premises)} premises flagged, "
+            f"Aerial drop planner: {len(aerial_premises)} premises flagged "
+            f"({from_leg} from the trench stage's aerial classification), "
             f"{skipped_no_flag} not flagged, {skipped_no_zone} outside zones, "
             f"{skipped_no_pole} no pole within {self.MAX_POLE_SEARCH_M}m."
         ))
@@ -363,10 +466,13 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
             snapped_pole = _snap_to_road(pole_pt, max_snap_m=20.0)
             snapped_premise = _snap_to_road(pt, max_snap_m=20.0)
 
-            # Build path: pole → premise (straight if both snapped, otherwise
-            # fall back to direct line)
-            if snapped_pole.distance(QgsGeometry.fromPointXY(pole_pt)) < 0.1 and \
-               snapped_premise.distance(QgsGeometry.fromPointXY(pt)) < 0.1:
+            # Build path: pole → premise (straight if neither endpoint moved,
+            # otherwise use the snapped points).
+            # Both values are QgsPointXY — comparing them against a QgsGeometry
+            # raises TypeError, which is what crashed this stage the first time
+            # a premise actually reached it.
+            if snapped_pole.distance(pole_pt) < 0.1 and \
+               snapped_premise.distance(pt) < 0.1:
                 path = [pole_pt, pt]
             else:
                 path = [snapped_pole, snapped_premise]
@@ -398,7 +504,14 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
                 COMMON_FIELDS.POLE_SPACING_M: spacing,
                 COMMON_FIELDS.CROSSINGS: 0,
                 COMMON_FIELDS.PERMIT_REQUIRED: False,
-                COMMON_FIELDS.AERIAL_REASON: "hlv_evaluation",
+                # Carry the trench stage's own reason (zone / chain / length)
+                # so the aerial drop traces back to the rule that made it
+                # aerial rather than to a generic label.
+                COMMON_FIELDS.AERIAL_REASON: (
+                    leg_reason.get(addr_val)
+                    or next((leg_reason[k] for k in leg_reason
+                             if k and addr_val and k in str(addr_val)), "")
+                    or "hlv_evaluation"),
                 COMMON_FIELDS.INFRA_STATUS: "Proposed",
                 COMMON_FIELDS.VERIFY_STATUS: "Assumed",
                 COMMON_FIELDS.STAGE: "HLD",

@@ -1058,6 +1058,11 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             "INPUT_AERIAL_ZONES": zones,
             "INPUT_FEEDER_TRENCHES": results.get("feeder"),
             "INPUT_PDP": results.get("pdp"),
+            # The legs the trench stage just classified as aerial. Without
+            # them a leg carries no pole, and the aerial drop stage below can
+            # build nothing from it.
+            "INPUT_AERIAL_LEGS": self._fast_resolve(
+                results.get("aerial_drops"), context),
             "OUT_POLES": self._dest(parameters, self.OUT_POLES, context),
         }
         return processing.run(ALG.POLE, params, context=context, feedback=feedback,
@@ -1148,12 +1153,20 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         bf_poles = self.parameterAsVectorLayer(parameters, self.P_BF_POLES, context)
         zones = self.parameterAsVectorLayer(parameters, self.P_AERIAL_ZONES, context)
         roads = self.parameterAsVectorLayer(parameters, self.P_TR_ROADS, context)
-        if zones is None or not zones.isValid() or zones.featureCount() == 0:
+        # The legs the trench stage classified as aerial are the authority, not
+        # the zone polygons: a leg can be aerial by the chain/length rule with no
+        # zone over it at all.  Bailing out on "no zones" was the second half of
+        # why a run could classify legs and still publish 0 aerial drops.
+        legs = self._fast_resolve(results.get("aerial_drops"), context)
+        has_zones = zones is not None and zones.isValid() and zones.featureCount() > 0
+        has_legs = legs is not None and legs.isValid() and legs.featureCount() > 0
+        if not has_zones and not has_legs:
             return None
         params = {
             "INPUT_PREMISES": premises,
             "INPUT_POLES": poles,
-            "INPUT_AERIAL_ZONES": zones,
+            "INPUT_AERIAL_ZONES": zones if has_zones else None,
+            "INPUT_AERIAL_LEGS": legs,
             "INPUT_ROADS": roads,
             "INPUT_BF_POLES": bf_poles,
             "POLE_SPACING_M": self.parameterAsDouble(parameters, self.P_SPACING, context),

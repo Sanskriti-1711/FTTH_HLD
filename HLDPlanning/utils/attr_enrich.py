@@ -998,6 +998,21 @@ def _segment_layer_at_chambers(path, chambers, feedback=None, label="layer",
         ml.AddGeometry(_mk_coords(coords))
         return ml
 
+    def _ends_of(first_pt, last_pt):
+        """(start, end) chamber ids for a piece — never the same one twice.
+
+        ``X -> X`` is not a span: the piece leaves a chamber and comes back to
+        it, which for duct geometry means a tap/fragment at that structure.
+        The span guard below already dropped the end for pieces the chambers
+        CUT; the two "publish the piece whole" paths did not, and that is
+        exactly where the 90 distribution self-pairs came from.
+        """
+        s = _chamber_at(chambers, first_pt[0], first_pt[1])
+        e = _chamber_at(chambers, last_pt[0], last_pt[1])
+        if s and s == e:
+            e = ""
+        return s, e
+
     def _stamp(feat, start_id, end_id, index, count, run_id):
         feat.SetField(i_kind, SPAN_KIND_CHAMBER)
         length = round(_geom_len_m(feat), 1)
@@ -1048,10 +1063,8 @@ def _segment_layer_at_chambers(path, chambers, feedback=None, label="layer",
                 # — geometry untouched, metadata stamped — so every trench row
                 # states which kind it is.
                 first, last = whole[0][0], whole[-1][-1]
-                _stamp(feat,
-                       _chamber_at(chambers, first[0], first[1]),
-                       _chamber_at(chambers, last[0], last[1]),
-                       1, 1, run_id)
+                _s_id, _e_id = _ends_of(first, last)
+                _stamp(feat, _s_id, _e_id, 1, 1, run_id)
                 feat.SetField(i_kind, SPAN_KIND_UNCHAMBERED)
                 lyr.SetFeature(feat)
                 published += 1
@@ -1091,10 +1104,8 @@ def _segment_layer_at_chambers(path, chambers, feedback=None, label="layer",
                     ml.AddGeometry(_mk_coords(coords))
                 remainder.SetGeometry(ml)
                 first, last = whole[0][0], whole[-1][-1]
-                _stamp(remainder,
-                       _chamber_at(chambers, first[0], first[1]),
-                       _chamber_at(chambers, last[0], last[1]),
-                       1, 1, run_id)
+                _s_id, _e_id = _ends_of(first, last)
+                _stamp(remainder, _s_id, _e_id, 1, 1, run_id)
                 remainder.SetField(i_kind, SPAN_KIND_UNCHAMBERED)
                 lyr.CreateFeature(remainder)
                 published += 1
@@ -1266,10 +1277,21 @@ _DUCT_WAYS_LADDER = (1, 2, 4, 6, 12)
 
 
 def _duct_ways_for(n_cables, default=4):
+    """Smallest ladder profile that carries ``n_cables``, never below
+    ``default``.
+
+    ``default`` is the tier's own profile and acts as a **floor**, not a
+    fallback: the feeder profile is 4-Way HDPE sized once for the run, so a
+    single trunk cable on it is still a 4-Way duct. Reading it as a fallback
+    is what let two Berlin feeder ducts be published as **1-Way** (the ladder
+    returns 1 for one cable, and the parameter was never consulted).
+    """
+    n = max(1, int(n_cables or 1))
+    floor = max(1, int(default or 1))
     for w in _DUCT_WAYS_LADDER:
-        if w >= n_cables:
-            return w
-    return _DUCT_WAYS_LADDER[-1]
+        if w >= n:
+            return max(w, floor)
+    return max(_DUCT_WAYS_LADDER[-1], floor)
 
 
 def _split_list(value):
@@ -1387,8 +1409,14 @@ def _min_line_dist(geom_a, geom_b):
     return best
 
 
+# How close a stub must lie to the span that would inherit it before deleting
+# it is free. Beyond this the stub carries geometry nothing else has (a tap
+# running out to a coupler), so it is re-labelled instead of removed.
+_STUB_COINCIDENT_M = 1.0
+
+
 def absorb_chamber_stubs(path, feedback=None,
-                         label="Feeder ducts", mode="absorb"):
+                         label="Feeder ducts", mode="absorb", floor=4):
     """Remove ducts that begin and end at the SAME chamber.
 
     A duct is pulled *between two structures*, so a component whose two ends
@@ -1405,12 +1433,19 @@ def absorb_chamber_stubs(path, feedback=None,
     "Chamber stub"``) rather than silently dropped, so it shows up instead of
     disappearing.
 
-    ``mode="flag"`` marks stubs without deleting anything. Used for the
-    DISTRIBUTION tier: it carried 85 of 202 stubs, and absorbing them moves the
-    duct out from under the couplers that tap it — it dropped 8 coupler joints
-    from 292 to 284. The operator spec allows distribution ducts to be several
-    per corridor and to run to the pseudo-object points, so their topology is
-    left alone and the stubs are surfaced for a decision instead.
+    ``mode="flag"`` marks stubs without deleting anything.
+
+    ``mode="coincident"`` (the DISTRIBUTION tier) deletes only the stubs whose
+    geometry **lies on** the span that inherits them (``_STUB_COINCIDENT_M``),
+    where deleting costs no coverage; a stub that genuinely stands off
+    (a tap running out to a coupler) keeps its geometry but stops pretending to
+    be a span — ``END_CHAMBER`` is cleared and ``SPAN_KIND`` becomes
+    ``Duct tap``, so no published duct claims to leave a chamber and come back
+    to it. ``mode="flag"`` was the old answer here and left Berlin with 90 of
+    188 distribution ducts reading ``START == END``.
+
+    ``floor`` is the minimum profile for this tier (4-Way feeder / 2-Way
+    distribution) — see ``_duct_ways_for``.
     """
     ds, lyr = _open_lyr(path)
     if lyr is None:
@@ -1423,6 +1458,8 @@ def absorb_chamber_stubs(path, feedback=None,
         ("capacity_spare", ogr.OFTReal),
     ])
     flag_only = str(mode).lower() == "flag"
+    coincident_only = str(mode).lower() == "coincident"
+    i_end = lyr.GetLayerDefn().GetFieldIndex("END_CHAMBER")
     rows = []
     for f in lyr:
         sc = str(_get(lyr, f, "START_CHAMBER") or "").strip()
@@ -1439,6 +1476,7 @@ def absorb_chamber_stubs(path, feedback=None,
     real = [r for r in rows if not r["stub"] and (r["sc"] or r["ec"])]
     absorbed = 0
     kept_unabsorbed = 0
+    relabelled = 0
     for r in rows:
         if not r["stub"]:
             continue
@@ -1469,6 +1507,18 @@ def absorb_chamber_stubs(path, feedback=None,
                 best_d, best = d, x
         if best is None:
             continue
+        if coincident_only and best_d > _STUB_COINCIDENT_M:
+            # The stub stands off the span it would be absorbed into, so it
+            # carries geometry nothing else has (a tap out to a coupler).
+            # Keep it, but stop it claiming to be a chamber-to-chamber span.
+            sf = r["f"]
+            if i_end >= 0:
+                sf.SetField(i_end, "")
+            sf.SetField("SPAN_KIND", "Duct tap")
+            sf.SetField("REVIEW", 1)
+            lyr.SetFeature(sf)
+            relabelled += 1
+            continue
         # Hand the stub's cables over, then recompute the receiver's capacity:
         # one duct still leaves that chamber, it just carries these too.
         cables = list(best["cables"])
@@ -1480,7 +1530,7 @@ def absorb_chamber_stubs(path, feedback=None,
             if pdp not in pdps:
                 pdps.append(pdp)
         best["cables"], best["pdps"] = cables, pdps
-        ways = _duct_ways_for(len(cables), 4)
+        ways = _duct_ways_for(len(cables), floor)
         bf = best["f"]
         bf.SetField("cables_carried", ",".join(cables))
         bf.SetField("pdp_ids", ",".join(pdps))
@@ -1501,6 +1551,11 @@ def absorb_chamber_stubs(path, feedback=None,
         absorbed += 1
 
     ds = None
+    if feedback and relabelled:
+        feedback.pushInfo(
+            f"  [enrich] {label}: {relabelled} stood-off stub(s) kept as 'Duct "
+            f"tap' (END_CHAMBER cleared) — a tap is not a chamber-to-chamber "
+            f"span.")
     if feedback and (absorbed or kept_unabsorbed):
         if flag_only:
             feedback.pushInfo(
@@ -1949,9 +2004,11 @@ def enrich_all(out_dir, feedback=None, roads_lyr=None):
     # them per corridor, which is why duplicates are folded for feeder only).
     n += absorb_chamber_stubs(p("Feeder_Ducts.gpkg"), feedback, "Feeder ducts")
     # Distribution keeps its topology (several ducts per corridor is allowed and
-    # the couplers tap it) — its stubs are flagged, not folded.
+    # the couplers tap it) — but it stops publishing fragments as spans. A stub
+    # whose geometry LIES ON the span that would inherit it is duplication and
+    # goes; one that stands off keeps its geometry as a 'Duct tap'.
     n += absorb_chamber_stubs(p("Distribution_Ducts.gpkg"), feedback,
-                              "Distribution ducts", mode="flag")
+                              "Distribution ducts", mode="coincident", floor=2)
     n += propagate_duct_pdp_id(p("Distribution_Ducts.gpkg"), feedback)
     # The coupler is the joint between the distribution and the drop duct, so
     # it has to name both — it could only carry the drop side when it was

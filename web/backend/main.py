@@ -71,6 +71,14 @@ ONECLICK_OUTPUTS: List[Tuple[str, str, str]] = [
     # part of Final_Trenches. Their own layer carries TRENCH_TYPE="Aerial",
     # AERIAL_REASON (zone / length / chain) and EXCAVATION=0.
     ("aerial_drops", "Aerial_Drops.gpkg", "Aerial_Drops.geojson"),
+    # What the pole + aerial stages BUILD from that classification: the drop
+    # trench (pole -> premise) and its cable. They are a different thing from
+    # Aerial_Drops (the designer's decision not to dig), so they publish
+    # separately — before this the aerial chain ran and its output was
+    # invisible on the platform because nothing served those two layers.
+    ("aerial_drop_trenches", "Aerial_Drop_Trenches.gpkg",
+     "Aerial_Drop_Trenches.geojson"),
+    ("aerial_cable", "Aerial_Cable.gpkg", "Aerial_Cable.geojson"),
     # The trench designer's STRUCTURAL NODES: the points where the network
     # changes tier or construction method (HDD drill openings, junctions,
     # splitter locations, bends, pull points). The chamber stage places its
