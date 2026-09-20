@@ -1980,9 +1980,21 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
         trench.
         """
         try:
+            # Dissolve needs the corridor's GEOMETRY only. `native:dissolve`
+            # copies the input's attribute schema onto its temporary output, and
+            # that output declares a 48-char string field; a run whose corridor
+            # carries a concatenated address list (`addr_id` reaches 223 chars on
+            # Berlin) then fails the write with "String of length 87 exceeds
+            # maximum field length (48)". The except below swallows it and
+            # returns (None, None), so the duct stage silently loses its
+            # trench-derived offsets and falls back to default side labels.
+            # Nothing downstream reads these attributes — the offsets ARE
+            # geometry — so drop them and the whole failure class goes away.
+            geom_only = self._geometry_only_layer(final)
             diss = self._run_child(
                 "native:dissolve",
-                {"INPUT": final, "FIELD": [], "SEPARATE_DISJOINT": False},
+                {"INPUT": geom_only if geom_only is not None else final,
+                 "FIELD": [], "SEPARATE_DISJOINT": False},
                 context, feedback, "corridor_dissolved")
             left = self._run_child(
                 "native:offsetline",
@@ -2002,6 +2014,45 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
                 "to default side labels.").format(exc))
             return None, None
         return left, right
+
+    @staticmethod
+    def _geometry_only_layer(layer: QgsVectorLayer, name: str = "corridor_geom",
+                             feedback=None) -> Optional[QgsVectorLayer]:
+        """An in-memory copy of ``layer`` with its geometry and NO attributes.
+
+        Used only for derived helper geometry (offsets, buffers), whose own
+        attribute set is a rendering detail, not a contract — and whose schema
+        is a liability, because a child algorithm's temporary output may declare
+        a narrower string field than the values in it. Returns ``None`` when the
+        copy cannot be built, so callers fall back to the source layer and
+        nothing is lost but the optimisation.
+        """
+        if layer is None:
+            return None
+        try:
+            uri = "%s?crs=%s" % (
+                QgsWkbTypes.displayString(layer.wkbType()), layer.crs().authid())
+            mem = QgsVectorLayer(uri, name, "memory")
+            if not mem.isValid():
+                return None
+            feats: List[QgsFeature] = []
+            for f in layer.getFeatures():
+                g = f.geometry()
+                if g is None or g.isEmpty():
+                    continue
+                out = QgsFeature()
+                out.setGeometry(g)
+                feats.append(out)
+            if not feats:
+                return None
+            mem.dataProvider().addFeatures(feats)
+            return mem
+        except Exception as exc:  # pragma: no cover - defensive
+            if feedback is not None:
+                feedback.pushInfo(_tr(
+                    "  geometry-only copy failed ({0}); using the source "
+                    "layer.").format(exc))
+            return None
 
     def _aoi_layer(self, polys: QgsVectorLayer, context, feedback):
         """Dissolved design boundary (Polygons + AOI buffer) — legacy parity."""

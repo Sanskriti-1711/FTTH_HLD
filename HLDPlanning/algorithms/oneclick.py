@@ -965,6 +965,18 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             params[self._CB_PDP] = results["pdp"]
         if results.get("mfg"):
             params[self._CB_MFG] = results["mfg"]
+        # State the trench input in the log: the cable layer is planned ON the
+        # designed trench route tree, and "which trench did this run use" was
+        # otherwise only inferable from the numbers that came out.
+        if self._CB_FINAL_TR in params:
+            feedback.pushInfo(self.tr(
+                "Cable stage: trench input = {0} feature(s) "
+                "(FINAL_TRENCHES — the cable is planned on this route tree)."
+            ).format(self._fast_count(params[self._CB_FINAL_TR], context)))
+        else:
+            feedback.pushInfo(self.tr(
+                "Cable stage: NO trench input — the legacy trench-copy path is "
+                "in use."))
         return processing.run(ALG.CABLE, params, context=context, feedback=feedback,
                               is_child_algorithm=True)
 
@@ -979,6 +991,26 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             self._DU_OUT_DROP: self._dest(parameters, self.OUT_DROP_DUCTS, context),
             self._DU_OUT_COUPLE: self._dest(parameters, self.OUT_COUPLEURS, context),
         }
+        # State the trench input in the log: every duct is built on this line
+        # network (and, when the designer's corridor produced them, on the
+        # offsets derived from it).
+        if params.get(self._DU_NETWORK):
+            feedback.pushInfo(self.tr(
+                "Duct stage: trench input = {0} feature(s) "
+                "(NETWORK_LINES — feeder/distribution/drop ducts are built on "
+                "this network)."
+            ).format(self._fast_count(params[self._DU_NETWORK], context)))
+        else:
+            feedback.pushInfo(self.tr(
+                "Duct stage: NO trench input — duct placement will fall back to "
+                "the sidewalk offsets only."))
+        if results.get("sidewalk_l") and results.get("sidewalk_r"):
+            feedback.pushInfo(self.tr(
+                "Duct stage: corridor offsets present (both sides) — ducts are "
+                "assigned their real side of the trench."))
+        else:
+            feedback.pushInfo(self.tr(
+                "Duct stage: corridor offsets ABSENT — side labels are default."))
         if results.get("pseudo_hh"):
             params[self._DU_PSEUDO] = results["pseudo_hh"]
         if results.get("garden"):
