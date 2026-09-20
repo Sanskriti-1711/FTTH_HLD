@@ -306,6 +306,28 @@ def _convert_gpkg_to_geojson(gpkg_path: Path, geojson_path: Path) -> bool:
     return result.returncode == 0 and geojson_path.exists()
 
 
+def _ensure_geojson(gpkg_path: Path, geojson_path: Path) -> bool:
+    """Export the GeoJSON unless an up-to-date one already exists.
+
+    A pipeline stage rewrites its GPKG in place AFTER the per-stage GeoJSON
+    export (the attribute-enrichment pass in particular), and a re-run rewrites
+    the GPKG again. So existence is NOT freshness: an old GeoJSON next to a
+    newer GPKG is the previous run's geometry, and serving it means the map
+    shows the previous design no matter what the new run produced
+    (project 0dc85304 served its pre-fix feeder ducts for hours after the
+    re-run because this check only asked whether the file existed).
+    """
+    if not gpkg_path.exists():
+        return geojson_path.exists()
+    if geojson_path.exists():
+        try:
+            if geojson_path.stat().st_mtime >= gpkg_path.stat().st_mtime:
+                return True
+        except OSError:
+            pass
+    return _convert_gpkg_to_geojson(gpkg_path, geojson_path)
+
+
 def _register_downloads(project_id: str, output_dir: Path) -> List[Dict[str, Any]]:
     downloads: List[Dict[str, Any]] = []
     for path in output_dir.rglob("*"):
@@ -343,8 +365,9 @@ def _restore_task_from_disk(project_id: str) -> Optional[Dict[str, Any]]:
             continue
         geojson_path = output_dir / geojson_name
         gpkg_path = output_dir / gpkg_name
-        if not geojson_path.exists() and gpkg_path.exists():
-            _convert_gpkg_to_geojson(gpkg_path, geojson_path)
+        # Freshness, not existence: a restored project must serve the CURRENT
+        # run's geometry, never a stale GeoJSON left beside a newer GPKG.
+        _ensure_geojson(gpkg_path, geojson_path)
         if geojson_path.exists():
             layer_files.setdefault(public_layer, []).append(str(geojson_path))
         elif gpkg_path.exists():
@@ -414,19 +437,11 @@ def _ingest_outputs(project_id: str, output_dir: Path) -> List[Dict[str, Any]]:
             if gpkg_path.exists():
                 layer_files.setdefault(public_layer, []).append(str(gpkg_path))
             continue
-        # Re-convert when the GPKG is newer than the GeoJSON: stages like
-        # the attribute-enrichment pass rewrite the GPKGs in place AFTER the
-        # per-stage GeoJSON exports, so a re-run must not ingest the stale
-        # previous run's GeoJSON.
-        needs_convert = (
-            not geojson_path.exists()
-            or (
-                gpkg_path.exists()
-                and gpkg_path.stat().st_mtime > geojson_path.stat().st_mtime
-            )
-        )
-        if needs_convert:
-            _convert_gpkg_to_geojson(gpkg_path, geojson_path)
+        # Re-convert when the GPKG is newer than the GeoJSON (see
+        # _ensure_geojson): stages like the attribute-enrichment pass rewrite
+        # the GPKGs in place AFTER the per-stage GeoJSON exports, so a re-run
+        # must not ingest the stale previous run's GeoJSON.
+        _ensure_geojson(gpkg_path, geojson_path)
         if geojson_path.exists():
             layer_files.setdefault(public_layer, []).append(str(geojson_path))
             if has_postgis:
@@ -3030,8 +3045,7 @@ def _run_lld_replan(
                 continue
             gpkg = design_dir / f"{oneclick_name}.gpkg"
             geojson = design_dir / f"{oneclick_name}.geojson"
-            if not geojson.exists() and gpkg.exists():
-                _convert_gpkg_to_geojson(gpkg, geojson)
+            _ensure_geojson(gpkg, geojson)
             if not geojson.exists():
                 _lld_append(project_id, lld_version, "warn",
                             f"Mode B: fresh design has no {oneclick_name} layer — skipping.")
