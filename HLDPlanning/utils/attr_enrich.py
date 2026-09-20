@@ -623,12 +623,24 @@ def enrich_trenches(trench_path, feedback=None, roads_lyr=None):
         # NEVER re-stamped as an excavated class, whatever its tier says.
         if tt_canon != "Aerial" and is_aerial_row(f):
             tt_canon = "Aerial"
-        # ``sidewalk`` is a STRING field in the delivered GPKG, so the literal
-        # "false"/"0" are truthy in Python — that silently flipped every
-        # reinstatement to Footpath/Sidewalk. Normalise it explicitly.
+        # ``sidewalk`` arrives in TWO shapes across the stages:
+        #   * a boolean-ish flag from the legacy stage ("true"/"false"/"1"/"0")
+        #   * the actual surface NAME from the designer ("Footway"/"Asphalt"/
+        #     "Garden" — `design.trench_design._surface_for`)
+        # The literal "false"/"0" are truthy in Python, and a surface NAME is
+        # truthy too, so reading a name as a flag made every span come out
+        # SURFACE=Footpath / REINSTATE=Sidewalk — including the **77 HDD road
+        # crossings** the designer had correctly marked Asphalt/Full. That fed
+        # the Surface Restoration Plan, the traffic-plan reinstatement text, the
+        # permit drawings and TRAFFIC_001. Read a name as a name.
         _sw_raw = str(_get(lyr, f, "sidewalk") or "").strip().lower()
         _sw_mixed = _sw_raw == "mixed"
         sidewalk = _sw_raw not in ("", "false", "0", "no", "none", "null")
+        # Road surfaces are not sidewalk: a drilled/dug crossing under asphalt is
+        # reinstated as road, which is what the (consumer-side) SURFACE vocabulary
+        # "Asphalt" + REINSTATE "Road" already means.
+        if _sw_raw in ("asphalt", "road", "carriageway", "street", "tarmac"):
+            sidewalk = False
         f.SetField("USAGE_TYPE", tt_canon)
         f.SetField("CONSTRUCT", TRENCH_CONSTRUCT.get(tt_canon, "Open Cut"))
         f.SetField("WIDTH_MM", TRENCH_WIDTH_MM.get(tt_canon, 300))
