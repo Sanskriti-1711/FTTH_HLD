@@ -15,6 +15,11 @@ deleted duct the field has to build: on Berlin the feeder layer came out as
 The rule now: fold/absorb only what the receiver already carries
 (``_covered_share`` >= 95 % within 0.5 m).
 
+Same file, same idea, one attribute: ``PARENT_TRENCH`` (which trench a duct
+rides in) was blank on **all 555 duct rows** of a Berlin run because the lookup
+asked for ``SRC_ID``/``id`` — and ``id`` is NULL on every published trench row,
+the trench stage publishes ``TRENCH_ID``.
+
 Run from the engine backend dir:
 
     cd HLD_Planning_01/web/backend
@@ -159,6 +164,34 @@ def test_absorb_keeps_a_stub_the_span_does_not_cover(tmp_path):
     assert tail[0]["END_CHAMBER"] == "", "a tail is not a chamber-to-chamber span"
     assert tail[0]["SPAN_KIND"] == "Duct tail"
     assert tail[0]["REVIEW"] == 1
+
+
+# ── PARENT_TRENCH ────────────────────────────────────────────────────────────
+
+def test_enrich_ducts_links_the_published_trench_id(tmp_path):
+    """A duct on a trench publishes that trench's id — TRENCH_ID, not `id`."""
+    trench = tmp_path / "Final_Trenches.gpkg"
+    _write_layer(trench, [
+        (_polyline([(0, 0), (0, 100)]),
+         # the real published schema: TRENCH_ID carries the id, `id` is NULL
+         {"TRENCH_ID": "TR-000001", "id": None,
+          "TRENCH_TYPE": "Open Cut", "TRENCH_TIER": "Feeder"}),
+    ], [("TRENCH_ID", ogr.OFTString), ("id", ogr.OFTInteger),
+        ("TRENCH_TYPE", ogr.OFTString), ("TRENCH_TIER", ogr.OFTString)])
+    duct = tmp_path / "Feeder_Ducts.gpkg"
+    _write_layer(duct, [
+        (_polyline([(0, 10), (0, 90)]),
+         {"cables_carried": "FEEDER-CABLE-001", "INFRA_STATUS": "Proposed"}),
+    ], [("cables_carried", ogr.OFTString), ("INFRA_STATUS", ogr.OFTString)])
+
+    attr_enrich.enrich_ducts(str(duct), str(tmp_path / "Distribution_Ducts.gpkg"),
+                             str(tmp_path / "Drop_Ducts.gpkg"),
+                             str(trench), str(tmp_path / "Chambers.gpkg"), None)
+    rows, _ds = _read(duct)
+
+    assert rows, "the duct is still published"
+    assert rows[0]["PARENT_TRENCH"] == "TR-000001", \
+        "the duct names the trench it rides in"
 
 
 def test_absorb_still_removes_a_stub_that_lies_on_the_span(tmp_path):

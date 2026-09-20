@@ -1333,10 +1333,15 @@ def enrich_ducts(feeder_path, dist_path, drop_path, trench_path, chamber_path, f
             if pts:
                 mid = pts[len(pts) // 2]
                 # Distribution ducts route on the sidewalk graph, offset from
-                # the trench lines — allow 10 m.  Prefer SRC_ID (stable id),
-                # fall back to the numeric row id.
+                # the trench lines — allow 10 m.  ``TRENCH_ID`` first, because
+                # that is the id the trench stage publishes (`SRC_ID`/`id` are
+                # the legacy spellings, and `id` is NULL on every published
+                # row): naming only the legacy fields is what left
+                # ``PARENT_TRENCH`` blank on all 555 duct rows of a Berlin run
+                # while every duct sat 0.00 m on the trench.
                 f.SetField("PARENT_TRENCH", _nearest_id(
-                    trench_path, mid[0], mid[1], 10.0, ("SRC_ID", "id")))
+                    trench_path, mid[0], mid[1], 10.0,
+                    ("TRENCH_ID", "SRC_ID", "id")))
                 sx, sy = pts[0]
                 ex, ey = pts[-1]
                 f.SetField("START_CHAMBER", _nearest_id(
