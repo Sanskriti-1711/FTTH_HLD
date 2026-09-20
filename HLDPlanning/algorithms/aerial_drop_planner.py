@@ -54,6 +54,8 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
     DEFAULT_SPACING = 50.0           # pole spacing fallback
     MIN_SPAN_M = 1.0                 # a pole standing on the premise is not a
                                      # drop anchor — it yields a 0.0 m span
+    BUILDING_ANCHOR_M = 5.0          # how close a leg's start must be to another
+                                     # premise before it is a house-to-house span
     LEG_MATCH_M = 5.0                # how close a premise must sit to the
                                      # classified aerial leg it belongs to
 
@@ -244,6 +246,20 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
         leg_addr = set()
         leg_geoms = []
         leg_reason = {}
+        leg_start = {}          # addr -> the leg's network/anchor end
+        leg_coords = {}         # addr -> the leg's own vertices (anchor -> premise)
+        building_index = []     # (addr, point) — the premise each leg ends at
+
+        def _polyline_coords(g):
+            """First part's vertices as [(x, y), ...] (empty when not a line)."""
+            try:
+                if g.isMultipart():
+                    parts = g.asMultiPolyline()
+                    return [(p.x(), p.y()) for p in parts[0]] if parts else []
+                return [(p.x(), p.y()) for p in g.asPolyline()]
+            except Exception:
+                return []
+
         if legs is not None and legs.isValid() and legs.featureCount() > 0:
             _xform = None
             try:
@@ -257,6 +273,7 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
             leg_reason_field = first_field_case_insensitive(
                 legs, ["AERIAL_REASON", "aerial_reason"])
             for lf in legs.getFeatures():
+                key = ""
                 if leg_addr_field:
                     v = lf[leg_addr_field]
                     if v is not None and str(v).strip():
@@ -273,6 +290,15 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
                     g = QgsGeometry(g)
                     g.transform(_xform)
                 leg_geoms.append(g)
+                coords = _polyline_coords(g)
+                if not coords or not key:
+                    continue
+                leg_start[key] = QgsPointXY(coords[0][0], coords[0][1])
+                leg_coords[key] = coords
+                # Every leg ENDS at the premise it serves, so those points are
+                # where the buildings are.
+                building_index.append(
+                    (key, QgsPointXY(coords[-1][0], coords[-1][1])))
 
         # ── Helper: find nearest pole ───────────────────────────────────────────
 
@@ -350,6 +376,25 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
                         return True
             return False
 
+        def _building_at(pt, own_addr):
+            """The premise this point stands on, or '' when it stands free.
+
+            A 'chain' leg leaves the house it feeds from, so its start sits on
+            a building — and a pole planted there would stand on that
+            customer's roof.  The leg endpoints are the evidence.
+            """
+            for addr, bp in building_index:
+                if not addr or addr == own_addr:
+                    continue
+                if _approx_meters(bp, pt) <= self.BUILDING_ANCHOR_M:
+                    return addr
+            return ""
+
+        def _path_len_m(points):
+            """Length of a vertex path in metres (a leg can be bent)."""
+            return sum(_approx_meters(points[i], points[i + 1])
+                       for i in range(len(points) - 1))
+
         def _snap_to_road(pt, max_snap_m=15.0):
             """Snap point to nearest road within max_snap_m, return snapped point."""
             if road_idx is None:
@@ -379,6 +424,7 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
         skipped_no_zone = 0
         skipped_no_pole = 0
         from_leg = 0
+        building_anchored = 0
 
         aerial_field = first_field_case_insensitive(
             premises, ["aerial_required", "AERIAL_REQUIRED", "aerial", "AERIAL"]
@@ -428,19 +474,42 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
                 skipped_no_zone += 1
                 continue
 
-            nearest = _nearest_pole(pt)
-            if nearest is None:
-                skipped_no_pole += 1
-                continue
+            # Anchor the drop.  When the leg starts on ANOTHER premise it is a
+            # house-to-house span ('chain'), so the anchor is that building and
+            # the leg geometry is the span — routing from the nearest pole
+            # instead published a 38.6 m span where the field builds ~18.6 m.
+            anchor_id, anchor_pt, anchor_dist, path = "", None, 0.0, None
+            start_pt = leg_start.get(addr) if addr else None
+            if start_pt is not None:
+                host = _building_at(start_pt, addr)
+                if host:
+                    anchor_id = "BLDG-%s" % host
+                    anchor_pt = start_pt
+                    path = leg_coords.get(addr)
+                    building_anchored += 1
+            if not anchor_id:
+                nearest = _nearest_pole(pt)
+                if nearest is None:
+                    skipped_no_pole += 1
+                    continue
+                anchor_id, anchor_geom, anchor_dist = nearest
+                anchor_pt = (
+                    anchor_geom.centroid().asPoint()
+                    if anchor_geom.wkbType() == QgsWkbTypes.PointGeometry
+                    else anchor_geom.asPoint())
 
-            pole_id, pole_geom, pole_dist = nearest
-            aerial_premises.append((f, pt, pole_id, pole_geom, pole_dist))
+            aerial_premises.append({
+                "f": f, "pt": pt, "addr": addr,
+                "anchor_id": anchor_id, "anchor_pt": anchor_pt,
+                "anchor_dist": anchor_dist, "path": path,
+            })
 
         feedback.pushInfo(self.tr(
             f"Aerial drop planner: {len(aerial_premises)} premises flagged "
-            f"({from_leg} from the trench stage's aerial classification), "
+            f"({from_leg} from the trench stage's aerial classification, "
+            f"{building_anchored} anchored on a building — house to house), "
             f"{skipped_no_flag} not flagged, {skipped_no_zone} outside zones, "
-            f"{skipped_no_pole} no pole within {self.MAX_POLE_SEARCH_M}m."
+            f"{skipped_no_pole} no reachable pole."
         ))
 
         if not aerial_premises:
@@ -455,29 +524,32 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
         import math
         counter = {"trench": 0, "cable": 0, "skipped": 0}
 
-        for f, pt, pole_id, pole_geom, pole_dist in aerial_premises:
-            if pole_dist > self.MAX_POLE_SEARCH_M:
-                counter["skipped"] += 1
-                continue
+        for item in aerial_premises:
+            f, pt = item["f"], item["pt"]
+            anchor_id = item["anchor_id"]
 
-            pole_pt = pole_geom.centroid().asPoint() if pole_geom.wkbType() == QgsWkbTypes.PointGeometry else pole_geom.asPoint()
-
-            # Snap both endpoints to roads for practical routing
-            snapped_pole = _snap_to_road(pole_pt, max_snap_m=20.0)
-            snapped_premise = _snap_to_road(pt, max_snap_m=20.0)
-
-            # Build path: pole → premise (straight if neither endpoint moved,
-            # otherwise use the snapped points).
-            # Both values are QgsPointXY — comparing them against a QgsGeometry
-            # raises TypeError, which is what crashed this stage the first time
-            # a premise actually reached it.
-            if snapped_pole.distance(pole_pt) < 0.1 and \
-               snapped_premise.distance(pt) < 0.1:
-                path = [pole_pt, pt]
+            if item["path"]:
+                # House-to-house: the leg IS the span, so keep its designed
+                # geometry from the building it hangs off.  No road snapping —
+                # an overhead span does not follow the carriageway.
+                path = [QgsPointXY(x, y) for x, y in item["path"]]
             else:
-                path = [snapped_pole, snapped_premise]
+                if item["anchor_dist"] > self.MAX_POLE_SEARCH_M:
+                    counter["skipped"] += 1
+                    continue
+                pole_pt = item["anchor_pt"]
+                # Snap both endpoints to roads for practical routing
+                snapped_pole = _snap_to_road(pole_pt, max_snap_m=20.0)
+                snapped_premise = _snap_to_road(pt, max_snap_m=20.0)
+                # Both values are QgsPointXY — comparing them against a
+                # QgsGeometry raises TypeError.
+                if snapped_pole.distance(pole_pt) < 0.1 and \
+                   snapped_premise.distance(pt) < 0.1:
+                    path = [pole_pt, pt]
+                else:
+                    path = [snapped_pole, snapped_premise]
 
-            length_m = _approx_meters(path[0], path[-1])
+            length_m = _path_len_m(path) if len(path) > 1 else 0.0
             if length_m > self.MAX_DROP_DISTANCE_M * 2:
                 feedback.pushWarning(
                     self.tr(f"Aerial drop {length_m:.0f}m exceeds 2x max span "
@@ -493,8 +565,11 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
             # Common properties
             trench_props = {
                 COMMON_FIELDS.AERIAL_TRENCH_ID: f"AT-{counter['trench'] + 1:04d}",
-                COMMON_FIELDS.POLE_ID: str(pole_id or ""),
-                COMMON_FIELDS.FROM_POLE: str(pole_id or ""),
+                # The anchor is a pole id, or `BLDG-<addr>` when the span leaves
+                # another building ('chain' leg) — the field names the anchor,
+                # whatever anchors it.
+                COMMON_FIELDS.POLE_ID: str(anchor_id or ""),
+                COMMON_FIELDS.FROM_POLE: str(anchor_id or ""),
                 COMMON_FIELDS.TO_PREMISE: addr_val,
                 COMMON_FIELDS.TRENCH_TYPE: "Aerial_Drop",
                 COMMON_FIELDS.CONSTRUCTION_METHOD: "Overhead",
@@ -521,7 +596,7 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
                 COMMON_FIELDS.CABLE_TYPE: "Aerial",
                 COMMON_FIELDS.FIBER_COUNT: 12,
                 COMMON_FIELDS.LENGTH_M: round(length_m, 1),
-                COMMON_FIELDS.SOURCE_NODE: str(pole_id or ""),
+                COMMON_FIELDS.SOURCE_NODE: str(anchor_id or ""),
                 COMMON_FIELDS.UTIL_PCT: 100.0,
                 COMMON_FIELDS.INFRA_STATUS: "Proposed",
                 COMMON_FIELDS.VERIFY_STATUS: "Assumed",

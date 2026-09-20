@@ -203,33 +203,68 @@ def _line_points(feat):
         return
 
 
+# Lookup layers are static while the enrichment runs, and ``_nearest_id`` is
+# called twice per duct row, so the parsed features are kept per process.
+_NEAREST_CACHE = {}
+
+
+def _nearest_geoms(path, id_fields):
+    """``[(cloned geometry, id value)]`` for ``path``, cached for the process.
+
+    ``_nearest_id`` used to reopen the GeoPackage and re-walk every feature on
+    every call — two calls per duct row (1100 on Berlin), each re-parsing 92
+    chambers or 535 trenches.  Once the writes were batched into transactions
+    this was the largest remaining cost of the enrichment step.  The lookup
+    layer does not change while the enrichment runs, so the geometries are
+    cloned once and every later call is only a distance scan.  They are cloned
+    rather than borrowed because a borrowed geometry is invalidated when its
+    datasource closes.
+    """
+    key = (str(path), tuple(id_fields))
+    hit = _NEAREST_CACHE.get(key)
+    if hit is not None:
+        return hit
+    out = []
+    ds, lyr = _open_lyr(path)
+    if lyr is not None:
+        for f in lyr:
+            g = f.GetGeometryRef()
+            if g is None or g.IsEmpty():
+                continue
+            v = ""
+            for fld in id_fields:
+                val = _get(lyr, f, fld)
+                if val not in (None, ""):
+                    v = str(val)
+                    break
+            if v:
+                out.append((g.Clone(), v))
+        ds = None
+    _NEAREST_CACHE[key] = out
+    return out
+
+
 def _nearest_id(path, x, y, tol_m, id_fields):
-    """Find the value of the first populated id field on the feature nearest to (x, y)."""
+    """Value of the first populated id field on the feature nearest to (x, y).
+
+    Only features that actually carry one of ``id_fields`` are considered — an
+    unnamed structure closer to the point must not mask the nearest named one
+    (the callers pass a preference order and take the first that is populated).
+    """
     if isinstance(id_fields, str):
         id_fields = [id_fields]
-    ds, lyr = _open_lyr(path)
-    if lyr is None:
-        return ""
     best = ""
     best_d = tol_m
     dg = ogr.Geometry(ogr.wkbPoint)
     dg.AddPoint(x, y)
-    for f in lyr:
-        g = f.GetGeometryRef()
-        if g is None or g.IsEmpty():
-            continue
+    for g, v in _nearest_geoms(path, id_fields):
         try:
             dist = g.Distance(dg)
         except Exception:
             continue
         if dist <= best_d:
             best_d = dist
-            for fld in id_fields:
-                v = _get(lyr, f, fld)
-                if v not in (None, ""):
-                    best = str(v)
-                    break
-    ds = None
+            best = v
     return best
 
 
@@ -267,6 +302,7 @@ def enrich_trench_sublayers(out_dir, feedback=None):
             ("USAGE_TYPE", ogr.OFTString, 24),
             ("CONSTRUCT", ogr.OFTString, 24),
         ])
+        lyr.StartTransaction()
         for f in lyr:
             if is_aerial_row(f):
                 # Aerial legs are never excavated: they keep the Aerial class
@@ -296,6 +332,7 @@ def enrich_trench_sublayers(out_dir, feedback=None):
             f.SetField("CONSTRUCT", TRENCH_CONSTRUCT.get(cls, "Open Cut"))
             lyr.SetFeature(f)
             total += 1
+        lyr.CommitTransaction()
         ds = None
     if feedback and total:
         feedback.pushInfo(f"  [enrich] Trench sub-layers: {total} classification attributes applied.")
@@ -519,6 +556,7 @@ def attribute_section_streets(trench_path, roads_source, feedback=None):
     idx = _RoadIndex(roads_source, aoi or (-180.0, 180.0, -90.0, 90.0), feedback)
     total = 0
     named = 0
+    lyr.StartTransaction()
     for f in lyr:
         parts = _line_parts(f.GetGeometryRef())
         sections = {}
@@ -545,6 +583,7 @@ def attribute_section_streets(trench_path, roads_source, feedback=None):
             named += 1
         lyr.SetFeature(f)
         total += len(sections)
+    lyr.CommitTransaction()
     ds = None
     if feedback:
         feedback.pushInfo(
@@ -568,6 +607,7 @@ def enrich_trenches(trench_path, feedback=None, roads_lyr=None):
         ("INFRA_STATUS", ogr.OFTString, 24),
     ])
     n = 0
+    lyr.StartTransaction()
     for f in lyr:
         # trench_type now carries the construction class (Open Cut / HDD /
         # Garden) straight from the pipeline; legacy tier tags (Feeder /
@@ -611,6 +651,7 @@ def enrich_trenches(trench_path, feedback=None, roads_lyr=None):
             f.SetField("INFRA_STATUS", "Proposed")
         lyr.SetFeature(f)
         n += 1
+    lyr.CommitTransaction()
     ds, lyr = None, None
     if feedback:
         feedback.pushInfo(f"  [enrich] Final_Trenches: {n} civil attributes applied.")
@@ -796,6 +837,7 @@ def _stamp_run_chambers(path, chamber_path, tol_m=15.0):
         ds = None
         return 0
     n = 0
+    lyr.StartTransaction()
     for f in lyr:
         sx_sy, ex_ey = _endpoints(f)
         if sx_sy is None or ex_ey is None:
@@ -812,6 +854,7 @@ def _stamp_run_chambers(path, chamber_path, tol_m=15.0):
         if changed:
             lyr.SetFeature(f)
             n += 1
+    lyr.CommitTransaction()
     ds = None
     return n
 
@@ -941,7 +984,8 @@ def _chamber_at(pts, x, y, tol_m=6.0):
 
 
 def _segment_layer_at_chambers(path, chambers, feedback=None, label="layer",
-                               snap_tol_m=5.0, span_len_fields=()):
+                               snap_tol_m=5.0, span_len_fields=(),
+                               snap_ends_m=0.0, end_tol_m=6.0):
     """Break every line feature of ``path`` at its chamber anchors.
 
     Publishes ONE FEATURE PER CHAMBER-TO-CHAMBER SPAN: each feature starts at a
@@ -957,6 +1001,13 @@ def _segment_layer_at_chambers(path, chambers, feedback=None, label="layer",
     published duct row IS one duct, so its bundle metres are its own metres —
     inheriting the pre-cut run's figure onto every span would multiply the
     billed material by the number of chambers on the run.
+
+    ``snap_ends_m`` pulls a labelled span's end vertices onto the chambers they
+    name (see ``_snap_ends``). 0 leaves geometry untouched.
+
+    ``end_tol_m`` is how far a span's endpoint may sit from a chamber and still
+    be labelled with it.  It must not be tighter than ``snap_tol_m``: a chamber
+    that *produced a cut* has to be able to name the end it created.
     """
     ds, lyr = _open_lyr(path)
     if lyr is None:
@@ -998,6 +1049,40 @@ def _segment_layer_at_chambers(path, chambers, feedback=None, label="layer",
         ml.AddGeometry(_mk_coords(coords))
         return ml
 
+    # Chamber id -> its coordinate, for pulling a labelled span's ends onto the
+    # structure it claims to terminate at.
+    chamber_xy = {cid: (cx, cy) for cx, cy, cid in chambers if cid}
+
+    def _snap_ends(feat, start_id, end_id):
+        """Pull a span's end vertices onto the chambers it is labelled with.
+
+        The two are snapped to the trench independently, so a structure can sit
+        a few metres off the duct's own line (Berlin: p50 0.8 m, p90 5.6 m).  A
+        span that is *labelled* chamber-to-chamber but physically stops metres
+        short of the chamber is not the component it claims to be, and the next
+        stage (LLD continuity, chamber-to-chamber ducts) reads that gap as a
+        break.  Only single-part geometry is moved — a branched remainder keeps
+        its shape.
+        """
+        if snap_ends_m <= 0 or not (start_id or end_id):
+            return
+        g = feat.GetGeometryRef()
+        parts = _line_parts(g) if g is not None else []
+        if len(parts) != 1 or len(parts[0]) < 2:
+            return
+        pts = list(parts[0])
+        moved = False
+        for idx, cid in ((0, start_id), (-1, end_id)):
+            p = chamber_xy.get(cid) if cid else None
+            if not p:
+                continue
+            if math.hypot(p[0] - pts[idx][0], p[1] - pts[idx][1]) <= snap_ends_m:
+                if (p[0], p[1]) != (pts[idx][0], pts[idx][1]):
+                    pts[idx] = (p[0], p[1])
+                    moved = True
+        if moved:
+            feat.SetGeometry(_mk_line(pts))
+
     def _ends_of(first_pt, last_pt):
         """(start, end) chamber ids for a piece — never the same one twice.
 
@@ -1007,14 +1092,17 @@ def _segment_layer_at_chambers(path, chambers, feedback=None, label="layer",
         CUT; the two "publish the piece whole" paths did not, and that is
         exactly where the 90 distribution self-pairs came from.
         """
-        s = _chamber_at(chambers, first_pt[0], first_pt[1])
-        e = _chamber_at(chambers, last_pt[0], last_pt[1])
+        s = _chamber_at(chambers, first_pt[0], first_pt[1], tol_m=end_tol_m)
+        e = _chamber_at(chambers, last_pt[0], last_pt[1], tol_m=end_tol_m)
         if s and s == e:
             e = ""
         return s, e
 
     def _stamp(feat, start_id, end_id, index, count, run_id):
         feat.SetField(i_kind, SPAN_KIND_CHAMBER)
+        # Snap before measuring: a span's length must be the length of the
+        # component it publishes, not of the pre-snap geometry.
+        _snap_ends(feat, start_id, end_id)
         length = round(_geom_len_m(feat), 1)
         feat.SetField(i_start, start_id or "")
         feat.SetField(i_end, end_id or "")
@@ -1065,15 +1153,23 @@ def _segment_layer_at_chambers(path, chambers, feedback=None, label="layer",
                 first, last = whole[0][0], whole[-1][-1]
                 _s_id, _e_id = _ends_of(first, last)
                 _stamp(feat, _s_id, _e_id, 1, 1, run_id)
-                feat.SetField(i_kind, SPAN_KIND_UNCHAMBERED)
+                # A run whose BOTH ends resolve to a chamber is chamber-bounded
+                # even when no chamber projects onto its middle — the label has
+                # to say so. Forcing UNCHAMBERED here published 432 m and 565 m
+                # rows carrying START_CHAMBER and END_CHAMBER while calling
+                # themselves "unchambered".
+                if not (_s_id and _e_id):
+                    feat.SetField(i_kind, SPAN_KIND_UNCHAMBERED)
+                    unchambered += 1
                 lyr.SetFeature(feat)
                 published += 1
-                unchambered += 1
                 continue
             count = len(spans)
             for pos, (coords, start_id, end_id) in enumerate(spans):
-                start_id = start_id or _chamber_at(chambers, coords[0][0], coords[0][1])
-                end_id = end_id or _chamber_at(chambers, coords[-1][0], coords[-1][1])
+                start_id = start_id or _chamber_at(
+                    chambers, coords[0][0], coords[0][1], tol_m=end_tol_m)
+                end_id = end_id or _chamber_at(
+                    chambers, coords[-1][0], coords[-1][1], tol_m=end_tol_m)
                 if start_id and start_id == end_id:
                     # a run that ends at the chamber it started from (a short
                     # tail past the last structure) — X -> X is not a span
@@ -1106,7 +1202,9 @@ def _segment_layer_at_chambers(path, chambers, feedback=None, label="layer",
                 first, last = whole[0][0], whole[-1][-1]
                 _s_id, _e_id = _ends_of(first, last)
                 _stamp(remainder, _s_id, _e_id, 1, 1, run_id)
-                remainder.SetField(i_kind, SPAN_KIND_UNCHAMBERED)
+                if not (_s_id and _e_id):
+                    remainder.SetField(i_kind, SPAN_KIND_UNCHAMBERED)
+                    unchambered += 1
                 lyr.CreateFeature(remainder)
                 published += 1
         lyr.CommitTransaction()
@@ -1136,7 +1234,7 @@ def segment_trenches_at_chambers(trench_path, chamber_path, feedback=None,
 
 
 def segment_ducts_at_chambers(feeder_path, dist_path, chamber_path,
-                              feedback=None, snap_tol_m=3.0):
+                              feedback=None, snap_tol_m=10.0):
     """Break the feeder + distribution ducts at their chambers.
 
     Replaces the old chamber *splicing* (one long corridor carrying a
@@ -1144,6 +1242,19 @@ def segment_ducts_at_chambers(feeder_path, dist_path, chamber_path,
     chamber to chamber, so the published unit is the span between two
     structures. ``enrich_ducts`` runs afterwards and stamps the catalogue
     attributes + endpoint chambers on every span. Drop ducts are left alone.
+
+    The cut tolerance is **10 m**, and that number is not a fudge: below the
+    feeder tier the ducts are routed on the **sidewalk graph**, which is offset
+    from the trench centreline — the same offset ``enrich_ducts`` already allows
+    for when it looks up ``PARENT_TRENCH`` ("distribution ducts route on the
+    sidewalk graph, offset from the trench lines — allow 10 m").  The chambers
+    are snapped to the **trench** (measured: within 0.00 m of it), so at a 3 m
+    tolerance the two never met: whole 400-500 m runs stayed uncut and the
+    distribution tier published 21 ``Unchambered`` rows, one per region run,
+    each of them a corridor passing five to eight chambers.
+
+    ``snap_ends_m`` and ``end_tol_m`` take the same 10 m so a span ends exactly
+    on the structure that cut it.
     """
     chambers = _chamber_points(chamber_path, feedback)
     if not chambers:
@@ -1154,7 +1265,8 @@ def segment_ducts_at_chambers(feeder_path, dist_path, chamber_path,
     for path, label in ((feeder_path, "Feeder ducts"), (dist_path, "Distribution ducts")):
         total += _segment_layer_at_chambers(
             path, chambers, feedback, label, snap_tol_m,
-            span_len_fields=("BUNDLE_LEN_M",))
+            span_len_fields=("BUNDLE_LEN_M",), snap_ends_m=snap_tol_m,
+            end_tol_m=snap_tol_m)
     return total
 
 
@@ -1183,6 +1295,7 @@ def enrich_ducts(feeder_path, dist_path, drop_path, trench_path, chamber_path, f
             ("INFRA_STATUS", ogr.OFTString, 24),
         ])
         prof = DUCT_PROFILE[profile_key]
+        lyr.StartTransaction()
         for f in lyr:
             f.SetField("DUCT_TYPE", prof["duct_type"])
             f.SetField("WAYS", prof["ways"])
@@ -1253,6 +1366,7 @@ def enrich_ducts(feeder_path, dist_path, drop_path, trench_path, chamber_path, f
                         f.SetField("END_CHAMBER", ends[-1])
             lyr.SetFeature(f)
             total += 1
+        lyr.CommitTransaction()
         ds = None
     if feedback:
         feedback.pushInfo(f"  [enrich] Ducts: {total} catalogue attributes applied.")
@@ -1333,6 +1447,7 @@ def merge_ducts_per_chamber_span(path, feedback=None, label="Feeder ducts"):
     ])
     groups: Dict[Tuple[str, str], List] = {}
     order: List[Tuple[str, str]] = []
+    lyr.StartTransaction()
     for f in lyr:
         sc = str(_get(lyr, f, "START_CHAMBER") or "").strip()
         ec = str(_get(lyr, f, "END_CHAMBER") or "").strip()
@@ -1383,6 +1498,7 @@ def merge_ducts_per_chamber_span(path, feedback=None, label="Feeder ducts"):
             lyr.DeleteFeature(f.GetFID())
             dropped += 1
         merged += 1
+    lyr.CommitTransaction()
     ds = None
     if feedback and merged:
         feedback.pushInfo(
@@ -1461,6 +1577,7 @@ def absorb_chamber_stubs(path, feedback=None,
     coincident_only = str(mode).lower() == "coincident"
     i_end = lyr.GetLayerDefn().GetFieldIndex("END_CHAMBER")
     rows = []
+    lyr.StartTransaction()
     for f in lyr:
         sc = str(_get(lyr, f, "START_CHAMBER") or "").strip()
         ec = str(_get(lyr, f, "END_CHAMBER") or "").strip()
@@ -1550,6 +1667,7 @@ def absorb_chamber_stubs(path, feedback=None,
         lyr.DeleteFeature(sf.GetFID())
         absorbed += 1
 
+    lyr.CommitTransaction()
     ds = None
     if feedback and relabelled:
         feedback.pushInfo(
@@ -1584,6 +1702,7 @@ def propagate_duct_pdp_id(path, feedback=None, label="Distribution ducts"):
         return 0
     _create_fields(lyr, [("PDP_ID", ogr.OFTString, 32)])
     n = 0
+    lyr.StartTransaction()
     for f in lyr:
         if str(_get(lyr, f, "PDP_ID") or "").strip():
             continue
@@ -1595,6 +1714,7 @@ def propagate_duct_pdp_id(path, feedback=None, label="Distribution ducts"):
         f.SetField("PDP_ID", src[0].upper())
         lyr.SetFeature(f)
         n += 1
+    lyr.CommitTransaction()
     ds = None
     if feedback and n:
         feedback.pushInfo(f"  [enrich] {label}: PDP_ID resolved on {n} duct(s).")
@@ -1677,6 +1797,7 @@ def link_couplers_to_ducts(coupler_path, dist_path, drop_path,
         ("PREMISE_ID", ogr.OFTString, 32),
     ])
     n = 0
+    lyr.StartTransaction()
     for f in lyr:
         # OGR geometry API (not the QGIS one): IsEmpty(), and GetX()/GetY()
         # on a point — asPoint()/isEmpty() belong to QgsGeometry and raise here.
@@ -1721,6 +1842,7 @@ def link_couplers_to_ducts(coupler_path, dist_path, drop_path,
         # EVERY coupler, including the ones whose distribution duct is not in
         # reach (those stay flagged by a blank DIST_DUCT_ID).
         lyr.SetFeature(f)
+    lyr.CommitTransaction()
     ds = None
     if feedback and n:
         feedback.pushInfo(
@@ -1768,6 +1890,7 @@ def enrich_cables(feeder_path, dist_path, objects_path, mfg_path, feedback=None)
         ])
         prof = CABLE_PROFILE["Feeder"]
         mfg_id = _first_field_value(mfg_path, "MFG_ID") or "MFG00001"
+        lyr.StartTransaction()
         for f in lyr:
             f.SetField("CABLE_TYPE", "Feeder")
             # The shared-feeder planner writes the real FIBER_COUNT / UTIL_PCT
@@ -1786,6 +1909,7 @@ def enrich_cables(feeder_path, dist_path, objects_path, mfg_path, feedback=None)
             f.SetField("INFRA_STATUS", "Proposed")
             lyr.SetFeature(f)
             total += 1
+        lyr.CommitTransaction()
         ds = None
 
     ds, lyr = _open_lyr(dist_path)
@@ -1799,6 +1923,7 @@ def enrich_cables(feeder_path, dist_path, objects_path, mfg_path, feedback=None)
             ("INFRA_STATUS", ogr.OFTString, 24),
         ])
         prof = CABLE_PROFILE["Distribution"]
+        lyr.StartTransaction()
         for f in lyr:
             # The distribution layer carries the shared spine trunks AND the
             # one-per-premise garden-leg drop cables. A drop is a 12F garden
@@ -1830,6 +1955,7 @@ def enrich_cables(feeder_path, dist_path, objects_path, mfg_path, feedback=None)
             f.SetField("INFRA_STATUS", "Proposed")
             lyr.SetFeature(f)
             total += 1
+        lyr.CommitTransaction()
         ds = None
     if feedback:
         feedback.pushInfo(f"  [enrich] Cables: {total} catalogue attributes applied.")
@@ -1860,6 +1986,7 @@ def enrich_equipment(pdp_path, mfg_path, feedback=None):
             ("POWER_REQ", ogr.OFTString, 8),
             ("MAINT_ZONE", ogr.OFTString, 24),
         ])
+        lyr.StartTransaction()
         for f in lyr:
             pid = str(_get(lyr, f, "PDP_ID") or "")
             f.SetField("EQUIP_TYPE", "PDP")
@@ -1896,6 +2023,7 @@ def enrich_equipment(pdp_path, mfg_path, feedback=None):
             f.SetField("MAINT_ZONE", "")
             lyr.SetFeature(f)
             total += 1
+        lyr.CommitTransaction()
         ds = None
 
     ds, lyr = _open_lyr(mfg_path)
@@ -1917,6 +2045,7 @@ def enrich_equipment(pdp_path, mfg_path, feedback=None):
             ("POWER_REQ", ogr.OFTString, 8),
             ("MAINT_ZONE", ogr.OFTString, 24),
         ])
+        lyr.StartTransaction()
         for f in lyr:
             f.SetField("EQUIP_TYPE", "MFG")
             f.SetField("EQUIP_NAME", str(_get(lyr, f, "MFG_ID") or "MFG00001"))
@@ -1928,6 +2057,7 @@ def enrich_equipment(pdp_path, mfg_path, feedback=None):
             f.SetField("MAINT_ZONE", "")
             lyr.SetFeature(f)
             total += 1
+        lyr.CommitTransaction()
         ds = None
     if feedback:
         feedback.pushInfo(f"  [enrich] Equipment: {total} catalogue attributes applied.")
@@ -1953,6 +2083,10 @@ def enrich_all(out_dir, feedback=None, roads_lyr=None):
 
     def p(name):
         return os.path.join(out_dir, name)
+
+    # The nearest-neighbour lookup cache survives grow-a-layer passes; the
+    # enrichment is a fresh look at freshly written files.
+    _NEAREST_CACHE.clear()
 
     n = 0
     # ── Chamber-to-chamber spans ────────────────────────────────────────
