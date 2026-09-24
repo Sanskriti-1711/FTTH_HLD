@@ -81,6 +81,8 @@ from qgis import processing
 from .trench_layer import TrenchLayerAlgorithm
 from ..utils.fields import first_field_case_insensitive as _pick_field
 from ..utils.layer_io import as_layer as _as_layer
+from ..utils.geometry_ops import unary_union_geoms as _unary_union_geoms
+from ..utils.geom import merge_contiguous_runs as _merge_contiguous_runs
 
 # ---------------------------------------------------------------------------
 # Construction catalogue — mirrors HLDPlanning/utils/attr_enrich.py so a
@@ -143,6 +145,22 @@ _FINAL_FIELDS: Tuple[Tuple[str, object], ...] = (
     # Aerial_Drops layer (TRENCH_TYPE = "Aerial", EXCAVATION = 0).
     ("AERIAL_ZONE", QMetaType.Type.Int),
     ("AERIAL_ZONE_REASON", QMetaType.Type.QString),
+    # ── Tier provenance ────────────────────────────────────────────────────
+    # `_ensure_backbone_reach` relabels a distribution spine to Feeder so the
+    # MFG → every PDP path exists on the published trench. That relabel is
+    # deliberate and must stay — but without a record of it a consumer cannot
+    # tell a real trunk from a promoted distribution spine, so anything that
+    # joins a duct or cable back to its tier trench (BOQ by tier, tier
+    # colouring, permit tier rules) mis-attributes ~24 % of ducts and ~50 % of
+    # cables. Nothing is geometrically wrong; only the label is ambiguous.
+    #
+    #   PROMOTED_FROM  the tier the span had BEFORE the relabel, empty for a
+    #                  span that was always what its TRENCH_TIER says
+    #   SERVES_TIER    the same fact as a value to group by directly, i.e.
+    #                  `PROMOTED_FROM or TRENCH_TIER`, derived in one place
+    #                  (`_stamp_tier_provenance`) so the two cannot disagree
+    ("PROMOTED_FROM", QMetaType.Type.QString),
+    ("SERVES_TIER", QMetaType.Type.QString),
 )
 
 _DRILL_FIELDS: Tuple[Tuple[str, object], ...] = (
@@ -373,6 +391,16 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
             "mfg": src["mfg"], "pdps": src["pdps"], "objects": src["objects"],
             "polygons": src["polygons"], "roads": src["roads"], "out": out_dir,
             "aerial": aerial_dst, "target_epsg": int(target_epsg),
+            # The ONE-SIDED kerb band is OFF, on the operator's instruction after
+            # reviewing it: it moved the whole carriageway-carried network onto
+            # one kerb and changed the shape that was approved. It is superseded
+            # by the two-sided rule — trench on BOTH kerbs of a street, never on
+            # the centreline, and cross between the two sides only where a
+            # premise needs it (that crossing is an HDD). The band stays in the
+            # designer, tested, behind this value; set it to KERB_OFFSET_M (3.0)
+            # to bring the one-sided version back. See docs/GLOBAL_TODO.md.
+            "kerb_offset_m": 0.0,
+            "sidewalk_link_m": 0.0,   # off too — see Params.sidewalk_link_m
         }
         feedback.pushInfo(_tr("Running the civil trench designer …"))
         report = run_design(cfg) or {}
@@ -433,6 +461,18 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
         # guarantees the *tier* does too, so Feeder_Trench / the feeder cable /
         # the feeder duct all reach every splitter.
         self._ensure_backbone_reach(final_rows, anchors, feedback)
+        # Multiple PDP routes may describe the same physical side-of-road
+        # corridor. Consolidate only coincident/connected main-corridor rows;
+        # chamber placement and the downstream duct/cable stages consume this
+        # physical network and preserve the chamber break rule.
+        final_rows = self._consolidate_physical_corridors(final_rows, feedback)
+        promoted_spans = self._stamp_tier_provenance(final_rows)
+        if promoted_spans:
+            feedback.pushInfo(_tr(
+                "Tier provenance: {0} span(s) are promoted (TRENCH_TIER reads "
+                "Feeder, PROMOTED_FROM names the tier they serve) - group by "
+                "SERVES_TIER, not TRENCH_TIER, when attributing a duct or "
+                "cable to a tier.").format(promoted_spans))
         feedback.pushInfo(_tr(
             "Designer spans: {0} total, {1} with an address, {2} HDD, "
             "{3} Garden, {4} node(s), {5} drill(s)").format(
@@ -1126,7 +1166,18 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
             while node is not None:
                 if (node not in backbone
                         and str(rows[node].get("TRENCH_TIER") or "") != "Garden"):
-                    rows[node]["TRENCH_TIER"] = "Feeder"
+                    row = rows[node]
+                    # Provenance, only when the TIER actually changes. A span
+                    # that already reads Feeder is merely absorbed into the
+                    # backbone set here; recording it as "promoted" would
+                    # fabricate a history that never happened (measured: 11 of
+                    # 27 absorbed spans on one Berlin run). `or` keeps the
+                    # FIRST origin if a span is ever promoted twice.
+                    was = str(row.get("TRENCH_TIER") or "")
+                    if was and was != "Feeder":
+                        row["PROMOTED_FROM"] = (row.get("PROMOTED_FROM")
+                                                or was)
+                    row["TRENCH_TIER"] = "Feeder"
                     backbone.add(node)
                     comp.add(node)
                     feeder.add(node)
@@ -1175,6 +1226,11 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
                 "TRENCH_ID": spur_id,
                 "RUN_ID": spur_id,
                 "TRENCH_TIER": "Feeder",
+                # The row was copied from `rows[tgt]`, so drop any provenance
+                # it would otherwise inherit: this spur is new Feeder
+                # construction, not a promoted distribution spine.
+                "PROMOTED_FROM": None,
+                "SERVES_TIER": "Feeder",
                 "trench_type": cls,
                 "USAGE_TYPE": cls,
                 "CONSTRUCT": cls,
@@ -1258,6 +1314,27 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
                     ", ".join("{0} {1} ({2} m)".format(*f) for f in far[:8])))
         return promoted + spurs
 
+    @staticmethod
+    def _stamp_tier_provenance(rows: List[dict]) -> int:
+        """Derive ``SERVES_TIER`` from ``PROMOTED_FROM`` on every span.
+
+        The last write before the sinks, so the published layer can never show
+        a ``SERVES_TIER`` that disagrees with the promotion record. Keeping the
+        derivation in one place is what makes it safe for a consumer to group
+        by ``SERVES_TIER`` alone instead of re-deriving the rule.
+
+        Returns how many spans carry provenance, i.e. were promoted, so the run
+        can report it.
+        """
+        promoted = 0
+        for row in rows:
+            origin = str(row.get("PROMOTED_FROM") or "").strip()
+            if origin:
+                promoted += 1
+            row["PROMOTED_FROM"] = origin or None
+            row["SERVES_TIER"] = origin or str(row.get("TRENCH_TIER") or "")
+        return promoted
+
     def _final_rows(self, final: QgsVectorLayer) -> List[dict]:
         """Designer span rows → the pipeline's Final_Trenches contract."""
         names = final.fields().names()
@@ -1292,6 +1369,10 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
                 "USAGE_TYPE": ttype,
                 "CONSTRUCT": ttype,
                 "TRENCH_TIER": tier,
+                # The designer does not emit provenance today; read it back if
+                # a future designer does, so the field survives a round trip.
+                "PROMOTED_FROM": g(f, "PROMOTED_FROM"),
+                "SERVES_TIER": g(f, "SERVES_TIER") or tier,
                 "obj_id": addr_s,
                 "addr_id": addr_s,
                 "hhs": None if hh is None else str(int(hh)),
@@ -1318,6 +1399,103 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
                 "AERIAL_ZONE_REASON": g(f, "AERIAL_ZONE_REASON"),
             })
         return rows
+
+    @staticmethod
+    def _consolidate_physical_corridors(rows: List[dict], feedback=None) -> List[dict]:
+        """Collapse duplicate physical trench geometry without changing routing.
+
+        The designer can emit one route record per PDP/polygon even when those
+        records ride the same physical corridor.  Keep the designer geometry as
+        authoritative, but dissolve only lines that have the same construction
+        type/tier and actually touch or overlap.  Parallel lines on opposite
+        sides of a street remain separate, as do HDD, open-cut, and garden
+        geometry.  Chamber segmentation runs later on the consolidated rows.
+        """
+        if not rows:
+            return rows
+
+        def value(row, key):
+            return str(row.get(key) or "").strip()
+
+        def append_unique(values, value):
+            for item in str(value or "").split(","):
+                item = item.strip()
+                if item and item not in values:
+                    values.append(item)
+
+        # Garden legs are premise-specific branches, not a shared corridor.
+        # Never dissolve them merely because two premises meet at the network.
+        groups = {}
+        for row in rows:
+            tier = value(row, "TRENCH_TIER")
+            # Surface/reinstatement are attributes of individual sub-spans,
+            # not physical identity. Keeping them in this key preserved every
+            # drafting break as a separate trench even when the route, tier and
+            # construction method were continuous. Chamber/PDP anchors are the
+            # authoritative breaks downstream.
+            key = (value(row, "trench_type"), tier,
+                   "garden" if tier == "Garden" else "main")
+            groups.setdefault(key, []).append(row)
+
+        consolidated = []
+        merged_rows = 0
+        merged_groups = 0
+        for key, members in groups.items():
+            clusters = []
+            for row in members:
+                geom = row.get("_geom")
+                if geom is None or geom.isEmpty():
+                    consolidated.append(row)
+                    continue
+                host = None
+                # Only exact/near contact is eligible.  This cannot pull a
+                # sidewalk route across a street to another side.
+                for cluster in clusters:
+                    if any(geom.distance(other.get("_geom")) <= 0.05
+                           for other in cluster):
+                        host = cluster
+                        break
+                if host is None:
+                    clusters.append([row])
+                else:
+                    host.append(row)
+
+            for cluster in clusters:
+                if len(cluster) == 1 or key[-1] == "garden":
+                    consolidated.extend(cluster)
+                    continue
+                geoms = [r["_geom"] for r in cluster
+                         if r.get("_geom") is not None and not r["_geom"].isEmpty()]
+                merged_geom = _unary_union_geoms(geoms)
+                if merged_geom is None or merged_geom.isEmpty():
+                    consolidated.extend(cluster)
+                    continue
+                merged_geom = _merge_contiguous_runs(merged_geom, grid=0.01)
+                base = dict(cluster[0])
+                base["_geom"] = merged_geom
+                for field in ("PDP_ID", "POLYGON_ID", "MFG_ID", "addr_id", "obj_id"):
+                    values = []
+                    for row in cluster:
+                        append_unique(values, row.get(field))
+                    if values:
+                        base[field] = ",".join(values)
+                base["length_m"] = round(merged_geom.length(), 2)
+                base["SPAN_LEN_M"] = base["length_m"]
+                base["SPAN_COUNT"] = 1
+                base["SPAN_INDEX"] = 1
+                base["SOURCE_RUNS"] = len(cluster)
+                consolidated.append(base)
+                merged_rows += len(cluster) - 1
+                merged_groups += 1
+
+        if feedback and merged_rows:
+            feedback.pushInfo(_tr(
+                "Physical trench consolidation: {0} coincident/connected "
+                "main-corridor row(s) folded into {1} physical feature(s); "
+                "garden legs and parallel opposite-side routes preserved. "
+                "Chamber splitting remains downstream.").format(
+                    merged_rows, merged_groups))
+        return consolidated
 
     @staticmethod
     def _pdp_points(pdps: QgsVectorLayer) -> Dict[str, QgsPointXY]:

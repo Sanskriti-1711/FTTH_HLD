@@ -69,6 +69,36 @@ def _tr(s: str) -> str:
     return QCoreApplication.translate("TrenchLayer", s)
 
 
+def trench_road_filter_expr() -> str:
+    """QGIS expression selecting the roads a trench may be DUG ALONG.
+
+    Generated from :data:`TRENCH_ROAD_CLASSES` instead of being typed out: the
+    previous hand-written list spelled the allowed classes itself while
+    ``TRENCH_NEVER_CLASSES`` separately said which may never carry a trench, so
+    the two could drift and a class could be allowed in one and forbidden in
+    the other. Now a never-class is excluded by NOT BEING ALLOWED — a motorway
+    can never be open-cut here, and nothing has to remember to exclude it.
+
+    Raises if the policy contradicts itself, so a future edit that adds a
+    never-class to the allowed list fails loudly instead of trenching it.
+    """
+    clash = [c for c in TRENCH_NEVER_CLASSES if c in TRENCH_ROAD_CLASSES]
+    if clash:
+        raise QgsProcessingException(
+            "Trench class policy is inconsistent: %s appears in both "
+            "TRENCH_ROAD_CLASSES and TRENCH_NEVER_CLASSES." % ", ".join(clash)
+        )
+    ok = " OR ".join('"fclass"=\'%s\'' % c for c in TRENCH_ROAD_CLASSES)
+    # `pedestrian` lines are allowed (a pedestrianised street is a street);
+    # `pedestrian` AREAS are not, which is what the area test below carries.
+    return (
+        "( (" + ok + ")"
+        " OR (\"fclass\"='pedestrian' AND COALESCE(\"area\",'F')<>'T')"
+        ") "
+        "AND COALESCE(\"bridge\",'F') <> 'T' AND COALESCE(\"tunnel\",'F') <> 'T'"
+    )
+
+
 # ---- Aerial feasibility evaluation -----------------------------------------
 # Used inside the garden-trench loop to decide whether a premise's drop
 # connection should be built underground or flagged for aerial routing.
@@ -89,9 +119,57 @@ _AERIAL_TERRAIN_TYPES = {
 # increase this via the algorithm parameter MAX_UG_DROP_M.
 _MAX_UG_DROP_M_DEFAULT = 300.0
 
+# ---- Trench basis: which roads a trench may be dug in -----------------------
+# Operator rule (2026-09-21): the network is dug in the CARRIAGEWAY — never in a
+# footway/path/cycleway — the PDP sits ON that trench rather than offset from
+# it, and a garden leg runs from the OPEN CUT to the object. These two lists are
+# the allowed set, declared here so the re-base has a single place to change:
+# `TRENCH_ROAD_CLASSES` is ordered **best-first**, so a route prefers the main
+# street and only falls back down the list where nothing higher goes — which is
+# what keeps "mostly main street" compatible with "every premise is reached".
+# `road_expr_raw` below must be derived from them, and the graph basis + the PDP
+# projection are switched over in the same change (see GLOBAL_TODO.md).
+TRENCH_ROAD_CLASSES = (
+    "primary", "primary_link", "secondary", "secondary_link",
+    "trunk", "trunk_link", "tertiary", "tertiary_link",
+    "unclassified", "residential", "living_street", "service",
+)
+# NOTE: `pedestrian` is deliberately NOT a never-class. OSM uses the tag for two
+# different things: a pedestrianised STREET (a line — diggable, and the filter
+# below allows it) and a pedestrian AREA (a polygon — not diggable, excluded by
+# the `area=T` test in trench_road_filter_expr()). A blanket ban would have
+# removed the pedestrian streets too and left those blocks unreached.
+TRENCH_NEVER_CLASSES = (
+    "footway", "path", "cycleway", "steps", "bridleway",
+    "sidewalk", "motorway", "motorway_link", "track",
+)
+
+# A garden leg longer than this is not buried — it is an AERIAL drop. The
+# operator rule: the garden trench runs from the open cut straight to the
+# object, and only when that run is too long does the connection go overhead.
+# (Distinct from `_MAX_UG_DROP_M_DEFAULT`, which is the feasibility helper's
+# economical-limit for a buried drop, not the routing rule for a garden leg.)
+AERIAL_LEG_MAX_M = 30.0
+
+# Distance from the road CENTRELINE at which this stage builds its sidewalk
+# lines, and therefore where the trench runs. Declared here (not inline in
+# run()) because the network stage picks its PDP positions on the same sidewalk:
+# the two used to disagree — the trench at 3 m, the PDP at 8 m — which is what
+# put the cabinets inside the residential blocks. A test pins them together.
+SIDEWALK_OFFSET_M = 3.0
+
 
 def _approx_meters(a, b):
-    """Equirectangular approximation in metres."""
+    """Distance in metres for either WGS84 or the pipeline projected CRS.
+
+    The legacy stage reprojects all inputs to EPSG:25833 before routing. The
+    old helper always treated those metre coordinates as longitude/latitude,
+    multiplying them by 111,320 and turning ordinary garden legs into
+    million-metre aerial drops. Keep the geographic approximation for degree
+    coordinates, but use Euclidean distance for projected coordinates.
+    """
+    if max(abs(a.x()), abs(a.y()), abs(b.x()), abs(b.y())) > 180.0:
+        return math.hypot(b.x() - a.x(), b.y() - a.y())
     dx = (b.x() - a.x()) * 111_320.0 * max(0.1, math.cos(math.radians((a.y() + b.y()) / 2)))
     dy = (b.y() - a.y()) * 111_320.0
     return (dx * dx + dy * dy) ** 0.5
@@ -646,24 +724,23 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
 
         # ---------- Fixed numeric & text defaults (parameter surface slimmed) ----------
         aoi_buf_dist  = 100.0  # AOI buffer distance (m) for pre-clipping roads
-        # Roads filter (formerly ROADS_FILTER_EXPR parameter default)
-        road_expr_raw = (
-            "("
-            "\"fclass\" IN ('residential','unclassified','living_street','service',"
-            "              'tertiary','tertiary_link','secondary','secondary_link',"
-            "              'primary','primary_link','trunk','trunk_link')"
-            " OR (\"fclass\"='pedestrian' AND COALESCE(\"area\",'F')<>'T')"
-            ") "
-            "AND \"fclass\" NOT IN ('motorway','motorway_link','track','path','footway','steps') "
-            "AND COALESCE(\"bridge\",'F') <> 'T' AND COALESCE(\"tunnel\",'F') <> 'T'"
-        )
+        # Roads filter (formerly ROADS_FILTER_EXPR parameter default), built
+        # from the declared class policy by trench_road_filter_expr().
+        road_expr_raw = trench_road_filter_expr()
 
         # Normalize the field name to whatever the input roads actually have
         road_expr = swap_canonical_field(
             road_expr_raw, roads, canonical="fclass", candidates=("fclass", "highway", "class")
         )
 
-        sw_off   = 3.0   # sidewalk offset distance (m), clamp kept below
+        feedback.pushInfo(
+            "Trench basis: allowed road classes [%s]; never [%s]; a garden leg "
+            "longer than %g m is built aerial."
+            % (", ".join(TRENCH_ROAD_CLASSES), ", ".join(TRENCH_NEVER_CLASSES),
+               AERIAL_LEG_MAX_M)
+        )
+
+        sw_off   = SIDEWALK_OFFSET_M   # sidewalk offset distance (m), clamp kept below
         sw_off   = max(0.5, min(sw_off, 12.0))  # keep realistic offsets
         sw_buf_w = 0.5   # sidewalk buffer width (m)
         sw_seg   = 8     # offset segments (curve smoothing)
@@ -1228,6 +1305,54 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
             context, "sidewalk_right"
         )
 
+        # A failed/degenerate offset can fall back onto the source road line.
+        # Remove those longitudinal centre-line pieces before the graph is
+        # built.  Road crossings are deliberately retained as tangent/HDD
+        # geometry; only linework that rides a road centreline is removed.
+        # Include service roads in this guard: they are road centre-lines too,
+        # even though they are not part of the motorway/primary crossing list.
+        try:
+            _centre_sources = [x for x in (veh_roads, service)
+                               if x is not None and x.featureCount() > 0]
+            if _centre_sources:
+                _centre_lines = as_layer(processing.run(
+                    "native:mergevectorlayers",
+                    {"LAYERS": _centre_sources, "CRS": roads.crs().authid(),
+                     "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
+                    is_child_algorithm=True, context=context, feedback=feedback
+                )["OUTPUT"], context, "centreline_sources")
+                _centre_buffer = as_layer(processing.run(
+                    "native:buffer",
+                    {"INPUT": _centre_lines, "DISTANCE": 1.25,
+                     "SEGMENTS": 5, "DISSOLVE": True,
+                     "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
+                    is_child_algorithm=True, context=context, feedback=feedback
+                )["OUTPUT"], context, "centreline_keepout")
+                left_sw = as_layer(processing.run(
+                    "native:difference",
+                    {"INPUT": left_sw, "OVERLAY": _centre_buffer,
+                     "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
+                    is_child_algorithm=True, context=context, feedback=feedback
+                )["OUTPUT"], context, "sidewalk_left_no_centreline")
+                right_sw = as_layer(processing.run(
+                    "native:difference",
+                    {"INPUT": right_sw, "OVERLAY": _centre_buffer,
+                     "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
+                    is_child_algorithm=True, context=context, feedback=feedback
+                )["OUTPUT"], context, "sidewalk_right_no_centreline")
+                feedback.pushInfo(
+                    "Centre-line guard: removed source-road overlap from both "
+                    "side routes; crossings remain HDD/tangent candidates."
+                )
+        except Exception as exc:
+            feedback.reportError(
+                "Centre-line guard failed; refusing to silently continue with "
+                "unfiltered side routes: %s" % exc
+            )
+            raise QgsProcessingException(
+                "Could not enforce the no-road-centreline trench rule."
+            )
+
         # 2) Small buffers around each sidewalk (used later for intersections & trims)
         bufL = as_layer(
             processing.run(
@@ -1689,6 +1814,12 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
             # use previously computed eps
             _add_lines_to_graph(G, left_sw,  dens, eps, _qkey)
             _add_lines_to_graph(G, right_sw, dens, eps, _qkey)
+            # Use the mapped footway graph to reconnect gaps created by the
+            # centre-line keep-out. Offset lines are the preferred basis, but
+            # they are not allowed to leave an unreachable gap when an actual
+            # sidewalk route exists.
+            if footways_clean and footways_clean.featureCount() > 0:
+                _add_lines_to_graph(G, footways_clean, dens, eps, _qkey)
             if tan_tmp:
                 _add_lines_to_graph(G, tan_tmp, dens, eps, _qkey)
 
@@ -2117,6 +2248,7 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
             )
 
             created_garden = 0
+            aerial_legs = 0   # garden legs flagged aerial (drop > AERIAL_LEG_MAX_M)
             for hf in hh.getFeatures():
                 hpt = _point_of(hf.geometry())
                 if not hpt:
@@ -2140,23 +2272,36 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                 # zones. Without them this block is a no-op, so existing
                 # HLD/LLD runs keep burying long-drop garden trenches exactly
                 # as before (no behavioral change).
-                if self.P_AERIAL_ZONES in p:
-                    aerial_zones = self.parameterAsVectorLayer(p, self.P_AERIAL_ZONES, context)
-                    if aerial_zones is not None and aerial_zones.isValid() and aerial_zones.featureCount() > 0:
-                        drop_dist_m = _approx_meters(hpt, best_pt)
-                        if drop_dist_m > _MAX_UG_DROP_M_DEFAULT:
-                            in_aerial_zone = False
+                # --- Aerial vs buried: the DISTANCE decides --------------------
+                # Operator rule (2026-09-21): the garden trench runs from the
+                # open cut straight to the object; only where that run is too
+                # long is the connection aerial. The distance test therefore
+                # applies whether or not the pipeline supplied aerial zones —
+                # the zone list no longer gates the rule (it is still accepted,
+                # and is now used only to say so in the report).
+                #
+                # The leg is KEPT and flagged, not dropped: the duct and cable
+                # tiers build exactly one drop per premise off this layer, so
+                # removing a row would silently leave that premise unserved
+                # (D8 — 295 rows for 295 premises).
+                drop_dist_m = _approx_meters(hpt, best_pt)
+                aerial_leg = drop_dist_m > AERIAL_LEG_MAX_M
+                if aerial_leg:
+                    aerial_legs += 1
+                    in_aerial_zone = False
+                    if self.P_AERIAL_ZONES in p:
+                        aerial_zones = self.parameterAsVectorLayer(p, self.P_AERIAL_ZONES, context)
+                        if aerial_zones is not None and aerial_zones.isValid():
                             for zf in aerial_zones.getFeatures():
                                 zg = zf.geometry()
                                 if zg and not zg.isEmpty() and zg.contains(QgsGeometry.fromPointXY(hpt)):
                                     in_aerial_zone = True
                                     break
-                            if in_aerial_zone:
-                                feedback.pushInfo(
-                                    f"Premise {str(hf.id())}: drop distance {drop_dist_m:.0f}m "
-                                    f"exceeds {_MAX_UG_DROP_M_DEFAULT}m — flagged for aerial."
-                                )
-                                continue  # skip buried garden trench; Stage 08b will route aerial
+                    feedback.pushInfo(
+                        f"Premise {str(hf.id())}: drop distance {drop_dist_m:.0f}m "
+                        f"exceeds {AERIAL_LEG_MAX_M:.0f}m — built as an AERIAL drop"
+                        + (" (inside a declared aerial zone)." if in_aerial_zone else ".")
+                    )
 
                 addr_val = str(hf[addr_field]) if addr_field and hf[addr_field] is not None else str(hf.id())
                 hhs_val  = str(hf[hh_hhs_field]) if (hh_hhs_field and hh_hhs_field in hh_names and hf[hh_hhs_field] is not None) else None
@@ -2170,7 +2315,7 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                 gf["addr_id"]    = addr_val
                 gf["hhs"]        = hhs_val
                 gf["sidewalk"]   = best_label
-                gf["method"]     = "nearest"
+                gf["method"]     = "aerial" if aerial_leg else "nearest"
                 gf["distance_m"] = round(best_d, 2)
                 gf["hh_fid"]     = int(hf.id())
                 # Propagate POLYGON_ID / PDP_ID from NetworkManager lookup
@@ -2330,7 +2475,10 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
 
             idPseudoHH = idPH
             feedback.pushInfo(f"✅ Created {created_pts} pseudo household points.")
-            feedback.pushInfo(f"✅ Garden trenches created: {created_garden}")
+            feedback.pushInfo(
+                f"✅ Garden trenches created: {created_garden}"
+                + (f" ({aerial_legs} aerial, drop > {AERIAL_LEG_MAX_M:.0f} m)" if aerial_legs else "")
+            )
             feedback.pushInfo(f"ℹ️ Proceeding to Stage-9 Distribution …")
 
 
@@ -2364,6 +2512,8 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                     def _add_lines(G, lyr): _add_lines_to_graph(G, lyr, dens, eps, _qkey)
                     _add_lines(Gd, left_sw)
                     _add_lines(Gd, right_sw)
+                    if footways_clean and footways_clean.featureCount() > 0:
+                        _add_lines(Gd, footways_clean)
                     if tan_tmp:
                         _add_lines(Gd, tan_tmp)
 

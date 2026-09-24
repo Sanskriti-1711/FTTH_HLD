@@ -402,12 +402,13 @@ def test_garden_leg_type_depends_on_length():
     assert by_addr["B"]["type"] == "Open Cut"      # 80 m would be a dig
 
 
-def test_garden_leg_skips_out_of_reach_houses():
+def test_garden_leg_keeps_out_of_reach_houses_for_aerial_evaluation():
     p = td.Params(house_search_m=50.0)
     network = [[(0, 0), (0, 100)]]
     houses = [{"x": 500.0, "y": 50.0, "ADDR_ID": "far", "PDP_ID": "P1"}]
     legs = td.design_garden_legs(network, houses, p, lambda m: None)
-    assert legs == []
+    assert len(legs) == 1
+    assert legs[0]["unreachable"] is True
 
 
 # ── aerial classification ────────────────────────────────────────────────────
@@ -474,6 +475,16 @@ def test_no_zone_and_no_length_rule_keeps_every_leg_trenched():
     trenched, aerial = td._split_drop_legs(_legs(), None, p, lambda m: None)
     assert len(trenched) == 2 and aerial == []
     assert set(leg["type"] for leg in trenched) == {"Garden"}
+
+
+def test_unreachable_drop_is_classified_as_aerial():
+    legs = [{"coords": [(0.0, 0.0), (0.0, 80.0)], "length": 80.0,
+             "type": "Open Cut", "house": {"ADDR_ID": "far"},
+             "parent": -1, "unreachable": True}]
+    _trenched, aerial = td._split_drop_legs(
+        legs, None, td.Params(), lambda m: None)
+    assert len(aerial) == 1
+    assert aerial[0]["aerial_reason"] == "unreachable"
 
 
 def test_aerial_max_leg_rule_is_opt_in():
@@ -841,6 +852,48 @@ def test_house_drop_is_exempt_from_the_loose_end_check():
              _span("TR-2", [(50, 0), (50, -20)], src="house-drop")]
     loose = td.dangling_ends(spans, [(0.0, 0.0), (100.0, 0.0)], td.Params())
     assert loose == []
+
+
+# ── is the published trench ONE network? ────────────────────────────────────
+# The duct router walks the trench, so a second disconnected group is duct that
+# cannot be laid. Berlin 2026-09-21: the layer is 92 groups (1 network plus 91
+# detached, 1,643 m) while the run reported "loose ends: 0" — because a drop
+# whose end touches ANOTHER DROP has no loose end and is still severed.
+
+def test_a_drop_touching_another_drop_is_not_loose_but_is_still_detached():
+    """The two checks answer different questions, and only one is the real one."""
+    spans = [_span("TR-1", [(0, 0), (100, 0)]),
+             _span("TR-2", [(50, 40), (50, 60)], src="house-drop"),
+             _span("TR-3", [(50, 60), (50, 80)], src="house-drop")]
+    loose = td.dangling_ends(spans, [(0.0, 0.0), (100.0, 0.0)], td.Params())
+    assert loose == []                        # nothing "loose" at all ...
+    off = td.detached_span_groups(spans)      # ... and still not reachable
+    assert len(off) == 1
+    assert off[0]["gap_m"] == 40.0
+    assert off[0]["drops"] == 2
+    assert off[0]["spans"] == 2
+
+
+def test_a_single_connected_network_has_no_detached_groups():
+    spans = [_span("TR-1", [(0, 0), (50, 0)]),
+             _span("TR-2", [(50, 0), (100, 0)])]
+    assert td.detached_span_groups(spans) == []
+
+
+def test_the_gap_is_measured_to_the_other_geometry_not_to_its_vertices():
+    """A group 3 m off a long corridor is 3 m off it, however far its ends are."""
+    spans = [_span("TR-1", [(0, 0), (100, 0)]),
+             _span("TR-2", [(40, 3), (60, 3)], src="house-drop")]
+    off = td.detached_span_groups(spans)
+    assert len(off) == 1 and off[0]["gap_m"] == 3.0
+
+
+def test_a_join_across_a_metre_is_not_detached():
+    """The tolerance is the difference between "stitched" and "two networks"."""
+    spans = [_span("TR-1", [(0, 0), (100, 0)]),
+             _span("TR-2", [(100, 1.0), (130, 1.0)])]
+    assert td.detached_span_groups(spans, join_tol=1.5) == []
+    assert len(td.detached_span_groups(spans, join_tol=0.5)) == 1
 
 
 def test_junction_end_is_not_a_loose_end():

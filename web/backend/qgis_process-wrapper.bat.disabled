@@ -1,0 +1,15 @@
+@echo off
+set OSGEO4W_ROOT=C:\Program Files\QGIS 3.44.6
+set PATH=%OSGEO4W_ROOT%\apps\qgis\bin;%OSGEO4W_ROOT%\apps\Python312\Scripts;%WINDIR%\system32;%WINDIR%;%WINDIR%\system32\WBem;%PATH%
+set QGIS_PREFIX_PATH=%OSGEO4W_ROOT%\apps\Python312
+set GDAL_FILENAME_IS_UTF8=YES
+set VSI_CACHE=TRUE
+set VSI_CACHE_SIZE=1000000
+set QT_PLUGIN_PATH=%OSGEO4W_ROOT%\apps\qgis\qtplugins;%OSGEO4W_ROOT%\apps\qt5\plugins
+set PYTHONPATH=%OSGEO4W_ROOT%\apps\Python312\Lib\site-packages;%OSGEO4W_ROOT%\apps\qgis\python;%PYTHONPATH%
+set QT_QPA_PLATFORM=offscreen
+set PYTHONUNBUFFERED=1
+REM QGIS_PLUGINPATH is already set by the engine's _run_command env
+REM Don't override it with %1
+shift
+"%OSGEO4W_ROOT%\apps\qgis\bin\qgis_process.exe" %*

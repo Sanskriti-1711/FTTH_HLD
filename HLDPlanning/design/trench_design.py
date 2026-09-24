@@ -36,6 +36,7 @@ runs in the same environment as the other post-processing utilities.
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import math
 import os
@@ -92,6 +93,14 @@ NON_CARRIER_CLASSES = tuple(
                 "primary", "primary_link", "secondary", "secondary_link",
                 "tertiary", "tertiary_link")
 )
+# Classes a trench is NEVER dug along — not routed on at any weight, and never
+# Open Cut. A motorway is not a street a trench can follow: it is only ever
+# CROSSED, and a crossing is a drill (HDD), so a motorway span can never be
+# open-cut. This is the operator rule, stated once and enforced by
+# :func:`_class_factor` (an infinite weight) rather than left to the routing
+# ladder, where a large finite cost is still a path the router will take when
+# the only alternative is long enough.
+NEVER_CARRIER_CLASSES = ("motorway", "motorway_link")
 
 # Edge weight multipliers: routing prefers the sidewalk corridor.
 #
@@ -112,10 +121,11 @@ CLASS_FACTOR = {
 #
 #     residential < tertiary < secondary < primary/motorway
 #
-# Every class stays *routable* (a graph that refuses outright disconnects), but
-# at these weights the router will accept a kilometres-long footway detour
-# before it enters a street, and when it must use one it picks the smallest
-# class available. `track` is a field haul road: cheap to cross, poor to dig.
+# Every class stays *routable* EXCEPT the motorway set — see
+# NEVER_CARRIER_CLASSES, which is excluded outright. At these weights the router
+# will accept a kilometres-long footway detour before it enters a street, and
+# when it must use one it picks the smallest class available. `track` is a field
+# haul road: cheap to cross, poor to dig.
 STREET_CLASS_FACTOR = {
     "track": CARRIAGE_FACTOR * 0.85,      # 10.2 — dirt/field track
     "residential": CARRIAGE_FACTOR,       # 12.0 — base street cost
@@ -128,9 +138,44 @@ STREET_CLASS_FACTOR = {
     "primary_link": CARRIAGE_FACTOR * 8.0,
     "primary": CARRIAGE_FACTOR * 9.0,     # 108.0 — federal road
     "trunk": CARRIAGE_FACTOR * 12.0,
-    "motorway": CARRIAGE_FACTOR * 15.0,
+    # No "motorway" entry: it is in NEVER_CARRIER_CLASSES and gets no weight at
+    # all (see _class_factor). A ladder entry would have implied it was a slow
+    # carrier, i.e. still a carrier.
 }
 NON_CARRIER_FACTOR = CARRIAGE_FACTOR  # any carriageway not in the ladder
+
+# ── the kerb band: never a trench down the middle of a carriageway ──────────
+# Where a street has no mapped pavement the router has only the carriageway
+# CENTRELINE to follow, so the published trench — and the duct and the cable
+# riding it — was drawn down the middle of the road. That geometry is laid at
+# the KERB instead: KERB_OFFSET_M out from the centreline, ramping back to the
+# exact OSM vertex at every end and at every junction, so no shared vertex, no
+# snap and no route moves (see _kerb_band / _kerb_side_sign).
+#
+# KERB_OFFSET_M is deliberately the distance the network stage places its PDP
+# candidates at (trench_layer.SIDEWALK_OFFSET_M): a splitter is a street
+# cabinet, so laying the trench at the kerb leaves the cabinet BESIDE its own
+# trench. A test pins the two equal.
+KERB_OFFSET_M = 3.0          # centreline -> kerb (the pavement band)
+KERB_RAMP_M = 6.0            # over how many metres the offset flares in and out
+KERB_SIDE_SEARCH_M = 2.0     # radius that counts as "the pavement is here"
+KERB_ANCHOR_SEARCH_M = 6.0   # radius that counts as "the cabinet is here"
+# Which classes the band applies to: the CARRIAGEWAY ladder, i.e. the classes the
+# design already treats as roads to be crossed (see STREET_CLASS_FACTOR), PLUS
+# ``service``. A service way is a driveway or parking aisle, and it is the single
+# biggest source of centreline-carried trench on the reference project (206 m of
+# 252 m) — "strictly never down the middle of the road" has to include it. It is
+# banded with the same taper, so its junctions and its access corridor are still
+# met exactly; a real pavement, where one exists, always wins the side.
+KERB_CLASSES = tuple(sorted(set(STREET_CLASS_FACTOR) | {"service"}))
+# How long a break in the PAVEMENT the graph may bridge. OSM carries the
+# pavement per block/crossing/driveway, so a real sidewalk is a chain of loose
+# ends: measured on the reference project, 49 090 footway endpoint pairs sit
+# within 15 m of each other. Crossing one of those pairs is a driveway apron or a
+# road crossing; NOT crossing it is what sends the router onto the carriageway
+# for the length of the block (the defect this closes). Crossings the link does
+# span are still drills — detect_drills sees the run cross a carriageway.
+SIDEWALK_LINK_M = 15.0
 
 
 @dataclass
@@ -184,6 +229,31 @@ class Params:
     # is built aerial — drawn as an aerial drop, never excavated. 0 = length
     # rule off (zone layer only).
     aerial_max_leg_m: float = 0.0
+    # The kerb band (see KERB_OFFSET_M): geometry along a carriageway is drawn at
+    # the kerb instead of on the centreline. 0 disables the rule.
+    kerb_offset_m: float = KERB_OFFSET_M
+    kerb_ramp_m: float = KERB_RAMP_M
+    # When enabled, longitudinal trench routing is restricted to actual OSM
+    # footway/sidewalk classes. Carriageway classes remain in the separate
+    # vehicular input solely for HDD crossing detection; they cannot become
+    # trench carriers.
+    sidewalk_only: bool = True
+    # A pavement mapped in pieces (every OSM block, crossing and driveway break
+    # leaves a pair of loose ends) is joined across gaps up to this long, so the
+    # router can stay on the pavement instead of stepping onto the carriageway
+    # to get around the break.
+    #
+    # DEFAULT 0.0 = OFF, and that is a measurement, not an oversight. On the
+    # reference project it bridges 718 breaks / 6 374 m and merges 195 graph
+    # components to 167 — and changes the published trench by 0 m, because a
+    # break's loose end is a DEAD END: the route never needed to pass through it
+    # unless an anchor snapped there, and at the stretch that was actually
+    # reported there is no mapped pavement at all, so there is no break to join.
+    # With it on, the duct and cable layers read WORSE (distribution ducts
+    # 110.7 -> 147.9 m within 1 m of a carriageway centreline). It is kept,
+    # tested and off; turn it on with --sidewalk_link_m when a project's pavement
+    # really is a chain of loose ends.
+    sidewalk_link_m: float = 0.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -307,6 +377,139 @@ def _substring(coords: Sequence[Tuple[float, float]], a0: float, a1: float
             out.append(coords[i])
     out.append(_at(a1))
     return out
+
+
+def _kerb_cell(x: float, y: float, size: float) -> Tuple[int, int]:
+    """Spatial bucket for the kerb-side search indexes."""
+    return (int(math.floor(x / size)), int(math.floor(y / size)))
+
+
+def _left_normal(coords: Sequence[Tuple[float, float]], i: int
+                 ) -> Tuple[float, float]:
+    """Unit normal to the LEFT of the travel direction at vertex ``i``."""
+    a = coords[i - 1] if i > 0 else coords[i]
+    b = coords[i + 1] if i + 1 < len(coords) else coords[i]
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    seg = math.hypot(dx, dy)
+    if seg <= 1e-9:
+        return (0.0, 0.0)
+    return (-dy / seg, dx / seg)
+
+
+def _kerb_band(coords: Sequence[Tuple[float, float]], anchors: Set[int],
+               kerb_m: float, ramp_m: float, sign: int
+               ) -> List[Tuple[float, float]]:
+    """A carriageway part's geometry, laid at the kerb instead of the centreline.
+
+    The offset is ZERO at every anchor vertex — the part's two ends and every
+    vertex OSM shares with another way — and ramps to ``kerb_m`` between them.
+    Those shared vertices are what joins two ways at a junction, and a run's
+    chambers, ducts and cables are all built on this geometry afterwards, so a
+    moved anchor drags everything attached to it: that is exactly how the three
+    earlier post-routing attempts at this offset failed. Ramps keep every
+    junction, and every row that used to coincide, precisely where OSM put it.
+    """
+    n = len(coords)
+    if n < 2 or kerb_m <= 0.0:
+        return [(x, y) for x, y in coords]
+    cum = _cum(coords)
+    a_chain = sorted(cum[i] for i in anchors if 0 <= i < n)
+    out: List[Tuple[float, float]] = []
+    for i in range(n):
+        x, y = coords[i]
+        if i in anchors:
+            out.append((x, y))
+            continue
+        near = float("inf")
+        if a_chain:
+            pos = bisect.bisect_left(a_chain, cum[i])
+            for j in (pos - 1, pos):
+                if 0 <= j < len(a_chain):
+                    near = min(near, abs(cum[i] - a_chain[j]))
+        t = 1.0 if (ramp_m <= 0.0 or near == float("inf")) else min(1.0, near / ramp_m)
+        if t <= 0.0:
+            out.append((x, y))
+            continue
+        nx_, ny_ = _left_normal(coords, i)
+        out.append((x + sign * kerb_m * t * nx_, y + sign * kerb_m * t * ny_))
+    return out
+
+
+def _nearest_in(index: Dict[Tuple[int, int], List[Tuple[float, float]]],
+                size: float, x: float, y: float, radius: float
+                ) -> Optional[float]:
+    """Distance to the nearest indexed point within ``radius`` (None if none).
+
+    ``size`` is the index's cell size and must be >= ``radius``, so the 3x3 cell
+    neighbourhood covers the whole search circle.
+    """
+    best: Optional[float] = None
+    cx, cy = _kerb_cell(x, y, size)
+    for gx in (cx - 1, cx, cx + 1):
+        for gy in (cy - 1, cy, cy + 1):
+            for px, py in index.get((gx, gy), ()):
+                d = math.hypot(px - x, py - y)
+                if d <= radius and (best is None or d < best):
+                    best = d
+    return best
+
+
+def _count_in(index: Dict[Tuple[int, int], List[Tuple[float, float]]],
+              size: float, x: float, y: float, radius: float) -> int:
+    """How many indexed points lie within ``radius`` of (x, y)."""
+    n = 0
+    cx, cy = _kerb_cell(x, y, size)
+    for gx in (cx - 1, cx, cx + 1):
+        for gy in (cy - 1, cy, cy + 1):
+            for px, py in index.get((gx, gy), ()):
+                if math.hypot(px - x, py - y) <= radius:
+                    n += 1
+    return n
+
+
+def _kerb_side_sign(coords: Sequence[Tuple[float, float]],
+                    foot_index: Dict[Tuple[int, int], List[Tuple[float, float]]],
+                    anchor_index: Dict[Tuple[int, int], List[Tuple[float, float]]]
+                    ) -> int:
+    """Which side of a carriageway its kerb band is laid on (+1 = left of travel).
+
+    Chosen from GEOMETRY, never from the way's direction: two OSM ways along one
+    street are routinely digitised in opposite directions, so a per-way
+    left/right rule puts them on OPPOSITE kerbs and rows that used to coincide
+    separate — the recorded failure of the earlier attempt. In order:
+
+    1. the side a real pavement covers — where the pavement is, the trench goes;
+    2. then the side the network's anchors are on, measured to the nearest one: a
+       splitter cabinet stands on the pavement it serves, so laying the kerb
+       band on that side leaves the cabinet beside its own trench;
+    3. then the higher-northing side (ties: the higher-easting one), which is a
+       function of geometry alone and so is stable for either digitisation.
+    """
+    mid = len(coords) // 2
+    x, y = coords[mid]
+    nx_, ny_ = _left_normal(coords, mid)
+    if nx_ == 0.0 and ny_ == 0.0:
+        return 1
+    sides: Dict[int, Tuple[float, float, int, Optional[float]]] = {}
+    for sign in (1, -1):
+        px = x + sign * nx_ * KERB_OFFSET_M
+        py = y + sign * ny_ * KERB_OFFSET_M
+        foot = _count_in(foot_index, KERB_SIDE_SEARCH_M, px, py,
+                         KERB_SIDE_SEARCH_M)
+        anchor = _nearest_in(anchor_index, KERB_ANCHOR_SEARCH_M, px, py,
+                             KERB_ANCHOR_SEARCH_M)
+        sides[sign] = (px, py, foot, anchor)
+    lx, ly, lfoot, lanchor = sides[1]
+    rx, ry, rfoot, ranchor = sides[-1]
+    if lfoot != rfoot:
+        return 1 if lfoot > rfoot else -1
+    if (lanchor is None) != (ranchor is None):
+        return 1 if lanchor is not None else -1
+    if lanchor is not None and ranchor is not None and abs(lanchor - ranchor) > 1e-6:
+        return 1 if lanchor < ranchor else -1
+    if abs(ly - ry) > 1e-9:
+        return 1 if ly > ry else -1
+    return 1 if lx >= rx else -1
 
 
 def _straighten(coords: Sequence[Tuple[float, float]], p: Params
@@ -674,6 +877,15 @@ class StreetGraph:
     # the largest connected piece of the walkable network: everything routable
     # belongs to it, and OSM always carries a few stray footway fragments
     main_component: Set[str] = field(default_factory=set)
+    # How much published geometry was moved off a carriageway centreline onto its
+    # kerb band (the "never run a trench down the middle of the road" rule), and
+    # the largest offset actually applied.
+    kerb_parts: int = 0
+    kerb_max_offset_m: float = 0.0
+    # Pavement breaks bridged (see ``Params.sidewalk_link_m``) and the total gap
+    # length they closed.
+    sidewalk_links: int = 0
+    sidewalk_link_m: float = 0.0
 
     def nearest_node(self, x: float, y: float, radius: float) -> Optional[str]:
         best, best_d = None, radius
@@ -702,12 +914,57 @@ class StreetGraph:
 
 
 def build_street_graph(walkable: Sequence[Tuple[List[Tuple[float, float]], str]],
-                       params: Params) -> StreetGraph:
+                       params: Params,
+                       anchors: Sequence[Tuple[float, float]] = ()) -> StreetGraph:
     """Node the walkable road network into a routable graph.
 
     OSM lines share exact vertices at intersections, so rounding coordinates is
     enough to connect the network; consecutive vertices become edges carrying
     their own geometry, so a route can be re-assembled without losing shape.
+
+    NOTE — where OSM has no footway, a run IS routed on the carriageway
+    centreline, so the published trench (and the duct and cable riding it) is
+    drawn down the middle of that street: 8.1 % of the carrier length on the
+    reference project, measured as 6 feeder-cable runs / 208.6 m hugging a
+    carriageway centreline at 0.00 m with no footway within 2 m, worst 64.7 m.
+
+    THREE attempts to shift that geometry afterwards were made and all REVERTED.
+    They are recorded with their numbers so none is retried blind, because the
+    lesson is the same every time and it is not about the shift itself:
+
+    * Offset at the node-keying step — fatal, because the keys are what join two
+      OSM ways at a junction: 6 components, 13 PDPs behind 392 m spurs, MFG
+      reached 18/31.
+    * Offset the STORED geometry only (keys untouched, tapered at junctions).
+      26/31, 2 connected parts, 130/304 couplers off — the chamber/duct chain is
+      built chamber-to-chamber on the trench, and the shift side is per OSM WAY,
+      so two ways along one street digitised in opposite directions move to
+      opposite kerbs and rows that used to coincide separate.
+    * Snap each road stretch back onto the PARALLEL SIDEWAY (the option chosen on
+      review, keyed on geometry not on way direction, sampled at 8 m, with the
+      stretch's joins kept exact). It moved 362 m over 10 stretches and still
+      cost the chain: 29/31 first, 26/31 with the join anchors kept, plus a
+      loose run end. Anything that moves the routed geometry afterwards pulls
+      the chambers and the ducts that attach to it.
+
+    Linking the sidewalk across its own break (an edge between nearby sidewalk
+    endpoints) was tried as the next lever and does NOT cover this: on the
+    reference project 49 090 footway endpoint pairs sit within 15 m of each
+    other, and at the reported stretch the graph carries a single 33 m
+    ``residential`` edge with NO footway edge at either end, so there is no
+    sidewalk to stay on and no gap to close.
+
+    WHAT DOES FIX IT is the BASIS itself, before any run exists. Carriageway-
+    carried geometry on the CARRIAGEWAY LADDER (``KERB_CLASSES``, which includes
+    `service`: a driveway aisle is still a carriageway) is published on the
+    street's KERB BAND — offset
+    KERB_OFFSET_M toward the kerb, ramping back to the exact OSM vertex at every
+    end and junction (see :func:`_kerb_band`, :func:`_kerb_side_sign`). The node
+    keys, the node positions and every edge WEIGHT stay on the original OSM
+    line, so the route chosen, the topology, the ranking and the connectivity are
+    all exactly as before; only the coordinates a run is drawn on move. A trench
+    can therefore not be drawn down the middle of a carriageway — where it has to
+    cross one, that crossing is still a drill (HDD).
     """
     key_of: Dict[Tuple[int, int], str] = {}
     node_xy: Dict[str, Tuple[float, float]] = {}
@@ -728,7 +985,16 @@ def build_street_graph(walkable: Sequence[Tuple[List[Tuple[float, float]], str]]
     def factor(cls: str) -> float:
         return _class_factor(cls, params.street_avoid_scale)
 
-    n_edges = 0
+    def rkey(x: float, y: float) -> Tuple[int, int]:
+        """The rounded key ``key()`` builds nodes from — used to spot junctions."""
+        return (int(round(x / tol)), int(round(y / tol)))
+
+    # ── pass 1: densify, and count how many parts share each vertex ───────────
+    # A vertex used by two parts is a JUNCTION. The keys come from these OSM
+    # coordinates and never from the kerb geometry below, so node identity — and
+    # with it every junction, snap and route — is exactly as it was.
+    dense_parts: List[Tuple[List[Tuple[float, float]], str]] = []
+    uses: Dict[Tuple[int, int], int] = {}
     for coords, cls in walkable:
         # density: no vertex spacing above 40 m so routes can bend realistically
         dense: List[Tuple[float, float]] = [coords[0]]
@@ -742,10 +1008,55 @@ def build_street_graph(walkable: Sequence[Tuple[List[Tuple[float, float]], str]]
                     dense.append((prev[0] + t * (q[0] - prev[0]),
                                   prev[1] + t * (q[1] - prev[1])))
             dense.append(q)
+        dense_parts.append((dense, cls))
+        for q in dense:
+            rk = rkey(q[0], q[1])
+            uses[rk] = uses.get(rk, 0) + 1
+
+    # What the kerb side is chosen from: real pavements, and the anchors the
+    # network exists to serve (the caller passes its PDP/MFG/premise points).
+    kerb_on = params.kerb_offset_m > 0.0
+    foot_index: Dict[Tuple[int, int], List[Tuple[float, float]]] = {}
+    anchor_index: Dict[Tuple[int, int], List[Tuple[float, float]]] = {}
+    if kerb_on:
+        for dense, cls in dense_parts:
+            if cls in PURE_FOOTWAY_CLASSES:
+                for x, y in dense:
+                    foot_index.setdefault(_kerb_cell(x, y, KERB_SIDE_SEARCH_M),
+                                          []).append((x, y))
+        for x, y in anchors:
+            anchor_index.setdefault(_kerb_cell(x, y, KERB_ANCHOR_SEARCH_M),
+                                    []).append((x, y))
+
+    n_edges = 0
+    n_kerb = 0
+    kerb_max = 0.0
+    n_links = 0
+    links_m = 0.0
+    for dense, cls in dense_parts:
+        # The geometry a RUN is drawn on. Where the only line along a street is
+        # its carriageway centreline, that geometry moves onto the kerb band;
+        # the keys and weights below still use the OSM coordinates, so which
+        # edges the router picks does not change.
+        geom: List[Tuple[float, float]] = dense
+        if kerb_on and cls in KERB_CLASSES:
+            anchors_i = {0, len(dense) - 1}
+            for i, q in enumerate(dense):
+                if uses.get(rkey(q[0], q[1]), 0) > 1:
+                    anchors_i.add(i)
+            geom = _kerb_band(dense, anchors_i, params.kerb_offset_m,
+                              params.kerb_ramp_m,
+                              _kerb_side_sign(dense, foot_index, anchor_index))
+            moved = max(math.hypot(gx - qx, gy - qy)
+                        for (qx, qy), (gx, gy) in zip(dense, geom))
+            if moved > 0.01:
+                n_kerb += 1
+                kerb_max = max(kerb_max, moved)
         prev_key = None
         prev_pt = None
+        prev_gq = None
         f = factor(cls)
-        for q in dense:
+        for q, gq in zip(dense, geom):
             k = key(q[0], q[1])
             if prev_key is not None and prev_key != k:
                 w = math.hypot(q[0] - prev_pt[0], q[1] - prev_pt[1]) * f
@@ -753,9 +1064,66 @@ def build_street_graph(walkable: Sequence[Tuple[List[Tuple[float, float]], str]]
                     ek = (prev_key, k) if prev_key < k else (k, prev_key)
                     if ek not in edge_coords:
                         G.add_edge(prev_key, k, weight=w, cls=cls)
-                        edge_coords[ek] = [prev_pt, q]
+                        edge_coords[ek] = [prev_gq, gq]
                         n_edges += 1
-            prev_key, prev_pt = k, q
+            prev_key, prev_pt, prev_gq = k, q, gq
+
+    # ── pavement continuity: bridge the breaks in the sidewalk ───────────────
+    # OSM carries a pavement per block / crossing / driveway, so a real sidewalk
+    # is a chain of loose ends 1-15 m apart. The router cannot cross one of those
+    # breaks, and the carriageway is then the only continuous line along the
+    # block, which is what makes it step off the pavement. Joining the loose ends
+    # fixes that at the source: the route stays on the pavement and NOTHING is
+    # moved after routing, so no chamber, duct or cable can be disturbed.
+    # Both ends must already exist as nodes (they do — pass 1 keyed every part),
+    # so a link only ever joins two real OSM vertices.
+    if params.sidewalk_link_m > 0.0:
+        cap = params.sidewalk_link_m
+        ends: List[Tuple[float, float, str, int]] = []
+        for pi, (dense, cls) in enumerate(dense_parts):
+            if cls in PURE_FOOTWAY_CLASSES and len(dense) >= 2:
+                for p in (dense[0], dense[-1]):
+                    ends.append((p[0], p[1], key(p[0], p[1]), pi))
+        cells: Dict[Tuple[int, int], List[int]] = {}
+        for i, e in enumerate(ends):
+            cells.setdefault(_kerb_cell(e[0], e[1], cap), []).append(i)
+        cands = []
+        for i, (xa, ya, ka, pa) in enumerate(ends):
+            cx, cy = _kerb_cell(xa, ya, cap)
+            for gx in (cx - 1, cx, cx + 1):
+                for gy in (cy - 1, cy, cy + 1):
+                    for j in cells.get((gx, gy), ()):
+                        if j <= i:
+                            continue
+                        xb, yb, kb, pb = ends[j]
+                        if ka == kb or pa == pb:
+                            continue
+                        d = math.hypot(xb - xa, yb - ya)
+                        if d <= tol or d > cap:
+                            continue
+                        # Only a loose end is a break. A vertex that already has
+                        # two ways through it is mid-network: linking it would
+                        # cut a corner across the pavement instead.
+                        if G.degree(ka) > 1 and G.degree(kb) > 1:
+                            continue
+                        ek = (ka, kb) if ka < kb else (kb, ka)
+                        if ek in edge_coords:
+                            continue
+                        cands.append((round(d, 3), ka, kb, xa, ya, xb, yb, ek))
+        # Nearest first, and deterministic: the edge set may not depend on the
+        # order the parts happened to come out of the reader.
+        cands.sort(key=lambda c: (c[0], c[1], c[2]))
+        used: Set[str] = set()
+        f_link = factor("footway")
+        for d, ka, kb, xa, ya, xb, yb, ek in cands:
+            if ka in used or kb in used:
+                continue
+            G.add_edge(ka, kb, weight=max(d, 1e-6) * f_link, cls="sidewalk_link")
+            edge_coords[ek] = [(xa, ya), (xb, yb)]
+            used.add(ka)
+            used.add(kb)
+            n_links += 1
+            links_m += d
 
     node_keys = list(node_xy.keys())
     idx = GridIndex(cell=50.0)
@@ -776,7 +1144,9 @@ def build_street_graph(walkable: Sequence[Tuple[List[Tuple[float, float]], str]]
     except Exception:
         main = set(node_keys)
     return StreetGraph(G=G, edge_coords=edge_coords, node_xy=node_xy,
-                       index=idx, node_keys=node_keys, main_component=main)
+                       index=idx, node_keys=node_keys, main_component=main,
+                       kerb_parts=n_kerb, kerb_max_offset_m=kerb_max,
+                       sidewalk_links=n_links, sidewalk_link_m=links_m)
 
 
 def _class_factor(cls: str, scale: float = 1.0) -> float:
@@ -786,7 +1156,16 @@ def _class_factor(cls: str, scale: float = 1.0) -> float:
     carriageway comes from :data:`STREET_CLASS_FACTOR`, ordered by road size.
     ``scale`` (``Params.street_avoid_scale``) dials the whole street penalty
     up or down without changing the order.
+
+    :data:`NEVER_CARRIER_CLASSES` (motorway) returns ``inf``: no path may be
+    routed along it at any ``scale``. A finite weight is not enough — the router
+    takes a big penalty whenever the detour is bigger — and "never open-cut on a
+    motorway" has to hold for every input, not just the ones where a footway
+    happens to exist. A motorway edge therefore can only be CROSSED, and every
+    crossing is a drill (HDD).
     """
+    if cls in NEVER_CARRIER_CLASSES:
+        return math.inf
     if cls in STREET_CLASS_FACTOR:
         return max(1.0, STREET_CLASS_FACTOR[cls] * max(0.0, scale))
     if cls in NON_CARRIER_CLASSES:
@@ -1069,9 +1448,14 @@ def design_garden_legs(network_parts: Sequence[List[Tuple[float, float]]],
     skipped = shared = 0
     for h in order:
         d, q, part_i = nearest(h["x"], h["y"])
-        if q is None or d > params.house_search_m:
+        if q is None:
             skipped += 1
             continue
+        # Keep an explicit candidate even when it is outside the normal
+        # underground search radius.  The aerial stage needs the house-to-road
+        # leg in order to evaluate an unreachable premise; silently dropping it
+        # made "unreachable" indistinguishable from "not in the plan".
+        unreachable = d > params.house_search_m
         if math.hypot(q[0] - h["x"], q[1] - h["y"]) < 0.5:
             continue
         parent = -1
@@ -1086,10 +1470,12 @@ def design_garden_legs(network_parts: Sequence[List[Tuple[float, float]]],
             "type": "Garden" if length <= params.max_garden_m else "Open Cut",
             "house": h,
             "parent": parent,
+            "unreachable": unreachable,
         })
         parts.append(coords)                 # later houses may share this trunk
-    log(f"garden legs: {len(legs)} leg(s), {skipped} house(s) out of reach, "
-        f"{shared} joined another drop instead of the mains")
+    log(f"garden legs: {len(legs)} leg(s), {skipped} house(s) without any network "
+        f"point, {sum(1 for leg in legs if leg.get('unreachable'))} beyond the "
+        f"underground search radius, {shared} joined another drop instead of the mains")
     return legs
 
 
@@ -1414,6 +1800,21 @@ def split_spans(run: Run, nodes: Sequence[dict], params: Params,
         for ta, tb, _tt in type_map:
             anchors.append((ta, None))
             anchors.append((tb, None))
+    # A drill interval is one complete civil HDD segment. Do not allow a
+    # nearby bend/pull/junction anchor inside that interval to create a short
+    # Open Cut "chamber span" before or after the bore. HDD entry/exit
+    # boundaries remain authoritative; the chamber layer then places the HDD
+    # pits on those exact trench points.
+    if type_map:
+        protected = []
+        for a, n in anchors:
+            inside_bore = any(ta + 0.01 < a < tb - 0.01
+                              for ta, tb, _tt in type_map)
+            if inside_bore and n is not None:
+                continue
+            protected.append((a, n))
+        anchors = protected
+
     # nodes win ties against bare arc boundaries at the same position
     anchors.sort(key=lambda t: (t[0], t[1] is None))
     kept: List[Tuple[float, Optional[dict]]] = []
@@ -1428,6 +1829,20 @@ def split_spans(run: Run, nodes: Sequence[dict], params: Params,
         # Dedupe only against REAL anchors: the synthetic run ends must not
         # swallow a crossing that starts a few metres into the run.
         if kept and abs(kept[-1][0] - a) < params.min_node_sep_m / 2.0:
+            # HDD boundaries are real construction boundaries, not ordinary
+            # structural nodes. Never swallow a synthetic bore boundary into a
+            # nearby bend/junction: doing so leaves a short open-cut "chamber
+            # span" before the HDD starts. Keep the boundary unless it is
+            # genuinely coincident (drafting noise below 1 cm).
+            previous_is_bore_boundary = kept[-1][1] is None
+            current_is_bore_boundary = n is None
+            if previous_is_bore_boundary != current_is_bore_boundary:
+                if abs(kept[-1][0] - a) < 0.01:
+                    if n is not None and kept[-1][1] is None:
+                        kept[-1] = (kept[-1][0], n)
+                    continue
+                kept.append((a, n))
+                continue
             if n is not None and kept[-1][1] is None:
                 kept[-1] = (kept[-1][0], n)
             continue
@@ -1638,7 +2053,9 @@ def _split_drop_legs(legs: Sequence[dict], zone_polys, params: Params, log
     for i, leg in enumerate(legs):
         item = dict(leg)
         parent = item.get("parent", -1)
-        if _leg_in_zone(zone_polys, item):
+        if item.get("unreachable"):
+            reason = "unreachable"
+        elif _leg_in_zone(zone_polys, item):
             reason = "zone"
         elif params.aerial_max_leg_m and item["length"] > params.aerial_max_leg_m:
             reason = "length"
@@ -2187,29 +2604,16 @@ def _anchor_points(pdps, houses, mfgs) -> List[Tuple[float, float]]:
     return out
 
 
-def prune_unanchored_spans(span_rows: List[dict], anchors_pts: Sequence[Tuple[float, float]],
-                           params: Params, log) -> Tuple[List[dict], List[dict]]:
-    """Drop span groups that reach no anchor — a trench to nowhere.
+def _span_groups(span_rows: Sequence[dict], join_tol: float) -> List[int]:
+    """Connected-group id per span — geometry, not just shared endpoints.
 
-    A designed sub-network is only worth digging when it reaches something: a
-    house/premise, a PDP or a MFG, or joins a group that does. A group of spans
-    that touches none of them is a stray assembly over a disconnected street
-    fragment (the classic "trench extending where it isn't needed").
-
-    Connectivity is *geometry*, not shared endpoints: a service leg that starts
-    mid-span on another run joins that run's group, and a house drop anchors
-    every span it hangs off. (Getting this wrong — endpoint keys only — prunes
-    distribution runs that are in fact feeding houses: measured 18 spans over
-    11 live drops on the Berlin project.)
-
-    Only *whole* groups are dropped: a single span is never cut out of a live
-    chain, so an anchored network cannot be damaged. The removals are written
-    to ``Pruned_Trenches`` so every drop stays auditable.
+    Two spans are one group when they share an end, or when one's end lands on
+    the other's geometry within ``join_tol`` (a service leg starting mid-span on
+    another run). This is the relation the duct router walks, so a group is one
+    trench network a duct can be laid along — and a second group is a place the
+    duct has to leave the trench to reach.
     """
-    if not params.prune_dangling or not span_rows:
-        return list(span_rows), []
     tol = 1.0
-    join_tol = max(1.0, params.prune_join_m)
 
     def key(pt) -> Tuple[int, int]:
         return (int(round(pt[0] / tol)), int(round(pt[1] / tol)))
@@ -2253,6 +2657,131 @@ def prune_unanchored_spans(span_rows: List[dict], anchors_pts: Sequence[Tuple[fl
             j = grid.nearest_index(pt[0], pt[1], join_tol, exclude=i)
             if j is not None:
                 union(i, j)
+    return [find(i) for i in range(len(span_rows))]
+
+
+def detached_span_groups(span_rows: Sequence[dict], join_tol: float = 1.5,
+                         gap_max_m: float = 200.0) -> List[dict]:
+    """Trench groups that are NOT the network — trench the duct cannot reach.
+
+    The published trench is meant to be ONE connected network: every duct,
+    cable and chamber rides it, and the pipeline reports "1 connected part".
+    The stitch pass, though, only closes ends within ``_STITCH_M`` (0.5 m), so
+    a group that stops further short than that is never joined and the map
+    quietly holds several networks at once.
+
+    Reported, never repaired: joining two groups means inventing trench the
+    design never asked for. On the Berlin reference run (2026-09-21) it reports
+    nothing — the stitch pass does close this network — and that is the point of
+    having it: the same day's worst-looking trench defect turned out to be the
+    duct router, not the trench. The router docked vertices onto passing spans
+    and saw the trench as 93 networks, while every one of those pieces touches
+    another to within 1 mm (worst 0.07 m, none of them a chamber). A group this
+    function DOES report is a real gap, and its cost is real: a distribution
+    duct serving a premise on a detached group has no trench to follow across
+    the gap, so it crosses on a chord and leaves the trench by exactly that
+    distance.
+
+    ``gap_m`` is the distance from the group's own geometry to the nearest
+    geometry of any OTHER group, so a group sitting beside a corridor it never
+    touches reads as 0 m, not as the distance between two far ends. Each entry
+    is ``{spans, length_m, drops, gap_m}``, worst gap first. When no span
+    carries ``length_m`` the largest group is taken by vertex count.
+    """
+    if not span_rows:
+        return []
+    groups = _span_groups(span_rows, join_tol)
+    by_g: Dict[int, List[int]] = defaultdict(list)
+    for i, g in enumerate(groups):
+        by_g[g].append(i)
+
+    verts: Dict[int, List[Tuple[float, float]]] = {}
+    drawn: Dict[int, float] = {}
+    for g, idx in by_g.items():
+        pts: List[Tuple[float, float]] = []
+        for i in idx:
+            pts.extend(_span_coords(span_rows[i]))
+        verts[g] = pts
+        drawn[g] = sum(float(span_rows[i].get("length_m") or 0.0) for i in idx)
+    if not verts:
+        return []
+    if max(drawn.values()) <= 0.0:
+        drawn = {g: float(len(pts)) for g, pts in verts.items()}
+    main = max(drawn, key=lambda g: drawn[g])
+
+    # One segment grid over the whole design, so the gap search stays local
+    # instead of group-by-group. Segments, not vertices: a group whose vertex is
+    # 40 m from another group's corridor but whose nearest point is 3 m away is
+    # 3 m off it, and only a point-to-segment distance says so.
+    cell = 30.0
+
+    def _cells_of(a, b):
+        x0, x1 = sorted((a[0], b[0]))
+        y0, y1 = sorted((a[1], b[1]))
+        for cx in range(int(math.floor(x0 / cell)),
+                        int(math.floor(x1 / cell)) + 1):
+            for cy in range(int(math.floor(y0 / cell)),
+                            int(math.floor(y1 / cell)) + 1):
+                yield (cx, cy)
+
+    seg_grid: Dict[Tuple[int, int], List[Tuple[int, Tuple[float, float],
+                                                  Tuple[float, float]]]] = defaultdict(list)
+    for g, idx in by_g.items():
+        for i in idx:
+            c = _span_coords(span_rows[i])
+            for j in range(len(c) - 1):
+                for cellxy in _cells_of(c[j], c[j + 1]):
+                    seg_grid[cellxy].append((g, c[j], c[j + 1]))
+    reach = int(math.ceil(gap_max_m / cell)) + 1
+
+    out: List[dict] = []
+    for g, idx in by_g.items():
+        if g == main or not verts[g]:
+            continue
+        gap = gap_max_m
+        for px, py in verts[g]:
+            cx, cy = int(math.floor(px / cell)), int(math.floor(py / cell))
+            for gx in range(cx - reach, cx + reach + 1):
+                for gy in range(cy - reach, cy + reach + 1):
+                    for og, a, b in seg_grid.get((gx, gy), ()):
+                        if og == g:
+                            continue
+                        d = _point_seg_dist(px, py, a, b)
+                        if d < gap:
+                            gap = d
+        out.append({"spans": len(idx), "length_m": round(drawn[g], 1),
+                    "drops": sum(1 for i in idx
+                                 if span_rows[i].get("SRC") == "house-drop"),
+                    "gap_m": round(gap, 1)})
+    out.sort(key=lambda d: -d["gap_m"])
+    return out
+
+
+def prune_unanchored_spans(span_rows: List[dict], anchors_pts: Sequence[Tuple[float, float]],
+                           params: Params, log) -> Tuple[List[dict], List[dict]]:
+    """Drop span groups that reach no anchor — a trench to nowhere.
+
+    A designed sub-network is only worth digging when it reaches something: a
+    house/premise, a PDP or a MFG, or joins a group that does. A group of spans
+    that touches none of them is a stray assembly over a disconnected street
+    fragment (the classic "trench extending where it isn't needed").
+
+    Connectivity is *geometry*, not shared endpoints: a service leg that starts
+    mid-span on another run joins that run's group, and a house drop anchors
+    every span it hangs off. (Getting this wrong — endpoint keys only — prunes
+    distribution runs that are in fact feeding houses: measured 18 spans over
+    11 live drops on the Berlin project.)
+
+    Only *whole* groups are dropped: a single span is never cut out of a live
+    chain, so an anchored network cannot be damaged. The removals are written
+    to ``Pruned_Trenches`` so every drop stays auditable.
+    """
+    if not params.prune_dangling or not span_rows:
+        return list(span_rows), []
+    groups = _span_groups(span_rows, max(1.0, params.prune_join_m))
+
+    def find(i: int) -> int:
+        return groups[i]
 
     anchor_grid = GridIndex(cell=max(20.0, 2 * params.prune_anchor_m))
     for i, (ax, ay) in enumerate(anchors_pts):
@@ -2295,6 +2824,10 @@ def dangling_ends(span_rows: Sequence[dict], anchors_pts: Sequence[Tuple[float, 
     Reported, never deleted: a single end in mid-air is often the last house of
     a service leg, while a *chain* of them is a real spur. Counting them per
     run is what tells us whether the design is reaching where it should.
+
+    This says nothing about whether the network is in ONE piece — a drop whose
+    end touches another drop is "not loose" here and still severed from the
+    mains. ``detached_span_groups`` is the check for that.
     """
     if not span_rows:
         return []
@@ -2356,11 +2889,34 @@ def design(cfg: dict) -> dict:
     log("area: %.0f × %.0f m" % (bbox[2] - bbox[0], bbox[3] - bbox[1]))
 
     walkable, vehicular = _read_road_parts(cfg["roads"], params.target_epsg, bbox)
-    log(f"roads: {len(walkable)} walkable part(s), {len(vehicular)} carriageway part(s)")
+    osm_sidewalks = [
+        (coords, cls) for coords, cls in walkable
+        if cls in PURE_FOOTWAY_CLASSES
+    ]
+    routing_walkable = osm_sidewalks if params.sidewalk_only else walkable
+    log(f"roads: {len(walkable)} walkable part(s), {len(vehicular)} carriageway part(s), "
+        f"{len(osm_sidewalks)} OSM sidewalk/footway part(s) selected for routing")
+    if params.sidewalk_only and not osm_sidewalks:
+        raise SystemExit("no OSM sidewalk/footway features available for longitudinal trench routing")
 
     # ── street graph + routing ───────────────────────────────────────────
-    sg = build_street_graph(walkable, params)
+    # The vehicular layer is intentionally NOT passed to the graph. It is used
+    # later by detect_drills() to classify road crossings as HDD. This prevents
+    # residential/service carriageways from becoming longitudinal trench
+    # carriers while preserving the existing route, node, chamber, duct and
+    # cable logic.
+    sg = build_street_graph(
+        routing_walkable, params,
+        anchors=[(p["x"], p["y"]) for p in pdps]
+        + [(h["x"], h["y"]) for h in houses]
+        + [(m["x"], m["y"]) for m in mfgs])
     log(f"street graph: {sg.G.number_of_nodes()} node(s), {sg.G.number_of_edges()} edge(s)")
+    log(f"kerb band: {sg.kerb_parts} carriageway part(s) drawn at the kerb "
+        f"(max {sg.kerb_max_offset_m:.1f} m off the centreline); no trench is "
+        f"laid down the middle of a road, crossings are drills (HDD)")
+    log(f"pavement continuity: {sg.sidewalk_links} break(s) bridged "
+        f"({sg.sidewalk_link_m:.0f} m of gap), so the route can stay on the "
+        f"pavement instead of stepping onto the carriageway")
 
     backbone_edges = design_backbone(sg, mfgs[0], pdps, params, log)
     spine_edges, edge_houses = design_spine(sg, pdps, houses, params, log)
@@ -2595,6 +3151,19 @@ def design(cfg: dict) -> dict:
         log("loose ends: %d end(s) not at an anchor/junction across %d run(s) %s"
             % (len(dangling), len(by_run),
                ", ".join(sorted(by_run)[:6])))
+
+    # Every duct is laid along the published trench, so it has to be ONE
+    # network. The stitch pass closes ends only within _STITCH_M, and a group
+    # that stops short of that stays severed — with the distribution duct that
+    # serves a premise on it having no trench to follow across the gap.
+    detached = detached_span_groups(span_rows)
+    if detached:
+        log("network: %d trench group(s) detached from the mains - %.0f m of "
+            "trench, %d house drop(s), gaps to %.1f m (a duct cannot follow "
+            "trench that is not there)"
+            % (len(detached), sum(d["length_m"] for d in detached),
+               sum(d["drops"] for d in detached),
+               max(d["gap_m"] for d in detached)))
 
     # ── spans reaching no premise at all (diagnostic, never removed) ──────
     grid_houses = GridIndex(cell=50.0)

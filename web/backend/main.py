@@ -12,21 +12,25 @@ import math
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
+import threading
 import time
 import uuid
 import zipfile
 from collections import Counter, deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Tuple, Union
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple, Union
 
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import BackgroundTasks, Body, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 
+import countries
 import design
 import occupancy
+import osm_source
 import postgis
 
 
@@ -79,12 +83,16 @@ ONECLICK_OUTPUTS: List[Tuple[str, str, str]] = [
     ("aerial_drop_trenches", "Aerial_Drop_Trenches.gpkg",
      "Aerial_Drop_Trenches.geojson"),
     ("aerial_cable", "Aerial_Cable.gpkg", "Aerial_Cable.geojson"),
-    # The trench designer's STRUCTURAL NODES: the points where the network
-    # changes tier or construction method (HDD drill openings, junctions,
-    # splitter locations, bends, pull points). The chamber stage places its
-    # civil structures on them, so they are served here as the evidence behind
-    # every chamber — and visible on the map next to the chambers they produce.
-    ("trench_nodes", "Trench_Nodes.gpkg", "Trench_Nodes.geojson"),
+    # NOTE: Trench_Nodes (the trench designer's STRUCTURAL NODES — the HDD
+    # drill openings, junctions, splitter positions, bends and pull points) is
+    # deliberately NOT published as a layer. It is an intermediate of the
+    # design: every one of those points is realised by a feature in the
+    # `chambers` layer below, which is what a reader of the HLD panel actually
+    # needs. Serving it put ~125 undifferentiated dots on the map next to the
+    # chambers they had already become, which is noise, not evidence. The file
+    # is still produced and still ships in the Design Package ZIP.
+    # (`design` in the LLD keeps it: there it is the designer's own working
+    # output, not a finished layer.)
     ("brownfield", "Existing_Infrastructure.gpkg", "Existing_Infrastructure.geojson"),
     ("brownfield", "Existing_Infrastructure_Points.gpkg", "Existing_Infrastructure_Points.geojson"),
     # NOTE: the duct/cable occupancy registry is derived by occupancy.store()
@@ -96,6 +104,35 @@ ONECLICK_OUTPUTS: List[Tuple[str, str, str]] = [
 ]
 
 DOWNLOAD_EXTS = {".gpkg", ".xlsx", ".csv", ".json", ".geojson", ".txt"}
+
+# Which files prove each pipeline stage ran, in stage order.  The pipeline's
+# own stage reporting comes from matching its stdout, which lives in memory --
+# so an engine restart mid-run loses it, and the project row is left saying
+# "running" forever with no stage.  The output files do not: they say exactly
+# how far the design got.  This is what the status page falls back to.
+_STAGE_OUTPUT_MARKERS: List[Tuple[str, List[str]]] = [
+    ("Object Layer", ["Objects.gpkg"]),
+    ("Polygon Layer", ["Polygons.gpkg"]),
+    ("Network Layer", ["PDPs.gpkg", "MFG.gpkg"]),
+    ("Trench Layer", ["Final_Trenches.gpkg"]),
+    ("Cable Layer", ["Feeder_Cable.gpkg", "Distribution_Cable.gpkg"]),
+    ("Duct Layer", ["Feeder_Ducts.gpkg", "Distribution_Ducts.gpkg", "Drop_Ducts.gpkg"]),
+]
+
+# How long an orphaned run's files must be quiet before it is declared dead.
+# An engine restart does NOT kill the qgis_process child: it kept writing this
+# project's ducts for two hours afterwards, so "the owner is gone" cannot mean
+# "failed" on sight -- the files are the only evidence either way.  Generous,
+# because a single HLD stage can compute for a long time without writing.
+ORPHAN_DEAD_SECONDS = int(os.environ.get("HLD_ORPHAN_DEAD_SECONDS", "1800"))
+# A broken output is conclusive much faster: a GeoPackage that fails its
+# integrity check cannot become valid by waiting, and a run whose last write is
+# minutes old is not mid-write on it.
+ORPHAN_BROKEN_SECONDS = int(os.environ.get("HLD_ORPHAN_BROKEN_SECONDS", "300"))
+
+# Guards the recovery of one project: two status polls arriving together must
+# not both ingest the outputs.
+_recover_lock = threading.Lock()
 
 app = FastAPI(
     title="FTTH Engine API",
@@ -263,9 +300,16 @@ def _run_command(project_id: str, cmd: Union[List[str], str], output_dir: Path) 
         for idx, stage in enumerate(PIPELINE_STAGES):
             if stage.lower() in text.lower():
                 task = _task(project_id)
+                if task.get("stage") == stage and task.get("stage_index") == idx:
+                    continue
                 task["stage"] = stage
                 task["stage_index"] = idx
                 task["progress"] = int((idx / len(PIPELINE_STAGES)) * 100)
+                task["updated_at"] = _now()
+                # Persisted, not just in memory: this is the only record of
+                # where the run was when the engine restarts, and it is what the
+                # platform's project list shows while the run is in flight.
+                _persist_project_state(project_id, task)
 
     process.stdout.close()
     timeout = int(os.environ.get("QGIS_PROCESS_TIMEOUT", "10800"))
@@ -344,6 +388,316 @@ def _register_downloads(project_id: str, output_dir: Path) -> List[Dict[str, Any
     return sorted(downloads, key=lambda item: item["name"])
 
 
+def _gpkg_is_intact(path: Path) -> bool:
+    """Is this GeoPackage a finished, readable file?
+
+    A GeoPackage is a SQLite file, so this needs no GDAL and no new dependency.
+    A pipeline killed mid-write leaves a journal (or WAL) beside the file --
+    SQLite has to roll it back before the file can be read, and a read-only
+    open cannot -- or a file whose pages are malformed.  Both are what a
+    half-written output looks like, and both are cheap to detect: a full
+    ``PRAGMA quick_check`` on every output was slow enough to time out the
+    project list.
+    """
+    if not path.is_file():
+        return False
+    if any(path.with_name(path.name + suffix).exists() for suffix in ("-journal", "-wal")):
+        return False
+    try:
+        conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True, timeout=10)
+    except sqlite3.Error:
+        return False
+    try:
+        # Touches the real pages: a truncated or malformed file raises here.
+        conn.execute("SELECT count(*) FROM gpkg_contents").fetchone()
+        return True
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()
+
+
+def _stage_from_outputs(output_dir: Path) -> Optional[Dict[str, Any]]:
+    """How far the pipeline got, according to the files it wrote.
+
+    Returns the stage being worked on, the last stage that finished, whether
+    every stage's files are there, which files are missing or damaged, and when
+    the run last wrote anything.  ``None`` when the directory holds no output.
+    """
+    if not output_dir.is_dir():
+        return None
+    files = [p for p in output_dir.iterdir() if p.is_file()]
+    if not files:
+        return None
+    newest = max(p.stat().st_mtime for p in files)
+    stages: List[Dict[str, Any]] = []
+    last_complete = -1
+    missing: List[str] = []
+    damaged: List[str] = []
+    for idx, (name, markers) in enumerate(_STAGE_OUTPUT_MARKERS):
+        gone = [m for m in markers if not (output_dir / m).is_file()]
+        stages.append({"index": idx, "name": name, "complete": not gone, "missing": gone})
+        if gone:
+            missing.extend(gone)
+        else:
+            last_complete = idx
+    for name in _marker_names():
+        path = output_dir / name
+        if path.is_file() and not _gpkg_is_intact(path):
+            damaged.append(name)
+    # The stage to report: the one in progress, or -- when every stage's files
+    # are present -- the last stage, because that is what the run was on.
+    current = min(last_complete + 1, len(_STAGE_OUTPUT_MARKERS) - 1)
+    complete = last_complete == len(_STAGE_OUTPUT_MARKERS) - 1 and not missing
+    return {
+        "stage_index": current,
+        "stage_name": _STAGE_OUTPUT_MARKERS[current][0],
+        "progress": int(round(((last_complete + 1) / len(_STAGE_OUTPUT_MARKERS)) * 100)),
+        "last_complete_stage": (
+            _STAGE_OUTPUT_MARKERS[last_complete][0] if last_complete >= 0 else None
+        ),
+        "all_stages_written": complete,
+        "missing": sorted(set(missing)),
+        "damaged": sorted(set(damaged)),
+        "newest_write": newest,
+        "stages": stages,
+    }
+
+
+def _marker_names() -> List[str]:
+    return [name for _stage, markers in _STAGE_OUTPUT_MARKERS for name in markers]
+
+
+def _recover_orphan_run(
+    project_id: str, task: Dict[str, Any], publish: bool = True
+) -> None:
+    """Settle a run whose owner is gone, from the files it left behind.
+
+    A project row says "running"; no thread in this process is running it.  That
+    happens when the engine restarts mid-run -- the background task dies with
+    it, the row keeps its last write, and the status page then shows a run that
+    is neither alive nor finished.  The qgis_process child usually SURVIVES the
+    restart, so "the owner is gone" is not on its own proof of failure: the
+    outputs are.  So:
+
+      * files still changing  -> keep reporting the stage they show, as running
+      * every stage written and every file intact -> complete it for real, so
+        the outputs page can show it
+      * otherwise -> failed, naming the stage it reached and what is damaged
+
+    ``publish=False`` settles the row without the expensive ingest; the results
+    endpoint then restores the layers from disk.  The project list uses that,
+    because a list of twenty projects must not ingest twenty designs.
+    """
+    if task.get("status") not in ("running", "queued"):
+        return
+    output_dir = OUTPUT_DIR / project_id
+    info = _stage_from_outputs(output_dir)
+    if info is None:
+        # Nothing on disk: the run never got as far as writing an output.
+        _settle_orphan(
+            project_id, task, "failed",
+            "The engine restarted before this run wrote any output. Run it again.",
+            stage_name="Resolve area", stage_index=0, progress=0,
+        )
+        return
+
+    # Always report the stage the FILES show, not the one the lost thread
+    # claimed: that is the whole point of the status page after a restart.
+    task.update({
+        "stage": info["stage_name"],
+        "stage_index": info["stage_index"],
+        "progress": info["progress"],
+        "updated_at": _now(),
+    })
+    quiet_for = max(0.0, time.time() - info["newest_write"])
+
+    if info["damaged"] and quiet_for > ORPHAN_BROKEN_SECONDS:
+        _settle_orphan(
+            project_id, task, "failed",
+            f"This run was interrupted during the {info['stage_name']} and its output "
+            f"is incomplete ({', '.join(info['damaged'])}). The layers that were built "
+            "are shown below; run the area again for a complete design.",
+            stage_name=info["stage_name"], stage_index=info["stage_index"],
+            progress=info["progress"],
+            damaged=info["damaged"], publish=publish,
+        )
+        return
+
+    if quiet_for <= ORPHAN_DEAD_SECONDS:
+        # The pipeline process may still be alive and writing (it outlives an
+        # engine restart), so this is a run in progress as far as the evidence
+        # goes -- reported with the stage its files show.
+        return
+
+    if info["all_stages_written"] and not info["damaged"]:
+        if publish:
+            _complete_orphan(project_id, task, info)
+        else:
+            # Row only: the results endpoint restores the layers from disk when
+            # this project is opened, so the list stays cheap.
+            _settle_orphan(
+                project_id, task, "completed", None,
+                stage_name="Complete", stage_index=len(PIPELINE_STAGES), progress=100,
+            )
+        return
+
+    reached = info["last_complete_stage"] or "no"
+    missing = (", " + ", ".join(info["missing"])) if info["missing"] else ""
+    _settle_orphan(
+        project_id, task, "failed",
+        f"This run was interrupted after the {reached}{missing}. The engine restarted "
+        "while the design was still being built, so it never finished. The layers "
+        "that were built are shown below; run the area again for a complete design.",
+        stage_name=info["stage_name"], stage_index=info["stage_index"],
+        progress=info["progress"],
+        damaged=info["damaged"], publish=publish,
+    )
+
+
+def _complete_orphan(project_id: str, task: Dict[str, Any], info: Dict[str, Any]) -> None:
+    """Publish a finished run whose completion write was lost with the thread."""
+    with _recover_lock:
+        if task.get("status") not in ("running", "queued"):
+            return
+        output_dir = OUTPUT_DIR / project_id
+        _append(
+            project_id, "info",
+            "Every pipeline output is on disk and intact, so this run was completed "
+            "after the engine restarted mid-run.",
+        )
+        layers = _ingest_outputs(project_id, output_dir)
+        downloads = _register_downloads(project_id, output_dir)
+        task.update({
+            "status": "completed",
+            "stage": "Complete",
+            "stage_index": len(PIPELINE_STAGES),
+            "progress": 100,
+            "layers": layers,
+            "downloads": downloads,
+            "runner": task.get("runner") or "qgis_process",
+            "recovered_from_disk": True,
+            "updated_at": _now(),
+        })
+        _persist_project_state(project_id, task, downloads=downloads)
+
+
+def _settle_orphan(
+    project_id: str,
+    task: Dict[str, Any],
+    status: str,
+    error: Optional[str],
+    *,
+    stage_name: str,
+    stage_index: int,
+    progress: int,
+    damaged: Optional[List[str]] = None,
+    publish: bool = False,
+) -> None:
+    """Put an orphaned run into a terminal state, in memory and in PostGIS.
+
+    An interrupted run's INTACT layers are still published, so the outputs page
+    shows the design as far as it got instead of an empty map.  The damaged
+    files are excluded and named, rather than served and crashed on.
+    """
+    with _recover_lock:
+        if task.get("status") not in ("running", "queued"):
+            return
+        task.update({
+            "status": status,
+            "error": error,
+            "stage": stage_name,
+            "stage_index": stage_index,
+            "progress": progress,
+            "recovered_from_disk": True,
+            "updated_at": _now(),
+        })
+        if damaged:
+            task["damaged_outputs"] = sorted(set(damaged))
+        if publish and status == "failed":
+            try:
+                task["layers"] = _ingest_outputs(
+                    project_id, OUTPUT_DIR / project_id, skip=set(damaged or [])
+                )
+            except Exception as exc:  # noqa: BLE001 - the status is what matters
+                _append(project_id, "warning", f"Partial layers not published: {exc}")
+        if error:
+            _append(project_id, "error" if status == "failed" else "info", error)
+        _persist_project_state(project_id, task)
+
+
+def _persist_project_state(
+    project_id: str,
+    task: Dict[str, Any],
+    downloads: Optional[List[Dict[str, Any]]] = None,
+) -> None:
+    """Write a run's status/stage/progress to PostGIS, best-effort.
+
+    The platform's project list and the outputs page read the row, so a stage
+    that only exists in this process's memory is invisible everywhere else --
+    and invisible again after the next restart.
+    """
+    if not postgis.is_available():
+        return
+    status = str(task.get("status") or "unknown")
+    progress = int(task.get("progress") or 0)
+    # Only a completed run is 100 %: a failed one that had written every stage
+    # before it broke would otherwise sit in the project list looking finished.
+    if status != "completed":
+        progress = min(progress, 99)
+    try:
+        postgis.upsert_project(
+            project_id,
+            status=status,
+            roads_filename=task.get("roads_filename"),
+            runner=task.get("runner"),
+            error=task.get("error"),
+            output_dir=task.get("output_dir") or str(OUTPUT_DIR / project_id),
+            downloads=downloads,
+            progress=progress,
+            stage_name=task.get("stage") or "",
+            stage_index=int(task.get("stage_index") or 0),
+            stage_count=int(task.get("stage_count") or len(PIPELINE_STAGES)),
+        )
+    except Exception:  # noqa: BLE001 - never fail a status read on a write
+        pass
+
+
+def _owned_in_process(project_id: str) -> bool:
+    """Is a pipeline thread in THIS process running this project?
+
+    The task registry is memory-only, so a task that exists here is only proof
+    of a live run when THIS process put it there: a task rebuilt from the
+    project row (after a restart) is a run whose thread died with the engine.
+    ``_from_db_row`` is that distinction.
+    """
+    task = tasks.get(project_id)
+    if task is None or task.get("_from_db_row"):
+        return False
+    return not task.get("recovered_from_disk")
+
+
+def _recover_orphan_from_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Settle an orphaned run described by a PostGIS project row."""
+    project_id = str(row.get("project_id") or "")
+    if not project_id or _owned_in_process(project_id):
+        return None
+    task = _task(project_id)
+    task.update({
+        "status": row.get("status"),
+        "runner": row.get("runner"),
+        "roads_filename": row.get("roads_filename"),
+        "error": row.get("error"),
+        "output_dir": row.get("output_dir") or str(OUTPUT_DIR / project_id),
+        "downloads": row.get("downloads") or [],
+        "_from_db_row": True,
+    })
+    # The list must stay cheap: settle the row, leave the ingest to the results
+    # endpoint (which restores the layers from disk).
+    _recover_orphan_run(project_id, task, publish=False)
+    return task
+
+
 def _restore_task_from_disk(project_id: str) -> Optional[Dict[str, Any]]:
     """Rebuild an in-memory task from output files already on disk.
 
@@ -356,8 +710,16 @@ def _restore_task_from_disk(project_id: str) -> Optional[Dict[str, Any]]:
     if not output_dir.is_dir():
         return None
 
+    # Files an interrupted run left half-written are NOT published: serving one
+    # to the results map breaks the page instead of showing the rest of the
+    # design.  Cheap now -- a journal beside the file, or an unreadable page.
+    info = _stage_from_outputs(output_dir)
+    damaged = set(info["damaged"]) if info else set()
+
     layer_files: Dict[str, List[str]] = {}
     for public_layer, gpkg_name, geojson_name in ONECLICK_OUTPUTS:
+        if gpkg_name in damaged:
+            continue
         if gpkg_name.lower().endswith(".xlsx"):
             path = output_dir / gpkg_name
             if path.is_file():
@@ -396,6 +758,22 @@ def _restore_task_from_disk(project_id: str) -> Optional[Dict[str, Any]]:
             task["downloads"] = _register_downloads(project_id, output_dir)
         task.setdefault("output_dir", str(output_dir))
         return task
+    if existed and task.get("status") == "failed":
+        # A FAILED run keeps its status here. The restore used to force it to
+        # "completed / 100 %", which turned an interrupted run into a finished
+        # one the moment the outputs page was opened — the one place a planner
+        # looks to find out what happened.  Its layers are still attached, so
+        # the design that was built stays visible.
+        task["files"] = layer_files
+        task["layers"] = [
+            {"name": layer, "feature_count": None, "geometry_type": None, "files": files}
+            for layer, files in sorted(layer_files.items())
+        ]
+        if damaged:
+            task["damaged_outputs"] = sorted(damaged)
+        task.setdefault("output_dir", str(output_dir))
+        task.setdefault("restored_from_disk", True)
+        return task
     task.update(
         {
             "status": "completed",
@@ -417,7 +795,11 @@ def _restore_task_from_disk(project_id: str) -> Optional[Dict[str, Any]]:
     return task
 
 
-def _ingest_outputs(project_id: str, output_dir: Path) -> List[Dict[str, Any]]:
+def _ingest_outputs(
+    project_id: str,
+    output_dir: Path,
+    skip: Optional[Set[str]] = None,
+) -> List[Dict[str, Any]]:
     has_postgis = postgis.is_available()
     if has_postgis:
         postgis.init_schema()
@@ -430,6 +812,11 @@ def _ingest_outputs(project_id: str, output_dir: Path) -> List[Dict[str, Any]]:
     layer_files: Dict[str, List[str]] = {}
 
     for public_layer, gpkg_name, geojson_name in ONECLICK_OUTPUTS:
+        # `skip` carries files an interrupted run left half-written: they are
+        # published by every other route, and serving one to the results map
+        # would 500 the page instead of showing the rest of the design.
+        if skip and gpkg_name in skip:
+            continue
         gpkg_path = output_dir / gpkg_name
         geojson_path = output_dir / geojson_name
         # Handle report files (.xlsx) that aren't vector layers
@@ -574,7 +961,10 @@ def _run_pipeline(
     brownfield_path: Optional[Path] = None,
 ) -> None:
     task = _task(project_id)
-    task.update({"status": "running", "stage": PIPELINE_STAGES[0], "updated_at": _now()})
+    task.update({
+        "status": "running", "stage": PIPELINE_STAGES[0], "stage_index": 0,
+        "progress": 0, "updated_at": _now(),
+    })
     if postgis.is_available():
         postgis.init_schema()
         postgis.upsert_project(
@@ -582,6 +972,10 @@ def _run_pipeline(
             status="running",
             roads_filename=roads_path.name,
             output_dir=str(output_dir),
+            stage_name=PIPELINE_STAGES[0],
+            stage_index=0,
+            stage_count=len(PIPELINE_STAGES),
+            progress=0,
         )
 
     try:
@@ -615,6 +1009,7 @@ def _run_pipeline(
             {
                 "status": "completed",
                 "stage": "Complete",
+                "stage_index": len(PIPELINE_STAGES),
                 "progress": 100,
                 "layers": layers,
                 "downloads": downloads,
@@ -631,6 +1026,9 @@ def _run_pipeline(
                 output_dir=str(output_dir),
                 downloads=downloads,
                 progress=100,
+                stage_name="Complete",
+                stage_index=len(PIPELINE_STAGES),
+                stage_count=len(PIPELINE_STAGES),
             )
     except Exception as exc:
         task.update({"status": "failed", "error": str(exc), "updated_at": _now()})
@@ -662,8 +1060,16 @@ def health() -> Dict[str, Any]:
         "uptime_seconds": int((datetime.now(timezone.utc) - APP_STARTED_AT).total_seconds()),
         "qgis_process": qgis,
         "postgis": postgis.db_info(),
+        "osm": _osm_health(),
         "endpoints": [
             "POST /ftth/hld/run",
+            "POST /ftth/hld/resolve-area",
+            "GET /ftth/hld/area-fetch?area=...&bbox=lon_w,lon_e,lat_s,lat_n",
+            "POST /ftth/hld/run-from-area",
+            "POST /ftth/hld/input-layers",
+            "GET /ftth/hld/countries",
+            "GET /ftth/hld/places",
+            "GET /ftth/hld/osm-status",
             "GET /ftth/hld/results/{project_id}",
             "GET /ftth/hld/results/{project_id}/layers/{layer}",
             "GET /ftth/hld/download/{project_id}/{file_path}",
@@ -748,6 +1154,422 @@ async def run_hld(
     return _public_task(project_id)
 
 
+# ---------------------------------------------------------------------------
+# Area-driven runs: an area name instead of hand-prepared input files.
+#
+# The area path CONVERGES ON THE FILE PATH: _run_area_pipeline writes the same
+# two files a manual upload would, then calls _run_pipeline unchanged.  Nothing
+# downstream — ingest, layers, tiles, downloads, BOQ, permits, LLD — can tell
+# the difference, which is what keeps this from becoming a second pipeline.
+# ---------------------------------------------------------------------------
+
+
+# The two files an area run writes, and therefore the names the platform's
+# project row carries (it has no uploaded filename to fall back on).
+AREA_ROADS_FILENAME = "roads.geojson"
+
+
+def _osm_health() -> Dict[str, Any]:
+    """Light OSM-store block for /health.  A DB hiccup must not fail the probe."""
+    try:
+        status = osm_source.osm_status()
+    except Exception as exc:  # noqa: BLE001
+        return {"loaded": False, "error": str(exc)}
+    return {
+        "loaded": status.get("loaded"),
+        "tables": status.get("tables") or {},
+        "extract": status.get("extract"),
+    }
+
+
+def _area_error(exc: Exception) -> HTTPException:
+    """Map an osm_source failure onto an honest, distinguishable response.
+
+    "OpenStreetMap is unreachable" and "no such area" must never be
+    confusable: one is a retry, the other is a different area name.
+    """
+    message = str(exc)
+    if isinstance(exc, LookupError):
+        return HTTPException(
+            status_code=404,
+            detail=("No area matched that name. Try adding the city and country, "
+                    "e.g. 'Mariendorf, Berlin, Germany'."),
+        )
+    if isinstance(exc, osm_source.TooManyPremises):
+        # Quote the cap that actually applied.  The run's cap and a caller-set
+        # preview cap are different numbers, and the old text always printed the
+        # run's -- so a preview refused by its own cap told the planner to look
+        # for a setting that would not have helped.
+        return HTTPException(
+            status_code=422,
+            detail=osm_source.oversize_detail(exc.count, exc.cap, exc.hint),
+        )
+    if message.startswith("too_many_premises:"):
+        # A cap that reached us as text (a persisted failure, say).  The cap
+        # travels in the token when the engine raised it; older rows carry only
+        # the count, and for those the run's cap is the only one it can have been.
+        parts = message.split(":")
+        try:
+            count = int(parts[1])
+            cap = int(parts[2]) if len(parts) > 2 else osm_source.MAX_PREMISES
+        except (IndexError, ValueError):
+            count, cap = 0, osm_source.MAX_PREMISES
+        return HTTPException(
+            status_code=422,
+            detail=osm_source.oversize_detail(count, cap),
+        )
+    if message == "no_premises":
+        return HTTPException(
+            status_code=422,
+            detail=("No premises were found inside this boundary — the area may have "
+                    "resolved to a building-free area, or the boundary is wrong."),
+        )
+    if message == "no_roads":
+        return HTTPException(
+            status_code=422,
+            detail=("No roads were found inside this boundary, so there is nothing for "
+                    "the design to route along."),
+        )
+    if message == "postgis_unavailable":
+        return HTTPException(
+            status_code=503,
+            detail=("PostGIS is unavailable, so OSM data cannot be stored or read. "
+                    "Start the database and retry."),
+        )
+    # Anything else is reported with its CAUSE.  An opaque "could not reach the
+    # OSM services" standing in front of a database or geometry error is worse
+    # than no message: it sends the reader to check the network for an hour.
+    return HTTPException(
+        status_code=502,
+        detail=(f"Area lookup failed — {type(exc).__name__}: {exc}"),
+    )
+
+
+@app.get("/ftth/hld/osm-status")
+def get_osm_status() -> Dict[str, Any]:
+    """What the local OSM store holds.  An empty store is NOT an error.
+
+    The store fills itself on the first resolve-area call for an area, so an
+    empty store is simply "nothing fetched yet" — no setup step is required.
+    """
+    status = osm_source.osm_status()
+    if not status.get("postgis"):
+        status["hint"] = "PostGIS is unavailable; area runs cannot store or read OSM data."
+    elif not status.get("loaded"):
+        status["hint"] = ("Nothing fetched yet. The first resolve-area call for an "
+                          "area fetches its OSM data into this store automatically.")
+    return status
+
+
+def _area_request(payload: Dict[str, Any]) -> Tuple[str, str, str]:
+    """Structured area inputs -> (search label, country code, input type).
+
+    Accepts the structured fields (country / city / postcode / area_name) and a
+    pre-composed `area` label, so an existing client keeps working.  The country
+    is never inferred: a country on its own is not an area, and a postcode on its
+    own is searched as typed rather than assumed to be German.
+    """
+    payload = payload or {}
+    given = str(payload.get("area") or "").strip()
+    code = countries.normalize_country_code(
+        payload.get("country_code") or payload.get("country")
+    )
+    city = str(payload.get("city") or "").strip()
+    postcode = str(payload.get("postcode") or "").strip()
+    name = str(payload.get("area_name") or payload.get("street") or "").strip()
+
+    if given and not (city or postcode or name):
+        return given, code, osm_source.input_type_for(area=given)
+    if not (city or postcode or name):
+        raise HTTPException(
+            status_code=400,
+            detail="Give a postcode and/or a place, street or city name.",
+        )
+    label = osm_source.compose_area(
+        area_name=name, postcode=postcode, city=city, country_code=code
+    )
+    input_type = osm_source.input_type_for(area=label, area_name=name, postcode=postcode)
+    return label, code, input_type
+
+
+@app.get("/ftth/hld/countries")
+def get_countries() -> Dict[str, Any]:
+    """Country options for the area input's country dropdown.
+
+    A static ISO 3166-1 list: Nominatim has no "list all countries" endpoint,
+    and a dropdown should not depend on a network round trip.
+    """
+    return {"countries": osm_source.country_list()}
+
+
+@app.get("/ftth/hld/places")
+def get_places(q: str = "", country: str = "", limit: int = 8) -> Dict[str, Any]:
+    """City/town suggestions for the area input's city combobox.
+
+    Best-effort by design: an empty list is a normal answer ("nothing matched"),
+    and an unreachable Nominatim comes back as ``reason: unavailable`` rather
+    than a 5xx on a page the planner is still filling in.
+    """
+    try:
+        limit_int = max(1, min(int(limit or 8), 20))
+    except (TypeError, ValueError):
+        limit_int = 8
+    return osm_source.suggest_places(q, country_code=country, limit=limit_int)
+
+
+@app.post("/ftth/hld/resolve-area")
+def resolve_area_endpoint(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    """Resolve an area to its boundary, premises and household mix.
+
+    Read-only and pipeline-free: this is the preview a planner checks before a
+    design gets built on these numbers.
+    """
+    area, country_code, input_type = _area_request(payload)
+    # No default cap: the preview exists to report the size of any area, and a
+    # refusal here used to hide the sub-area breakdown that says where to
+    # narrow.  A caller may still impose a cap, and if it is exceeded the error
+    # names that cap rather than the run's.
+    raw_cap = (payload or {}).get("max_premises")
+    try:
+        max_premises = int(raw_cap) if str(raw_cap or "").strip() else None
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="'max_premises' must be an integer.") from exc
+    # boundary_only: Nominatim only, so the map can draw the boundary before
+    # paying for the OSM fetch that the counts need.
+    boundary_only = bool((payload or {}).get("boundary_only"))
+    try:
+        result = osm_source.preview_area(
+            area,
+            max_premises=max_premises,
+            boundary_only=boundary_only,
+            country_code=country_code,
+            input_type=input_type,
+            postcode=str((payload or {}).get("postcode") or ""),
+        )
+    except Exception as exc:  # noqa: BLE001 - mapped by _area_error
+        raise _area_error(exc) from exc
+    # The boundary call also STARTS the download, so the counts the page asks
+    # for next are already in progress.  Measured on a cold city the fetch is
+    # 10-16 min, and the page used to sit on a single blocking call for all of
+    # it -- which the gateway then cut, leaving a boundary and nothing else.
+    result["osm_fetch"] = osm_source.ensure_area_data_background(
+        area, result.get("bbox") or []
+    )
+    return result
+
+
+@app.get("/ftth/hld/area-fetch")
+def get_area_fetch(
+    area: str = "",
+    bbox: str = "",
+) -> Dict[str, Any]:
+    """Progress of the OSM download for an area (read-only, no DB writes).
+
+    The page polls this while it waits, so a ten-minute download says what it
+    is doing instead of looking like a hang.  ``bbox`` is ``lon_w,lon_e,lat_s,
+    lat_n`` as returned by resolve-area; without it the area name is resolved
+    first, which costs one Nominatim call.
+    """
+    box: Optional[List[float]] = None
+    if bbox.strip():
+        try:
+            box = [float(v) for v in bbox.split(",")][:4]
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="'bbox' must be four numbers.") from exc
+        if len(box) != 4:
+            raise HTTPException(status_code=400, detail="'bbox' must be four numbers.")
+    if box is None:
+        try:
+            resolution = osm_source.resolve_area(area)
+            box = list(resolution["bbox"])
+        except Exception as exc:  # noqa: BLE001 - mapped by _area_error
+            raise _area_error(exc) from exc
+    return osm_source.area_fetch_state(area, box)
+
+
+def _run_area_pipeline(
+    project_id: str,
+    area: str,
+    output_dir: Path,
+    poly_method: int = 3,
+    country_code: str = "",
+    input_type: str = "",
+    postcode: str = "",
+) -> None:
+    """Generate an area's input files, then run the UNCHANGED pipeline on them."""
+    task = _task(project_id)
+    task.update({
+        "status": "running",
+        "stage": "Resolve area",
+        "stage_index": 0,
+        "progress": 0,
+        "updated_at": _now(),
+    })
+    _append(project_id, "info", f"Resolving area: {area}")
+    # Marked running (with its stage) the moment it starts: until now the row
+    # said "queued" for the whole resolve, and a restart during it left no trace
+    # that this run had ever begun.
+    task["output_dir"] = str(output_dir)
+    if postgis.is_available():
+        postgis.upsert_project(
+            project_id,
+            status="running",
+            roads_filename=AREA_ROADS_FILENAME,
+            output_dir=str(output_dir),
+            stage_name="Resolve area",
+            stage_index=0,
+            stage_count=len(PIPELINE_STAGES),
+            progress=0,
+        )
+
+    try:
+        built = osm_source.build_inputs(
+            project_id, area, str(output_dir),
+            country_code=country_code, input_type=input_type, postcode=postcode,
+        )
+    except Exception as exc:  # noqa: BLE001 - reported to the caller
+        # A refused area is a decision about the design, not an internal error,
+        # so it is said in the same words the preview would use -- including the
+        # cap that applied and where to narrow.  `too_many_premises:257127:20000`
+        # is a token, and it was being shown to planners as it stood.
+        if isinstance(exc, osm_source.TooManyPremises):
+            detail = osm_source.oversize_detail(exc.count, exc.cap, exc.hint)
+        else:
+            detail = str(exc)
+        task.update({"status": "failed", "error": detail, "updated_at": _now()})
+        _append(project_id, "error", detail)
+        if postgis.is_available():
+            postgis.upsert_project(
+                project_id,
+                status="failed",
+                roads_filename=AREA_ROADS_FILENAME,
+                error=detail,
+                output_dir=str(output_dir),
+            )
+        return
+
+    households = built["households"]
+    extract = built.get("extract") or {}
+    _append(project_id, "info", f"Area resolved to {built.get('matched') or area}.")
+    _append(
+        project_id, "info",
+        f"OSM data: {extract.get('source') or 'local store'}"
+        f"{(' (' + str(extract.get('detail'))) + ')' if extract.get('detail') else ''}.",
+    )
+    _append(
+        project_id, "info",
+        f"Premises: {built['premises']}; households: {households['total']} "
+        f"({int(round(households.get('estimated_share', 0) * 100))}% estimated).",
+    )
+    if built.get("polygon_source") != "nominatim":
+        _append(
+            project_id, "warning",
+            "The area resolved to a bounding box, not a polygon — it is a rectangle and "
+            "may take in neighbouring areas.",
+        )
+    _append(
+        project_id, "info",
+        f"Roads: {built['roads_km']} km. Wrote inputs/Main_DataSet.xlsx and "
+        "inputs/roads.geojson.",
+    )
+
+    # Provenance: the run records what OSM it was built from, so a re-run is a
+    # decision rather than "whatever the services returned that day".
+    try:
+        provenance = output_dir / "inputs" / "area_resolution.json"
+        with provenance.open("w", encoding="utf-8") as f:
+            json.dump(built, f, indent=2, default=str)
+    except Exception:
+        pass
+
+    task["area"] = area
+    task["area_meta"] = {
+        "matched": built.get("matched"),
+        "polygon_source": built.get("polygon_source"),
+        "premises": built["premises"],
+        "households": households,
+        "roads_km": built["roads_km"],
+        "extract": extract,
+    }
+
+    _run_pipeline(
+        project_id,
+        Path(built["excel_path"]),
+        Path(built["roads_path"]),
+        output_dir,
+        poly_method,
+    )
+
+
+@app.post("/ftth/hld/run-from-area", status_code=202)
+async def run_from_area(
+    background_tasks: BackgroundTasks,
+    payload: Dict[str, Any] = Body(...),
+) -> Dict[str, Any]:
+    """Start a full HLD run from an area — no files to prepare."""
+    area, country_code, input_type = _area_request(payload)
+    postcode = str((payload or {}).get("postcode") or "")
+    project_id = str((payload or {}).get("project_id") or uuid.uuid4().hex)
+    name = (payload or {}).get("name")
+    try:
+        poly_method = int((payload or {}).get("poly_method") or 3)
+    except (TypeError, ValueError):
+        poly_method = 3
+
+    output_dir = OUTPUT_DIR / project_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    task = _task(project_id)
+    task.update({
+        "status": "queued",
+        "project_name": name or area,
+        "area": area,
+        "poly_method": poly_method,
+        "output_dir": str(output_dir),
+        "updated_at": _now(),
+    })
+    if postgis.is_available():
+        postgis.init_schema()
+        # roads_filename is NOT NULL in Django's ftth_projects table, and an
+        # area run has no uploaded file to name — so name the file this run is
+        # about to write, which is exactly what the column holds for a manual
+        # upload too.
+        postgis.upsert_project(
+            project_id,
+            status="queued",
+            roads_filename=AREA_ROADS_FILENAME,
+            output_dir=str(output_dir),
+        )
+
+    background_tasks.add_task(
+        _run_area_pipeline, project_id, area, output_dir, poly_method,
+        country_code, input_type, postcode,
+    )
+    return _public_task(project_id)
+
+
+@app.post("/ftth/hld/input-layers")
+def get_input_layer(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    """Return one complete generated OSM/HLD input layer before execution."""
+    layer = str((payload or {}).get("layer") or "").strip()
+    if not layer:
+        raise HTTPException(status_code=400, detail="'layer' is required.")
+    area, country_code, _input_type = _area_request(payload)
+    try:
+        resolution = osm_source.resolve_area(area, country_code=country_code)
+        osm_source.ensure_area_data(area, resolution["bbox"])
+        return osm_source.input_layer_geojson(
+            resolution["polygon"],
+            layer,
+            country=resolution.get("country") or "",
+            city=resolution.get("city") or "",
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise _area_error(exc) from exc
+
+
 @app.get("/ftth/hld/results/{project_id}")
 def get_results(project_id: str) -> Dict[str, Any]:
     if project_id not in tasks and postgis.is_available():
@@ -760,6 +1582,17 @@ def get_results(project_id: str) -> Dict[str, Any]:
                     "runner": project.get("runner"),
                     "roads_filename": project.get("roads_filename"),
                     "error": project.get("error"),
+                    "output_dir": project.get("output_dir") or str(OUTPUT_DIR / project_id),
+                    # Rebuilt from a row, NOT started by this process: no thread
+                    # here is running it, so a "running" status is an orphan
+                    # left by the last engine restart.
+                    "_from_db_row": True,
+                    # The stage the row recorded, when it has one: without it a
+                    # restored run reports stage=None and the page shows a
+                    # progress bar with nothing to label it.
+                    "stage": project.get("stage_name") or None,
+                    "stage_index": int(project.get("stage_index") or 0),
+                    "progress": int(project.get("progress") or 0),
                     "downloads": project.get("downloads") or [],
                     "layers": postgis.list_project_layers(project_id),
                 }
@@ -783,6 +1616,12 @@ def get_results(project_id: str) -> Dict[str, Any]:
     if project_id not in tasks:
         raise HTTPException(status_code=404, detail="Project not found")
     task = tasks[project_id]
+    # A run this process does not own (the row says running, but no thread here
+    # is running it -- the engine restarted mid-run) is settled from the files
+    # it left behind, so the page shows a stage that is real and a status that
+    # is terminal instead of "running" forever.
+    if task.get("status") in ("running", "queued") and not _owned_in_process(project_id):
+        _recover_orphan_run(project_id, task)
     # Downloads may be empty in the DB row (older runs) even though the
     # design package files exist on disk — surface them and persist back.
     if not (task.get("downloads") or []):
@@ -943,6 +1782,12 @@ def projects(limit: int = 50) -> List[Dict[str, Any]]:
         # results page reports the real stage.
         for row in rows:
             live = tasks.get(row.get("project_id"))
+            if not live and row.get("status") in ("running", "queued"):
+                # A row left "running" by an engine restart. Settle it from the
+                # files on disk before the list is rendered, so the projects /
+                # outputs page does not show a run that stopped hours ago as
+                # if it were still going.
+                live = _recover_orphan_from_row(row)
             if not live:
                 # No live task (engine restart) — the stored row is the truth,
                 # but rows written before the progress column was persisted
@@ -950,6 +1795,9 @@ def projects(limit: int = 50) -> List[Dict[str, Any]]:
                 # "completed · 0 %". Derive it from the terminal status.
                 if row.get("status") == "completed" and not row.get("progress"):
                     row["progress"] = 100
+                # Same key the live overlay uses, so a caller does not have to
+                # know whether the stage came from the row or from this process.
+                row["stage"] = row.get("stage_name") or None
                 continue
             # A live in-memory task is always the more recent truth — it also
             # covers the window where the pipeline has finished but its final

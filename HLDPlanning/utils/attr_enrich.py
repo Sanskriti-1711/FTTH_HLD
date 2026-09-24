@@ -23,6 +23,7 @@ segfaults.  Every function here therefore:
 import json
 import math
 import os
+from collections import deque
 
 try:
     from osgeo import ogr
@@ -985,6 +986,226 @@ def _coords_len(coords):
                for i in range(len(coords) - 1))
 
 
+# ── Trench measure: projecting a duct end onto the trench it rides ───────────
+#
+# A duct may only ever be drawn ON the trench (rule D10), so closing an open
+# chamber joint means the duct END has to travel *along its own trench* to the
+# structure instead of jumping across the footway to it. These are the bits of
+# that: measure a point along a polyline, and cut the piece between two
+# measures. Plain coordinate maths on purpose — this pass runs in the publish
+# stage, which has OGR but no QGIS.
+
+def _load_line_coords(path):
+    """Every line of a GPKG as its own coordinate list."""
+    ds, lyr = _open_lyr(path)
+    if lyr is None:
+        return []
+    out = []
+    for f in lyr:
+        for part in _geom_parts(f.GetGeometryRef()):
+            if len(part) >= 2:
+                out.append([(float(p[0]), float(p[1])) for p in part])
+    ds = None
+    return out
+
+
+def _measure_along(coords, x, y):
+    """(distance_to_the_line, measure_along_it, foot_x, foot_y).
+
+    Measure 0 is the first vertex, so a substring can be taken between two
+    measures without rebuilding the geometry.
+    """
+    best = None
+    run = 0.0
+    for i in range(len(coords) - 1):
+        ax, ay = coords[i]
+        bx, by = coords[i + 1]
+        dx, dy = bx - ax, by - ay
+        seg = math.hypot(dx, dy)
+        if seg <= 1e-12:
+            continue
+        t = ((x - ax) * dx + (y - ay) * dy) / (seg * seg)
+        t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+        fx, fy = ax + t * dx, ay + t * dy
+        d = math.hypot(x - fx, y - fy)
+        if best is None or d < best[0]:
+            best = (d, run + t * seg, fx, fy)
+        run += seg
+    return best
+
+
+def _substring_coords(coords, m0, m1):
+    """The piece of ``coords`` between two measures, from ``m0`` to ``m1``."""
+    if m1 < m0:
+        return []
+    out = []
+    run = 0.0
+    for i in range(len(coords) - 1):
+        ax, ay = coords[i]
+        bx, by = coords[i + 1]
+        seg = math.hypot(bx - ax, by - ay)
+        if seg <= 1e-12:
+            continue
+        s0, s1 = run, run + seg
+        run = s1
+        if s1 < m0 or s0 > m1:
+            continue
+        lo = max(m0, s0)
+        hi = min(m1, s1)
+        if hi - lo <= 1e-9:
+            continue
+        for m in (lo, hi):
+            t = (m - s0) / seg
+            px, py = ax + t * (bx - ax), ay + t * (by - ay)
+            if not out or math.hypot(px - out[-1][0], py - out[-1][1]) > 1e-9:
+                out.append((px, py))
+    return out
+
+
+def _dist_to_coords(coords, x, y):
+    """Distance from (x, y) to a polyline, or None when it is degenerate."""
+    m = _measure_along(coords, x, y)
+    return None if m is None else m[0]
+
+
+def _link_along_trench(trench_parts, ax, ay, bx, by, tol_m=1.0):
+    """The shortest piece of ONE trench part carrying both (ax, ay) and (bx, by).
+
+    Returns a coordinate list, or None when no single trench feature comes
+    within ``tol_m`` of both ends — the caller then decides whether a straight
+    connector is acceptable (and says so).
+    """
+    best = None
+    for cs in trench_parts:
+        ma = _measure_along(cs, ax, ay)
+        mb = _measure_along(cs, bx, by)
+        if ma is None or mb is None:
+            continue
+        if ma[0] > tol_m or mb[0] > tol_m:
+            continue
+        lo, hi = (ma[1], mb[1]) if ma[1] <= mb[1] else (mb[1], ma[1])
+        piece = _substring_coords(cs, lo, hi)
+        if len(piece) < 2:
+            continue
+        if best is None or _coords_len(piece) < _coords_len(best):
+            best = piece
+    return best
+
+
+def _trench_network_path(trench_parts, ax, ay, bx, by, tol_m=1.0, cap_m=None):
+    """The run of trench PIECES carrying (ax, ay) to (bx, by), or None.
+
+    Trench is published span by span and cut at every chamber, so the route
+    between two points on it is normally a CHAIN of features — and
+    :func:`_link_along_trench` only ever finds the single-feature case. When it
+    fails, the caller used to fall back to a straight chord, and a chord between
+    two points of the same street is drawn down the middle of that street: that
+    is the duct-on-a-carriageway the operator objected to. This assembles the
+    link the way the duct has to run anyway — along the trench, piece by piece,
+    through the chambers it passes — and returns None only when the two points
+    are on trench that genuinely does not join up (a chord is then the honest
+    answer, and the caller counts it). ``cap_m`` refuses a path longer than that,
+    so a broken region link cannot become a cross-town detour.
+    """
+    parts = [cs for cs in trench_parts if len(cs) >= 2]
+    if not parts:
+        return None
+
+    def node_of(x, y):
+        return (int(round(x / tol_m)), int(round(y / tol_m)))
+
+    coords_of = {}
+    adj = {}
+    for ei, cs in enumerate(parts):
+        ka, kb = node_of(*cs[0]), node_of(*cs[-1])
+        coords_of[ka] = (cs[0][0], cs[0][1])
+        coords_of[kb] = (cs[-1][0], cs[-1][1])
+        adj.setdefault(ka, []).append(ei)
+        adj.setdefault(kb, []).append(ei)
+
+    def nearest_node(x, y):
+        best_key, best_d = None, None
+        for k, (px, py) in coords_of.items():
+            d = math.hypot(px - x, py - y)
+            if best_d is None or d < best_d:
+                best_key, best_d = k, d
+        return best_key, best_d
+
+    na, da = nearest_node(ax, ay)
+    nb, db = nearest_node(bx, by)
+    if na is None or nb is None or da > tol_m or db > tol_m:
+        return None
+    if na == nb:
+        return None          # one feature carries both: _link_along_trench did it
+
+    # Few hops (a link crosses a chamber or two), so plain BFS is enough — and
+    # adjacency is in feature order, so the chain is deterministic.
+    prev = {na: None}
+    q = deque([na])
+    while q:
+        k = q.popleft()
+        if k == nb:
+            break
+        for ei in adj.get(k, ()):
+            cs = parts[ei]
+            other = node_of(*cs[-1]) if node_of(*cs[0]) == k else node_of(*cs[0])
+            if other not in prev:
+                prev[other] = (k, ei)
+                q.append(other)
+    if nb not in prev:
+        return None
+
+    chain = []
+    k = nb
+    while prev[k] is not None:
+        pk, ei = prev[k]
+        chain.append((pk, ei))
+        k = pk
+    chain.reverse()
+
+    out = []
+    for k0, ei in chain:
+        cs = parts[ei]
+        if node_of(*cs[0]) != k0:
+            cs = list(reversed(cs))
+        if out and math.hypot(out[-1][0] - cs[0][0],
+                              out[-1][1] - cs[0][1]) <= tol_m:
+            out.extend(cs[1:])
+        else:
+            out.extend(cs)
+    if len(out) < 2:
+        return None
+    if cap_m is not None and _coords_len(out) > cap_m:
+        return None
+    # the link must START at the duct foot and END on the region's own point
+    if math.hypot(out[0][0] - ax, out[0][1] - ay) > 1e-9:
+        out = [(ax, ay)] + out
+    if math.hypot(out[-1][0] - bx, out[-1][1] - by) > 1e-9:
+        out = out + [(bx, by)]
+    return out
+
+
+def _point_geom(x, y):
+    pt = ogr.Geometry(ogr.wkbPoint)
+    pt.AddPoint_2D(x, y)
+    return pt
+
+
+def _line_from_coords(coords):
+    ls = ogr.Geometry(ogr.wkbLineString)
+    for x, y in coords:
+        ls.AddPoint_2D(x, y)
+    return ls
+
+
+def _ml_from_parts(parts):
+    ml = ogr.Geometry(ogr.wkbMultiLineString)
+    for coords in parts:
+        if len(coords) >= 2:
+            ml.AddGeometry(_line_from_coords(coords))
+    return ml
+
+
 def _chamber_at(pts, x, y, tol_m=6.0):
     """Nearest chamber id within ``tol_m`` of (x, y), else ''."""
     best, best_d = "", tol_m
@@ -997,7 +1218,9 @@ def _chamber_at(pts, x, y, tol_m=6.0):
 
 def _segment_layer_at_chambers(path, chambers, feedback=None, label="layer",
                                snap_tol_m=5.0, span_len_fields=(),
-                               snap_ends_m=0.0, end_tol_m=6.0):
+                               snap_ends_m=0.0, end_tol_m=6.0,
+                               trench_path=None, join_tol_m=1.5,
+                               extend_max_m=25.0):
     """Break every line feature of ``path`` at its chamber anchors.
 
     Publishes ONE FEATURE PER CHAMBER-TO-CHAMBER SPAN: each feature starts at a
@@ -1065,6 +1288,168 @@ def _segment_layer_at_chambers(path, chambers, feedback=None, label="layer",
     # structure it claims to terminate at.
     chamber_xy = {cid: (cx, cy) for cx, cy, cid in chambers if cid}
 
+    # The trench each duct rides. Used to EXTEND an end to its chamber along the
+    # trench — never to move it across the footway to the chamber.
+    trench_parts = _load_line_coords(trench_path) if trench_path else []
+    ext_stats = {"extended": 0, "closed": 0, "no_trench": 0,
+                 "too_far": 0, "behind": 0, "no_piece": 0,
+                 "behind_open": 0}
+
+    def _nearest_trench(x, y):
+        best = None
+        for cs in trench_parts:
+            m = _measure_along(cs, x, y)
+            if m is None:
+                continue
+            if best is None or m[0] < best[0]:
+                best = (m[0], cs, m[1], m[2], m[3])
+        return best
+
+    # Every published span piece, snapshotted BEFORE the loop rewrites any of
+    # them: the backward-walk test below asks whether the piece between an end
+    # and a chamber that sits behind it is already laid duct, and that question
+    # can only be answered against the geometry as published.
+    published_parts = []        # [(source fid, coords)]
+    published_ends = []         # [(source fid, (x, y))] — every part endpoint
+    for _f in lyr:
+        _g = _f.GetGeometryRef()
+        if _g is not None:
+            for _cs in _line_parts(_g):
+                if len(_cs) < 2:
+                    continue
+                published_parts.append((_f.GetFID(), _cs))
+                published_ends.append((_f.GetFID(), _cs[0]))
+                published_ends.append((_f.GetFID(), _cs[-1]))
+    lyr.ResetReading()
+
+    def _reached_by_other(target, skip_fid=None):
+        """Does ANOTHER duct already run to this chamber?
+
+        That is the only thing a backward walk can duplicate: if some other
+        row's geometry ends at the structure, the piece from here to it is
+        already laid (an adjacent duct runs chamber -> this junction), so
+        walking backwards would lay a second duct over the first.
+
+        The test is deliberately about REACHING the chamber, not about the
+        corridor being covered. The layer being segmented holds one row per
+        RUN, and a run's own geometry covers the corridor between a span end
+        and its chamber by construction — counting that as "already laid" is
+        what left 20 distribution chamber joints published OPEN on the
+        2026-09-21 run, p50 7.0 m / max 13.7 m, with the chamber named at both
+        ends and every one inside the extension cap. Neither side reached the
+        chamber; each side merely saw the other's corridor.
+        """
+        if not published_ends:
+            return False
+        for fid, (x, y) in published_ends:
+            if skip_fid is not None and fid == skip_fid:
+                continue
+            if math.hypot(x - target[0], y - target[1]) <= join_tol_m:
+                return True
+        return False
+
+    def _extend_ends(feat, start_id, end_id, skip_fid=None):
+        """Walk a labelled end ALONG its trench to the chamber it names.
+
+        The removed end-snap assigned the chamber's coordinate to the duct,
+        which teleported a coarse span off the trench (feeder duct drifted to
+        19.9 % off-network). This does the opposite: it keeps every new vertex
+        on the trench the span already rides, and takes the piece of that
+        trench between the end and the structure.
+
+        Both ends are demonstrably on the network — the chambers sit within
+        0.00 m of it and the published ducts measure 0.00 m off it — so the
+        joint closes **on trench geometry**. A span whose end is not actually
+        on a trench, or whose chamber is further along it than
+        ``extend_max_m``, is left alone and counted.
+
+        The walk is FORWARD only, and that is the load-bearing rule. When the
+        chamber's measure on the end's own trench piece is *behind* the end,
+        the piece between the two is duct the network **already has** —
+        measured on the 2026-09-21 Berlin run: of 24 such feeder ends and 22
+        distribution ends, 100 % of the candidate patch lay on published duct
+        (an adjacent span runs chamber -> this junction already). Extending
+        them would lay a second duct over the first, and the metres are billed
+        per span. Those are counted as ``behind``, not as failures: the joint
+        is closed, by the span that reaches the chamber.
+        """
+        if not trench_parts or not (start_id or end_id):
+            return
+        g = feat.GetGeometryRef()
+        parts = _line_parts(g) if g is not None else []
+        if len(parts) != 1 or len(parts[0]) < 2:
+            return                      # a branched remainder keeps its shape
+        pts = [(float(p[0]), float(p[1])) for p in parts[0]]
+        changed = False
+        for idx, cid in ((0, start_id), (-1, end_id)):
+            target = chamber_xy.get(cid) if cid else None
+            if not target:
+                continue
+            ex, ey = pts[idx]
+            if math.hypot(target[0] - ex, target[1] - ey) <= join_tol_m:
+                ext_stats["closed"] += 1
+                continue                # already at the structure
+            near = _nearest_trench(ex, ey)
+            if near is None:
+                ext_stats["no_trench"] += 1
+                continue
+            dist, cs, m_end, _fx, _fy = near
+            if dist > 1.0:
+                # An end more than a metre off its trench is not something to
+                # extend from — closing it would draw a chord off the network.
+                ext_stats["no_trench"] += 1
+                continue
+            m_chamber = _measure_along(cs, target[0], target[1])
+            if m_chamber is None or abs(m_chamber[1] - m_end) <= 0.01:
+                ext_stats["closed"] += 1
+                continue
+            if m_chamber[1] < m_end:
+                # The chamber sits BEHIND the end on this very trench piece.
+                # That was taken to mean "the piece between them is duct that is
+                # already laid" (an adjacent span runs chamber -> here) and
+                # refused outright. The assumption was measured once — 100 % of
+                # 24 feeder and 22 distribution candidate patches lay on
+                # published duct — but the same run published 22 distribution
+                # chamber joints still OPEN (p50 9.3 m, max 21.1 m, every one
+                # inside this cap and with the chamber named at BOTH ends), so
+                # the assumption is not safe on its own. It is now CHECKED: walk
+                # backwards only when the piece is genuinely not covered by a
+                # published span; otherwise keep refusing, exactly as before.
+                back = _substring_coords(cs, m_chamber[1], m_end)
+                if not back or len(back) < 2:
+                    ext_stats["no_piece"] += 1
+                    continue
+                if _coords_len(back) > extend_max_m:
+                    ext_stats["too_far"] += 1
+                    continue
+                if _reached_by_other(target, skip_fid):
+                    ext_stats["behind"] += 1
+                    continue
+                piece = back[::-1]        # end -> chamber, as in the forward case
+                ext_stats["behind_open"] += 1
+            else:
+                piece = _substring_coords(cs, m_end, m_chamber[1])
+                if len(piece) < 2:
+                    ext_stats["no_piece"] += 1
+                    continue
+                if _coords_len(piece) > extend_max_m:
+                    ext_stats["too_far"] += 1
+                    continue
+            if idx == 0:
+                add = piece[::-1]       # chamber -> the old start
+                if math.hypot(add[0][0] - pts[0][0], add[0][1] - pts[0][1]) < 1e-9:
+                    add = add[1:]
+                pts = list(add) + pts
+            else:
+                add = piece            # the old end -> chamber
+                if math.hypot(add[0][0] - pts[-1][0], add[0][1] - pts[-1][1]) < 1e-9:
+                    add = add[1:]
+                pts = pts + list(add)
+            changed = True
+            ext_stats["extended"] += 1
+        if changed:
+            feat.SetGeometry(_mk_line(pts))
+
     def _snap_ends(feat, start_id, end_id):
         """Pull a span's end vertices onto the chambers it is labelled with.
 
@@ -1110,10 +1495,11 @@ def _segment_layer_at_chambers(path, chambers, feedback=None, label="layer",
             e = ""
         return s, e
 
-    def _stamp(feat, start_id, end_id, index, count, run_id):
+    def _stamp(feat, start_id, end_id, index, count, run_id, skip_fid=None):
         feat.SetField(i_kind, SPAN_KIND_CHAMBER)
-        # Snap before measuring: a span's length must be the length of the
-        # component it publishes, not of the pre-snap geometry.
+        # Close the joints BEFORE measuring: a span's length must be the length
+        # of the component it publishes, not of the open pre-extension one.
+        _extend_ends(feat, start_id, end_id, skip_fid)
         _snap_ends(feat, start_id, end_id)
         length = round(_geom_len_m(feat), 1)
         feat.SetField(i_start, start_id or "")
@@ -1139,6 +1525,7 @@ def _segment_layer_at_chambers(path, chambers, feedback=None, label="layer",
             continue
         runs += 1
         run_id = "RUN-%05d" % f.GetFID()
+        own_fid = f.GetFID()   # the run this feature's spans are cut from
         spans = []    # chamber-bounded pieces (the selective sequences)
         whole = []    # pieces no chamber touches — one uncut run
         for part in parts:
@@ -1164,7 +1551,7 @@ def _segment_layer_at_chambers(path, chambers, feedback=None, label="layer",
                 # states which kind it is.
                 first, last = whole[0][0], whole[-1][-1]
                 _s_id, _e_id = _ends_of(first, last)
-                _stamp(feat, _s_id, _e_id, 1, 1, run_id)
+                _stamp(feat, _s_id, _e_id, 1, 1, run_id, own_fid)
                 # A run whose BOTH ends resolve to a chamber is chamber-bounded
                 # even when no chamber projects onto its middle — the label has
                 # to say so. Forcing UNCHAMBERED here published 432 m and 565 m
@@ -1190,14 +1577,14 @@ def _segment_layer_at_chambers(path, chambers, feedback=None, label="layer",
                     # reuse the source feature for the first span (keeps the
                     # original attribute row + fid)
                     feat.SetGeometry(_mk_line(coords))
-                    _stamp(feat, start_id, end_id, pos + 1, count, run_id)
+                    _stamp(feat, start_id, end_id, pos + 1, count, run_id, own_fid)
                     lyr.SetFeature(feat)
                 else:
                     clone = ogr.Feature(defn)
                     for i in range(defn.GetFieldCount()):
                         clone.SetField(i, feat.GetField(i))
                     clone.SetGeometry(_mk_line(coords))
-                    _stamp(clone, start_id, end_id, pos + 1, count, run_id)
+                    _stamp(clone, start_id, end_id, pos + 1, count, run_id, own_fid)
                     lyr.CreateFeature(clone)
                 published += 1
             if whole:
@@ -1213,7 +1600,7 @@ def _segment_layer_at_chambers(path, chambers, feedback=None, label="layer",
                 remainder.SetGeometry(ml)
                 first, last = whole[0][0], whole[-1][-1]
                 _s_id, _e_id = _ends_of(first, last)
-                _stamp(remainder, _s_id, _e_id, 1, 1, run_id)
+                _stamp(remainder, _s_id, _e_id, 1, 1, run_id, own_fid)
                 if not (_s_id and _e_id):
                     remainder.SetField(i_kind, SPAN_KIND_UNCHAMBERED)
                     unchambered += 1
@@ -1230,6 +1617,19 @@ def _segment_layer_at_chambers(path, chambers, feedback=None, label="layer",
             f"{published - unchambered} chamber-to-chamber span(s) + "
             f"{unchambered} unchambered run(s) ({cut_runs} run(s) cut at "
             f"{anchors} chamber anchor(s); tol {snap_tol_m:g} m).")
+        if trench_parts:
+            feedback.pushInfo(
+                "  [joints] {0}: {1} span end(s) already at their chamber, "
+                "{2} extended ALONG the trench to reach it ({8} of them "
+                "BACKWARD, because the piece behind the end was not duct "
+                "yet); left as they are: {3} end(s) not on a trench within "
+                "1 m, {4} beyond the {5:g} m extension limit, {6} whose "
+                "chamber is behind the end AND another duct already runs "
+                "to it, {7} with no trench piece between the two."
+                .format(label, ext_stats["closed"], ext_stats["extended"],
+                        ext_stats["no_trench"], ext_stats["too_far"],
+                        extend_max_m, ext_stats["behind"],
+                        ext_stats["no_piece"], ext_stats["behind_open"]))
     return published
 
 
@@ -1246,7 +1646,8 @@ def segment_trenches_at_chambers(trench_path, chamber_path, feedback=None,
 
 
 def segment_ducts_at_chambers(feeder_path, dist_path, chamber_path,
-                              feedback=None, snap_tol_m=10.0):
+                              feedback=None, snap_tol_m=10.0,
+                              trench_path=None):
     """Break the feeder + distribution ducts at their chambers.
 
     Replaces the old chamber *splicing* (one long corridor carrying a
@@ -1275,11 +1676,405 @@ def segment_ducts_at_chambers(feeder_path, dist_path, chamber_path,
         return 0
     total = 0
     for path, label in ((feeder_path, "Feeder ducts"), (dist_path, "Distribution ducts")):
+        # ``snap_ends_m=0`` on purpose: a duct is laid IN the trench (rule D10),
+        # so its geometry must never leave the trench it rides. Pulling a span
+        # end onto the chamber it is labelled with copies the chamber's
+        # coordinate into the duct — the chamber is only ever *near* the duct
+        # (p50 0.8 m, p90 5.6 m off its line), so the move is mostly lateral,
+        # and because a published span is a coarse 2-6 point polyline, moving
+        # one end by up to ``snap_tol_m`` swings the WHOLE span off the trench.
+        # Measured on the 2026-09-21 Berlin run: 57 % of published feeder span
+        # ends sat exactly (<=1 mm) on a chamber and the feeder layer drifted
+        # from 0.0 % to **19.9 %** of its length off the trench network
+        # (distribution 21.1 % -> 49.1 %). The chamber linkage is an ATTRIBUTE
+        # (START_CHAMBER / END_CHAMBER, resolved at ``end_tol_m``); it was never
+        # meant to deform the duct. Leave the geometry alone.
         total += _segment_layer_at_chambers(
             path, chambers, feedback, label, snap_tol_m,
-            span_len_fields=("BUNDLE_LEN_M",), snap_ends_m=snap_tol_m,
-            end_tol_m=snap_tol_m)
+            span_len_fields=("BUNDLE_LEN_M",), snap_ends_m=0.0,
+            end_tol_m=snap_tol_m, trench_path=trench_path)
     return total
+
+
+# ── Region confinement: the distribution stays in its own polygon ──────────
+#
+# Rule D5: "for the distribution ducts they will connect from the pdps to the
+# pseudo obj points in that particular polygon/having same polygon_id". Measured
+# on the 2026-09-21 Berlin run the published layer did not obey it: **2,654.8 m
+# of the distribution duct (40.5 %) lay outside the polygon its own row named** —
+# 699.2 m of that reaching ANOTHER region's pseudo point, 580.2 m a boundary
+# straddle, 1,375.4 m reaching no point of any region at all.
+#
+# The fix is safe because of one measurement (`tmp/dist_cross_serve.py`): every
+# off-region piece was classified by its endpoints, and **not one is a bridge**
+# (both ends back on the boundary, i.e. part of the route between two points of
+# the region) — all 108 of them are SPURS. So removing the off-region material
+# cannot sever a route inside the region, which is exactly what a clip does to a
+# bridge and the reason the rule could not be enforced by clipping before the
+# question was asked.
+
+DIST_REGION_TOL_M = 2.0        # how far past its own edge a duct may sit
+DIST_REGION_TAP_TOL_M = 0.5    # a pseudo point counts as reached at this distance
+DIST_REGION_LINK_MAX_M = 30.0  # longest link built to reach a region's own point
+
+
+def _load_polygon_geoms(path):
+    """{POLYGON_ID: ogr geometry} for the region polygons."""
+    ds, lyr = _open_lyr(path)
+    if lyr is None:
+        return {}
+    idx = lyr.GetLayerDefn().GetFieldIndex("POLYGON_ID")
+    out = {}
+    for f in lyr:
+        g = f.GetGeometryRef()
+        if g is None or g.IsEmpty() or idx < 0:
+            continue
+        pid = str(f.GetField(idx) or "").strip().upper()
+        if pid:
+            out[pid] = g.Clone()
+    ds = None
+    return out
+
+
+def _region_tap_points(path):
+    """[(polygon_id, x, y)] for the pseudo object points of every region."""
+    ds, lyr = _open_lyr(path)
+    out = []
+    if lyr is None:
+        return out
+    defn = lyr.GetLayerDefn()
+    i_poly = defn.GetFieldIndex("POLYGON_ID")
+    i_pdp = defn.GetFieldIndex("pdp_pol_id")
+    for f in lyr:
+        g = f.GetGeometryRef()
+        if g is None or g.IsEmpty():
+            continue
+        try:
+            pt = g.GetPoint(0)
+        except Exception:
+            continue
+        pid = ""
+        if i_poly >= 0:
+            pid = str(f.GetField(i_poly) or "").strip().upper()
+        if not pid and i_pdp >= 0:
+            pid = str(f.GetField(i_pdp) or "").strip().upper()
+        out.append((pid, pt[0], pt[1]))
+    ds = None
+    return out
+
+
+def confine_distribution_to_region(dist_path, poly_path, tap_path,
+                                   trench_path=None, feedback=None,
+                                   tol_m=DIST_REGION_TOL_M,
+                                   tap_tol_m=DIST_REGION_TAP_TOL_M,
+                                   more_paths=()):
+    """Keep every distribution duct inside its own polygon, and keep reaching
+    every pseudo object point of its own PDP.
+
+    Two halves, in this order per region:
+
+    1. **Confinement** — the duct is clipped to its own polygon buffered by
+       ``tol_m`` (the polygon edge is a cluster edge, not a street edge, so a
+       boundary straddle inside the tolerance is not a departure).
+    2. **Reach** — every pseudo object point tagged to the region must sit on a
+       duct of that region. A point the region's duct does not reach is joined by
+       the shortest piece of a single trench carrying both ends, or by a straight
+       connector when none does (counted, same convention as the duct stage's
+       taps), and the link is clipped to the region too.
+
+    A row whose whole length is outside its own polygon is deleted — it serves
+    nothing in its region — and every figure is reported, including the points
+    that stay unconnected and the REGIONS THAT GOT NO DUCT AT ALL (the loop can
+    only iterate regions that have a row, so without counting those separately
+    their points silently disappear from the reach figure).
+
+    ``more_paths`` are further layers over the SAME regions — the
+    ``Distribution_Ducts_Runs`` layer, whose geometry the chamber segmentation
+    reads. They get the identical clip and the identical links, so the runs and
+    the spans published from them cannot disagree.
+    """
+    polys = _load_polygon_geoms(poly_path)
+    if not polys:
+        if feedback:
+            feedback.pushInfo(
+                "  [region] No polygons with POLYGON_ID — distribution "
+                "confinement skipped.")
+        return 0
+    taps = _region_tap_points(tap_path) if tap_path else []
+    trench = _load_line_coords(trench_path) if trench_path else []
+    links = {}
+    wrote = 0
+    paths = [dist_path] + [q for q in more_paths if q and q != dist_path]
+    for idx, path in enumerate(paths):
+        wrote += _confine_one_layer(path, polys, taps, trench, links, feedback,
+                                    tol_m, tap_tol_m, report=(idx == 0))
+    if feedback and len(paths) > 1:
+        feedback.pushInfo(
+            "  [region] the same clip and the same reach link(s) were applied to "
+            "%s, so the runs agree with the spans cut from them."
+            % ", ".join(os.path.basename(q) for q in paths))
+    return wrote
+
+
+def _region_layer_rows(path):
+    """``(ds, lyr, rows)`` for one duct layer, or ``(None, None, [])``.
+
+    A row is ``[fid, feature, [POLYGON_ID, ...], [part, ...]]``. Grouping keys
+    off the FIRST id a row names: after this pass a row straddles at most one
+    boundary, and the clip goes to the group the row belongs to.
+    """
+    ds, lyr = _open_lyr(path)
+    if lyr is None:
+        return None, None, []
+    i_poly = lyr.GetLayerDefn().GetFieldIndex("POLYGON_ID")
+    if i_poly < 0:
+        ds = None
+        return None, None, []
+    rows = []
+    for f in lyr:
+        parts = _line_parts(f.GetGeometryRef())
+        if not parts:
+            continue
+        pids = [p.strip().upper() for p in
+                str(f.GetField(i_poly) or "").replace(";", ",").split(",")
+                if p.strip()]
+        rows.append([f.GetFID(), f, pids, parts])
+    return ds, lyr, rows
+
+
+def _tap_buckets(taps, polys, by_region):
+    """The pseudo points the per-region loop CANNOT see, by reason.
+
+    The loop iterates the regions that have a duct row, so a region whose
+    distribution was never built simply vanishes from the coverage figure —
+    the run then reports "reached 235/295 ... 0 left unconnected" while 60
+    points of the 8 ductless regions sit on nothing. These buckets are what
+    make the reach figure add up to the points that actually exist.
+    """
+    no_duct, unknown, untagged = {}, {}, 0
+    for p, _x, _y in taps:
+        if p in by_region:
+            continue                      # the per-region loop reports these
+        if not p:
+            untagged += 1
+        elif p in polys:
+            no_duct[p] = no_duct.get(p, 0) + 1
+        else:
+            unknown[p] = unknown.get(p, 0) + 1
+    return no_duct, unknown, untagged
+
+
+def _confine_one_layer(path, polys, taps, trench, links, feedback,
+                       tol_m, tap_tol_m, report):
+    """Clip one layer's rows to their own polygon, then join the region links.
+
+    ``links`` maps a region to the coordinate lists the REPORTING layer built
+    (``report=True``, the ducts layer). Every later layer re-uses exactly those
+    links rather than rebuilding its own, so the spans a layer publishes and the
+    runs the chamber stage reads off cannot drift apart.
+    """
+    ds, lyr, rows = _region_layer_rows(path)
+    if lyr is None:
+        if feedback:
+            feedback.pushInfo(
+                "  [region] %s carries no POLYGON_ID — confinement skipped."
+                % os.path.basename(path))
+        return 0
+
+    by_region = {}
+    for row in rows:
+        by_region.setdefault(row[2][0] if row[2] else "", []).append(row)
+
+    no_duct, unknown, untagged = (_tap_buckets(taps, polys, by_region)
+                                  if report else ({}, {}, 0))
+
+    off_len = 0.0
+    dropped = 0
+    already = extended = chords = 0
+    joined = 0          # links assembled across multiple trench spans
+    unreached = []
+    keep_parts = {}      # fid -> its clipped (+ link) coordinate lists
+    emptied = set()      # fid -> nothing of it is in its own region
+    no_region = 0        # fid -> no polygon known for the ids the row names
+    lyr.StartTransaction()
+    try:
+        for key, group in sorted(by_region.items()):
+            named = set()
+            for _fid, _f, pids, _parts in group:
+                named.update(pids)
+            env = None
+            for pid in named:
+                pg = polys.get(pid)
+                if pg is None:
+                    continue
+                env = pg.Buffer(tol_m) if env is None else env.Union(pg.Buffer(tol_m))
+            if env is None:
+                no_region += len(group)  # its region is not in Polygons — leave it
+                continue
+            mine = [(p, x, y) for (p, x, y) in taps if p == key]
+            # The region's OWN points may sit on (or just outside) its edge, so
+            # each one gets a bubble: the duct must be able to touch its own
+            # PDP's points without the clip cutting the contact off.
+            env_cov = env.Clone()
+            for _p, x, y in mine:
+                env_cov = env_cov.Union(
+                    _point_geom(x, y).Buffer(tap_tol_m))
+
+            parts_of = {}
+            for fid, f, _pids, _parts in group:
+                g = f.GetGeometryRef()
+                total = g.Length()
+                try:
+                    inter = g.Intersection(env_cov)
+                except Exception:
+                    inter = None
+                kept = _line_parts(inter) if inter is not None else []
+                off_len += max(0.0, total - sum(_coords_len(c) for c in kept))
+                if not kept:
+                    emptied.add(fid)
+                    dropped += 1
+                    continue
+                parts_of[fid] = kept
+
+            if report:
+                for _pid, x, y in mine:
+                    best = None            # (dist, fid, coords, foot)
+                    for fid, kept in parts_of.items():
+                        for coords in kept:
+                            m = _measure_along(coords, x, y)
+                            if m is None:
+                                continue
+                            if best is None or m[0] < best[0]:
+                                best = (m[0], fid, coords, (m[2], m[3]))
+                    if best is None:
+                        unreached.append((key, x, y, float("inf"),
+                                          "no duct of its own region"))
+                        continue
+                    dist, fid, _coords, foot = best
+                    if dist <= tap_tol_m:
+                        already += 1
+                        continue
+                    if dist > DIST_REGION_LINK_MAX_M:
+                        unreached.append(
+                            (key, x, y, dist,
+                             "beyond the %g m link limit"
+                             % DIST_REGION_LINK_MAX_M))
+                        continue
+                    link = (_link_along_trench(trench, foot[0], foot[1], x, y)
+                            if trench else None)
+                    if link is not None:
+                        extended += 1
+                    elif trench:
+                        # A distribution trunk is allowed to cross several
+                        # chamber-bounded trench features, but it must never
+                        # jump between them with a straight chord. Assemble
+                        # the connected trench chain first; the chamber stage
+                        # will split the resulting duct back into one component
+                        # per chamber pair.
+                        link = _trench_network_path(
+                            trench, foot[0], foot[1], x, y,
+                            cap_m=max(DIST_REGION_LINK_MAX_M * 20.0, 500.0))
+                        if link is not None:
+                            joined += 1
+                            extended += 1
+                    if link is None:
+                        # No connected trench path exists. Do not manufacture
+                        # an off-trench duct; leave the point explicitly
+                        # unresolved for the run report.
+                        unreached.append((key, x, y, dist,
+                                          "no connected trench path"))
+                        continue
+                    try:
+                        link_geom = _line_from_coords(link).Intersection(env_cov)
+                    except Exception:
+                        link_geom = None
+                    got = _line_parts(link_geom) if link_geom is not None else []
+                    if not got:
+                        unreached.append((key, x, y, dist,
+                                          "its link was clipped away"))
+                        continue
+                    parts_of[fid] = list(parts_of[fid]) + got
+                    links.setdefault(key, []).extend(got)
+            else:
+                # The reporting layer's links, re-applied verbatim: this layer
+                # must not end up carrying a route the ducts layer lacks.
+                host = next(iter(parts_of), None)
+                if host is not None:
+                    for coords in links.get(key, []):
+                        parts_of[host] = list(parts_of[host]) + [coords]
+
+            keep_parts.update(parts_of)
+
+        # ── write the clipped + extended geometry back ────────────────────
+        wrote = 0
+        for fid, f, _pids, _parts in rows:
+            if fid in emptied:
+                lyr.DeleteFeature(fid)     # nothing of it is in its own region
+                continue
+            if fid not in keep_parts:
+                continue                   # no polygon known — left untouched
+            f.SetGeometry(_ml_from_parts(keep_parts[fid]))
+            i_len = lyr.GetLayerDefn().GetFieldIndex("length_m")
+            if i_len >= 0:
+                f.SetField(i_len, round(sum(_coords_len(c)
+                                            for c in keep_parts[fid]), 2))
+            lyr.SetFeature(f)
+            wrote += 1
+        lyr.CommitTransaction()
+    except Exception:
+        lyr.RollbackTransaction()
+        raise
+    ds = None
+
+    if feedback and report:
+        strand_total = sum(no_duct.values())
+        unk_total = sum(unknown.values())
+        why = {}
+        for _p, _x, _y, _d, w in unreached:
+            why[w] = why.get(w, 0) + 1
+        extra = ""
+        if strand_total:
+            extra += ("; %d point(s) in %d region(s) with NO distribution duct "
+                      "of their own" % (strand_total, len(no_duct)))
+        if untagged:
+            extra += "; %d point(s) carry no region tag" % untagged
+        if unk_total:
+            extra += ("; %d point(s) are tagged to %d region(s) not in "
+                      "Polygons" % (unk_total, len(unknown)))
+        if no_region:
+            extra += ("; %d row(s) name a region that is not in Polygons and "
+                      "were left as they are" % no_region)
+        feedback.pushInfo(
+            "  [region] Distribution confined to its own polygon: "
+            "%.1f m off-region removed (every off-region piece is a spur, so "
+            "no route was severed), %d empty row(s) dropped of %d; pseudo "
+            "object points reached %d/%d (%d already on a region duct, %d "
+            "extended along the trench%s); %d left unconnected%s%s."
+            % (off_len, dropped, len(rows),
+               already + extended + joined + chords, len(taps),
+               already, extended,
+               ((", %d joined span by span along the trench" % joined)
+                if joined else "") +
+               ((", %d by a straight connector" % chords) if chords else ""),
+               len(unreached),
+               (" (%s)" % ", ".join("%d %s" % (n, w)
+                                    for w, n in sorted(why.items())))
+               if why else "",
+               extra))
+        for pid, x, y, d, w in unreached[:8]:
+            feedback.pushWarning(
+                "  [region] pseudo point (%.1f, %.1f) of %s is %.1f m from any "
+                "duct of its own region (%s) — left unconnected."
+                % (x, y, pid or "(no region tag)", d, w))
+        if no_duct:
+            feedback.pushWarning(
+                "  [region] %d pseudo point(s) in %d region(s) have no "
+                "distribution duct of their own (%s) — no duct of their region "
+                "exists to reach them, so they stay unconnected."
+                % (strand_total, len(no_duct),
+                   ", ".join(sorted(no_duct)[:8])
+                   + (", ..." if len(no_duct) > 8 else "")))
+    return wrote
 
 
 # ── Duct enrichment ──────────────────────────────────────────────────────────
@@ -1708,10 +2503,15 @@ def absorb_chamber_stubs(path, feedback=None,
         return 0
     _create_fields(lyr, [
         ("STUB_ABSORBED", ogr.OFTInteger),
-        # Not present on the distribution layer (the merge creates them on the
-        # feeder) — without these, SetField fails with "Invalid index : -1".
+        # These fields are not guaranteed on legacy or distribution outputs.
+        # The stub pass writes them when it relabels a non-span, so create them
+        # here rather than allowing an OGR Invalid index error to abort all
+        # subsequent NetworkManager propagation.
         ("capacity_used", ogr.OFTReal),
         ("capacity_spare", ogr.OFTReal),
+        ("REVIEW", ogr.OFTInteger),
+        ("SPAN_KIND", ogr.OFTString, 24),
+        ("END_CHAMBER", ogr.OFTString, 24),
     ])
     flag_only = str(mode).lower() == "flag"
     coincident_only = str(mode).lower() == "coincident"
@@ -2394,6 +3194,204 @@ def verify_duct_continuity(out_dir, feedback=None):
     return report
 
 
+# Which layers carry a region tag, and how to derive it. Points take the
+# polygon they fall in; lines take every polygon they actually run through,
+# ordered by how much of the line each one carries.
+_REGION_POINT_LAYERS = (
+    ("Chambers.gpkg", "POLYGON_ID", "chamber"),
+    ("Trench_Nodes.gpkg", "POLYGON_ID", "trench node"),
+)
+_REGION_LINE_LAYERS = (
+    ("Final_Trenches.gpkg", "POLYGON_ID", "trench span"),
+    ("Feeder_Trench.gpkg", "POLYGON_ID", "feeder trench span"),
+    ("Distribution_Trench.gpkg", "POLYGON_ID", "distribution trench span"),
+    ("Garden_Trench.gpkg", "POLYGON_ID", "garden trench span"),
+    ("Feeder_Ducts.gpkg", "POLYGON_ID", "feeder duct"),
+    ("Feeder_Ducts_Runs.gpkg", "POLYGON_ID", "feeder duct run"),
+    ("Distribution_Ducts.gpkg", "POLYGON_ID", "distribution duct"),
+    ("Distribution_Ducts_Runs.gpkg", "POLYGON_ID", "distribution duct run"),
+    ("Drop_Ducts.gpkg", "POLYGON_ID", "drop duct"),
+    ("Feeder_Cable.gpkg", "POLYGON_ID", "feeder cable"),
+    ("Distribution_Cable.gpkg", "POLYGON_ID", "distribution cable"),
+)
+
+# A line has to run at least this far inside a polygon to be tagged with it —
+# otherwise a span clipping a corner is reported as serving that region.
+_REGION_MIN_OVERLAP_M = 2.0
+# A point just outside the boundary still belongs to the region it is beside.
+_REGION_POINT_TOL_M = 25.0
+
+
+def _polygon_index(out_dir):
+    """[(POLYGON_ID, geometry)] from Polygons.gpkg (read-only)."""
+    path = os.path.join(out_dir, "Polygons.gpkg")
+    if not os.path.isfile(path) or not _HAS_OGR:
+        return []
+    ds = ogr.Open(path, 0)
+    if ds is None:
+        return []
+    lyr = ds.GetLayer(0)
+    defn = lyr.GetLayerDefn()
+    i_poly = defn.GetFieldIndex("POLYGON_ID")
+    out = []
+    for ft in lyr:
+        g = ft.GetGeometryRef()
+        if g is None or _is_empty(g):
+            continue
+        pid = str(ft.GetField(i_poly) or "").strip() if i_poly >= 0 else ""
+        if pid:
+            out.append((pid, g.Clone()))
+    ds = None
+    return out
+
+
+def stamp_region_identity(out_dir, feedback=None):
+    """Put POLYGON_ID (and the PDP link where one exists) on EVERY layer.
+
+    Region confinement, the chamber rules and the permit/BOM grouping all ask
+    the same question — *which region does this row belong to* — and on
+    `f0426f44…` (2026-09-21) most of the layers could not answer it: POLYGON_ID
+    was absent from all **92 chambers** and all **125 trench nodes**, blank on
+    **39 of 544** trench spans, and blank on **every** feeder duct (0/123),
+    feeder duct run (0/3) and feeder cable (0/9) row. Those are exactly the rows
+    a distribution duct gets grouped and clipped by, so the tag is a
+    prerequisite, not a nicety.
+
+    Purely additive: an existing value is never overwritten, no geometry moves,
+    and a row that cannot be attributed is left blank and counted, so the log
+    states the coverage rather than implying it. Returns the number of values
+    written.
+    """
+    if not out_dir or not os.path.isdir(out_dir) or not _HAS_OGR:
+        return 0
+    polys = _polygon_index(out_dir)
+    if not polys:
+        if feedback:
+            feedback.pushInfo(
+                "  [identity] No Polygons.gpkg — region tags cannot be stamped "
+                "(the layer is written by the polygon stage).")
+        return 0
+
+    written = 0
+    report = []
+
+    def _pt_geom(x, y):
+        g = ogr.Geometry(ogr.wkbPoint)
+        g.AddPoint_2D(x, y)
+        return g
+
+    for fname, field, label in _REGION_POINT_LAYERS + _REGION_LINE_LAYERS:
+        path = os.path.join(out_dir, fname)
+        if not os.path.isfile(path):
+            continue
+        ds, lyr = _open_lyr(path)
+        if lyr is None:
+            continue
+        _create_fields(lyr, [(field, ogr.OFTString, 255)])
+        defn = lyr.GetLayerDefn()
+        i_f = defn.GetFieldIndex(field)
+        if i_f < 0:
+            ds = None
+            continue
+        is_point = label in ("chamber", "trench node")
+        filled = blank = 0
+        for ft in lyr:
+            if str(ft.GetField(i_f) or "").strip():
+                continue                     # never overwrite what is known
+            g = ft.GetGeometryRef()
+            if g is None or _is_empty(g):
+                blank += 1
+                continue
+            try:
+                if is_point:
+                    cx, cy = g.GetX(), g.GetY()
+                    pg = _pt_geom(cx, cy)
+                    best, best_d = "", None
+                    for pid, poly in polys:
+                        if poly.Contains(pg):
+                            best, best_d = pid, -1.0
+                            break
+                        d = poly.Distance(pg)
+                        if d <= _REGION_POINT_TOL_M and (best_d is None or d < best_d):
+                            best, best_d = pid, d
+                    val = best
+                else:
+                    overlaps = []
+                    for pid, poly in polys:
+                        try:
+                            inter = poly.Intersection(g)
+                        except Exception:
+                            continue
+                        if inter is None or _is_empty(inter):
+                            continue
+                        L = inter.Length()
+                        if L >= _REGION_MIN_OVERLAP_M:
+                            overlaps.append((L, pid))
+                    overlaps.sort(reverse=True)
+                    val = ",".join(pid for _L, pid in overlaps)
+                if val:
+                    ft.SetField(i_f, val)
+                    lyr.SetFeature(ft)
+                    filled += 1
+                else:
+                    blank += 1
+            except Exception:
+                blank += 1
+        written += filled
+        report.append((label, filled, blank))
+        ds = None
+
+    # The PDP link, where a structure plainly sits on one.
+    pdp_path = os.path.join(out_dir, "PDPs.gpkg")
+    chamber_path = os.path.join(out_dir, "Chambers.gpkg")
+    pdp_written = 0
+    if os.path.isfile(pdp_path) and os.path.isfile(chamber_path):
+        pdps = []
+        dsp = ogr.Open(pdp_path, 0)
+        if dsp is not None:
+            lp = dsp.GetLayer(0)
+            idx = lp.GetLayerDefn().GetFieldIndex("PDP_ID")
+            for ft in lp:
+                g = ft.GetGeometryRef()
+                if g is not None and not _is_empty(g) and idx >= 0:
+                    pid = str(ft.GetField(idx) or "").strip()
+                    if pid:
+                        pdps.append((pid, g.Clone()))
+            dsp = None
+        ds, lyr = _open_lyr(chamber_path)
+        if lyr is not None:
+            _create_fields(lyr, [("PDP_ID", ogr.OFTString, 24)])
+            i_pdp = lyr.GetLayerDefn().GetFieldIndex("PDP_ID")
+            for ft in lyr:
+                if i_pdp < 0 or str(ft.GetField(i_pdp) or "").strip():
+                    continue
+                g = ft.GetGeometryRef()
+                if g is None or _is_empty(g):
+                    continue
+                pg = _pt_geom(g.GetX(), g.GetY())
+                hit = next((pid for pid, pgeom in pdps
+                            if pgeom.Distance(pg) <= 1.0), None)
+                if hit:
+                    ft.SetField(i_pdp, hit)
+                    lyr.SetFeature(ft)
+                    pdp_written += 1
+            ds = None
+    written += pdp_written
+
+    if feedback:
+        parts = ["%s %d/%d" % (lab, ok, ok + miss)
+                 for lab, ok, miss in report if ok or miss]
+        feedback.pushInfo(
+            "  [identity] POLYGON_ID written on: " + (", ".join(parts) or "-")
+            + ("; PDP_ID on %d chamber(s)" % pdp_written if pdp_written else ""))
+        missing = [lab for lab, _ok, miss in report if miss]
+        if missing:
+            feedback.pushInfo(
+                "  [identity] left blank (no polygon overlap / outside every "
+                "region): " + ", ".join(missing))
+    return written
+
+
 def enrich_all(out_dir, feedback=None, roads_lyr=None):
     """Enrich every pipeline GPKG inside out_dir (no-op when out_dir is empty).
 
@@ -2432,6 +3430,35 @@ def enrich_all(out_dir, feedback=None, roads_lyr=None):
         if feedback:
             feedback.pushInfo(f"  [segment] Trench segmentation skipped: {exc}")
 
+    # Stamp region identity before confinement. Legacy distribution rows can
+    # arrive without POLYGON_ID; deriving it from their final geometry first
+    # prevents the confinement pass from silently skipping the layer.
+    try:
+        stamp_region_identity(out_dir, feedback)
+    except Exception as exc:
+        if feedback:
+            feedback.pushInfo(f"  [identity] Pre-confinement stamp skipped: {exc}")
+
+    # ── The distribution stays in its own polygon (rule D5) ─────────────
+    # Runs BEFORE the chamber segmentation on purpose: the confinement and the
+    # tap links change the geometry, and the spans must be cut from the
+    # geometry that ships. Feeder ducts and drop ducts are not touched — the
+    # feeder backbone runs BETWEEN regions by design.
+    #
+    # ``Distribution_Ducts_Runs`` is confined in the SAME call: it is the layer
+    # the chamber segmentation groups runs from, so confining only the ducts
+    # left the two disagreeing by the off-region material (3.5 km of spans vs
+    # 6.4 km of runs on Berlin) and the runs still reported as off-polygon.
+    try:
+        confine_distribution_to_region(
+            p("Distribution_Ducts.gpkg"), p("Polygons.gpkg"),
+            p("Pseudo_HH.gpkg"), trench_path=p("Final_Trenches.gpkg"),
+            feedback=feedback,
+            more_paths=(p("Distribution_Ducts_Runs.gpkg"),))
+    except Exception as exc:
+        if feedback:
+            feedback.pushInfo(f"  [region] Distribution confinement skipped: {exc}")
+
     # Ducts are pulled chamber to chamber exactly like the trench: the
     # published feeder/distribution duct layers now carry ONE row per duct
     # (duct_layer publishes the bins, not a per-tier clubbed corridor), so
@@ -2442,7 +3469,8 @@ def enrich_all(out_dir, feedback=None, roads_lyr=None):
     try:
         segment_ducts_at_chambers(
             p("Feeder_Ducts.gpkg"), p("Distribution_Ducts.gpkg"),
-            p("Chambers.gpkg"), feedback)
+            p("Chambers.gpkg"), feedback,
+            trench_path=p("Final_Trenches.gpkg"))
     except Exception as exc:
         if feedback:
             feedback.pushInfo(f"  [segment] Duct segmentation skipped: {exc}")
@@ -2486,9 +3514,14 @@ def enrich_all(out_dir, feedback=None, roads_lyr=None):
         p("Feeder_Cable.gpkg"), p("Distribution_Cable.gpkg"),
         p("Objects.gpkg"), p("MFG.gpkg"), feedback,
     )
-    n += enrich_equipment(p("PDPs.gpkg"), p("MFG.gpkg"), feedback)
+    n += enrich_equipment(p("PDPs.gpkg"), p("MFG.gpkg"), feedback)    # ── Identity on every layer ──────────────────────────────────────────
+    # Region confinement and the chamber rules both group rows by POLYGON_ID,
+    # so it has to exist and be populated on the civil layers too. Run this
+    # after all geometry/duct/coupler edits so the final attributes describe
+    # the final published spans rather than an earlier pre-segmentation layer.
+    n += stamp_region_identity(out_dir, feedback)
     if feedback:
         feedback.pushInfo(
-            f"  [enrich] HLD_attr catalogue pass complete ({n} features updated)."
+            "  [enrich] Final NetworkManager identity propagation complete."
         )
     return True

@@ -370,6 +370,9 @@ def upsert_project(
     output_dir: Optional[str] = None,
     downloads: Optional[List[Dict[str, Any]]] = None,
     progress: Optional[int] = None,
+    stage_name: Optional[str] = None,
+    stage_index: Optional[int] = None,
+    stage_count: Optional[int] = None,
 ) -> None:
     """Insert/update a project row (shared with Django's ftth_projects).
 
@@ -377,6 +380,11 @@ def upsert_project(
     dashboard read this column (the engine's live in-memory progress only
     exists while it is serving the run), so a finished run must not sit at the
     column default of 0 %.
+
+    ``stage_name`` / ``stage_index`` / ``stage_count`` are the same idea for the
+    stage: the engine tracks it in memory while a run streams its output, and
+    the row is what survives a restart and what the project list shows.  They go
+    in a second statement, so a status-only upsert leaves the recorded stage be.
     """
     conn = get_conn()
     with conn.cursor() as cur:
@@ -421,6 +429,20 @@ def upsert_project(
                 progress,
             ),
         )
+        if stage_name is not None or stage_index is not None or stage_count is not None:
+            cur.execute(
+                sql.SQL(
+                    """
+                    UPDATE {projects}
+                    SET stage_name = COALESCE(%s, stage_name),
+                        stage_index = COALESCE(%s, stage_index),
+                        stage_count = COALESCE(%s, stage_count),
+                        updated_at = now()
+                    WHERE project_id = %s
+                    """
+                ).format(projects=_biz_ident("ftth_projects")),
+                (stage_name, stage_index, stage_count, project_id),
+            )
 
 
 def update_project_downloads(

@@ -685,6 +685,88 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             return "{0}|layername={1}".format(gpkg_path, LAYERNAMES.OBJECT)
         return None
 
+    def _split_lines_at_chambers(self, lines, chambers, context, feedback, label):
+        """Split a line layer at the authoritative chamber positions.
+
+        This is deliberately implemented with ``lineSubstring`` rather than a
+        provider algorithm: QGIS installations differ on the availability and
+        parameter names of the native point splitter. Source attributes are
+        copied to every chamber-to-chamber span.
+        """
+        source = self._fast_resolve(lines, context)
+        points = self._fast_resolve(chambers, context)
+        if source is None or points is None or points.featureCount() == 0:
+            return lines
+        if source.featureCount() == 0:
+            return lines
+
+        chamber_pts = []
+        for pf in points.getFeatures():
+            pg = pf.geometry()
+            if pg is None or pg.isEmpty():
+                continue
+            try:
+                p = pg.asPoint()
+                chamber_pts.append(QgsPointXY(p))
+            except Exception:
+                continue
+        if not chamber_pts:
+            return lines
+
+        out = QgsVectorLayer(
+            "LineString?crs=%s" % source.crs().authid(),
+            "%s_chamber_spans" % label, "memory")
+        out.dataProvider().addAttributes(list(source.fields()))
+        out.updateFields()
+        written = 0
+        for sf in source.getFeatures():
+            sg = sf.geometry()
+            if sg is None or sg.isEmpty():
+                continue
+            parts = []
+            try:
+                parts = sg.asMultiPolyline() if sg.isMultipart() else [sg.asPolyline()]
+            except Exception:
+                parts = []
+            for coords in parts:
+                if len(coords) < 2:
+                    continue
+                line = QgsGeometry.fromPolylineXY([QgsPointXY(p) for p in coords])
+                cuts = []
+                for cp in chamber_pts:
+                    try:
+                        if line.distance(QgsGeometry.fromPointXY(cp)) <= 0.75:
+                            m = float(line.lineLocatePoint(
+                                QgsGeometry.fromPointXY(cp)))
+                            if 0.01 < m < line.length() - 0.01:
+                                cuts.append(m)
+                    except Exception:
+                        continue
+                cuts = sorted(set(round(m, 6) for m in cuts))
+                bounds = [0.0] + cuts + [float(line.length())]
+                for a, b in zip(bounds, bounds[1:]):
+                    if b - a <= 0.02:
+                        continue
+                    try:
+                        span = line.lineSubstring(a, b)
+                    except Exception:
+                        span = None
+                    if span is None or span.isEmpty() or span.length() <= 0.02:
+                        continue
+                    nf = QgsFeature(out.fields())
+                    nf.setGeometry(span)
+                    nf.setAttributes(sf.attributes())
+                    out.dataProvider().addFeature(nf)
+                    written += 1
+        out.updateExtents()
+        if written == 0:
+            return lines
+        feedback.pushInfo(
+            self.tr("Chamber span split: %s %d → %d feature(s)") %
+            (label, source.featureCount(), written)
+        )
+        return out
+
     def _fast_resolve(self, val, context):
         """Fast layer existence check without loading features.
         Returns a QgsMapLayer if resolvable, None otherwise.
@@ -1050,10 +1132,13 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         # individual runs.  Falls back to the published layers when the runs
         # were not produced (no cable-driven duct build).
         runs = results.get("duct_runs") or {}
-        feeder_ducts_in = (runs.get(self._DU_FEEDER_RUNS)
-                           or ducts.get(self._DU_OUT_FEEDER))
-        dist_ducts_in = (runs.get(self._DU_DIST_RUNS)
-                         or ducts.get(self._DU_OUT_DIST))
+        # Legacy distribution mode does not emit per-route run layers. Resolve
+        # the run path first and only use it when it is a valid layer; otherwise
+        # pass the published duct layer to the chamber stage.
+        feeder_runs = self._fast_resolve(runs.get(self._DU_FEEDER_RUNS), context)
+        dist_runs = self._fast_resolve(runs.get(self._DU_DIST_RUNS), context)
+        feeder_ducts_in = feeder_runs or ducts.get(self._DU_OUT_FEEDER)
+        dist_ducts_in = dist_runs or ducts.get(self._DU_OUT_DIST)
         # Resolve the trench stage's temporary tangent-crossing layer to a
         # concrete layer object (or None).  Passing an unresolved temp-id
         # string into a child algorithm has caused native crashes in headless
@@ -1679,6 +1764,60 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         if results.get("chambers"):
             results["chambers"] = self._save_layer_to_gpkg(
                 results["chambers"], "Chambers.gpkg", out_dir, context, feedback)
+
+        # Chambers are the authoritative civil break points.  The route stages
+        # run before chamber placement because chamber candidates use duct and
+        # trench junction evidence; immediately after placement, normalize every
+        # physical line layer against the same points.  This makes one published
+        # component mean one chamber-to-chamber span instead of leaving the
+        # trench fragmented differently from its ducts/cables.
+        if results.get("chambers"):
+            span_layers = [
+                ("trenches", "Final_Trenches.gpkg"),
+                ("feeder", "Feeder_Trench.gpkg"),
+                ("distribution", "Distribution_Trench.gpkg"),
+                ("garden", "Garden_Trench.gpkg"),
+                ("cables", "Feeder_Cable.gpkg"),
+                ("ducts", "Feeder_Ducts.gpkg"),
+            ]
+            # The nested cable/duct dictionaries are handled below; the first
+            # four are direct pipeline results.
+            for key, filename in span_layers[:4]:
+                original = results.get(key)
+                split = self._split_lines_at_chambers(
+                    original, results["chambers"], context, feedback, filename)
+                if split is not original:
+                    results[key] = self._save_layer_to_gpkg(
+                        split, filename, out_dir, context, feedback)
+
+            cables = results.get("cables") or {}
+            for key, filename, label in (
+                    (self._CB_OUT_FEEDER, "Feeder_Cable.gpkg", "Feeder_Cable"),
+                    (self._CB_OUT_DIST, "Distribution_Cable.gpkg", "Distribution_Cable")):
+                original = cables.get(key)
+                split = self._split_lines_at_chambers(
+                    original, results["chambers"], context, feedback, label)
+                if split is not original:
+                    cables[key] = self._save_layer_to_gpkg(
+                        split, filename, out_dir, context, feedback)
+            results["cables"] = cables
+
+            ducts = results.get("ducts") or {}
+            for key, filename, label in (
+                    (self._DU_OUT_FEEDER, "Feeder_Ducts.gpkg", "Feeder_Ducts"),
+                    (self._DU_OUT_DIST, "Distribution_Ducts.gpkg", "Distribution_Ducts"),
+                    (self._DU_OUT_DROP, "Drop_Ducts.gpkg", "Drop_Ducts")):
+                original = ducts.get(key)
+                split = self._split_lines_at_chambers(
+                    original, results["chambers"], context, feedback, label)
+                if split is not original:
+                    ducts[key] = self._save_layer_to_gpkg(
+                        split, filename, out_dir, context, feedback)
+            results["ducts"] = ducts
+            feedback.pushInfo(self.tr(
+                "Chamber span normalization complete: trench, duct, and cable "
+                "layers use the same chamber break positions."
+            ))
 
         if feedback.isCanceled():
             return {}

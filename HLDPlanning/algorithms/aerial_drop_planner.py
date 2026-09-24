@@ -300,7 +300,36 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
                 building_index.append(
                     (key, QgsPointXY(coords[-1][0], coords[-1][1])))
 
-        # ── Helper: find nearest pole ───────────────────────────────────────────
+        # ── Helper: find nearest eligible pole ─────────────────────────────────
+        # The aerial planning contract requires adequate height/clearance and
+        # spare loading.  Generated poles carry these fields; older brownfield
+        # pole layers may omit them, in which case they are not safe enough to
+        # anchor a new aerial span and the drop is reported as unresolved.
+        def _pole_eligible(feat):
+            names = feat.fields().names()
+            field_names = feat.fields().names()
+            lower_names = {name.lower(): name for name in field_names}
+            def _field(candidates):
+                for candidate in candidates:
+                    if candidate.lower() in lower_names:
+                        return lower_names[candidate.lower()]
+                return None
+            height_f = _field(["HEIGHT_M", "height_m", "HEIGHT", "height"])
+            used_f = _field(["CAPACITY_USED", "capacity_used", "CABLE_CNT", "cable_count"])
+            total_f = _field(["CAPACITY_TOTAL", "capacity_total", "CAPACITY", "capacity"])
+            if not height_f or not used_f or not total_f:
+                return False, "missing pole height/loading fields"
+            try:
+                height = float(feat[height_f] or 0)
+                used = float(feat[used_f] or 0)
+                total = float(feat[total_f] or 0)
+            except (TypeError, ValueError):
+                return False, "invalid pole height/loading fields"
+            if height < 5.5:
+                return False, "ground clearance below 5.5 m"
+            if total <= 0 or used / total >= 0.80:
+                return False, "pole loading is at or above 80%"
+            return True, ""
 
         def _nearest_pole(pt: QgsPointXY):
             """Return (pole_id, pole_geom, distance_m) or None."""
@@ -312,6 +341,9 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
                 g = feat.geometry()
                 if not g or g.isEmpty():
                     continue
+                eligible, _reason = _pole_eligible(feat)
+                if not eligible:
+                    continue
                 d = float(g.distance(QgsGeometry.fromPointXY(pt)))
                 candidates.append((d, feat, g))
 
@@ -321,6 +353,9 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
                     continue
                 g = feat.geometry()
                 if not g or g.isEmpty():
+                    continue
+                eligible, _reason = _pole_eligible(feat)
+                if not eligible:
                     continue
                 d = float(g.distance(QgsGeometry.fromPointXY(pt)))
                 candidates.append((d, feat, g))
@@ -522,7 +557,78 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
         # ── Route aerial drops ──────────────────────────────────────────────────
 
         import math
-        counter = {"trench": 0, "cable": 0, "skipped": 0}
+        counter = {"trench": 0, "cable": 0, "pole_spans": 0, "skipped": 0}
+        pole_span_written = set()
+
+        def _pole_id(feat):
+            for name in (COMMON_FIELDS.POLE_ID, "POLE_ID", "pole_id", "id", "feature_id"):
+                if name in feat.fields().names() and feat[name] not in (None, ""):
+                    return str(feat[name])
+            return str(feat.id())
+
+        def _poles_on_path(path):
+            """Return eligible poles ordered along an aerial path."""
+            if len(path) < 2 or poles is None or not poles.isValid():
+                return []
+            line = QgsGeometry.fromPolylineXY(path)
+            total = line.length()
+            found = []
+            for pf in poles.getFeatures():
+                pg = pf.geometry()
+                if pg is None or pg.isEmpty():
+                    continue
+                try:
+                    if pg.distance(line) > 8.0:
+                        continue
+                    at = line.lineLocatePoint(pg)
+                    if at < -0.01 or at > total + 0.01:
+                        continue
+                    found.append((at, _pole_id(pf), pg.asPoint()))
+                except Exception:
+                    continue
+            found.sort(key=lambda row: row[0])
+            return found
+
+        def _write_pole_span(a, b, p1, p2):
+            """Write one deduplicated pole-to-pole aerial trench and cable."""
+            if not a or not b or a == b:
+                return
+            key = tuple(sorted((str(a), str(b))))
+            if key in pole_span_written:
+                return
+            length = _path_len_m([p1, p2])
+            if length <= self.MIN_SPAN_M or length > self.MAX_DROP_DISTANCE_M:
+                return
+            pole_span_written.add(key)
+            tprops = {
+                COMMON_FIELDS.AERIAL_TRENCH_ID: f"AT-P{counter['pole_spans'] + 1:04d}",
+                COMMON_FIELDS.POLE_ID: str(a), COMMON_FIELDS.FROM_POLE: str(a),
+                COMMON_FIELDS.TO_PREMISE: "POLE:%s" % b,
+                COMMON_FIELDS.TRENCH_TYPE: "Aerial_Drop",
+                COMMON_FIELDS.CONSTRUCTION_METHOD: "Overhead",
+                COMMON_FIELDS.CABLE_TYPE: "Aerial", COMMON_FIELDS.FIBER_COUNT: 12,
+                COMMON_FIELDS.LENGTH_M: round(length, 1), COMMON_FIELDS.POLE_SPACING_M: spacing,
+                COMMON_FIELDS.CROSSINGS: 0, COMMON_FIELDS.PERMIT_REQUIRED: False,
+                COMMON_FIELDS.AERIAL_REASON: "pole_to_pole",
+                COMMON_FIELDS.INFRA_STATUS: "Proposed", COMMON_FIELDS.VERIFY_STATUS: "Assumed",
+                COMMON_FIELDS.STAGE: "HLD",
+            }
+            cprops = {
+                COMMON_FIELDS.CABLE_TYPE: "Aerial", COMMON_FIELDS.FIBER_COUNT: 12,
+                COMMON_FIELDS.LENGTH_M: round(length, 1),
+                COMMON_FIELDS.SOURCE_NODE: "%s->%s" % (a, b), COMMON_FIELDS.UTIL_PCT: 100.0,
+                COMMON_FIELDS.INFRA_STATUS: "Proposed", COMMON_FIELDS.VERIFY_STATUS: "Assumed",
+                COMMON_FIELDS.STAGE: "HLD",
+            }
+            geom = QgsGeometry.fromPolylineXY([p1, p2])
+            tf = QgsFeature(trench_fields); tf.setGeometry(geom)
+            for k, v in tprops.items(): tf[k] = v
+            sink_t.addFeature(tf)
+            cf = QgsFeature(cable_fields); cf.setGeometry(geom)
+            for k, v in cprops.items(): cf[k] = v
+            sink_c.addFeature(cf)
+            counter["pole_spans"] += 1
+            counter["trench"] += 1; counter["cable"] += 1
 
         for item in aerial_premises:
             f, pt = item["f"], item["pt"]
@@ -549,11 +655,19 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
                 else:
                     path = [snapped_pole, snapped_premise]
 
+            # Materialize the overhead backbone between every consecutive
+            # eligible pole found on this aerial route. The premise span below
+            # remains separate; shared pole pairs are written only once.
+            pole_seq = _poles_on_path(path)
+            for (_at0, pid0, p0), (_at1, pid1, p1) in zip(pole_seq, pole_seq[1:]):
+                _write_pole_span(pid0, pid1, p0, p1)
+
             length_m = _path_len_m(path) if len(path) > 1 else 0.0
-            if length_m > self.MAX_DROP_DISTANCE_M * 2:
+            if length_m > self.MAX_DROP_DISTANCE_M:
                 feedback.pushWarning(
-                    self.tr(f"Aerial drop {length_m:.0f}m exceeds 2x max span "
-                            f"({self.MAX_DROP_DISTANCE_M}m) — skipping.")
+                    self.tr(f"Aerial drop {length_m:.0f}m exceeds the "
+                            f"{self.MAX_DROP_DISTANCE_M:.0f}m maximum span — "
+                            "no compliant aerial route was found.")
                 )
                 counter["skipped"] += 1
                 continue
@@ -621,7 +735,8 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
 
         feedback.pushInfo(self.tr(
             f"Aerial drop planner complete: {counter['trench']} trenches, "
-            f"{counter['cable']} cables, {counter['skipped']} skipped."
+            f"{counter['cable']} cables ({counter['pole_spans']} pole-to-pole), "
+            f"{counter['skipped']} skipped."
         ))
 
         return {

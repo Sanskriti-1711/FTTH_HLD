@@ -216,7 +216,16 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
         "\"fclass\" IN ('residential','living_street','unclassified',"
         "'tertiary','secondary','primary','service')"
     )
-    DEFAULT_SIDEWALK = 8.0    # sidewalk ribbon offset (m)
+    # Sidewalk ribbon offset (m): the distance from the road CENTRELINE at which
+    # PDP candidates are sampled, so it IS where the cabinet ends up. It was
+    # 8.0 m, which is past the kerb and at the building line — measured on the
+    # reference run, 24 of 31 PDPs sat exactly 8.00 m off their street, i.e.
+    # inside the residential block, while the trench that serves them is offset
+    # 3.0 m (`trench_layer.run()` sw_off). A splitter is a street cabinet: it
+    # belongs on the sidewalk, so this now matches the trench's own sidewalk
+    # offset (`trench_layer.SIDEWALK_OFFSET_M`) instead of contradicting it; a
+    # test asserts the two are equal so they cannot drift apart again.
+    DEFAULT_SIDEWALK = 3.0    # sidewalk ribbon offset (m)
     DEFAULT_SPACING = 30.0    # candidate PDP spacing along sidewalks (m)
     DEFAULT_INTER_BUF = 20.0  # intersection guard radius (m)
     DEFAULT_CENTROID_R = 10.0  # centroid catch radius (m)
@@ -474,6 +483,30 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
             pr.addFeature(f)
             vl.updateExtents()
             return vl
+
+        def _nearest_street_point(pt_geom, lines_layer):
+            """Nearest point ON a street line to ``pt_geom``, and its distance.
+
+            A PDP is a street cabinet, so when no sidewalk candidate exists this
+            is where it goes — never at a polygon's interior. Returns
+            ``(None, None)`` when the area carries no street at all.
+            """
+            if lines_layer is None or pt_geom is None or pt_geom.isEmpty():
+                return None, None
+            best_d, best_pt = None, None
+            try:
+                for f in lines_layer.getFeatures():
+                    g = f.geometry()
+                    if g is None or g.isEmpty():
+                        continue
+                    d = g.distance(pt_geom)
+                    if best_d is None or d < best_d:
+                        best_d, best_pt = d, QgsGeometry(g.nearestPoint(pt_geom))
+            except Exception:
+                return None, None
+            if best_pt is None or best_pt.isEmpty():
+                return None, None
+            return best_pt, best_d
 
         def _polygon_reference_points(poly_geom, object_layer, polygon_crs):
             """Return a list of representative points for a polygon, preferring object points."""
@@ -1114,15 +1147,30 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
                                 f"Polygon {pid_val}: brownfield PDP snap skipped ({e!r})."
                             )
                 else:
-                    # Guarantee a PDP for EVERY polygon: when no candidate point is
-                    # available, place the PDP at the polygon's point-on-surface
-                    # (always inside the polygon) so no polygon is left unassigned.
-                    final_pdp_geom = QgsGeometry(centroid_geom)
-                    _src_id = ""
-                    feedback.pushInfo(
-                        f"Polygon {pid_val}: no candidate PDP point available — "
-                        "PDP placed at polygon point-on-surface (fallback)."
-                    )
+                    # Guarantee a PDP for EVERY polygon — but keep it on a
+                    # STREET. The old fallback used the polygon's point-on-
+                    # surface, which for a residential block is the middle of
+                    # the block: measured on the reference run that is how
+                    # PDP00030 landed 117.8 m from the nearest road (and
+                    # PDP00017/18/19 27-38 m), cabinets with no street to be
+                    # built on. The nearest point on the nearest allowed street
+                    # is the honest position; the point-on-surface is kept only
+                    # for an area with no street at all.
+                    street_pt, street_d = _nearest_street_point(centroid_geom, filtered)
+                    if street_pt is not None:
+                        final_pdp_geom = street_pt
+                        _src_id = ""
+                        feedback.pushInfo(
+                            f"Polygon {pid_val}: no sidewalk candidate point — PDP "
+                            f"placed on the nearest street ({street_d:.1f} m away)."
+                        )
+                    else:
+                        final_pdp_geom = QgsGeometry(centroid_geom)
+                        _src_id = ""
+                        feedback.pushWarning(
+                            f"Polygon {pid_val}: no candidate PDP point and no street "
+                            "in the area — PDP placed at polygon point-on-surface."
+                        )
 
                 # --- Keep the PDP inside its OWN polygon, and NEVER inside another ---
                 # Preferred: inside its own polygon. Acceptable: a clean nearby road

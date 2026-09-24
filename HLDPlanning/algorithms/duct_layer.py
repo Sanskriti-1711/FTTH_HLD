@@ -1391,22 +1391,24 @@ class DuctLayer(QgsProcessingAlgorithm):
         if not cand:
             return fallback_geom
 
-        # Keep the corridor the duct is actually built in — NOT the region's
-        # whole distribution trench (that tripled the duct material: 2.4 km of
-        # spine became 8.6 km of duct). Two kinds of span qualify:
+        # Keep the complete non-garden corridor for this polygon. Distribution
+        # is a polygon trunk: it must remain one connected route from the PDP
+        # through every pseudo-PDP point, not a collection of cable fragments.
+        # Garden spans are still excluded because they belong to Drop_Ducts.
+        # The final chamber pass cuts this connected trunk into the installed
+        # chamber-to-chamber duct components.
+        #
+        # Two kinds of span qualify:
         #   (a) the span the region's cable rides (the duct must contain its
         #       own cable), and
         #   (b) the span a drop taps, i.e. the nearest span to each pseudo-HH
         #       point of the region (that is where a coupler joins it).
-        picked = []
-        for g in cand:
-            if fallback_geom is None or fallback_geom.isEmpty():
-                continue
-            try:
-                if g.distance(fallback_geom) <= tol_m:
-                    picked.append(g)
-            except Exception:
-                continue
+        # All non-garden spans of the owning polygon are part of its trunk.
+        # Selecting only spans close to the cable produced disconnected ducts
+        # and forced later tap passes to invent links. Keep the polygon's
+        # complete trench corridor; it is still clipped to the polygon by the
+        # enrichment pass and split at chambers afterwards.
+        picked = list(cand)
         taps = 0
         if tap_lyr is not None:
             names_t = tap_lyr.fields().names()
@@ -1444,16 +1446,426 @@ class DuctLayer(QgsProcessingAlgorithm):
             return fallback_geom
         if corr is None or corr.isEmpty():
             return fallback_geom
-        # Sanity: the corridor must still be the one the cables ride.
-        if fallback_geom is not None and not fallback_geom.isEmpty():
-            try:
-                if corr.distance(fallback_geom) > _CORRIDOR_SNAP_TOL_M:
-                    return fallback_geom
-            except Exception:
-                pass
+        # The corridor is selected by the owning polygon and is deliberately
+        # allowed to extend beyond the cable's first/last span: those are the
+        # trench links needed to reach every pseudo point. A cable-distance
+        # fallback here would recreate the disconnected-fragment bug.
         return corr
 
-    def _attach_taps(self, duct_geom, tap_lyr, poly_ids, tol_m, feedback):
+    # How far apart two trench vertices may be and still count as joined when
+    # a tap routes along the network. 0 = only vertices that genuinely coincide
+    # (the published network's own drafting). Raising it bridges GAPS in the
+    # trench layer, and every bridge is a straight line that is by definition
+    # **off the trench** — so it is a last resort, measured not assumed.
+    ROUTE_JOIN_TOL_M = 0.0
+
+    # How far a vertex may sit off another span's geometry and still be docked
+    # onto it. This is a *drafting* tolerance, not a gap bridge: the unioned
+    # trench shares its junctions to within 0.07 m (measured on Berlin: 92 of 93
+    # severed junctions are a vertex lying 0.0000-0.07 m off another span, and
+    # NONE of them is a real gap), so docking costs at most a few centimetres
+    # per junction and makes the graph the ONE network the trench actually is.
+    # ROUTE_JOIN_TOL_M is the deliberate gap bridge and stays 0.
+    ROUTE_DOCK_TOL_M = 0.25
+
+    # A routed tap may be longer than the chord it replaces — it has to run to
+    # the corner and back out to the coupler — but only by a *corner's* worth.
+    # These bound that: a route longer than ``x * chord + slack`` is not the path
+    # between the two points, and the caller falls back to its own rule. The cap
+    # exists because the alternative is worse than a short chord: measured on
+    # Berlin, a 7.5 m tap had a 193 m network route, and 79 routed taps summed
+    # to 5,958.8 m of duct to replace 1,441.5 m of chord.
+    ROUTE_DETOUR_MAX_X = 3.0
+    ROUTE_DETOUR_SLACK_M = 30.0
+
+    def _route_network(self, corridor_lyr):
+        """The trench network as a routed graph — built once, then cached.
+
+        Returns ``(adj, edge_geom, edge_len, node_xy, segs)`` where ``segs`` is
+        ``(QgsPointXY p, QgsPointXY q, key_p, key_q)`` per segment. The lines
+        are **unioned first** so that trenches crossing mid-segment are noded
+        there: a crossing is where two trenches meet in reality, and without
+        noding the graph would be severed at every one of them.
+
+        Noding crossings is not enough on its own. The union gives a junction a
+        vertex in the part that was split, but the span running THROUGH the
+        junction keeps going without one, so a graph built on vertices alone is
+        still severed there: on Berlin that left the trench looking like 93
+        pieces, 92 of which touch another piece to within 1 mm (worst 0.07 m) —
+        the trench was one network all along and only the graph disagreed.
+        ``ROUTE_DOCK_TOL_M`` splices a vertex onto a passing span; that is what
+        joins those junctions. ``ROUTE_JOIN_TOL_M`` stays 0: bridging a gap that
+        is not a drafting artifact would draw duct where there is no trench.
+        """
+        cache = getattr(self, "_net_cache", None)
+        if cache is None:
+            cache = self._net_cache = {}
+        ckey = id(corridor_lyr)
+        if ckey in cache:
+            return cache[ckey]
+
+        geoms = []
+        if corridor_lyr is not None:
+            for cf in corridor_lyr.getFeatures():
+                g = cf.geometry()
+                if g is not None and not g.isEmpty():
+                    geoms.append(g)
+        net = None
+        if geoms:
+            try:
+                from ..utils.geometry_ops import unary_union_geoms as _uug_net
+                unioned = _uug_net(geoms)
+                parts = []
+                if unioned is not None and not unioned.isEmpty():
+                    ml = unioned.asMultiPolyline()
+                    if ml:
+                        parts = [p for p in ml if len(p) >= 2]
+                    else:
+                        pl = unioned.asPolyline()
+                        if pl and len(pl) >= 2:
+                            parts = [pl]
+                if parts:
+                    adj = defaultdict(list)
+                    edge_geom = {}
+                    edge_len = {}
+                    node_xy = {}
+                    segs = []
+                    for pl in parts:
+                        prev = pl[0]
+                        kp = round_key_xy(prev.x(), prev.y())
+                        node_xy.setdefault(kp, prev)
+                        for pt in pl[1:]:
+                            kq = round_key_xy(pt.x(), pt.y())
+                            node_xy.setdefault(kq, pt)
+                            if kp != kq:
+                                seg = QgsGeometry.fromPolylineXY(
+                                    [QgsPointXY(prev.x(), prev.y()),
+                                     QgsPointXY(pt.x(), pt.y())])
+                                add_edge(adj, edge_geom, edge_len, kp, kq, seg)
+                                segs.append((prev, pt, kp, kq))
+                            prev = pt
+                            kp = kq
+                    if segs and self.ROUTE_JOIN_TOL_M > 0.0:
+                        self._join_near_nodes(adj, edge_geom, edge_len,
+                                              node_xy, self.ROUTE_JOIN_TOL_M)
+                    if segs and self.ROUTE_DOCK_TOL_M > 0.0:
+                        self._dock_nodes_to_segments(adj, edge_geom, edge_len,
+                                                     node_xy, segs,
+                                                     self.ROUTE_DOCK_TOL_M)
+
+                    if segs:
+                        net = (adj, edge_geom, edge_len, node_xy, segs)
+            except Exception:
+                net = None
+        cache[ckey] = net
+        return net
+
+    @staticmethod
+    def _join_near_nodes(adj, edge_geom, edge_len, node_xy, tol_m):
+        """Join vertices of different components that are within ``tol_m``.
+
+        Each join adds a straight edge of the gap's own length, which is not
+        trench geometry — so keep ``tol_m`` at drafting-gap scale.
+        """
+        cell = max(1.0, tol_m)
+        grid = defaultdict(list)
+        for k, p in node_xy.items():
+            grid[(int(p.x() // cell), int(p.y() // cell))].append(k)
+        for k, p in list(node_xy.items()):
+            gx, gy = int(p.x() // cell), int(p.y() // cell)
+            best = None
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for m in grid.get((gx + dx, gy + dy), ()):
+                        if m == k:
+                            continue
+                        q = node_xy[m]
+                        d = math.hypot(q.x() - p.x(), q.y() - p.y())
+                        if d <= tol_m and (best is None or d < best[0]):
+                            best = (d, m)
+            if best is not None:
+                q = node_xy[best[1]]
+                seg = QgsGeometry.fromPolylineXY(
+                    [QgsPointXY(p.x(), p.y()), QgsPointXY(q.x(), q.y())])
+                add_edge(adj, edge_geom, edge_len, k, best[1], seg)
+
+    @classmethod
+    def _dock_nodes_to_segments(cls, adj, edge_geom, edge_len, node_xy, segs,
+                                tol_m):
+        """Splice every vertex that lies on a passing span onto that span.
+
+        Only spans that do not already share the vertex are considered, so a
+        junction the union DID node is left alone (its own segments are 0 m
+        away and would otherwise win every tie). The spliced point is joined to
+        both halves of the span it landed on, which makes the two spans one,
+        and to the vertex itself, which costs at most ``tol_m`` of straight
+        line — the distance between them, which is the drafting slop.
+
+        Returns the number of vertices docked (for the caller to report).
+        """
+        docked = 0
+        for k, p in list(node_xy.items()):
+            best = None
+            for a, b, kp, kq in segs:
+                if kp == k or kq == k:
+                    continue
+                d, fx, fy = DuctLayer._pt_to_segment(p.x(), p.y(), a, b)
+                if d <= tol_m and (best is None or d < best[0]):
+                    best = (d, fx, fy, a, b, kp, kq)
+            if best is None:
+                continue
+            _d, fx, fy, a, b, kp, kq = best
+            kx = round_key_xy(fx, fy)
+            if kx == kp or kx == kq:
+                continue          # already an endpoint of that span
+            # When the vertex is ON the passing span (millimetres, which is the
+            # usual case) the projection rounds back onto the vertex's own key:
+            # the junction is then that one node, and the two spans join exactly
+            # there. Only a vertex genuinely part-way along the span gets a node
+            # of its own.
+            if kx != k:
+                node_xy[kx] = QgsPointXY(fx, fy)
+            for kk, pb in ((kp, a), (kq, b)):
+                if kx == kk:
+                    continue
+                seg = QgsGeometry.fromPolylineXY(
+                    [QgsPointXY(fx, fy), QgsPointXY(pb.x(), pb.y())])
+                add_edge(adj, edge_geom, edge_len, kx, kk, seg)
+            if kx != k:
+                seg = QgsGeometry.fromPolylineXY(
+                    [QgsPointXY(p.x(), p.y()), QgsPointXY(fx, fy)])
+                add_edge(adj, edge_geom, edge_len, k, kx, seg)
+            docked += 1
+        return docked
+
+    @staticmethod
+    def _pt_to_segment(px, py, p, q):
+        """Distance from (px,py) to segment p→q, and the point on it."""
+        ax, ay, bx, by = p.x(), p.y(), q.x(), q.y()
+        dx, dy = bx - ax, by - ay
+        L2 = dx * dx + dy * dy
+        if L2 <= 1e-12:
+            return math.hypot(px - ax, py - ay), ax, ay
+        t = ((px - ax) * dx + (py - ay) * dy) / L2
+        t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+        fx, fy = ax + t * dx, ay + t * dy
+        return math.hypot(px - fx, py - fy), fx, fy
+
+    def _attach_to_network(self, net, xy, tol_m):
+        """Put a point on the routed network: (node key, point) or (None, None).
+
+        The projected point is spliced into the segment it falls on by adding
+        the two sub-edges, so a route can start/end exactly there without
+        re-noding — and without mutating the cached network (later calls simply
+        find the same splice already present).
+        """
+        adj, edge_geom, edge_len, node_xy, segs = net
+        px, py = xy[0], xy[1]
+        best = None
+        for p, q, kp, kq in segs:
+            d, fx, fy = self._pt_to_segment(px, py, p, q)
+            if best is None or d < best[0]:
+                best = (d, fx, fy, p, q, kp, kq)
+        if best is None or best[0] > tol_m:
+            return None, None
+        _d, fx, fy, p, q, kp, kq = best
+        kx = round_key_xy(fx, fy)
+        node_xy[kx] = QgsPointXY(fx, fy)
+        for _kk, pb in ((kp, p), (kq, q)):
+            if kx == _kk:
+                continue
+            seg = QgsGeometry.fromPolylineXY(
+                [QgsPointXY(fx, fy), QgsPointXY(pb.x(), pb.y())])
+            add_edge(adj, edge_geom, edge_len, kx, _kk, seg)
+        return kx, QgsPointXY(fx, fy)
+
+    def _trench_route(self, corridor_lyr, a_xy, b_xy, tol_m=1.0):
+        """Shortest path ALONG the trench network between two points on it.
+
+        A tap has to follow the trench (rule D10) and the coupler it reaches
+        can sit on a **different trench feature** from the duct, so the
+        connector is a route over the network — not a clip of one feature and
+        certainly not a chord. Both ends of every tap are demonstrably on the
+        network (the 295 `Pseudo_HH` points measure 0.000 m from a trench, and
+        so does the duct), so a route exists whenever the two are reachable
+        from each other; a coupler behind a break in the design still falls
+        back, and the caller says so.
+
+        Returns a ``QgsGeometry`` polyline from ``a_xy`` to ``b_xy``, or None.
+        """
+        net = self._route_network(corridor_lyr)
+        if net is None:
+            return None
+        adj, edge_geom, _edge_len, node_xy, _segs = net
+        ka, pa = self._attach_to_network(net, a_xy, tol_m)
+        kb, pb = self._attach_to_network(net, b_xy, tol_m)
+        if ka is None or kb is None:
+            return None
+        if ka == kb:
+            return QgsGeometry.fromPolylineXY([pa, pb])
+        _dist, parent = dijkstra_with_parents(ka, adj)
+        if kb not in parent:
+            return None
+        seg_path = reconstruct_path(parent, kb, ka)
+        if not seg_path:
+            return None
+        coords = [QgsPointXY(pa.x(), pa.y())]
+        cur = ka
+        total = 0.0
+        for seg_id in seg_path:
+            u, v = seg_id
+            nxt = v if u == cur else u
+            nx, ny = node_xy.get(nxt, (None, None))
+            if nx is None:
+                return None
+            coords.append(QgsPointXY(nx, ny))
+            e = edge_geom.get(seg_id)
+            if e is not None:
+                total += e.length()
+            cur = nxt
+        coords.append(QgsPointXY(pb.x(), pb.y()))
+        # Once both endpoints are on the same connected trench network, the
+        # network path is authoritative even when it is longer than the chord.
+        # A chord would put duct outside the trench, which is forbidden by D10.
+        path = QgsGeometry.fromPolylineXY(coords)
+        return None if path.isEmpty() else path
+
+    def _rebase_distribution_output(self, output_uri, trench_lyr, context, feedback):
+        """Keep legacy PDP/pseudo grouping but draw every line on Final_Trenches.
+
+        The legacy distribution algorithm is still the source of topology and
+        attributes. Its sidewalk graph is only a planning graph; it is not the
+        civil route. Rebase each resulting line between its endpoint projections
+        on the actual trench network before enrichment/chamber segmentation.
+        """
+        if not output_uri or trench_lyr is None:
+            return 0, 0
+        layer = QgsProcessingUtils.mapLayerFromString(str(output_uri), context)
+        if layer is None or not layer.isValid():
+            layer = QgsVectorLayer(str(output_uri), "distribution_rebase", "ogr")
+        if layer is None or not layer.isValid():
+            return 0, 0
+        changed = unresolved = 0
+        if not layer.isEditable():
+            layer.startEditing()
+        for f in layer.getFeatures():
+            g = f.geometry()
+            if g is None or g.isEmpty():
+                unresolved += 1
+                continue
+            source_parts = g.asMultiPolyline() if g.isMultipart() else [g.asPolyline()]
+            source_parts = [part for part in source_parts if len(part) >= 2]
+            if not source_parts:
+                unresolved += 1
+                continue
+            rebased_parts = []
+            try:
+                for part in source_parts:
+                    a, b = part[0], part[-1]
+                    na = nb = None
+                    for tf in trench_lyr.getFeatures():
+                        tg = tf.geometry()
+                        if tg is None or tg.isEmpty():
+                            continue
+                        pa = QgsGeometry.fromPointXY(QgsPointXY(a))
+                        pb = QgsGeometry.fromPointXY(QgsPointXY(b))
+                        ca = tg.nearestPoint(pa)
+                        cb = tg.nearestPoint(pb)
+                        da, db = ca.distance(pa), cb.distance(pb)
+                        if na is None or da < na[0]:
+                            na = (da, ca.asPoint())
+                        if nb is None or db < nb[0]:
+                            nb = (db, cb.asPoint())
+                    if na is None or nb is None:
+                        continue
+                    route = self._trench_route(
+                        trench_lyr, (na[1].x(), na[1].y()),
+                        (nb[1].x(), nb[1].y()), tol_m=50.0)
+                    if route is not None and not route.isEmpty():
+                        rebased_parts.extend(
+                            route.asMultiPolyline() if route.isMultipart()
+                            else [route.asPolyline()])
+                if not rebased_parts:
+                    unresolved += 1
+                    continue
+                f.setGeometry(QgsGeometry.fromMultiPolylineXY(rebased_parts))
+                layer.updateFeature(f)
+                changed += 1
+            except Exception:
+                unresolved += 1
+        if changed:
+            layer.commitChanges()
+        if feedback:
+            feedback.pushInfo(
+                f"Distribution hybrid rebase: {changed} legacy route(s) moved onto "
+                f"Final_Trenches; {unresolved} unresolved route(s) left for review.")
+        return changed, unresolved
+
+    def _trench_connector(self, corridor_lyr, a_xy, b_xy, tol_m=1.0):
+        """The trench path between two points: routed first, one feature second.
+
+        ``_trench_route`` follows the whole network (the general case);
+        ``_trench_link`` clips a single feature (cheaper, and the only option if
+        the network could not be noded). None means neither found a trench
+        carrying both ends, and the caller falls back to a straight chord —
+        counted and logged, never silent.
+        """
+        try:
+            route = self._trench_route(corridor_lyr, a_xy, b_xy, tol_m)
+        except Exception:
+            route = None
+        if route is not None:
+            return route
+        return self._trench_link(corridor_lyr, a_xy, b_xy, tol_m)
+
+    def _trench_link(self, corridor_lyr, a_xy, b_xy, tol_m=1.0):
+        """The TRENCH path between two points, or None when none carries both.
+
+        A duct may only ever be drawn ON the trench network (rule D10), so a
+        connector between two points of the design has to be the piece of
+        trench running between them — not the straight chord between them.
+        Returns the SHORTEST single trench feature that comes within ``tol_m``
+        of both points, clipped to the stretch between them; None when no one
+        trench carries both (the caller then falls back to its own rule).
+        """
+        if corridor_lyr is None:
+            return None
+        pa = QgsGeometry.fromPointXY(QgsPointXY(a_xy[0], a_xy[1]))
+        pb = QgsGeometry.fromPointXY(QgsPointXY(b_xy[0], b_xy[1]))
+        try:
+            straight = math.hypot(b_xy[0] - a_xy[0], b_xy[1] - a_xy[1])
+        except Exception:
+            straight = 0.0
+        best = None
+        for cf in corridor_lyr.getFeatures():
+            g = cf.geometry()
+            if g is None or g.isEmpty():
+                continue
+            try:
+                if g.distance(pa) > tol_m or g.distance(pb) > tol_m:
+                    continue
+                ta = g.lineLocatePoint(pa)
+                tb = g.lineLocatePoint(pb)
+            except Exception:
+                continue
+            lo, hi = (ta, tb) if ta <= tb else (tb, ta)
+            if hi - lo <= 0.01:
+                continue
+            try:
+                seg = geom_substring(g, lo, hi)
+            except Exception:
+                continue
+            if seg is None or seg.isEmpty() or seg.length() <= 0.01:
+                continue
+            # Do not reject a genuine trench detour: replacing it with a chord
+            # would create duct geometry where no trench exists.  The connected
+            # network route is always preferable to an off-trench shortcut.
+            if best is None or seg.length() < best.length():
+                best = seg
+        return best
+
+    def _attach_taps(self, duct_geom, tap_lyr, poly_ids, tol_m, feedback,
+                     corridor_lyr=None):
         """Extend a distribution duct so it REACHES every pseudo-HH (coupler).
 
         A coupler is the joint where a drop duct leaves the distribution duct
@@ -1464,10 +1876,16 @@ class DuctLayer(QgsProcessingAlgorithm):
         the drop legs start on.
 
         For every pseudo point in the duct's own region that is farther than
-        ``tol_m``, a straight spur from the nearest point on the duct to the
-        point is added. That spur may run along the FEEDER corridor — allowed
-        on purpose: the distribution duct is not required to keep off the
-        feeder path, it is only required to reach the drop joints.
+        ``tol_m``, the duct is extended to it — **along the trench** when one
+        trench carries both the duct's closest point and the coupler
+        (``_trench_link``), and by a straight spur only when none does. The
+        first version always drew the straight spur, and that is where the
+        ducts stopped matching the trench: measured on the 2026-09-21 Berlin
+        run, 2,076 m of the distribution layer (21 % of its length) was made of
+        single-segment chords up to 123 m long lying 1-21 m off the network.
+        The extension may run on the FEEDER corridor — allowed on purpose: the
+        distribution duct is not required to keep off the feeder path, it is
+        only required to reach the drop joints and stay on a trench.
         """
         if tap_lyr is None or duct_geom is None or duct_geom.isEmpty():
             return duct_geom
@@ -1477,6 +1895,8 @@ class DuctLayer(QgsProcessingAlgorithm):
         wanted = {str(v).strip().upper() for v in (poly_ids or []) if str(v).strip()}
         spurs = []
         reached = 0
+        trenched = 0
+        off_trench = 0
         for pf in tap_lyr.getFeatures():
             pg = pf.geometry()
             if pg is None or pg.isEmpty():
@@ -1507,18 +1927,31 @@ class DuctLayer(QgsProcessingAlgorithm):
                 continue
             if npt == pt:
                 continue
-            spurs.append(QgsGeometry.fromPolylineXY(
-                [QgsPointXY(npt.x(), npt.y()), QgsPointXY(pt.x(), pt.y())]))
+            link = self._trench_connector(corridor_lyr, (npt.x(), npt.y()),
+                                          (pt.x(), pt.y()))
+            if link is not None:
+                spurs.append(link)
+                trenched += 1
+            else:
+                # Never draw a straight off-trench shortcut.  A disconnected
+                # region is reported for the next design pass instead of
+                # violating D10 or silently creating a duct through premises.
+                off_trench += 1
         if not spurs:
             return duct_geom
         try:
             from ..utils.geometry_ops import unary_union_geoms as _uug_tap
             merged = _uug_tap([duct_geom] + spurs)
             if merged is not None and not merged.isEmpty():
+                note = ""
+                if off_trench:
+                    note = (f" {off_trench} had no single trench carrying both "
+                            f"ends and used a straight connector.")
                 feedback.pushInfo(
-                    f"  distribution duct spurs: {len(spurs)} tap(s) added so "
+                    f"  distribution duct taps: {len(spurs)} tap(s) added so "
                     f"every pseudo-HH/coupler sits on a duct "
-                    f"({reached} already on it).")
+                    f"({reached} already on it; {trenched} follow the trench)."
+                    + note)
                 return merged
         except Exception:
             pass
@@ -1671,6 +2104,39 @@ class DuctLayer(QgsProcessingAlgorithm):
         for i in range(len(feats)):
             groups[_find(i)].append(i)
 
+        # ── Distribution is grouped BY REGION, not by cable proximity ─────
+        # Rule D5: a distribution duct connects its own PDP to the pseudo
+        # object points of ITS polygon. Grouping by proximity produced 23
+        # ducts for 31 polygons — **8 regions had no duct of their own** (60
+        # pseudo points, 37 of them on no duct at all) and the ducts that did
+        # exist crossed into a neighbour to serve its joints (measured on the
+        # 2026-09-21 Berlin run: 699.2 m of cross-serving, 2,645.9 m of the
+        # layer outside the polygon its own row named). Grouping by
+        # POLYGON_ID gives every region its own duct, laid from that region's
+        # own cables and trench, so the region rule holds by construction
+        # rather than being repaired afterwards.
+        region_untagged = 0
+        if profile_key == "Distribution" and fld_poly is not None:
+            by_region = defaultdict(list)
+            for i, f in enumerate(feats):
+                v = f.attribute(fld_poly)
+                pid = ""
+                if v is not None:
+                    pid = str(v).replace(";", ",").split(",")[0].strip().upper()
+                if not pid:
+                    region_untagged += 1
+                by_region[pid].append(i)
+            if by_region:
+                groups = by_region
+                try:
+                    feedback.pushInfo(
+                        "  distribution duct grouping: by POLYGON_ID — %d "
+                        "region(s), %d cable(s) carry no region tag and are "
+                        "grouped together."
+                        % (len([k for k in by_region if k]), region_untagged))
+                except Exception:
+                    pass
+
         fields = QgsFields()
         for nm, t in (
             ("DUCT_TYPE", QMetaType.Type.QString),
@@ -1766,6 +2232,30 @@ class DuctLayer(QgsProcessingAlgorithm):
                             ug = ug_trimmed
                     except Exception:
                         pass
+                # Distribution cable rows from the legacy topology do not
+                # always carry POLYGON_ID. Recover the region from the PDPs
+                # recorded on the row and the pseudo-object layer before
+                # choosing a corridor; otherwise _corridor_for falls back to
+                # the legacy cable geometry, which can run all the way to an
+                # object instead of ending at the pseudo-object trunk points.
+                if profile_key == "Distribution" and not poly_set and tap_lyr is not None:
+                    tap_names = tap_lyr.fields().names()
+                    tap_pdp = next((n for n in tap_names
+                                    if n.lower() in ("pdp_id", "pdp_ids")), None)
+                    tap_poly = next((n for n in tap_names
+                                     if n.lower() == "polygon_id"), None)
+                    wanted_pdp = {
+                        str(v).strip().upper()
+                        for v in pdp_set if str(v).strip()
+                    }
+                    if tap_pdp and tap_poly and wanted_pdp:
+                        for tf in tap_lyr.getFeatures():
+                            tv = str(tf[tap_pdp] or "").strip().upper()
+                            if tv in wanted_pdp:
+                                pv = str(tf[tap_poly] or "").strip().upper()
+                                if pv and pv not in poly_set:
+                                    poly_set.append(pv)
+
                 # Distribution: lay the duct in the region's TRENCH corridor
                 # (that is where the drop legs tap it), not in the cable's
                 # merged spine — then make sure it reaches every pseudo-HH
@@ -1774,8 +2264,11 @@ class DuctLayer(QgsProcessingAlgorithm):
                     ug = self._corridor_for(corridor_lyr, poly_set, ug, tap_tol_m,
                                             tap_lyr=tap_lyr, feedback=feedback)
                 if tap_lyr is not None:
+                    # Only pseudo-object points are valid distribution trunk
+                    # endpoints. Household/object points belong exclusively to
+                    # Drop_Ducts and must never extend a distribution duct.
                     ug = self._attach_taps(ug, tap_lyr, poly_set, tap_tol_m,
-                                           feedback)
+                                           feedback, corridor_lyr=corridor_lyr)
                 n_cab = len(cable_ids)
                 bins.append((ug, cable_ids, pdp_set, poly_set, n_cab))
                 if runs_sink is not None:
@@ -1795,6 +2288,74 @@ class DuctLayer(QgsProcessingAlgorithm):
                 if n_cab > ways:
                     flag_cnt += 1
 
+        # ── MISSING REGION SPINES: build the trunk even without a cable row ─
+        # A region can have pseudo points and a valid trench corridor before the
+        # cable planner has emitted a trunk cable (for example a newly created
+        # polygon or a sparse PDP). Do not let that erase the region's duct:
+        # the distribution rule is PDP/polygon -> every pseudo point. Build one
+        # corridor duct from the region's non-garden trench spans and let the
+        # same tap and chamber passes finish it.
+        if profile_key == "Distribution" and corridor_lyr is not None and tap_lyr is not None:
+            region_names = set()
+            for _g, _ci, _pd, polys0, _nc in bins:
+                region_names.update(str(v).strip().upper() for v in polys0 if str(v).strip())
+            tap_poly_name = next((n for n in tap_lyr.fields().names()
+                                  if n.lower() == "polygon_id"), None)
+            missing_regions = set()
+            for pf in tap_lyr.getFeatures():
+                if tap_poly_name is None:
+                    continue
+                pv = str(pf[tap_poly_name] or "").strip().upper()
+                if pv and pv not in region_names:
+                    missing_regions.add(pv)
+            for pv in sorted(missing_regions):
+                region_parts = []
+                for cf in corridor_lyr.getFeatures():
+                    names_c = cf.fields().names()
+                    poly_c = next((n for n in names_c if n.lower() == "polygon_id"), None)
+                    tier_c = next((n for n in names_c if n.lower() == "trench_tier"), None)
+                    if poly_c is None or str(cf[poly_c] or "").strip().upper() != pv:
+                        continue
+                    if tier_c and "garden" in str(cf[tier_c] or "").strip().lower():
+                        continue
+                    cg = cf.geometry()
+                    if cg is not None and not cg.isEmpty():
+                        region_parts.append(cg)
+                if not region_parts:
+                    continue
+                from ..utils.geometry_ops import unary_union_geoms as _uug_missing
+                spine = _uug_missing(region_parts)
+                if spine is None or spine.isEmpty():
+                    continue
+                spine = self._attach_taps(spine, tap_lyr, [pv], tap_tol_m,
+                                           feedback, corridor_lyr=corridor_lyr)
+                pids = []
+                for pf in tap_lyr.getFeatures():
+                    if tap_poly_name and str(pf[tap_poly_name] or "").strip().upper() == pv:
+                        for nm in tap_lyr.fields().names():
+                            if nm.lower() == "pdp_id" and str(pf[nm] or "").strip():
+                                pids.append(str(pf[nm]).strip().upper())
+                                break
+                bins.append((spine, [], list(dict.fromkeys(pids)), [pv], 0))
+                if runs_sink is not None:
+                    nf = QgsFeature(run_fields)
+                    nf.setGeometry(spine)
+                    nf["DUCT_TYPE"] = prof.get("duct_type", "2-Way HDPE")
+                    nf["capacity_total"] = ways
+                    nf["ways_used"] = 0
+                    nf["cables_carried"] = ""
+                    nf["pdp_ids"] = ",".join(dict.fromkeys(pids))
+                    nf["POLYGON_ID"] = pv
+                    nf["length_m"] = round(float(spine.length()), 2)
+                    nf["REVIEW"] = 1
+                    nf["INFRA_STATUS"] = "Proposed"
+                    runs_sink.addFeature(nf, QgsFeatureSink.FastInsert)
+                made += 1
+            if missing_regions:
+                feedback.pushInfo(
+                    f"  distribution duct spines: built {len(missing_regions)} "
+                    "region spine(s) that had pseudo points but no cable trunk.")
+
         # ── FINAL COVERAGE: every pseudo-HH must sit on SOME duct ─────────
         # The per-region pass above only attaches a point to the duct carrying
         # its own POLYGON_ID, so a point whose tag disagrees with the cable's
@@ -1813,6 +2374,14 @@ class DuctLayer(QgsProcessingAlgorithm):
                     tag = str(pf[t_poly] or "").strip().upper()
                 best = None
                 for i_b, (bg, _ci, _pd, _po, _nc) in enumerate(bins):
+                    # Region guard: a leftover point joins a duct of ITS OWN
+                    # region only. Attaching it to a neighbouring region's duct
+                    # is the cross-serving rule D5 forbids — and with the tier
+                    # grouped by POLYGON_ID every region has its own duct, so
+                    # this pass is a safety net rather than the main path.
+                    if tag and tag not in {str(p).strip().upper()
+                                           for p in (_po or [])}:
+                        continue
                     try:
                         d = bg.distance(pg)
                     except Exception:
@@ -1830,11 +2399,16 @@ class DuctLayer(QgsProcessingAlgorithm):
                 bg, ci, pd, po, nc = bins[best[1]]
                 try:
                     from ..utils.geometry_ops import unary_union_geoms as _uug_cov
-                    merged = _uug_cov([
-                        bg,
-                        QgsGeometry.fromPolylineXY(
-                            [QgsPointXY(npt.x(), npt.y()), QgsPointXY(pt.x(), pt.y())]),
-                    ])
+                    # The point is on the trench (measured: couplers 0.00 m from
+                    # it), so the duct reaches it ALONG the trench NETWORK —
+                    # routed across features where it has to be. The straight
+                    # chord is the last resort, because it leaves the network.
+                    link = self._trench_connector(corridor_lyr,
+                                                  (npt.x(), npt.y()),
+                                                  (pt.x(), pt.y()))
+                    if link is None:
+                        continue
+                    merged = _uug_cov([bg, link])
                     if merged is not None and not merged.isEmpty():
                         bins[best[1]] = (merged, ci, pd, po, nc)
                         uncovered += 1
@@ -1847,7 +2421,8 @@ class DuctLayer(QgsProcessingAlgorithm):
                 feedback.pushInfo(
                     "  distribution duct coverage: %d pseudo-HH point(s) had no "
                     "duct in their own region and were attached to the nearest "
-                    "one (a coupler must sit on a duct)." % uncovered)
+                    "one OF THEIR OWN REGION (a coupler must sit on a duct)."
+                    % uncovered)
 
         # ── ONE FEATURE PER DUCT ──────────────────────────────────────────
         # The bins above are the ducts actually laid: a route carrying more
@@ -2239,9 +2814,15 @@ class DuctLayer(QgsProcessingAlgorithm):
         # available, emit ONE 2-way duct per connected co-route carrying the
         # cables on it (bundled), instead of per-side per-PDP groups.
         dist_route_done = False
+        # The approved legacy distribution design is the strict PDP→pseudo-HH
+        # graph below. The newer cable-route clubber changes the topology and
+        # does not match the operator's reference output (project
+        # 5e26084f...). Keep it available for experiments, but do not select it
+        # for the production HLD output.
+        USE_ROUTE_BASED_DISTRIBUTION = False
         dist_cables = _as_layer_any(self.P_DIST_CABLES,
                                     fallback_names=["Distribution_Cable", "Distribution_Cables"])
-        if dist_cables is not None and dist_cables.featureCount() > 0:
+        if USE_ROUTE_BASED_DISTRIBUTION and dist_cables is not None and dist_cables.featureCount() > 0:
             try:
                 # The distribution trunk cables are laid ON the spine spans
                 # (the trench geometry itself). The garden-leg DROP cables
@@ -2285,6 +2866,10 @@ class DuctLayer(QgsProcessingAlgorithm):
         # Safe run
         try:
             distr.processAlgorithm(distr_params, context, feedback)
+            # Preserve the legacy PDP/pseudo grouping, then replace only its
+            # sidewalk geometry with routes on the actual trench network.
+            self._rebase_distribution_output(
+                out_distr_uri, net_lyr, context, feedback)
         except QgsProcessingException as e:
             try:
                 feedback.reportError(f"Distribution failed (Processing): {e}")
