@@ -626,7 +626,19 @@ def _read_points(path: str, target_epsg: int, bbox=None) -> List[dict]:
             p = g.Clone()
             if tr is not None:
                 p.Transform(tr)
-            if p.GetGeometryName() not in ("POINT", "MULTIPOINT"):
+            name = p.GetGeometryName()
+            if name == "MULTIPOINT":
+                # Reused brownfield PDPs are written as MultiPoint (single
+                # part) into a POINT layer — QGIS warns but allows it.  OGR's
+                # GetX() on a MultiPoint is "Incompatible geometry" when
+                # exceptions are enabled, so unwrap to the first point.
+                if p.GetGeometryCount() == 0:
+                    continue
+                sub = p.GetGeometryRef(0)
+                if sub is None or sub.IsEmpty():
+                    continue
+                p = sub.Clone()
+            elif name not in ("POINT",):
                 p = p.Centroid() if not p.IsEmpty() else p
                 if p is None or p.IsEmpty():
                     continue
