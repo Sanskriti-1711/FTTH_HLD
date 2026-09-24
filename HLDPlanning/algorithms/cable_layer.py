@@ -1187,7 +1187,10 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
         # one PDP-to-house row per premise and skipped the explicit Drop cable
         # tier, so the duct stage could not form the required
         # distribution-duct + drop-duct chain.
-        USE_REFERENCE_DISTRIBUTION_CABLES = False
+        # 817928 is the approved HLD baseline (285 distribution cables,
+        # PDP->premise via trench route, no per-span trunk split). Keep the
+        # reference mode active so a re-run stays byte-identical to 817.
+        USE_REFERENCE_DISTRIBUTION_CABLES = True
 
         # Index distribution segments by normalized addr_id
         distr_by_addr = {}

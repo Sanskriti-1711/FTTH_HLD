@@ -174,6 +174,11 @@ def full_one(cand: Dict[str, str], out_root: Path) -> Dict[str, Any]:
             # by country.
             "from_address_node": (preview.get("premises") or {}).get("from_address_node"),
             "from_building_centroid": (preview.get("premises") or {}).get("from_building_centroid"),
+            # Of the centroid premises: no address at all, vs an address taken
+            # from the building polygon.  These are different designs, and the
+            # gap is what the object layer actually works with.
+            "without_address": (preview.get("premises") or {}).get("without_address"),
+            "from_building_polygon": (preview.get("premises") or {}).get("from_building_polygon"),
             "household_estimated_share": (preview.get("households") or {}).get("estimated_share"),
             "postcode_is_boundary": preview.get("postcode_is_boundary"),
             "boundary": {

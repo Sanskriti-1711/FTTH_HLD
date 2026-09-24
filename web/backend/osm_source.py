@@ -3264,11 +3264,30 @@ def preview_area(
             "No polygon could be found for this area, so the bounding box was used "
             "instead — it is a rectangle and may include neighbouring areas."
         )
+    # What the workbook actually carries, counted from its ROWS rather than
+    # from the ADDR_ID suffix.  A `-C` suffix means the point is the building's
+    # centroid, and that is true both for a building with `addr:*` of its own
+    # and for one with no address at all.  Measured on a US ZIP, the old count
+    # said "5,946 premises have no addr:housenumber" when 46 % of them carried
+    # one -- a warning that overstates the gap is as misleading as one that
+    # hides it.  The planner needs to know how many designs will carry no
+    # address versus how many took one from the building polygon.
     centroid_only = sum(1 for p in premises if str(p["ADDR_ID"]).endswith("-C"))
-    if centroid_only:
+    anonymous = sum(
+        1 for p in premises
+        if not str(p.get("Housenumber") or "").strip()
+        and not str(p.get("Address") or "").strip()
+    )
+    if anonymous:
         warnings.append(
-            f"{centroid_only} premise(s) have no addr:housenumber and were placed at the "
-            "building centroid."
+            f"{anonymous} premise(s) have neither a street nor a house number in "
+            "OpenStreetMap; they are the building's centroid and the design will "
+            "carry no address for them."
+        )
+    if centroid_only and centroid_only > anonymous:
+        warnings.append(
+            f"{centroid_only - anonymous} premise(s) took their address from the "
+            "building polygon rather than from a separate address point."
         )
     if stats["duplicates_merged"]:
         warnings.append(f"{stats['duplicates_merged']} duplicate address(es) merged.")
@@ -3343,6 +3362,12 @@ def preview_area(
             "count": len(premises),
             "from_address_node": sum(1 for p in premises if not str(p["ADDR_ID"]).endswith("-C")),
             "from_building_centroid": centroid_only,
+            # Of the centroid premises, how many carry NO address at all, as
+            # opposed to one taken from the building polygon.  The two are
+            # different designs: the first puts an unnamed point on the map,
+            # the second has a street and a number from OSM.
+            "without_address": anonymous,
+            "from_building_polygon": max(0, centroid_only - anonymous),
             "duplicates_merged": stats["duplicates_merged"],
             "buildings_excluded": stats["buildings_excluded"],
             "sample": premises[:20],
@@ -3413,7 +3438,8 @@ EXCEL_HEADERS = (
 )
 
 ROADS_PROPERTIES = ("fclass", "highway", "name", "ref", "oneway", "bridge",
-                    "tunnel", "access", "surface", "maxspeed", "lanes", "osm_id")
+                    "tunnel", "access", "surface", "maxspeed", "lanes", "osm_id",
+                    "carrier_source")
 
 
 def write_address_workbook(path: str, premises: Sequence[Dict[str, Any]]) -> str:
@@ -3459,6 +3485,666 @@ def write_roads_geojson(path: str, roads: Sequence[Dict[str, Any]]) -> str:
     return path
 
 
+# ---------------------------------------------------------------------------
+# The pavement (sidewalk) carrier network
+# ---------------------------------------------------------------------------
+# A duct trench runs in the PAVEMENT, not down the carriageway, and the designer
+# is built that way round: with `Params.sidewalk_only` on -- the default -- it
+# routes ONLY on footway/sidewalk classes and keeps the carriageway classes back
+# in a separate vehicular layer that exists for HDD crossing detection. Its own
+# network stage places the splitter cabinets on a sidewalk line 3 m off the road
+# centreline (`trench_layer.SIDEWALK_OFFSET_M`), so the pavement beside every
+# street is already part of the engine's world model.
+#
+# The OSM extract has to carry that pavement, and in the UK it largely does not.
+# Measured on North Edgbaston (3.54 km^2, 71.8 km of roads): OSM maps 184
+# footway/path/cycleway ways, about 5.9 km of them. Handed that as the routing
+# graph, the design fell into 29 pieces, 44 of its 45 splitters could not reach
+# the MFG, the real street routing was dropped (42 runs / 4 834 m) and 280
+# straight `pdp-spur` features replaced it -- chords up to 998 m, drawn across
+# whatever lay between two points. That is what "the trenches are not on the
+# roads" was.
+#
+# So the roads layer this build writes carries the pavement network itself: every
+# carrier-class street is offset to BOTH kerbs at `PAVEMENT_OFFSET_M` (the same
+# 3 m the engine places its cabinets at, so a splitter ends up on its own trench
+# rather than 3 m off it), the derived lines are welded to each other and tied
+# into the mapped footways, and the result is written as ordinary `footway`
+# features. Nothing about the design changes: an arterial is still a carriageway
+# crossing, so crossing one is still a drill.
+PAVEMENT_OFFSET_M = 3.0
+# The carrier classes to derive a pavement beside -- exactly the classes the
+# designer itself treats as routable when `sidewalk_only` is off. Arterials
+# (primary/secondary/trunk/tertiary) are deliberately left alone: a derived
+# pavement there would be the cheapest carrier in the class ladder and would let
+# the router run a trench down the A456, which the class factors exist to prevent.
+PAVEMENT_CLASSES = ("residential", "unclassified", "living_street", "service",
+                    "track")
+# The classes that ARE the pavement where OSM maps one; kept as they arrive.
+PAVEMENT_MAPPED_CLASSES = ("footway", "path", "pedestrian", "cycleway", "steps",
+                           "bridleway", "sidewalk")
+PAVEMENT_WELD_M = 0.75       # two vertices this close are one pavement node
+PAVEMENT_LINK_M = 3.0        # a loose end is tied to the nearest line within this
+PAVEMENT_EXTEND_M = 4.2      # end extension that closes a junction corner
+PAVEMENT_SOURCE = "derived-pavement"
+# Pavement ends that face each other across one of these are joined by a
+# crossing. The arterials are the classes deliberately left WITHOUT a derived
+# pavement (see PAVEMENT_CLASSES), so they are exactly what cuts the carrier
+# network into pieces: on North Edgbaston the pavement on one side of City Road,
+# Sandon Road, Icknield Port Road or Hagley Road sat 5-25 m from the pavement on
+# the other side, with no mapped crossing between them. A link is only made over
+# a carriageway, and the designer still classifies the crossing it spans as a
+# drill, so this restores connectivity without putting a trench along the road.
+PAVEMENT_CROSS_M = 35.0
+PAVEMENT_CROSSING_CLASSES = ("primary", "primary_link", "secondary",
+                             "secondary_link", "tertiary", "tertiary_link",
+                             "trunk", "trunk_link")
+# Off switch, so an operator can compare an area with and without the derived
+# pavement without editing code (same convention as the other OSM_* knobs).
+PAVEMENT_ENABLED = os.environ.get("OSM_PAVEMENT_CARRIERS", "1").strip().lower() \
+    not in ("0", "false", "no", "off")
+# Pavement beside the ARTERIALS as well, not just the carrier streets.
+#
+# Default OFF: the class ladder exists so a trench does not run down an arterial
+# (permits, traffic management), and a derived pavement there is a footway-class
+# carrier with the cheapest weight in that ladder, so the router would use it.
+# ON, the carrier network mirrors every street and nothing is stranded: measured
+# on North Edgbaston, 45 of 45 splitters reach the MFG with it on, against 34 of
+# 45 with it off (the other 11 sit on estates whose only connection to the rest
+# of the network is across an arterial).  Named rather than hidden, so that
+# trade is a decision and not a default.
+PAVEMENT_ARTERIALS = os.environ.get("OSM_PAVEMENT_ARTERIALS", "0").strip().lower() \
+    not in ("0", "false", "no", "off")
+ARTERIAL_CLASSES = ("primary", "primary_link", "secondary", "secondary_link",
+                    "tertiary", "tertiary_link", "trunk", "trunk_link")
+
+
+def pavement_classes() -> Tuple[str, ...]:
+    """The street classes a pavement is derived beside (see PAVEMENT_CLASSES)."""
+    if PAVEMENT_ARTERIALS:
+        return PAVEMENT_CLASSES + ARTERIAL_CLASSES
+    return PAVEMENT_CLASSES
+
+
+def _polyline_parts(row: Dict[str, Any]) -> List[List[List[float]]]:
+    """The line parts of a road row's geometry (single, or a MultiLineString)."""
+    geom = row.get("geom_json")
+    if isinstance(geom, str):
+        try:
+            geom = json.loads(geom)
+        except (TypeError, ValueError):
+            return []
+    if not isinstance(geom, dict):
+        return []
+    if geom.get("type") == "LineString":
+        coords = geom.get("coordinates") or []
+        return [coords] if len(coords) >= 2 else []
+    if geom.get("type") == "MultiLineString":
+        return [c for c in (geom.get("coordinates") or []) if len(c) >= 2]
+    return []
+
+
+def _offset_polyline(pts: Sequence[Sequence[float]], dist: float,
+                     miter_limit: float = 2.0) -> List[Tuple[float, float]]:
+    """A polyline offset to its LEFT by ``dist`` metres (negative = right).
+
+    Miter joins with a limit, which is what the engine's own sidewalk offset
+    uses (`native:offsetline`, JOIN_STYLE=1, MITER_LIMIT=2.0), so a derived
+    pavement turns a corner the way the engine expects one to. A miter longer
+    than the limit is clamped rather than spiked.
+    """
+    clean: List[Tuple[float, float]] = [(float(pts[0][0]), float(pts[0][1]))]
+    for p in pts[1:]:
+        q = (float(p[0]), float(p[1]))
+        if math.hypot(q[0] - clean[-1][0], q[1] - clean[-1][1]) > 1e-9:
+            clean.append(q)
+    if len(clean) < 2:
+        return clean
+    normals: List[Tuple[float, float]] = []
+    for a, b in zip(clean, clean[1:]):
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        length = math.hypot(dx, dy)
+        normals.append((-dy / length, dx / length))
+    out: List[Tuple[float, float]] = []
+    last = len(clean) - 1
+    for i, p in enumerate(clean):
+        if i == 0:
+            mx, my = normals[0]
+        elif i == last:
+            mx, my = normals[-1]
+        else:
+            nx, ny = normals[i - 1][0] + normals[i][0], normals[i - 1][1] + normals[i][1]
+            length = math.hypot(nx, ny)
+            if length < 1e-9:            # a doubling back bend: no outer side
+                mx, my = normals[i - 1]
+            else:
+                mx, my = nx / length, ny / length
+                cos_half = mx * normals[i - 1][0] + my * normals[i - 1][1]
+                scale = min(1.0 / max(cos_half, 1e-6), miter_limit)
+                mx, my = mx * scale, my * scale
+        out.append((p[0] + mx * dist, p[1] + my * dist))
+    return out
+
+
+def _extend_ends(pts: List[Tuple[float, float]], extra: float
+                 ) -> List[Tuple[float, float]]:
+    """Push both ends of a line out along its own direction.
+
+    A street offset to the kerb stops level with the junction node, so the two
+    pavements meeting at a corner stop 3 m short of each other. Extending by
+    more than the offset makes them cross instead, which is the corner.
+    """
+    if len(pts) < 2 or extra <= 0.0:
+        return list(pts)
+    out = list(pts)
+    a, b = out[0], out[1]
+    length = math.hypot(b[0] - a[0], b[1] - a[1])
+    if length > 1e-9:
+        out[0] = (a[0] + (a[0] - b[0]) / length * extra,
+                  a[1] + (a[1] - b[1]) / length * extra)
+    a, b = out[-1], out[-2]
+    length = math.hypot(a[0] - b[0], a[1] - b[1])
+    if length > 1e-9:
+        out[-1] = (a[0] + (a[0] - b[0]) / length * extra,
+                   a[1] + (a[1] - b[1]) / length * extra)
+    return out
+
+
+def _union_find(size: int) -> Tuple[List[int], Any, Any]:
+    parent = list(range(size))
+
+    def find(a: int) -> int:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    return parent, find, union
+
+
+def _weld_vertices(lines: List[List[Tuple[float, float]]], tol: float
+                   ) -> List[List[Tuple[float, float]]]:
+    """Merge vertices within ``tol`` into one point, at their mean.
+
+    The designer nodes its graph on shared VERTICES (keys rounded to 0.25 m), so
+    two pavement lines that merely cross do not connect. Welding turns every
+    near-coincident vertex into exactly the same point, which is what makes the
+    derived network one graph instead of dozens of pieces -- the failure the
+    29-component run logged.
+    """
+    flat: List[Tuple[float, float]] = []
+    where: List[Tuple[int, int]] = []
+    for li, line in enumerate(lines):
+        for vi, p in enumerate(line):
+            flat.append(p)
+            where.append((li, vi))
+    if not flat:
+        return lines
+    parent, find, union = _union_find(len(flat))
+    cells: Dict[Tuple[int, int], List[int]] = {}
+    for i, p in enumerate(flat):
+        cells.setdefault((int(math.floor(p[0] / tol)),
+                          int(math.floor(p[1] / tol))), []).append(i)
+    for i, p in enumerate(flat):
+        cx, cy = int(math.floor(p[0] / tol)), int(math.floor(p[1] / tol))
+        for gx in (cx - 1, cx, cx + 1):
+            for gy in (cy - 1, cy, cy + 1):
+                for j in cells.get((gx, gy), ()):
+                    if j <= i:
+                        continue
+                    q = flat[j]
+                    if math.hypot(q[0] - p[0], q[1] - p[1]) <= tol:
+                        union(i, j)
+    members: Dict[int, List[int]] = {}
+    for i in range(len(flat)):
+        members.setdefault(find(i), []).append(i)
+    mean: Dict[int, Tuple[float, float]] = {}
+    for root, group in members.items():
+        mean[root] = (sum(flat[i][0] for i in group) / len(group),
+                      sum(flat[i][1] for i in group) / len(group))
+    out = [list(line) for line in lines]
+    for i, (li, vi) in enumerate(where):
+        out[li][vi] = mean[find(i)]
+    return out
+
+
+def _segment_hit(a: Tuple[float, float], b: Tuple[float, float],
+                 c: Tuple[float, float], d: Tuple[float, float]
+                 ) -> Optional[Tuple[Tuple[float, float], float, float]]:
+    """Where two segments cross: ``(point, t, u)``, or ``None``.
+
+    Endpoint touches are deliberately left to the welding pass; this finds the
+    interior crossings that a pavement grid is full of (every street crosses
+    another) and that the vertex-only node keying would otherwise ignore.  The
+    two parameters are how far along each segment the crossing sits -- they are
+    what keeps the inserted vertices in order (see :func:`_split_at_crossings`).
+    """
+    rx, ry = b[0] - a[0], b[1] - a[1]
+    sx, sy = d[0] - c[0], d[1] - c[1]
+    denom = rx * sy - ry * sx
+    if abs(denom) < 1e-12:            # parallel or collinear
+        return None
+    qx, qy = c[0] - a[0], c[1] - a[1]
+    t = (qx * sy - qy * sx) / denom
+    u = (qx * ry - qy * rx) / denom
+    if not (-1e-9 <= t <= 1 + 1e-9 and -1e-9 <= u <= 1 + 1e-9):
+        return None
+    return ((a[0] + t * rx, a[1] + t * ry), t, u)
+
+
+def _split_at_crossings(lines: List[List[Tuple[float, float]]],
+                        cell_m: float = 20.0) -> int:
+    """Insert a shared vertex wherever two lines cross.
+
+    Without this the network looks connected on a map and is not: the designer
+    keys nodes on identical vertices, so two pavements that merely cross are two
+    graphs. Returns how many crossings were noded.
+    """
+    segs: List[Tuple[Tuple[float, float], Tuple[float, float], int, int]] = []
+    for li, line in enumerate(lines):
+        for si, (a, b) in enumerate(zip(line, line[1:])):
+            segs.append((a, b, li, si))
+    if not segs:
+        return 0
+    grid: Dict[Tuple[int, int], List[int]] = {}
+    for k, (a, b, _li, _si) in enumerate(segs):
+        for gx in range(int(math.floor(min(a[0], b[0]) / cell_m)),
+                        int(math.floor(max(a[0], b[0]) / cell_m)) + 1):
+            for gy in range(int(math.floor(min(a[1], b[1]) / cell_m)),
+                            int(math.floor(max(a[1], b[1]) / cell_m)) + 1):
+                grid.setdefault((gx, gy), []).append(k)
+    # line -> segment -> [(position along that segment, point)].  The position
+    # is what makes the insertions ordered: several crossings can land on ONE
+    # segment, and inserting them in any other order folds the line back over
+    # itself (measured: a first version inflated the network by 14 km of zig-zag
+    # on this ward alone).
+    hits: Dict[int, Dict[int, Dict[float, Tuple[float, float]]]] = {}
+    seen: set = set()
+    noded = 0
+    for members in grid.values():
+        for i in range(len(members)):
+            for j in range(i + 1, len(members)):
+                k1, k2 = members[i], members[j]
+                pair = (k1, k2) if k1 < k2 else (k2, k1)
+                if pair in seen:
+                    continue
+                seen.add(pair)
+                a, b, l1, s1 = segs[k1]
+                c, d, l2, s2 = segs[k2]
+                if l1 == l2:
+                    continue
+                hit = _segment_hit(a, b, c, d)
+                if hit is None:
+                    continue
+                point, t, u = hit
+                hits.setdefault(l1, {}).setdefault(s1, {})[round(t, 9)] = point
+                hits.setdefault(l2, {}).setdefault(s2, {})[round(u, 9)] = point
+                noded += 1
+    for li, per_segment in hits.items():
+        for si in sorted(per_segment, reverse=True):      # earlier indices stay valid
+            for offset, key in enumerate(sorted(per_segment[si])):
+                lines[li].insert(si + 1 + offset, per_segment[si][key])
+    return noded
+
+
+def _loose_ends(lines: List[List[Tuple[float, float]]]
+                ) -> List[Tuple[int, int]]:
+    """Line endpoints that no other line shares -- the pavement's dead ends."""
+    count: Dict[Tuple[int, int], int] = {}
+    for line in lines:
+        for p in (line[0], line[-1]):
+            k = (int(round(p[0] / 0.25)), int(round(p[1] / 0.25)))
+            count[k] = count.get(k, 0) + 1
+    ends: List[Tuple[int, int]] = []
+    for li, line in enumerate(lines):
+        if len(line) < 2:
+            continue
+        for vi in (0, len(line) - 1):
+            p = line[vi]
+            k = (int(round(p[0] / 0.25)), int(round(p[1] / 0.25)))
+            if count.get(k, 0) <= 1:
+                ends.append((li, vi))
+    return ends
+
+
+def _piece_index(lines: List[List[Tuple[float, float]]]) -> List[int]:
+    """Which connected piece each line belongs to, under the designer's keying."""
+    parent, find, union = _union_find(len(lines))
+    cells: Dict[Tuple[int, int], int] = {}
+    for li, line in enumerate(lines):
+        for p in line:
+            k = (int(round(p[0] / 0.25)), int(round(p[1] / 0.25)))
+            other = cells.setdefault(k, li)
+            if other != li:
+                union(other, li)
+    return [find(i) for i in range(len(lines))]
+
+
+def _tie_across_carriageways(lines: List[List[Tuple[float, float]]],
+                             carriageways: List[List[Tuple[float, float]]],
+                             max_m: float = PAVEMENT_CROSS_M,
+                             cell_m: float = 25.0) -> int:
+    """Tie a pavement end onto the pavement on the far side of a carriageway.
+
+    This is the crossing: a duct (and a pedestrian) gets to the other side by
+    crossing the road, and the designer already classifies a carriageway crossing
+    as an HDD drill -- so the network only has to carry the crossing as a line.
+    The end is moved onto the far pavement, so the crossing is part of the
+    pavement itself rather than a separate link to account for.
+
+    Only ends of DIFFERENT pieces are tied, shortest first and each end once, so
+    this can never invent a shortcut inside a pavement that is already connected.
+    Returns how many crossings were made.
+    """
+    if not lines or not carriageways:
+        return 0
+    ends = _loose_ends(lines)
+    if not ends:
+        return 0
+    car_segs = [(a, b) for line in carriageways for a, b in zip(line, line[1:])]
+    if not car_segs:
+        return 0
+    car_grid: Dict[Tuple[int, int], List[int]] = {}
+    for k, (a, b) in enumerate(car_segs):
+        for gx in range(int(math.floor(min(a[0], b[0]) / cell_m)),
+                        int(math.floor(max(a[0], b[0]) / cell_m)) + 1):
+            for gy in range(int(math.floor(min(a[1], b[1]) / cell_m)),
+                            int(math.floor(max(a[1], b[1]) / cell_m)) + 1):
+                car_grid.setdefault((gx, gy), []).append(k)
+
+    def crosses_a_carriageway(a: Tuple[float, float],
+                              b: Tuple[float, float]) -> bool:
+        for gx in range(int(math.floor(min(a[0], b[0]) / cell_m)),
+                        int(math.floor(max(a[0], b[0]) / cell_m)) + 1):
+            for gy in range(int(math.floor(min(a[1], b[1]) / cell_m)),
+                            int(math.floor(max(a[1], b[1]) / cell_m)) + 1):
+                for k in car_grid.get((gx, gy), ()):
+                    if _segment_hit(a, b, car_segs[k][0], car_segs[k][1]) is not None:
+                        return True
+        return False
+
+    # Every pavement segment, so an end can reach the far side wherever it is --
+    # not only where another pavement happens to end facing it.
+    segs: List[Tuple[Tuple[float, float], Tuple[float, float], int, int]] = []
+    for li, line in enumerate(lines):
+        for si, (a, b) in enumerate(zip(line, line[1:])):
+            segs.append((a, b, li, si))
+    grid: Dict[Tuple[int, int], List[int]] = {}
+    for k, (a, b, _li, _si) in enumerate(segs):
+        for gx in range(int(math.floor(min(a[0], b[0]) / cell_m)),
+                        int(math.floor(max(a[0], b[0]) / cell_m)) + 1):
+            for gy in range(int(math.floor(min(a[1], b[1]) / cell_m)),
+                            int(math.floor(max(a[1], b[1]) / cell_m)) + 1):
+                grid.setdefault((gx, gy), []).append(k)
+
+    piece = _piece_index(lines)
+    candidates: List[Tuple[float, int, int, int, int, Tuple[float, float]]] = []
+    radius = int(math.ceil(max_m / cell_m)) + 1
+    for li, vi in ends:
+        p = lines[li][vi]
+        gx, gy = int(math.floor(p[0] / cell_m)), int(math.floor(p[1] / cell_m))
+        for i in range(gx - radius, gx + radius + 1):
+            for j in range(gy - radius, gy + radius + 1):
+                for k in grid.get((i, j), ()):
+                    a, b, lj, si = segs[k]
+                    if lj == li or piece[lj] == piece[li]:
+                        continue
+                    vx, vy = b[0] - a[0], b[1] - a[1]
+                    L2 = vx * vx + vy * vy
+                    t = 0.0 if L2 == 0.0 else min(1.0, max(
+                        0.0, ((p[0] - a[0]) * vx + (p[1] - a[1]) * vy) / L2))
+                    q = (a[0] + t * vx, a[1] + t * vy)
+                    d = math.hypot(q[0] - p[0], q[1] - p[1])
+                    if d <= max_m and d > 1e-6:
+                        candidates.append((round(d, 3), li, vi, lj, si, q))
+    candidates.sort()
+    used: set = set()
+    accepted: Dict[int, List[Tuple[int, Tuple[float, float]]]] = {}
+    made = 0
+    for d, li, vi, lj, si, q in candidates:
+        if (li, vi) in used or piece[li] == piece[lj] or d > max_m:
+            continue
+        if not crosses_a_carriageway(lines[li][vi], q):
+            continue
+        accepted.setdefault(lj, []).append((si, q))
+        lines[li][vi] = q
+        used.add((li, vi))
+        piece[li] = piece[lj]
+        made += 1
+    # Descending, so inserting one crossing does not shift the index of the next.
+    for lj, items in accepted.items():
+        for si, q in sorted(set(items), reverse=True):
+            lines[lj].insert(si + 1, q)
+    return made
+
+
+def _tie_loose_ends(lines: List[List[Tuple[float, float]]], tol: float) -> int:
+    """Tie every loose end onto the nearest other line within ``tol``.
+
+    A mapped footway ends at the kerb, a derived pavement runs past it; a
+    derived pavement stops at a junction, a mapped one may cross it. Either way
+    the connection only exists once both share a VERTEX, so the end is projected
+    onto the nearest line and that point is inserted into it. Returns how many
+    ends were tied.
+    """
+    segs: List[Tuple[Tuple[float, float], Tuple[float, float], int, int]] = []
+    for li, line in enumerate(lines):
+        for si, (a, b) in enumerate(zip(line, line[1:])):
+            segs.append((a, b, li, si))
+    if not segs:
+        return 0
+    cell = max(tol, 1.0)
+    grid: Dict[Tuple[int, int], List[int]] = {}
+    for k, (a, b, _li, _si) in enumerate(segs):
+        for gx in range(int(math.floor((min(a[0], b[0]) - tol) / cell)),
+                        int(math.floor((max(a[0], b[0]) + tol) / cell)) + 1):
+            for gy in range(int(math.floor((min(a[1], b[1]) - tol) / cell)),
+                            int(math.floor((max(a[1], b[1]) + tol) / cell)) + 1):
+                grid.setdefault((gx, gy), []).append(k)
+    inserts: Dict[int, List[Tuple[int, Tuple[float, float]]]] = {}
+    tied = 0
+    for li, line in enumerate(lines):
+        for vi in (0, len(line) - 1):
+            p = line[vi]
+            gx, gy = int(math.floor(p[0] / cell)), int(math.floor(p[1] / cell))
+            best: Optional[Tuple[float, int, int, Tuple[float, float]]] = None
+            for i in (gx - 1, gx, gx + 1):
+                for j in (gy - 1, gy, gy + 1):
+                    for k in grid.get((i, j), ()):
+                        a, b, lj, si = segs[k]
+                        if lj == li:
+                            continue
+                        vx, vy = b[0] - a[0], b[1] - a[1]
+                        L2 = vx * vx + vy * vy
+                        t = 0.0 if L2 == 0.0 else min(1.0, max(
+                            0.0, ((p[0] - a[0]) * vx + (p[1] - a[1]) * vy) / L2))
+                        q = (a[0] + t * vx, a[1] + t * vy)
+                        d = math.hypot(q[0] - p[0], q[1] - p[1])
+                        if d <= tol and (best is None or d < best[0]):
+                            best = (d, lj, si, q)
+            if best is None:
+                continue
+            _d, lj, si, q = best
+            inserts.setdefault(lj, []).append((si, q))
+            line[vi] = q
+            tied += 1
+    # Descending, so the local segment index of every later insert stays valid.
+    for lj, items in inserts.items():
+        for si, q in sorted(set(items), reverse=True):
+            lines[lj].insert(si + 1, q)
+    return tied
+
+
+def pavement_carriers(roads: Sequence[Dict[str, Any]],
+                      offset_m: float = PAVEMENT_OFFSET_M
+                      ) -> Dict[str, Any]:
+    """Derive the pavement network beside the carrier streets. Pure + testable.
+
+    Returns ``{"rows", "derived_km", "mapped_km", "total_km", "pieces",
+    "tied"}``. Only the DERIVED lines are returned as rows -- the mapped footways
+    are already in ``roads`` and stay exactly as OSM drew them; they are fed into
+    the welding pass so the derived pavement joins onto them.
+    """
+    derived: List[Tuple[List[List[float]], Dict[str, Any], float]] = []
+    mapped: List[Tuple[List[List[float]], Dict[str, Any]]] = []
+    for row in roads:
+        fclass = str(row.get("fclass") or "")
+        if fclass in pavement_classes():
+            for coords in _polyline_parts(row):
+                if len(coords) >= 2:
+                    # BOTH kerbs: the engine places its splitter cabinets on the
+                    # sidewalk of either side, so a one-sided network leaves the
+                    # far side's cabinets unreachable again.
+                    for dist in (offset_m, -offset_m):
+                        derived.append((coords, row, dist))
+        elif fclass in PAVEMENT_MAPPED_CLASSES:
+            mapped.extend((coords, row) for coords in _polyline_parts(row))
+    if not derived:
+        return {"rows": [], "replaced_osm_ids": [], "derived_km": 0.0,
+                "mapped_km": 0.0, "total_km": 0.0, "pieces": 0, "tied": 0,
+                "nodings": 0, "crossings": 0, "arterials": False}
+
+    # All geometry in a local metre plane, so an offset is an offset everywhere
+    # in the area and not a different distance north to south.
+    sample = [c for coords, _row, _d in derived for c in coords][:4000] or \
+        [c for coords, _row in mapped for c in coords][:4000]
+    lon0 = sum(float(c[0]) for c in sample) / len(sample)
+    lat0 = sum(float(c[1]) for c in sample) / len(sample)
+    mx = 111320.0 * math.cos(math.radians(lat0))
+    my = 110540.0
+
+    def to_xy(c: Sequence[float]) -> Tuple[float, float]:
+        return ((float(c[0]) - lon0) * mx, (float(c[1]) - lat0) * my)
+
+    def to_lonlat(p: Tuple[float, float]) -> Tuple[float, float]:
+        return (round(p[0] / mx + lon0, 7), round(p[1] / my + lat0, 7))
+
+    lines: List[List[Tuple[float, float]]] = []
+    sources: List[Dict[str, Any]] = []
+    kinds: List[str] = []
+    for coords, row, dist in derived:
+        off = _offset_polyline([to_xy(c) for c in coords], dist)
+        lines.append(_extend_ends(off, PAVEMENT_EXTEND_M))
+        sources.append(row)
+        kinds.append("derived")
+    for coords, row in mapped:
+        lines.append([to_xy(c) for c in coords])
+        sources.append(row)
+        kinds.append("mapped")
+
+    lines = _weld_vertices(lines, PAVEMENT_WELD_M)
+    crossed = _split_at_crossings(lines)
+    tied = _tie_loose_ends(lines, PAVEMENT_LINK_M)
+    lines = _weld_vertices(lines, PAVEMENT_WELD_M)
+    # The welding above moves vertices, so a second pass nodes the crossings it
+    # created; a line is never connected by a crossing that is not a vertex.
+    crossed += _split_at_crossings(lines)
+
+    # The arterial crossings, then one more node pass so the moved ends are
+    # welded onto the pavements they reach.
+    carriageways = [[to_xy(c) for c in coords]
+                    for row in roads
+                    if str(row.get("fclass") or "") in PAVEMENT_CROSSING_CLASSES
+                    for coords in _polyline_parts(row)]
+    crossings = _tie_across_carriageways(lines, carriageways)
+    lines = _weld_vertices(lines, PAVEMENT_WELD_M)
+    crossed += _split_at_crossings(lines)
+
+    # Both halves go back to the caller: the derived pavements as new `footway`
+    # features, and the mapped footways REBUILT, because the node/tying passes
+    # inserted vertices into them.  Emitting only the derived lines would hand
+    # the designer a pavement that touches a mapped footway at a point which is
+    # not a vertex of it -- which is not a connection to a graph keyed on
+    # vertices, and was measured as reaching 1 splitter of 45.
+    rows: List[Dict[str, Any]] = []
+    replaced: List[Any] = []
+    derived_m = 0.0
+    mapped_m = 0.0
+    for i, line in enumerate(lines):
+        pts = _thin_vertices(line)
+        if len(pts) < 2:
+            continue
+        length = sum(math.hypot(b[0] - a[0], b[1] - a[1])
+                     for a, b in zip(pts, pts[1:]))
+        if length < 0.5:
+            continue
+        geom_json = json.dumps({"type": "LineString",
+                                "coordinates": [list(to_lonlat(p)) for p in pts]})
+        row = sources[i]
+        if kinds[i] == "derived":
+            derived_m += length
+            rows.append({
+                "osm_id": "pave-%s" % row.get("osm_id"),
+                "fclass": "footway",
+                "highway": "footway",
+                "name": row.get("name"),
+                "surface": row.get("surface"),
+                "carrier_source": PAVEMENT_SOURCE,
+                "geom_json": geom_json,
+            })
+        else:
+            mapped_m += length
+            rebuilt = dict(row)
+            rebuilt["geom_json"] = geom_json
+            rebuilt["carrier_source"] = "osm-footway"
+            rows.append(rebuilt)
+            if row.get("osm_id") is not None:
+                replaced.append(row.get("osm_id"))
+    total_m = derived_m + mapped_m
+    return {
+        "rows": rows,
+        "replaced_osm_ids": replaced,
+        "derived_km": round(derived_m / 1000.0, 1),
+        "mapped_km": round(mapped_m / 1000.0, 1),
+        "total_km": round(total_m / 1000.0, 1),
+        "pieces": _pieces(lines),
+        "tied": tied,
+        "nodings": crossed,
+        "crossings": crossings,
+        "arterials": bool(PAVEMENT_ARTERIALS),
+    }
+
+
+def _thin_vertices(pts: List[Tuple[float, float]], min_gap_m: float = 1.0
+                   ) -> List[Tuple[float, float]]:
+    """Drop the duplicate vertices the welding pass leaves behind."""
+    if len(pts) < 2:
+        return list(pts)
+    out = [pts[0]]
+    for q in pts[1:-1]:
+        if math.hypot(q[0] - out[-1][0], q[1] - out[-1][1]) >= min_gap_m:
+            out.append(q)
+    if math.hypot(pts[-1][0] - out[-1][0], pts[-1][1] - out[-1][1]) > 1e-9:
+        out.append(pts[-1])
+    return out
+
+
+def _pieces(lines: Sequence[Sequence[Tuple[float, float]]],
+            key_m: float = 0.25) -> int:
+    """How many pieces the line set falls into under the designer's own keying.
+
+    The trench designer nodes on shared vertices rounded to 0.25 m, so this is
+    the number it will see. Reported with the build so a regression that returns
+    the network to dozens of pieces is visible without running a design.
+    """
+    parent, find, union = _union_find(len(lines) if lines else 0)
+    cells: Dict[Tuple[int, int], int] = {}
+    for li, line in enumerate(lines):
+        for p in line:
+            k = (int(round(p[0] / key_m)), int(round(p[1] / key_m)))
+            other = cells.setdefault(k, li)
+            if other != li:
+                union(other, li)
+    if not lines:
+        return 0
+    return len({find(i) for i in range(len(lines))})
+
+
 def build_inputs(
     project_id: str,
     area: str,
@@ -3498,7 +4184,23 @@ def build_inputs(
         )
     inputs_dir = os.path.join(output_dir, "inputs")
     excel_path = write_address_workbook(os.path.join(inputs_dir, "Main_DataSet.xlsx"), premises)
-    roads_path = write_roads_geojson(os.path.join(inputs_dir, "roads.geojson"), roads)
+    # `roads_km` keeps meaning the OSM street network the area resolved to; the
+    # derived pavement is reported separately, because it is our geometry, not
+    # OSM's, and a planner has to be able to tell the two apart.
+    streets_km = road_summary(roads)["total_km"]
+    pavement = (pavement_carriers(roads) if PAVEMENT_ENABLED
+                else {"rows": [], "replaced_osm_ids": [], "derived_km": 0.0,
+                      "mapped_km": 0.0, "total_km": 0.0, "pieces": 0,
+                      "tied": 0, "nodings": 0, "crossings": 0,
+                      "arterials": False})
+    # The mapped footways come back rebuilt (the node and tying passes put
+    # vertices on them), so the originals are dropped rather than written twice.
+    replaced = {str(v) for v in pavement.get("replaced_osm_ids") or []}
+    kept_roads = [r for r in roads if str(r.get("osm_id")) not in replaced]
+    roads_path = write_roads_geojson(
+        os.path.join(inputs_dir, "roads.geojson"),
+        kept_roads + list(pavement["rows"]),
+    )
 
     hh = household_summary(premises)
     return {
@@ -3527,7 +4229,12 @@ def build_inputs(
         "resolution_key": resolution_key(area, country_code),
         "premises": len(premises),
         "households": hh,
-        "roads_km": road_summary(roads)["total_km"],
+        "roads_km": streets_km,
+        # The pavement network the designer actually routes on: what OSM mapped,
+        # what had to be derived beside the carrier streets, and how many pieces
+        # the result falls into under the designer's own node keying.
+        "pavement": {k: v for k, v in pavement.items()
+                     if k not in ("rows", "replaced_osm_ids")},
         "extract": extract,
         "stats": stats,
     }

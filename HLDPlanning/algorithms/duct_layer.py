@@ -1403,12 +1403,22 @@ class DuctLayer(QgsProcessingAlgorithm):
         #       own cable), and
         #   (b) the span a drop taps, i.e. the nearest span to each pseudo-HH
         #       point of the region (that is where a coupler joins it).
-        # All non-garden spans of the owning polygon are part of its trunk.
-        # Selecting only spans close to the cable produced disconnected ducts
-        # and forced later tap passes to invent links. Keep the polygon's
-        # complete trench corridor; it is still clipped to the polygon by the
-        # enrichment pass and split at chambers afterwards.
-        picked = list(cand)
+        # Keep the corridor the duct is actually built in — NOT the region's
+        # whole distribution trench (that tripled the duct material: 2.4 km of
+        # spine became 8.6 km of duct). Two kinds of span qualify:
+        #   (a) the span the region's cable rides (the duct must contain its
+        #       own cable), and
+        #   (b) the span a drop taps, i.e. the nearest span to each pseudo-HH
+        #       point of the region (that is where a coupler joins it).
+        picked = []
+        for g in cand:
+            if fallback_geom is None or fallback_geom.isEmpty():
+                continue
+            try:
+                if g.distance(fallback_geom) <= tol_m:
+                    picked.append(g)
+            except Exception:
+                continue
         taps = 0
         if tap_lyr is not None:
             names_t = tap_lyr.fields().names()
@@ -1446,10 +1456,13 @@ class DuctLayer(QgsProcessingAlgorithm):
             return fallback_geom
         if corr is None or corr.isEmpty():
             return fallback_geom
-        # The corridor is selected by the owning polygon and is deliberately
-        # allowed to extend beyond the cable's first/last span: those are the
-        # trench links needed to reach every pseudo point. A cable-distance
-        # fallback here would recreate the disconnected-fragment bug.
+        # Sanity: the corridor must still be the one the cables ride.
+        if fallback_geom is not None and not fallback_geom.isEmpty():
+            try:
+                if corr.distance(fallback_geom) > 0.5:
+                    return fallback_geom
+            except Exception:
+                pass
         return corr
 
     # How far apart two trench vertices may be and still count as joined when

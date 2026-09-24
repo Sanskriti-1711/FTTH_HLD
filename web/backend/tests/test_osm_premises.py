@@ -688,6 +688,109 @@ def test_write_roads_geojson_keeps_fclass_and_geometry(tmp_path):
     assert feature["geometry"]["type"] == "LineString"
 
 
+# ---------------------------------------------------------------------------
+# The derived pavement (sidewalk) carrier network
+# ---------------------------------------------------------------------------
+
+def _road_row(osm_id, fclass, coords, name=None):
+    return {
+        "osm_id": osm_id, "fclass": fclass, "highway": fclass, "name": name,
+        "geom_json": json.dumps({"type": "LineString", "coordinates": coords}),
+    }
+
+
+def _line_distance_m(row, point):
+    """Distance from a point to a road row's line, in metres (local planar)."""
+    coords = json.loads(row["geom_json"])["coordinates"]
+    mx = 111320.0 * math.cos(math.radians(coords[0][1]))
+    my = 110540.0
+    px = ((point[0] - coords[0][0]) * mx, (point[1] - coords[0][1]) * my)
+    pts = [(((c[0] - coords[0][0]) * mx, (c[1] - coords[0][1]) * my)) for c in coords]
+    best = float("inf")
+    for a, b in zip(pts, pts[1:]):
+        vx, vy = b[0] - a[0], b[1] - a[1]
+        L2 = vx * vx + vy * vy
+        t = 0.0 if L2 == 0 else max(0.0, min(1.0, ((px[0] - a[0]) * vx + (px[1] - a[1]) * vy) / L2))
+        best = min(best, math.hypot(px[0] - (a[0] + t * vx), px[1] - (a[1] + t * vy)))
+    return best
+
+
+def test_pavement_carriers_paves_both_kerbs_at_the_kerb_distance():
+    # A trench runs in the pavement, and the designer routes ONLY on footway
+    # classes -- so this is the layer it needs, on BOTH kerbs because its
+    # cabinets are placed on either side.
+    # Three vertices, so the middle one is an offset vertex rather than an
+    # extended end (the ends reach past the junction node, by PAVEMENT_EXTEND_M).
+    street = _road_row(1, "residential",
+                       [[13.3800, 52.4400], [13.3830, 52.4400], [13.3860, 52.4400]],
+                       "Test Street")
+    result = osm_source.pavement_carriers([street])
+    assert len(result["rows"]) == 2
+    assert {r["fclass"] for r in result["rows"]} == {"footway"}
+    assert {r["highway"] for r in result["rows"]} == {"footway"}
+    assert {r["carrier_source"] for r in result["rows"]} == {osm_source.PAVEMENT_SOURCE}
+    assert all(r["name"] == "Test Street" for r in result["rows"])
+    assert result["derived_km"] > 0 and result["mapped_km"] == 0
+    for row in result["rows"]:
+        middle = json.loads(row["geom_json"])["coordinates"][1]
+        assert _line_distance_m(street, middle) == pytest.approx(
+            osm_source.PAVEMENT_OFFSET_M, abs=0.2)
+    # one line each side of the street, not two on the same side
+    sides = {round(json.loads(r["geom_json"])["coordinates"][0][1] - 52.4400, 5)
+             for r in result["rows"]}
+    assert len(sides) == 2
+
+
+def test_crossing_streets_form_one_connected_pavement():
+    # The designer nodes its graph on shared VERTICES, so two pavements that
+    # merely cross are two graphs.  Measured on the ward run that fed it the OSM
+    # footways alone: 77 pieces, 44 of 45 splitters unreachable from the MFG.
+    roads = [
+        _road_row(1, "residential", [[13.3800, 52.4400], [13.3860, 52.4400]]),
+        _road_row(2, "service", [[13.3830, 52.4370], [13.3830, 52.4430]]),
+    ]
+    result = osm_source.pavement_carriers(roads)
+    assert len(result["rows"]) == 4
+    assert result["pieces"] == 1
+
+
+def test_pavement_carriers_rebuilds_the_mapped_footways():
+    # The node/tying passes put vertices ON the mapped footways, and a connection
+    # that is not a vertex of both lines is not a connection.  So the mapped
+    # footways come back rebuilt and their originals are named for removal --
+    # emitting the derived lines alone reached 1 splitter of 45.
+    roads = [
+        _road_row(1, "residential", [[13.3800, 52.4400], [13.3850, 52.4400]]),
+        _road_row(2, "footway", [[13.3820, 52.4400], [13.3820, 52.4408]]),
+    ]
+    result = osm_source.pavement_carriers(roads)
+    assert result["replaced_osm_ids"] == [2]
+    rebuilt = [r for r in result["rows"] if r["osm_id"] == 2]
+    assert len(rebuilt) == 1
+    assert rebuilt[0]["fclass"] == "footway"
+    assert rebuilt[0]["carrier_source"] == "osm-footway"
+    assert result["mapped_km"] > 0
+
+
+def test_arterials_are_not_paved_by_default(monkeypatch):
+    # The class ladder exists so a trench does not run down an arterial; a
+    # derived pavement there would be the cheapest carrier in that ladder.
+    roads = [_road_row(1, "primary", [[13.3800, 52.4400], [13.3850, 52.4400]])]
+    assert osm_source.pavement_carriers(roads)["rows"] == []
+    monkeypatch.setattr(osm_source, "PAVEMENT_ARTERIALS", True)
+    paved = osm_source.pavement_carriers(roads)
+    assert len(paved["rows"]) == 2
+    assert paved["arterials"] is True
+
+
+def test_pavement_carriers_without_pavable_roads():
+    result = osm_source.pavement_carriers(
+        [{"fclass": "primary", "geom_json": None},
+         {"fclass": "construction", "geom_json": None}])
+    assert result["rows"] == []
+    assert result["pieces"] == 0 and result["derived_km"] == 0.0
+
+
 def test_road_summary_groups_kilometres_by_fclass():
     roads = [{
         "fclass": "residential", "highway": "residential",
@@ -960,6 +1063,58 @@ def test_preview_is_quiet_for_an_area_search(monkeypatch):
     out = osm_source.preview_area("Mariendorf, Berlin, Germany")
 
     assert not [w for w in out["warnings"] if "did not resolve to a postcode" in w]
+
+
+def test_preview_centroid_warning_counts_what_the_workbook_will_carry(monkeypatch):
+    """The old warning counted the ADDR_ID suffix, so a US ZIP reported
+    5,946 premises with no addr:housenumber when 46 % carried one.
+    The planner must be told how many will ship with NO address and how many
+    took one from the building polygon."""
+    building_with_address = {
+        "ADDR_ID": "OSM-W7-C", "Address": "High Street", "Housenumber": "7",
+        "City": "Asheville", "Postcode": "28801", "Country": "United States",
+        "District": "", "HH": 1, "HH_METHOD": "fallback_one",
+        "LATITUDE": 35.58, "LONGITUDE": -82.55, "OSM_ID": 7,
+    }
+    bare_building = {
+        "ADDR_ID": "OSM-W8-C", "Address": "", "Housenumber": "",
+        "City": "Kenya", "Postcode": "", "Country": "Kenya",
+        "District": "", "HH": 1, "HH_METHOD": "fallback_one",
+        "LATITUDE": -0.02, "LONGITUDE": 37.07, "OSM_ID": 8,
+    }
+    _stub_area(monkeypatch, [building_with_address, bare_building])
+
+    out = osm_source.preview_area("Asheville, United States")
+
+    w = " ".join(out["warnings"])
+    assert "1 premise(s) have neither a street nor a house number" in w
+    assert "1 premise(s) took their address from the building" in w
+    assert "have no addr:housenumber" not in w
+    assert out["premises"]["without_address"] == 1
+    assert out["premises"]["from_building_polygon"] == 1
+    assert out["premises"]["from_building_centroid"] == 2
+
+
+def test_preview_colours_a_fully_addressed_centroid_as_the_building_not_anonymous(monkeypatch):
+    """An anonymous warning must not fire when every centroid row carries an
+    address from the building polygon: the gap is not the anonymous one."""
+    premises = [
+        {
+            "ADDR_ID": f"OSM-W{i}-C", "Address": "Kaiserstrasse", "Housenumber": str(i),
+            "City": "Berlin", "Postcode": "12105", "Country": "Germany",
+            "District": "", "HH": 1, "HH_METHOD": "fallback_one",
+            "LATITUDE": 52.44, "LONGITUDE": 13.38, "OSM_ID": 100 + i,
+        }
+        for i in (17, 18)
+    ]
+    _stub_area(monkeypatch, premises)
+
+    out = osm_source.preview_area("Berlin, Germany")
+    w = " ".join(out["warnings"])
+
+    assert "have neither a street nor a house number" not in w
+    assert "2 premise(s) took their address from the building" in w
+    assert out["premises"]["without_address"] == 0
 
 
 def test_the_postcode_warning_does_not_duplicate_the_administrative_one(monkeypatch):
