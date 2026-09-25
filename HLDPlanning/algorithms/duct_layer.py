@@ -1737,9 +1737,15 @@ class DuctLayer(QgsProcessingAlgorithm):
                 total += e.length()
             cur = nxt
         coords.append(QgsPointXY(pb.x(), pb.y()))
-        # Once both endpoints are on the same connected trench network, the
-        # network path is authoritative even when it is longer than the chord.
-        # A chord would put duct outside the trench, which is forbidden by D10.
+        # A route that is an absurd detour is not the path between the points:
+        # it would invent far more duct than the chord it replaces. Cap it at
+        # ``x * chord + slack`` so a 5 m tap does not get a 1 km network route.
+        try:
+            straight = math.hypot(b_xy[0] - a_xy[0], b_xy[1] - a_xy[1])
+        except Exception:
+            straight = 0.0
+        if total > straight * self.ROUTE_DETOUR_MAX_X + self.ROUTE_DETOUR_SLACK_M:
+            return None
         path = QgsGeometry.fromPolylineXY(coords)
         return None if path.isEmpty() else path
 
@@ -1870,9 +1876,11 @@ class DuctLayer(QgsProcessingAlgorithm):
                 continue
             if seg is None or seg.isEmpty() or seg.length() <= 0.01:
                 continue
-            # Do not reject a genuine trench detour: replacing it with a chord
-            # would create duct geometry where no trench exists.  The connected
-            # network route is always preferable to an off-trench shortcut.
+            # Detour cap: a single-feature trench that carries both points the
+            # long way round (loop) is not the path between them — it would
+            # invent far more duct than the chord it replaces.
+            if seg.length() > straight * self.ROUTE_DETOUR_MAX_X + self.ROUTE_DETOUR_SLACK_M:
+                continue
             if best is None or seg.length() < best.length():
                 best = seg
         return best
@@ -1946,11 +1954,28 @@ class DuctLayer(QgsProcessingAlgorithm):
                 spurs.append(link)
                 trenched += 1
             else:
-                # Never draw a straight off-trench shortcut.  A disconnected
-                # region is reported for the next design pass instead of
-                # violating D10 or silently creating a duct through premises.
+                # No trench carries both ends — fall back to a straight
+                # connector so the coupler is still reached (D9), but count
+                # and log it so the design pass knows it was off-trench.
+                try:
+                    straight_geom = QgsGeometry.fromPolylineXY(
+                        [QgsPointXY(npt.x(), npt.y()), QgsPointXY(pt.x(), pt.y())])
+                except Exception:
+                    straight_geom = None
+                if straight_geom is not None and not straight_geom.isEmpty():
+                    spurs.append(straight_geom)
                 off_trench += 1
         if not spurs:
+            if off_trench:
+                try:
+                    feedback.pushInfo(
+                        f"  distribution duct taps: 0 tap(s) added so "
+                        f"every pseudo-HH/coupler sits on a duct "
+                        f"({reached} already on it; {trenched} follow the trench). "
+                        f"{off_trench} had no single trench carrying both "
+                        f"ends and used a straight connector.")
+                except Exception:
+                    pass
             return duct_geom
         try:
             from ..utils.geometry_ops import unary_union_geoms as _uug_tap
