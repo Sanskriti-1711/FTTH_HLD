@@ -40,7 +40,11 @@ BACKEND_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BACKEND_DIR / "outputs"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-MAX_MESSAGES = 500
+MAX_MESSAGES = 5000
+# ADDR_ID truncation warnings flood the log (one per feature) and bury the
+# real Cable Layer error under 500 identical messages — collapse them to a
+# single counted entry so the failure stays visible.
+_ADR_WARN_MARKERS = ("ADDR_ID", "exceeds maximum field length", "Value of field")
 tasks: Dict[str, Dict[str, Any]] = {}
 
 PIPELINE_STAGES = [
@@ -194,6 +198,22 @@ def _public_task(project_id: str) -> Dict[str, Any]:
 
 def _append(project_id: str, level: str, text: str) -> None:
     task = _task(project_id)
+    # Collapse the per-feature ADDR_ID / ogr field-width warnings: they fire
+    # once per feature (2-3k times) and push the real error out of the 500-
+    # message deque. Keep the first occurrence and count the rest.
+    if "ADDR_ID" in text and any(m in text for m in _ADR_WARN_MARKERS):
+        cnt = int(task.get("_addr_warn_count") or 0) + 1
+        task["_addr_warn_count"] = cnt
+        if cnt == 1:
+            task["messages"].append({"ts": _now(), "level": level, "text": text + " (further identical ADDR_ID warnings collapsed)"})
+        else:
+            # update the first warning in place to show the running total
+            for msg in task["messages"]:
+                if "ADDR_ID" in msg["text"] and "collapsed" in msg["text"]:
+                    msg["text"] = f"ADDR_ID field-width warnings collapsed: {cnt} occurrences (first: {text[:140]})"
+                    break
+        task["updated_at"] = _now()
+        return
     task["messages"].append({"ts": _now(), "level": level, "text": text})
     task["updated_at"] = _now()
 
