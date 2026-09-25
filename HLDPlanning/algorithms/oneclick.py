@@ -1111,6 +1111,15 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         dc = cables.get(self._CB_OUT_DIST)
         if dc:
             params[self._DU_DIST_CABLES] = dc
+        if not fc and not dc:
+            # Cascade order: cables are planned AFTER the ducts now, so the
+            # route-based bundling (one duct per cable route) has no input —
+            # the duct stage falls back to its own bundling on the trench
+            # network, which is the behaviour the plan approved for the
+            # reordered cascade.
+            feedback.pushInfo(self.tr(
+                "Duct stage: no cable inputs (cables run after ducts in the "
+                "cascade) — ducts are bundled on the trench network."))
         # Per-route duct layers for the chamber stage (see duct_layer):
         # junction chambers are placed where >= 3 DISTINCT ducts meet, so that
         # stage must see the runs rather than the published single component.
@@ -1139,6 +1148,15 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         dist_runs = self._fast_resolve(runs.get(self._DU_DIST_RUNS), context)
         feeder_ducts_in = feeder_runs or ducts.get(self._DU_OUT_FEEDER)
         dist_ducts_in = dist_runs or ducts.get(self._DU_OUT_DIST)
+        if feeder_ducts_in is None and dist_ducts_in is None:
+            # Cascade order: chambers are placed straight after the trench
+            # design, so the duct evidence rules (junctions, drop transitions)
+            # cannot fire — the designer's Trench_Nodes + PDPs + trench
+            # junctions are the candidate sources instead.
+            feedback.pushInfo(self.tr(
+                "Chamber stage: no duct inputs (ducts run after chambers in "
+                "the cascade) — candidates come from Trench_Nodes, PDPs, "
+                "tangent crossings and trench junctions."))
         # Resolve the trench stage's temporary tangent-crossing layer to a
         # concrete layer object (or None).  Passing an unresolved temp-id
         # string into a child algorithm has caused native crashes in headless
@@ -1674,38 +1692,55 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
 
         if feedback.isCanceled():
             return {}
-        # --- Cable Layer ---
+        # --- Chamber Layer (civil structures) ---
+        # Phase C cascade order (TRENCH_DESIGN.md §6.1): trench → chambers →
+        # ducts → cables. Chambers come directly after the trench design
+        # because a chamber IS the opening of the trench at a structural node
+        # (INPUT_TRENCH_NODES — the designer's Trench_Nodes), and every later
+        # stage is built chamber-to-chamber on the spans it defines. The duct
+        # inputs are NOT available yet: chamber_layer takes them as optional,
+        # and the designer nodes + PDPs + trench junctions supply candidates.
         steps.setCurrentStep(5)
-        feedback.pushInfo(self.tr("[80%] Running Cable Layer"))
-        self._preflight_cable(results, context, feedback)
+        feedback.pushInfo(self.tr("[75%] Running Chamber Layer"))
         t0 = time.time()
-        cab = self._run("Cable Layer", self.run_cable_layer,
-                        parameters, context, steps, feedback, results=results)
-        results["cables"] = cab
+        chambers = self._run("Chamber Layer", self.run_chamber_layer,
+                             parameters, context, steps, feedback, results=results)
+        results["chambers"] = chambers.get("OUT_CHAMBERS") if chambers else None
         elapsed = time.time() - t0
-        n_fc = self._fast_count(cab.get(self._CB_OUT_FEEDER), context)
-        n_dc = self._fast_count(cab.get(self._CB_OUT_DIST), context)
-        parts = []
-        if n_fc is not None:
-            parts.append("Feeder: {}".format(n_fc))
-        if n_dc is not None:
-            parts.append("Dist: {}".format(n_dc))
-        fc_str = ("{} features, ".format(", ".join(parts))) if parts else ""
-        feedback.pushInfo(self.tr("  [timing] Cable Layer: {}{:.3f}s".format(fc_str, elapsed)))
-        fc = results["cables"].get(self._CB_OUT_FEEDER)
-        if fc:
-            results["cables"][self._CB_OUT_FEEDER] = self._save_layer_to_gpkg(
-                fc, "Feeder_Cable.gpkg", out_dir, context, feedback)
-        dc = results["cables"].get(self._CB_OUT_DIST)
-        if dc:
-            results["cables"][self._CB_OUT_DIST] = self._save_layer_to_gpkg(
-                dc, "Distribution_Cable.gpkg", out_dir, context, feedback)
+        n_ch = self._fast_count(results.get("chambers"), context)
+        fc_str = "{} features, ".format(n_ch) if n_ch is not None else ""
+        feedback.pushInfo(self.tr("  [timing] Chamber Layer: {}{:.3f}s".format(fc_str, elapsed)))
+        if results.get("chambers"):
+            results["chambers"] = self._save_layer_to_gpkg(
+                results["chambers"], "Chambers.gpkg", out_dir, context, feedback)
+
+        # Chambers are the authoritative civil break points. The trench layers
+        # are normalized against them NOW, so the duct and cable stages that
+        # follow are built chamber-to-chamber (one published component = one
+        # chamber-to-chamber span). Cables and ducts do not exist yet at this
+        # point — they get their own pass after the cable stage below.
+        if results.get("chambers"):
+            for key, filename in (
+                    ("trenches", "Final_Trenches.gpkg"),
+                    ("feeder", "Feeder_Trench.gpkg"),
+                    ("distribution", "Distribution_Trench.gpkg"),
+                    ("garden", "Garden_Trench.gpkg")):
+                original = results.get(key)
+                split = self._split_lines_at_chambers(
+                    original, results["chambers"], context, feedback, filename)
+                if split is not original:
+                    results[key] = self._save_layer_to_gpkg(
+                        split, filename, out_dir, context, feedback)
+            feedback.pushInfo(self.tr(
+                "Trench layers normalized at chambers: ducts and cables will "
+                "be built on chamber-to-chamber spans."
+            ))
 
         if feedback.isCanceled():
             return {}
         # --- Duct Layer ---
         steps.setCurrentStep(6)
-        feedback.pushInfo(self.tr("[95%] Running Duct Layer"))
+        feedback.pushInfo(self.tr("[85%] Running Duct Layer"))
         self._preflight_duct(results, context, feedback)
         t0 = time.time()
         duct = self._run("Duct Layer", self.run_duct_layer,
@@ -1750,46 +1785,41 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
 
         if feedback.isCanceled():
             return {}
-        # --- Chamber Layer (civil structures) ---
+        # --- Cable Layer (planned last: pulled where the civil work is) ---
+        # Last in the cascade — chambers are placed and ducts are laid inside
+        # the designed spans before a cable is planned. The route tree is still
+        # the (chamber-split) trench network: the ducts lie inside those same
+        # spans, so a cable can only go where a duct exists.
         steps.setCurrentStep(7)
-        feedback.pushInfo(self.tr("[97%] Running Chamber Layer"))
+        feedback.pushInfo(self.tr("[95%] Running Cable Layer"))
+        self._preflight_cable(results, context, feedback)
         t0 = time.time()
-        chambers = self._run("Chamber Layer", self.run_chamber_layer,
-                             parameters, context, steps, feedback, results=results)
-        results["chambers"] = chambers.get("OUT_CHAMBERS") if chambers else None
+        cab = self._run("Cable Layer", self.run_cable_layer,
+                        parameters, context, steps, feedback, results=results)
+        results["cables"] = cab
         elapsed = time.time() - t0
-        n_ch = self._fast_count(results.get("chambers"), context)
-        fc_str = "{} features, ".format(n_ch) if n_ch is not None else ""
-        feedback.pushInfo(self.tr("  [timing] Chamber Layer: {}{:.3f}s".format(fc_str, elapsed)))
-        if results.get("chambers"):
-            results["chambers"] = self._save_layer_to_gpkg(
-                results["chambers"], "Chambers.gpkg", out_dir, context, feedback)
+        n_fc = self._fast_count(cab.get(self._CB_OUT_FEEDER), context)
+        n_dc = self._fast_count(cab.get(self._CB_OUT_DIST), context)
+        parts = []
+        if n_fc is not None:
+            parts.append("Feeder: {}".format(n_fc))
+        if n_dc is not None:
+            parts.append("Dist: {}".format(n_dc))
+        fc_str = ("{} features, ".format(", ".join(parts))) if parts else ""
+        feedback.pushInfo(self.tr("  [timing] Cable Layer: {}{:.3f}s".format(fc_str, elapsed)))
+        fc = results["cables"].get(self._CB_OUT_FEEDER)
+        if fc:
+            results["cables"][self._CB_OUT_FEEDER] = self._save_layer_to_gpkg(
+                fc, "Feeder_Cable.gpkg", out_dir, context, feedback)
+        dc = results["cables"].get(self._CB_OUT_DIST)
+        if dc:
+            results["cables"][self._CB_OUT_DIST] = self._save_layer_to_gpkg(
+                dc, "Distribution_Cable.gpkg", out_dir, context, feedback)
 
-        # Chambers are the authoritative civil break points.  The route stages
-        # run before chamber placement because chamber candidates use duct and
-        # trench junction evidence; immediately after placement, normalize every
-        # physical line layer against the same points.  This makes one published
-        # component mean one chamber-to-chamber span instead of leaving the
-        # trench fragmented differently from its ducts/cables.
+        # Second normalization pass: the duct and cable layers were built
+        # AFTER the trench pass above, so cut those at the chambers too — one
+        # chamber-to-chamber component everywhere on the map and in the BOQ.
         if results.get("chambers"):
-            span_layers = [
-                ("trenches", "Final_Trenches.gpkg"),
-                ("feeder", "Feeder_Trench.gpkg"),
-                ("distribution", "Distribution_Trench.gpkg"),
-                ("garden", "Garden_Trench.gpkg"),
-                ("cables", "Feeder_Cable.gpkg"),
-                ("ducts", "Feeder_Ducts.gpkg"),
-            ]
-            # The nested cable/duct dictionaries are handled below; the first
-            # four are direct pipeline results.
-            for key, filename in span_layers[:4]:
-                original = results.get(key)
-                split = self._split_lines_at_chambers(
-                    original, results["chambers"], context, feedback, filename)
-                if split is not original:
-                    results[key] = self._save_layer_to_gpkg(
-                        split, filename, out_dir, context, feedback)
-
             cables = results.get("cables") or {}
             for key, filename, label in (
                     (self._CB_OUT_FEEDER, "Feeder_Cable.gpkg", "Feeder_Cable"),

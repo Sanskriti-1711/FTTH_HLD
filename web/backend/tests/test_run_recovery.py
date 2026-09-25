@@ -137,7 +137,9 @@ def test_a_run_whose_files_are_still_changing_stays_running(project):
 
     assert task["status"] == "running"
     # Reported at the stage its files prove, not the one the lost thread claimed.
-    assert task["stage"] == "Cable Layer"
+    # Index 4 is the Duct Layer since the cascade reorder (trench → chambers →
+    # ducts → cables): the duct files land before the cable files on disk.
+    assert task["stage"] == "Duct Layer"
     assert task["stage_index"] == 4
 
 
@@ -255,7 +257,7 @@ def test_a_failed_run_is_not_resurrected_as_completed_by_the_disk_restore(projec
         "status": "failed",
         "error": "interrupted during the Duct Layer",
         "stage": "Duct Layer",
-        "stage_index": 5,
+        "stage_index": 4,
     })
     # A restore that would export GeoJSON needs ogr2ogr; stub it out.
     monkeypatch.setattr(main, "_ensure_geojson", lambda gpkg, geojson: False)

@@ -48,8 +48,8 @@ PIPELINE_STAGES = [
     "Polygon Layer",
     "Network Layer",
     "Trench Layer",
-    "Cable Layer",
     "Duct Layer",
+    "Cable Layer",
 ]
 
 ONECLICK_OUTPUTS: List[Tuple[str, str, str]] = [
@@ -115,8 +115,11 @@ _STAGE_OUTPUT_MARKERS: List[Tuple[str, List[str]]] = [
     ("Polygon Layer", ["Polygons.gpkg"]),
     ("Network Layer", ["PDPs.gpkg", "MFG.gpkg"]),
     ("Trench Layer", ["Final_Trenches.gpkg"]),
-    ("Cable Layer", ["Feeder_Cable.gpkg", "Distribution_Cable.gpkg"]),
+    # Phase C cascade order (TRENCH_DESIGN.md §6.1): trench → chambers →
+    # ducts → cables, so the duct files land before the cable files on disk
+    # and the recovery walk below reads the run's real position.
     ("Duct Layer", ["Feeder_Ducts.gpkg", "Distribution_Ducts.gpkg", "Drop_Ducts.gpkg"]),
+    ("Cable Layer", ["Feeder_Cable.gpkg", "Distribution_Cable.gpkg"]),
 ]
 
 # How long an orphaned run's files must be quiet before it is declared dead.
@@ -513,12 +516,23 @@ def _recover_orphan_run(
     quiet_for = max(0.0, time.time() - info["newest_write"])
 
     if info["damaged"] and quiet_for > ORPHAN_BROKEN_SECONDS:
+        # Name the stage that OWNS the damaged file — the run broke while
+        # writing that stage's output. The file walk reports the furthest
+        # stage whose files merely EXIST, which since the duct/cable cascade
+        # reorder can be a LATER stage than the broken file's owner (duct
+        # files land before cable files, so a broken duct file coexists with
+        # a complete cable set).
+        broke_stage, broke_index = info["stage_name"], info["stage_index"]
+        for idx, (name, markers) in enumerate(_STAGE_OUTPUT_MARKERS):
+            if any(m in info["damaged"] for m in markers):
+                broke_stage, broke_index = name, idx
+                break
         _settle_orphan(
             project_id, task, "failed",
-            f"This run was interrupted during the {info['stage_name']} and its output "
+            f"This run was interrupted during the {broke_stage} and its output "
             f"is incomplete ({', '.join(info['damaged'])}). The layers that were built "
             "are shown below; run the area again for a complete design.",
-            stage_name=info["stage_name"], stage_index=info["stage_index"],
+            stage_name=broke_stage, stage_index=broke_index,
             progress=info["progress"],
             damaged=info["damaged"], publish=publish,
         )
@@ -952,6 +966,177 @@ def _brownfield_args(brownfield_path: Optional[Path], output_dir: Path) -> List[
     return args
 
 
+# ── OSM reference layers → design constraints ─────────────────────────────
+# The platform's upload form has always ACCEPTED railways / waterways / water /
+# landuse / natural and stored them under inputs/osm/<key>/ — but nothing
+# consumed them ("NOT consumed by the design algorithm yet"). They now feed
+# the two places that can act on them:
+#
+#   POLY_BARRIER_EXTRA  → the polygon growth stage's barrier rule (every
+#                         feature of the extra layers is a barrier the service
+#                         polygons must not grow across: railways, rivers,
+#                         water, natural)
+#   AERIAL_ZONES        → the trench stage's aerial classification (restricted
+#                         landuse the designer derives zones from — the same
+#                         derivation the on-demand designer runs)
+#
+# A DESIGN_INPUT_MAP is also written next to the design so a reviewer (and the
+# log line above) can see exactly which constraints the run carried.
+OSM_BARRIER_KEYS = ("railways", "waterways", "water", "natural")
+OSM_AERIAL_KEY = "landuse"
+
+
+def _vector_layer_arg(path: Path) -> Optional[str]:
+    """A qgis_process-ready path for an uploaded OSM layer (zip or file).
+
+    qgis_process resolves processing layer parameters as plain paths, so a
+    shapefile inside an archive is EXTRACTED to ``<key>/extracted/`` first
+    (sidecars included) and its .shp path returned — /vsizip/ works for
+    ogr.Open but is not reliably loadable as a QgsProcessingParameterVectorLayer.
+    A plain GeoJSON/GPKG passes through; None means the upload is unreadable.
+    """
+    if not path or not path.exists():
+        return None
+    suffix = path.suffix.lower()
+    if suffix == ".zip":
+        return _extract_zip_layer(path)
+    if suffix in {".geojson", ".json", ".gpkg"}:
+        return path.as_posix()
+    return None
+
+
+def _extract_zip_layer(zip_path: Path, prefer: Optional[str] = None) -> Optional[str]:
+    """Extract the vector layer from an archive next to it and return its path.
+
+    Idempotent: re-running a project reuses the previously extracted copy.
+    Returns None when the archive holds no readable vector layer.
+    """
+    target = zip_path.parent / "extracted"
+    # Already extracted once?
+    prior = sorted(target.glob("*.geojson")) + sorted(target.glob("*.gpkg")) \
+        + sorted(target.glob("*.shp"))
+    if prior:
+        if prefer:
+            for p in prior:
+                if prefer in p.name.lower():
+                    return p.as_posix()
+        return prior[0].as_posix()
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            names = zf.namelist()
+            base = str(zip_path.resolve())
+            wanted = [n for n in names if n.lower().endswith(
+                (".shp", ".dbf", ".shx", ".prj", ".cpg", ".qpj",
+                 ".geojson", ".json", ".gpkg"))]
+            if not wanted:
+                return None
+            target.mkdir(parents=True, exist_ok=True)
+            for member in wanted:
+                dest = (target / Path(member).name)
+                with zf.open(member) as src, open(dest, "wb") as out:
+                    shutil.copyfileobj(src, out)
+    except (OSError, zipfile.BadZipFile, RuntimeError):
+        return None
+    out_files = sorted(target.glob("*.geojson")) + sorted(target.glob("*.gpkg")) \
+        + sorted(target.glob("*.shp"))
+    if not out_files:
+        return None
+    if prefer:
+        for p in out_files:
+            if prefer in p.name.lower():
+                return p.as_posix()
+    return out_files[0].as_posix()
+
+
+def _osm_constraint_args(
+    output_dir: Path, project_id: str, log: bool = True
+) -> List[str]:
+    """POLY_BARRIER_EXTRA=… / AERIAL_ZONES=… args from inputs/osm/.
+
+    Every entry the platform accepted is considered; missing or unreadable
+    ones are logged and skipped (an optional constraint must never fail the
+    run — the layers are evidence the planner supplied, not required input).
+    """
+    osm_dir = output_dir / "inputs" / "osm"
+    if not osm_dir.is_dir():
+        return []
+    barrier_paths: List[str] = []
+    for key in OSM_BARRIER_KEYS:
+        if not (osm_dir / key).is_dir():
+            continue
+        resolved = None
+        for candidate in sorted((osm_dir / key).iterdir()):
+            if candidate.is_file() and candidate.name != "design_inputs.json":
+                resolved = _vector_layer_arg(candidate)
+                if resolved:
+                    break
+        if resolved:
+            barrier_paths.append(resolved)
+            if log:
+                _append(project_id, "info",
+                       f"OSM barrier input '{key}' feeding POLY_BARRIER_EXTRA.")
+        elif log:
+            _append(project_id, "warn",
+                    f"OSM input '{key}' is not a readable vector layer — "
+                    "skipped (constraints unaffected).")
+
+    aerial_path: Optional[str] = None
+    landuse_dir = osm_dir / OSM_AERIAL_KEY
+    if landuse_dir.is_dir():
+        for candidate in sorted(landuse_dir.iterdir()):
+            if not candidate.is_file():
+                continue
+            if candidate.suffix.lower() == ".zip":
+                aerial_path = _extract_zip_layer(candidate, prefer=OSM_AERIAL_KEY)
+                if aerial_path:
+                    break
+                continue
+            if candidate.suffix.lower() in {".geojson", ".json", ".gpkg"}:
+                aerial_path = candidate.as_posix()
+                break
+
+    args: List[str] = []
+    if barrier_paths:
+        for p in barrier_paths:
+            args.append(f"POLY_BARRIER_EXTRA={p}")
+    if aerial_path:
+        args.append(f"AERIAL_ZONES={aerial_path}")
+        if log:
+            _append(project_id, "info",
+                    "OSM landuse input feeding AERIAL_ZONES — restricted "
+                    "landuse classifies non-diggable drop legs aerial.")
+
+    if args:
+        _write_design_input_map(output_dir, barrier_paths, aerial_path)
+    elif log:
+        _append(project_id, "info",
+                "No OSM constraint inputs (or none readable) — polygon "
+                "barrier rule uses the road classes only.")
+    return args
+
+
+def _write_design_input_map(
+    output_dir: Path, barrier_paths: List[str], aerial_path: Optional[str]
+) -> None:
+    """Record which constraints a run carried — beside the outputs, where a
+    reviewer looking at the finished design can find it."""
+    try:
+        payload = {
+            "poly_barrier_extra": list(barrier_paths),
+            "aerial_zones": aerial_path,
+            "note": (
+                "OSM reference layers bound to the design: barriers gate the "
+                "polygon growth rule; landuse derives aerial zones for the "
+                "trench stage's non-diggable drop classification."
+            ),
+        }
+        (output_dir / "design_inputs.json").write_text(
+            json.dumps(payload, indent=2), encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+
 def _run_pipeline(
     project_id: str,
     excel_path: Path,
@@ -998,6 +1183,9 @@ def _run_pipeline(
         if bf_args:
             cmd.extend(bf_args)
             _append(project_id, "info", "Brownfield upload detected; enabling reuse.")
+        osm_args = _osm_constraint_args(output_dir, project_id)
+        if osm_args:
+            cmd.extend(osm_args)
         if os.name == "nt" and qgis.lower().endswith((".bat", ".cmd")):
             cmd = " ".join(_quote_cmd_arg(part) for part in cmd)
 
@@ -1086,8 +1274,10 @@ async def run_hld(
     excel: UploadFile = File(...),
     roads: UploadFile = File(...),
     brownfield: Optional[UploadFile] = File(None),
-    # Optional OSM reference layers — stored in inputs/ for future routing-
-    # constraint / permit use. NOT consumed by the design algorithm yet.
+    # Optional OSM reference layers — stored in inputs/ AND consumed as design
+    # constraints: railways/waterways/water/natural feed the polygon barrier
+    # rule (POLY_BARRIER_EXTRA) and landuse feeds the trench stage's aerial
+    # zones (AERIAL_ZONES) via _osm_constraint_args when the run starts.
     railways: Optional[UploadFile] = File(None),
     waterways: Optional[UploadFile] = File(None),
     water: Optional[UploadFile] = File(None),
