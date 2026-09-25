@@ -951,7 +951,20 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
             if not items: continue
             pdp_pt, pdp_node = pdp_map[pid]
             try:
-                lengths, paths = nx.single_source_dijkstra(G, pdp_node, weight="weight")
+                # Dijkstra path dict for the WHOLE graph materialises every
+                # path as a Python list — on Hagley's 68k-node densified
+                # sidewalk graph x 45 PDPs that was ~3M live lists and the
+                # memory climb that hung the duct stage. Only the endpoint
+                # nodes need their paths, so ask for exactly those.
+                endpoint_nodes = {n for (_hid, n, _pt) in items}
+                lengths, paths = {}, {}
+                for target in endpoint_nodes:
+                    try:
+                        L, seq = nx.single_source_dijkstra(G, pdp_node, target=target, weight="weight")
+                    except Exception:
+                        continue
+                    lengths[target] = L
+                    paths[target] = seq
             except Exception:
                 lengths = nx.single_source_shortest_path_length(G, pdp_node)
                 paths   = nx.single_source_shortest_path(G, pdp_node)
@@ -1513,6 +1526,9 @@ class DuctLayer(QgsProcessingAlgorithm):
         cache = getattr(self, "_net_cache", None)
         if cache is None:
             cache = self._net_cache = {}
+        # Per-network attach grids (see _attach_to_network): keyed the same way.
+        if not hasattr(self, "_attach_grid_cache"):
+            self._attach_grid_cache = {}
         ckey = id(corridor_lyr)
         if ckey in cache:
             return cache[ckey]
@@ -1615,16 +1631,36 @@ class DuctLayer(QgsProcessingAlgorithm):
         line — the distance between them, which is the drafting slop.
 
         Returns the number of vertices docked (for the caller to report).
+
+        Candidate segments come from a uniform grid over segment bounding
+        boxes: the vertex only tests the segments whose cell it falls in, not
+        the whole network. Hagley measured the linear scan at ~9k segments per
+        vertex (~80M distance tests) which hung the duct stage for over an
+        hour; the grid turns that into a handful per vertex.
         """
         docked = 0
+        # Grid over segment endpoints: cell size = tol (a dock candidate is
+        # within tol of the segment, so its own cell + 8 neighbours cover it).
+        cell = max(tol_m, 1.0)
+        seg_grid = defaultdict(list)
+        for si, (a, b, kp, kq) in enumerate(segs):
+            x0, x1 = sorted((a.x(), b.x()))
+            y0, y1 = sorted((a.y(), b.y()))
+            for gx in range(int(x0 // cell), int(x1 // cell) + 1):
+                for gy in range(int(y0 // cell), int(y1 // cell) + 1):
+                    seg_grid[(gx, gy)].append(si)
         for k, p in list(node_xy.items()):
             best = None
-            for a, b, kp, kq in segs:
-                if kp == k or kq == k:
-                    continue
-                d, fx, fy = DuctLayer._pt_to_segment(p.x(), p.y(), a, b)
-                if d <= tol_m and (best is None or d < best[0]):
-                    best = (d, fx, fy, a, b, kp, kq)
+            gx, gy = int(p.x() // cell), int(p.y() // cell)
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for si in seg_grid.get((gx + dx, gy + dy), ()):
+                        a, b, kp, kq = segs[si]
+                        if kp == k or kq == k:
+                            continue
+                        d, fx, fy = DuctLayer._pt_to_segment(p.x(), p.y(), a, b)
+                        if d <= tol_m and (best is None or d < best[0]):
+                            best = (d, fx, fy, a, b, kp, kq)
             if best is None:
                 continue
             _d, fx, fy, a, b, kp, kq = best
@@ -1671,14 +1707,42 @@ class DuctLayer(QgsProcessingAlgorithm):
         the two sub-edges, so a route can start/end exactly there without
         re-noding — and without mutating the cached network (later calls simply
         find the same splice already present).
+
+        The nearest segment is found through a per-network uniform grid (built
+        once, cached with the network) instead of a linear scan of every
+        segment: this runs once per route attach and once per tap, ~5,400
+        times on Hagley, and the scan was the second hotspot after docking.
         """
         adj, edge_geom, edge_len, node_xy, segs = net
         px, py = xy[0], xy[1]
+        grid = self._attach_grid_cache.get(id(segs))
+        if grid is None:
+            cell = max(self.ROUTE_DOCK_TOL_M, 1.0)
+            grid = {}
+            for si, (a, b, _kp, _kq) in enumerate(segs):
+                x0, x1 = sorted((a.x(), b.x()))
+                y0, y1 = sorted((a.y(), b.y()))
+                for gx in range(int(x0 // cell), int(x1 // cell) + 1):
+                    for gy in range(int(y0 // cell), int(y1 // cell) + 1):
+                        grid.setdefault((gx, gy), []).append(si)
+            self._attach_grid_cache[id(segs)] = grid
+        cell = max(self.ROUTE_DOCK_TOL_M, 1.0)
         best = None
-        for p, q, kp, kq in segs:
-            d, fx, fy = self._pt_to_segment(px, py, p, q)
-            if best is None or d < best[0]:
-                best = (d, fx, fy, p, q, kp, kq)
+        gx, gy = int(px // cell), int(py // cell)
+        # Widen the search ring until a candidate is found (a point slightly
+        # off the network at tol_m still lands within a few cells).
+        for ring in range(0, 4):
+            for dx in range(-ring, ring + 1):
+                for dy in range(-ring, ring + 1):
+                    if max(abs(dx), abs(dy)) != ring:
+                        continue
+                    for si in grid.get((gx + dx, gy + dy), ()):
+                        p, q, kp, kq = segs[si]
+                        d, fx, fy = self._pt_to_segment(px, py, p, q)
+                        if best is None or d < best[0]:
+                            best = (d, fx, fy, p, q, kp, kq)
+            if best is not None and best[0] <= tol_m:
+                break
         if best is None or best[0] > tol_m:
             return None, None
         _d, fx, fy, p, q, kp, kq = best
@@ -1765,6 +1829,36 @@ class DuctLayer(QgsProcessingAlgorithm):
         if layer is None or not layer.isValid():
             return 0, 0
         changed = unresolved = 0
+        # Spatial index over the trench features: the rebase used to scan all
+        # 3,58 trenches with two GEOS nearestPoint calls per endpoint per duct
+        # (45 PDPs × dozens of ducts × 2 endpoints), which is where the duct
+        # stage spent its hour on Hagley. The index answers "which trenches
+        # could be near this endpoint" in a handful of candidates.
+        trench_idx = QgsSpatialIndex(trench_lyr.getFeatures())
+        trench_geoms = {tf.id(): tf.geometry()
+                        for tf in trench_lyr.getFeatures()
+                        if tf.geometry() is not None and not tf.geometry().isEmpty()}
+        SEARCH_R = 50.0
+
+        def _nearest_trench_point(pt_xy):
+            """(distance, QgsPointXY) of the closest trench point, via index."""
+            pt = QgsPointXY(pt_xy)
+            pg = QgsGeometry.fromPointXY(pt)
+            best = None
+            rect = QgsGeometry.fromPointXY(pt).buffer(SEARCH_R, 8).boundingBox()
+            for fid in trench_idx.intersects(rect):
+                tg = trench_geoms.get(fid)
+                if tg is None:
+                    continue
+                near = tg.nearestPoint(pg)
+                if near is None or near.isEmpty():
+                    continue
+                np = near.asPoint()
+                d = math.hypot(np.x() - pt.x(), np.y() - pt.y())
+                if best is None or d < best[0]:
+                    best = (d, np)
+            return best
+
         if not layer.isEditable():
             layer.startEditing()
         for f in layer.getFeatures():
@@ -1781,20 +1875,8 @@ class DuctLayer(QgsProcessingAlgorithm):
             try:
                 for part in source_parts:
                     a, b = part[0], part[-1]
-                    na = nb = None
-                    for tf in trench_lyr.getFeatures():
-                        tg = tf.geometry()
-                        if tg is None or tg.isEmpty():
-                            continue
-                        pa = QgsGeometry.fromPointXY(QgsPointXY(a))
-                        pb = QgsGeometry.fromPointXY(QgsPointXY(b))
-                        ca = tg.nearestPoint(pa)
-                        cb = tg.nearestPoint(pb)
-                        da, db = ca.distance(pa), cb.distance(pb)
-                        if na is None or da < na[0]:
-                            na = (da, ca.asPoint())
-                        if nb is None or db < nb[0]:
-                            nb = (db, cb.asPoint())
+                    na = _nearest_trench_point(a)
+                    nb = _nearest_trench_point(b)
                     if na is None or nb is None:
                         continue
                     route = self._trench_route(
