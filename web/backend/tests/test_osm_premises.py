@@ -454,15 +454,51 @@ def test_excluded_building_classes_are_dropped():
     assert stats["buildings_excluded"] == 1
 
 
-def test_duplicate_street_and_number_is_merged():
+def test_every_house_gets_its_own_premise_even_with_same_street_and_number():
+    # Each OSM address node is a house — two nodes with the same street+number
+    # at the same coordinates still produce two premises at two distinct points.
     buildings = []
     addresses = [
         _address(11, "12", addr_street="Mariendorfer Damm"),
         _address(12, " 12 ", addr_street="mariendorfer damm "),
     ]
     premises, stats = osm_source.assemble_premises(buildings, addresses, {})
-    assert len(premises) == 1
-    assert stats["duplicates_merged"] == 1
+    assert len(premises) == 2
+    assert stats["duplicates_merged"] == 0
+    assert stats["points_jittered"] == 1
+    assert len({p["ADDR_ID"] for p in premises}) == 2
+    assert len({(p["LONGITUDE"], p["LATITUDE"]) for p in premises}) == 2
+
+
+def test_identical_coordinates_are_micro_jittered_into_distinct_points():
+    buildings = []
+    addresses = [
+        _address(11, "1", lon=13.381, lat=52.441),
+        _address(12, "2", lon=13.381, lat=52.441),
+        _address(13, "3", lon=13.381, lat=52.441),
+    ]
+    premises, stats = osm_source.assemble_premises(buildings, addresses, {})
+    assert len(premises) == 3
+    assert len({(p["LONGITUDE"], p["LATITUDE"]) for p in premises}) == 3
+    assert stats["points_jittered"] == 2
+    # ~0.5 m dispersal, not metres-away — still on the same parcel
+    for p in premises:
+        assert abs(p["LONGITUDE"] - 13.381) < 0.001
+        assert abs(p["LATITUDE"] - 52.441) < 0.001
+
+
+def test_same_building_same_housenumber_nodes_each_get_a_premise():
+    # A terraced row where several address nodes sit in the same building
+    # polygon with the same housenumber still yields one premise per node.
+    buildings = [_building(99, lon=13.38, lat=52.44)]
+    addresses = [
+        _address(11, "7", lon=13.381, lat=52.441),
+        _address(12, "7", lon=13.381, lat=52.441),
+    ]
+    premises, stats = osm_source.assemble_premises(buildings, addresses, {11: 99, 12: 99})
+    assert len(premises) == 2
+    assert len({p["ADDR_ID"] for p in premises}) == 2
+    assert len({(p["LONGITUDE"], p["LATITUDE"]) for p in premises}) == 2
 
 
 def test_address_without_a_building_falls_back_to_one_household():

@@ -2615,20 +2615,35 @@ def assemble_premises(
     }
 
     # --- 1/2. address points, grouped by the building they sit in -----------
+    # Every OSM address node is a premise — no street+number deduplication.
+    # The old key on (street, housenumber) collapsed two distinct houses that
+    # share an address string into a single object point (measured on North
+    # Edgbaston: 95 of 2616 premises merged). The design needs one trench /
+    # garden leg per house, so each node gets its own premise. Identical
+    # coordinates are micro-jittered so every premise has a distinct point.
     grouped: Dict[Optional[int], List[Dict[str, Any]]] = {}
-    seen: Dict[Tuple[str, str], int] = {}
     for addr in addresses:
-        key = (
-            re.sub(r"\s+", " ", str(addr.get("addr_street") or "").strip().lower()),
-            str(addr.get("addr_housenumber") or "").strip().lower(),
-        )
-        if not key[1]:
+        housenumber = str(addr.get("addr_housenumber") or "").strip()
+        if not housenumber:
             continue
-        if key in seen:
-            stats["duplicates_merged"] += 1
-            continue
-        seen[key] = int(addr["osm_id"])
         grouped.setdefault(addr_to_building.get(int(addr["osm_id"])), []).append(addr)
+    # kept for API compat — no merging any more
+    stats["duplicates_merged"] = 0
+    stats["points_jittered"] = 0
+    coord_counts: Dict[Tuple[int, int], int] = {}
+
+    def _unique_lonlat(lon: float, lat: float) -> Tuple[float, float]:
+        lon_f = round(float(lon), 7)
+        lat_f = round(float(lat), 7)
+        key = (int(round(lon_f * 1e7)), int(round(lat_f * 1e7)))
+        n = coord_counts.get(key, 0)
+        coord_counts[key] = n + 1
+        if n == 0:
+            return lon_f, lat_f
+        stats["points_jittered"] += 1
+        angle = (n * 137.508) * math.pi / 180.0
+        radius_deg = 0.0000045 * n  # ~0.5 m per duplicate, golden-angle dispersal
+        return round(lon_f + math.cos(angle) * radius_deg, 7), round(lat_f + math.sin(angle) * radius_deg, 7)
 
     premises: List[Dict[str, Any]] = []
 
@@ -2660,12 +2675,14 @@ def assemble_premises(
 
         if building is None:
             # An address with no building polygon: its own tags, else 1.
+            # Every node is kept — even two nodes with the same street+number
+            # become two premises with distinct points.
             for addr in ordered:
                 flats = parse_flats(addr.get("addr_flats"))
                 hh = min(flats, MAX_FLATS_PER_BUILDING) if flats else 1
                 method = "addr_flats" if flats else "fallback_one"
                 premises.append(_row(addr, None, hh, method, f"N{int(addr['osm_id'])}",
-                                     (addr["lon"], addr["lat"])))
+                                     _unique_lonlat(addr["lon"], addr["lat"])))
             continue
 
         building_type = str(building.get("building") or "").strip().lower()
@@ -2691,9 +2708,14 @@ def assemble_premises(
 
         multi = len(ordered) > 1
         for i, addr in enumerate(ordered):
-            suffix = f"W{building['osm_id']}-P{i + 1}" if multi else f"W{building['osm_id']}"
+            # Suffix uses osm_id when several addresses share the same building
+            # and same housenumber — P-index alone would hide which nodes they are.
+            if multi and len({str(a.get("addr_housenumber") or "").strip().lower() for a in ordered}) != len(ordered):
+                suffix = f"W{building['osm_id']}-N{int(addr['osm_id'])}"
+            else:
+                suffix = f"W{building['osm_id']}-P{i + 1}" if multi else f"W{building['osm_id']}"
             premises.append(_row(addr, building, per[i], methods[i], suffix,
-                                 (addr["lon"], addr["lat"])))
+                                 _unique_lonlat(addr["lon"], addr["lat"])))
 
     # --- 3. buildings with no address node ---------------------------------
     with_addr_node = set(grouped.keys())
@@ -2719,7 +2741,7 @@ def assemble_premises(
             "addr_suburb": building.get("addr_suburb"),
         }
         premises.append(_row(synthetic, building, total, method, f"W{bid}-C",
-                             (building["lon"], building["lat"])))
+                             _unique_lonlat(building["lon"], building["lat"])))
         stats["boundary_buildings"] += 1
 
     return premises, stats
@@ -4078,8 +4100,15 @@ def pavement_carriers(roads: Sequence[Dict[str, Any]],
         row = sources[i]
         if kinds[i] == "derived":
             derived_m += length
+            # `osm_id` must stay an INTEGER: the roads GeoJSON is read by
+            # QGIS as a vector layer and a mixed int/string column fails the
+            # whole Trench stage ("Error converting value (8098827) for field
+            # osm_id") — the first feature fixes the field type, the other
+            # type then fails.  Derived pavements are not OSM objects, so use
+            # a synthetic negative id outside the OSM range (unique per line).
+            synthetic_id = -(1_000_000_000 + i)
             rows.append({
-                "osm_id": "pave-%s" % row.get("osm_id"),
+                "osm_id": synthetic_id,
                 "fclass": "footway",
                 "highway": "footway",
                 "name": row.get("name"),

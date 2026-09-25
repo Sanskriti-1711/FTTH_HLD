@@ -240,6 +240,34 @@ class NominatimClient:
             time.sleep(min(0.1, sleep_for))
             sleep_for = self.min_delay - (time.time() - self._last_call)
 
+    # Minimal country name -> alpha-2 for Nominatim countrycodes. Full list
+    # lives in web/backend/countries.py; a compact copy here avoids an import
+    # cycle and keeps the HLD plugin standalone.
+    _COUNTRY_CODES = {
+        "germany": "de", "deutschland": "de", "united kingdom": "gb", "uk": "gb",
+        "england": "gb", "united states": "us", "usa": "us", "france": "fr", "italy": "it",
+        "spain": "es", "poland": "pl", "netherlands": "nl", "belgium": "be",
+        "austria": "at", "switzerland": "ch", "sweden": "se", "norway": "no",
+        "denmark": "dk", "ireland": "ie", "portugal": "pt", "czechia": "cz",
+        "croatia": "hr", "slovenia": "si", "slovakia": "sk", "hungary": "hu",
+        "romania": "ro", "bulgaria": "bg", "greece": "gr", "turkey": "tr",
+        "finland": "fi", "india": "in", "australia": "au", "canada": "ca",
+        "brazil": "br", "mexico": "mx", "south africa": "za", "kenya": "ke",
+        "nepal": "np", "vietnam": "vn", "colombia": "co", "japan": "jp",
+        "china": "cn", "russia": "ru", "ukraine": "ua", "israel": "il",
+    }
+
+    def _countrycodes_for(self, country: str) -> str:
+        raw = str(country or "").strip()
+        if not raw:
+            return ""
+        low = raw.strip().lower()
+        if len(raw) == 2 and raw.isalpha():
+            return low
+        if low in self._COUNTRY_CODES:
+            return self._COUNTRY_CODES[low]
+        return ""
+
     def _structured_params(self, structured: Dict[str, str]) -> Dict[str, str]:
         """
         Prefer structured search parameters supported by Nominatim.
@@ -261,11 +289,10 @@ class NominatimClient:
             if city:       params["city"] = city
             if postalcode: params["postalcode"] = str(postalcode)
             if country:    params["country"] = country
-            # NEW: hint country code if Germany (avoids rare cross-border hits)
-            if str(country).lower() in ("germany", "de", "deutschland"):
-                params["countrycodes"] = "de"
+            code = self._countrycodes_for(country)
+            if code:
+                params["countrycodes"] = code
             return params
-        
 
         # Fallback to single 'q' string (should be rare in our pipeline)
         q_parts = [v for v in [street, city, postalcode, country] if v]
@@ -276,11 +303,66 @@ class NominatimClient:
             "q": ", ".join(q_parts),
         }
 
+    def _q_params(self, structured: Dict[str, str]) -> Dict[str, str]:
+        street = str(structured.get("street", "") or "").strip()
+        city = str(structured.get("city", "") or "").strip()
+        postalcode = str(structured.get("postalcode", "") or "").strip()
+        country = str(structured.get("country", "") or "").strip()
+        q_parts = [p for p in [street, city, postalcode, country] if p]
+        params: Dict[str, str] = {
+            "format": "jsonv2",
+            "addressdetails": 1,
+            "limit": 1,
+            "q": ", ".join(q_parts),
+        }
+        code = self._countrycodes_for(country)
+        if code:
+            params["countrycodes"] = code
+        return params
+
+    def _do_request(self, params: Dict[str, str]) -> Tuple[Optional[float], Optional[float], Dict[str, Any]]:
+        url = urljoin(self.base_url, "search")
+        tries = 0
+        raw: Dict[str, Any] = {}
+        lon = lat = None
+        while True:
+            tries += 1
+            try:
+                resp = self.session.get(url, params=params, timeout=self.timeout)
+                self._last_call = time.time()
+                status = resp.status_code
+                if status == 200:
+                    try:
+                        data = resp.json()
+                        if isinstance(data, list) and data:
+                            first = data[0]
+                            raw = first
+                            lon = float(first.get("lon")) if first.get("lon") is not None else None
+                            lat = float(first.get("lat")) if first.get("lat") is not None else None
+                    except Exception:
+                        pass
+                    break
+                if status in (429, 500, 502, 503, 504) and tries <= self.max_retries:
+                    self._sleep_backoff(self.backoff_factor ** (tries - 1))
+                    continue
+                break
+            except requests.RequestException:
+                self._last_call = time.time()
+                if tries <= self.max_retries:
+                    self._sleep_backoff(self.backoff_factor ** (tries - 1))
+                    continue
+                break
+        return lon, lat, raw
+
     def geocode(self, structured: Dict[str, str]) -> Tuple[Optional[float], Optional[float], Dict[str, Any], bool]:
         """
         returns: lon, lat, raw, from_cache
         - Uses cache first.
         - Otherwise performs structured search, with retries on 429/5xx.
+        - If structured returns nothing, retries once with a free-text `q` query
+          (same components joined) before giving up — this is the "very very
+          strong" fallback so a house with a slightly misspelled street still
+          gets a point rather than (0,85).
         - Always caches the result (including None) to avoid repeated failing calls.
         """
         key = make_cache_key(structured)
@@ -291,52 +373,22 @@ class NominatimClient:
                 if (lon is not None) and (lat is not None):
                     return lon, lat, raw, True
 
-
         # throttle before live call
         self._throttle()
 
         params = self._structured_params(structured)
-        url = urljoin(self.base_url, "search")
-
-        tries = 0
-        raw: Dict[str, Any] = {}
-        lon = lat = None
-
-        while True:
-            tries += 1
-            try:
-                resp = self.session.get(url, params=params, timeout=self.timeout)
-                self._last_call = time.time()
-                status = resp.status_code
-
-                if status == 200:
-                    try:
-                        data = resp.json()
-                        if isinstance(data, list) and data:
-                            first = data[0]
-                            raw = first
-                            lon = float(first.get("lon")) if first.get("lon") is not None else None
-                            lat = float(first.get("lat")) if first.get("lat") is not None else None
-                    except Exception:
-                        # keep lon/lat as None if parsing fails
-                        pass
-                    break
-
-                # Retry on 429/5xx (requests' adapter may already handle, but we also loop here)
-                if status in (429, 500, 502, 503, 504) and tries <= self.max_retries:
-                    self._sleep_backoff(self.backoff_factor ** (tries - 1))
-                    continue
-
-                # Non-retryable or retries exhausted
-                break
-
-            except requests.RequestException:
-                # Network error; retry if allowed
-                self._last_call = time.time()
-                if tries <= self.max_retries:
-                    self._sleep_backoff(self.backoff_factor ** (tries - 1))
-                    continue
-                break
+        lon, lat, raw = self._do_request(params)
+        # Strong fallback: structured found nothing, try free-text q with same parts.
+        if lon is None or lat is None:
+            has_q = any(str(structured.get(k) or "").strip() for k in ("street", "city", "postalcode", "country"))
+            if has_q:
+                q_params = self._q_params(structured)
+                # avoid double-hitting the identical query
+                if q_params.get("q") and q_params.get("q") != params.get("q"):
+                    self._throttle()
+                    q_lon, q_lat, q_raw = self._do_request(q_params)
+                    if q_lon is not None and q_lat is not None:
+                        lon, lat, raw = q_lon, q_lat, q_raw
 
         rec = {"key": key, "lon": lon, "lat": lat, "raw": raw, "q": structured}
         if self.use_cache:
