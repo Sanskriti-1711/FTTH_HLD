@@ -951,20 +951,57 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
             if not items: continue
             pdp_pt, pdp_node = pdp_map[pid]
             try:
-                # Dijkstra path dict for the WHOLE graph materialises every
-                # path as a Python list — on Hagley's 68k-node densified
-                # sidewalk graph x 45 PDPs that was ~3M live lists and the
-                # memory climb that hung the duct stage. Only the endpoint
-                # nodes need their paths, so ask for exactly those.
+                # One Dijkstra per PDP, stopping when every HH of this PDP is settled.
+                # Previous versions either materialised every path in the whole 176k-node
+                # graph (memory blow) or ran one Dijkstra per HH (45 × ~50 heaps → ~4000 s
+                # on Hagley). Hagley's densified sidewalk graph is 176k nodes / 381k edges,
+                # so a single early-stop heap per PDP is the right granularity.
                 endpoint_nodes = {n for (_hid, n, _pt) in items}
-                lengths, paths = {}, {}
-                for target in endpoint_nodes:
-                    try:
-                        L, seq = nx.single_source_dijkstra(G, pdp_node, target=target, weight="weight")
-                    except Exception:
-                        continue
-                    lengths[target] = L
-                    paths[target] = seq
+                import heapq as _hq
+                def _multi_target_dijkstra(graph, src, tgts):
+                    tgt_set = set(tgts)
+                    if not tgt_set:
+                        return {}, {}
+                    dist = {src: 0.0}
+                    prev = {}
+                    heap = [(0.0, src)]
+                    seen = set()
+                    found_dist = {}
+                    found_path = {}
+                    # Handle source == target (PDP co-located with a HH footway point)
+                    if src in tgt_set:
+                        found_dist[src] = 0.0
+                        found_path[src] = [src]
+                        if len(found_dist) == len(tgt_set):
+                            return found_dist, found_path
+                    while heap:
+                        d, u = _hq.heappop(heap)
+                        if u in seen:
+                            continue
+                        seen.add(u)
+                        if u in tgt_set and u not in found_dist:
+                            found_dist[u] = d
+                            # reconstruct src → u
+                            rev = [u]
+                            cur = u
+                            while cur != src:
+                                cur = prev.get(cur)
+                                if cur is None:
+                                    break
+                                rev.append(cur)
+                            rev.reverse()
+                            found_path[u] = rev
+                            if len(found_dist) == len(tgt_set):
+                                break
+                        for nb, edata in graph[u].items():
+                            w = float(edata.get("weight", 1.0))
+                            nd = d + w
+                            if nb not in dist or nd + 1e-9 < dist[nb]:
+                                dist[nb] = nd
+                                prev[nb] = u
+                                _hq.heappush(heap, (nd, nb))
+                    return found_dist, found_path
+                lengths, paths = _multi_target_dijkstra(G, pdp_node, endpoint_nodes)
             except Exception:
                 lengths = nx.single_source_shortest_path_length(G, pdp_node)
                 paths   = nx.single_source_shortest_path(G, pdp_node)
@@ -3013,13 +3050,26 @@ class DuctLayer(QgsProcessingAlgorithm):
             }
 
         # Success: return URIs so Processing auto-loads the layer(s)
+        # Only advertise a runs output when the file was actually written —
+        # the feeder/distribution route builders are optional and legacy
+        # distribution (USE_ROUTE_BASED_DISTRIBUTION=False) produces no
+        # per-route file, so returning a path to a non-existent GPKG makes
+        # QGIS raise Status 2 "file could not be found" and kills the stage.
+        def _runs_out(uri):
+            if not uri or not isinstance(uri, str):
+                return None
+            base = uri.split("|", 1)[0].strip()
+            try:
+                return uri if os.path.isfile(base) else None
+            except Exception:
+                return None
         return {
             self.O_FEEDER: out_feeder_uri,
             self.O_DISTR:  out_distr_uri,
             self.O_DROP:   out_drop_id,
             self.O_COUPLE: locals().get("out_coupler_id", None),
-            self.O_FEEDER_RUNS: runs_feeder_uri,
-            self.O_DIST_RUNS:   runs_dist_uri,
+            self.O_FEEDER_RUNS: _runs_out(runs_feeder_uri),
+            self.O_DIST_RUNS:   _runs_out(runs_dist_uri),
         }
 
 
