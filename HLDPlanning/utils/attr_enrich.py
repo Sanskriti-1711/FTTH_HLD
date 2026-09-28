@@ -653,6 +653,10 @@ def enrich_trenches(trench_path, feedback=None, roads_lyr=None):
         if _sw_mixed:
             f.SetField("SURFACE", "Mixed (Footpath + Asphalt)")
             f.SetField("REINSTATE", "Mixed (Sidewalk + Road)")
+        elif _sw_raw in ("garden", "grass", "lawn", "dirt", "unpaved", "seed"):
+            # Garden / off-road drops are not pavement and not road.
+            f.SetField("SURFACE", "Garden")
+            f.SetField("REINSTATE", "Seed")
         else:
             f.SetField("SURFACE", "Footpath" if sidewalk else "Asphalt")
             f.SetField("REINSTATE", "Sidewalk" if sidewalk else "Road")

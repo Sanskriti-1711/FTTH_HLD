@@ -156,7 +156,10 @@ AERIAL_LEG_MAX_M = 30.0
 # run()) because the network stage picks its PDP positions on the same sidewalk:
 # the two used to disagree — the trench at 3 m, the PDP at 8 m — which is what
 # put the cabinets inside the residential blocks. A test pins them together.
-SIDEWALK_OFFSET_M = 3.0
+# The value is the BASE band (residential: half the 6.5 m carriageway + a
+# 1.25 m footway inset); the per-class rule lives in
+# trench_design.kerb_offset_for / osm_source.pavement_offset_for.
+SIDEWALK_OFFSET_M = 4.5
 
 
 def _approx_meters(a, b):

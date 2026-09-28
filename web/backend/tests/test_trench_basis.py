@@ -151,6 +151,23 @@ def test_the_kerb_band_is_the_kerb_the_cabinet_sits_at():
     assert td.KERB_OFFSET_M == nl.NetworkLayerAlgorithm.DEFAULT_SIDEWALK
 
 
+def test_the_pavement_band_and_the_kerb_band_are_one_rule():
+    """Three codebases lay the band; they may not drift apart.
+
+    The engine backend cannot import plugin code, so osm_source duplicates the
+    carriageway width table. This pins the rules equal and the tables identical
+    — a trench, its derived pavement and its splitter cabinet sit on one band.
+    """
+    import osm_source
+    assert osm_source.PAVEMENT_FOOTWAY_INSET_M == td.KERB_FOOTWAY_INSET_M
+    assert osm_source.PAVEMENT_WIDTH_M == td.VEHICULAR_WIDTH_M
+    for cls in td.VEHICULAR_WIDTH_M:
+        assert osm_source.pavement_offset_for(cls) == td.kerb_offset_for(cls)
+    assert td.KERB_OFFSET_M == osm_source.PAVEMENT_OFFSET_M
+    assert (td.KERB_OFFSET_M == nl.NetworkLayerAlgorithm.DEFAULT_SIDEWALK
+            == tl.SIDEWALK_OFFSET_M)
+
+
 def test_a_street_with_no_pavement_is_drawn_at_the_kerb_not_the_middle():
     """The reported defect: a run down a carriageway centreline.
 
@@ -242,8 +259,10 @@ def test_the_kerb_band_follows_the_pavement_when_there_is_one():
     sg = td.build_street_graph(walk, p)
     street = [pt[1] for ek, coords in sg.edge_coords.items()
               if sg.G[ek[0]][ek[1]]["cls"] == "residential" for pt in coords]
-    assert max(street) > 2.9, "the trench must be on the pavement side"
-    assert max(street) < 4.0, "and at the kerb, not on the pavement line"
+    assert max(street) == pytest.approx(
+        td.kerb_offset_for("residential"), abs=0.01), \
+        "the trench must be on the pavement side, at its class band"
+    assert max(street) < 4.9, "and at its own band, not on the pavement line"
 
 
 def test_a_real_pavement_is_never_moved():
@@ -376,7 +395,10 @@ def test_a_service_aisle_is_banded_too():
     p = td.Params()
     sg = td.build_street_graph([([(0.0, 0.0), (200.0, 0.0)], "service")], p)
     ys = [pt[1] for coords in sg.edge_coords.values() for pt in coords]
-    assert max(abs(y) for y in ys) == pytest.approx(td.KERB_OFFSET_M, abs=0.01)
+    # banded at ITS class width (5 m service -> 3.75 m), not the base band
+    assert max(abs(y) for y in ys) == pytest.approx(
+        td.kerb_offset_for("service"), abs=0.01)
+    assert td.kerb_offset_for("service") != td.KERB_OFFSET_M
 
 
 def test_the_kerb_rule_can_be_turned_off():

@@ -82,9 +82,16 @@ def test_a_surface_name_is_not_read_as_a_sidewalk_flag(tmp_path):
                                ("Garden", "Garden")])
     assert got["HDD"] == ("Asphalt", "Road")
     assert got["Open Cut"] == ("Footpath", "Sidewalk")
+    assert got["Garden"] == ("Garden", "Seed")
 
 
-@pytest.mark.parametrize("spelling", ["asphalt", "Asphalt", " road ", "tarmac"])
+def test_carriageway_surface_reinstates_as_road(tmp_path):
+    """A residential carrier is asphalt/road, not footpath."""
+    got = _surfaces(tmp_path, [("Asphalt", "Open Cut")])
+    assert got["Open Cut"] == ("Asphalt", "Road")
+
+
+@pytest.mark.parametrize("spelling", ["asphalt", "Asphalt", " road ", "tarmac", "carriageway"])
 def test_road_surface_spellings_all_reinstate_as_road(tmp_path, spelling):
     got = _surfaces(tmp_path, [(spelling, "HDD")])
     assert got["HDD"] == ("Asphalt", "Road")

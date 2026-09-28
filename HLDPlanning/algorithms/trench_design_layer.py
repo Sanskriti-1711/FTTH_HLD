@@ -397,8 +397,9 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
             # by the two-sided rule — trench on BOTH kerbs of a street, never on
             # the centreline, and cross between the two sides only where a
             # premise needs it (that crossing is an HDD). The band stays in the
-            # designer, tested, behind this value; set it to KERB_OFFSET_M (3.0)
-            # to bring the one-sided version back. See docs/GLOBAL_TODO.md.
+            # designer, tested, behind this value; set it to KERB_OFFSET_M (the
+            # per-class base, 4.5) to bring the one-sided version back. See
+            # docs/GLOBAL_TODO.md.
             "kerb_offset_m": 0.0,
             "sidewalk_link_m": 0.0,   # off too — see Params.sidewalk_link_m
         }

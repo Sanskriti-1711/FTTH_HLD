@@ -221,11 +221,16 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
     # 8.0 m, which is past the kerb and at the building line — measured on the
     # reference run, 24 of 31 PDPs sat exactly 8.00 m off their street, i.e.
     # inside the residential block, while the trench that serves them is offset
-    # 3.0 m (`trench_layer.run()` sw_off). A splitter is a street cabinet: it
+    # (`trench_layer.run()` sw_off). A splitter is a street cabinet: it
     # belongs on the sidewalk, so this now matches the trench's own sidewalk
     # offset (`trench_layer.SIDEWALK_OFFSET_M`) instead of contradicting it; a
     # test asserts the two are equal so they cannot drift apart again.
-    DEFAULT_SIDEWALK = 3.0    # sidewalk ribbon offset (m)
+    #
+    # The ribbon is laid PER CLASS at the band rule (half the carriageway + a
+    # footway inset — trench_design.kerb_offset_for, the same rule the derived
+    # pavement and the designer's kerb band follow); this value is the BASE
+    # band and the fallback for a class the width table does not name.
+    DEFAULT_SIDEWALK = 4.5    # base sidewalk ribbon offset (m)
     DEFAULT_SPACING = 30.0    # candidate PDP spacing along sidewalks (m)
     DEFAULT_INTER_BUF = 20.0  # intersection guard radius (m)
     DEFAULT_CENTROID_R = 10.0  # centroid catch radius (m)
@@ -774,13 +779,54 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
         else:
             feedback.pushWarning("No 'fclass'/'highway' field found; skipping non-diggable road exclusion.")
 
-        # Sidewalk/road-boundary ribbon from the filtered clipped roads
-        road_boundary_polys = as_layer(processing.run(
-            "native:buffer",
-            {"INPUT": filtered, "DISTANCE": off, "SEGMENTS": 8, "DISSOLVE": False,
-             "END_CAP_STYLE": 0, "JOIN_STYLE": 0, "MITER_LIMIT": 2, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
-            is_child_algorithm=True, context=context, feedback=feedback
-        )["OUTPUT"], context)
+        # Sidewalk/road-boundary ribbon from the filtered clipped roads.
+        # PER CLASS at the band rule (trench_design.kerb_offset_for: half the
+        # carriageway + a footway inset), not one flat distance — a flat 3.0 m
+        # left the cabinets on the road edge of every street wider than 6 m,
+        # the same defect the derived pavement had.
+        try:
+            from ..design.trench_design import kerb_offset_for as _band_for
+        except Exception:   # pragma: no cover - designer present under QGIS
+            _band_for = None
+        ribbon_parts = []
+        by_class = {}
+        if _fld is not None:
+            for f in filtered.getFeatures():
+                val = f[_fld]
+                key = str(val).strip().lower() if val is not None else ""
+                by_class.setdefault(key, "" if val is None else str(val))
+        for key in sorted(by_class):
+            dist = _band_for(key) if _band_for else off
+            expr_val = by_class[key].replace("'", "''")
+            subset = as_layer(processing.run(
+                "native:extractbyexpression",
+                {"INPUT": filtered, "EXPRESSION": f'"{_fld}" = \'{expr_val}\'',
+                 "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
+                is_child_algorithm=True, context=context, feedback=feedback
+            )["OUTPUT"], context)
+            if subset is None or subset.featureCount() == 0:
+                continue
+            ribbon_parts.append(as_layer(processing.run(
+                "native:buffer",
+                {"INPUT": subset, "DISTANCE": dist, "SEGMENTS": 8, "DISSOLVE": False,
+                 "END_CAP_STYLE": 0, "JOIN_STYLE": 0, "MITER_LIMIT": 2, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
+                is_child_algorithm=True, context=context, feedback=feedback
+            )["OUTPUT"], context))
+        if not ribbon_parts:
+            ribbon_parts = [as_layer(processing.run(
+                "native:buffer",
+                {"INPUT": filtered, "DISTANCE": off, "SEGMENTS": 8, "DISSOLVE": False,
+                 "END_CAP_STYLE": 0, "JOIN_STYLE": 0, "MITER_LIMIT": 2, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
+                is_child_algorithm=True, context=context, feedback=feedback
+            )["OUTPUT"], context)]
+        if len(ribbon_parts) > 1:
+            road_boundary_polys = as_layer(processing.run(
+                "native:mergevectorlayers",
+                {"LAYERS": ribbon_parts, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
+                is_child_algorithm=True, context=context, feedback=feedback
+            )["OUTPUT"], context)
+        else:
+            road_boundary_polys = ribbon_parts[0]
 
         road_boundary_lines = as_layer(processing.run(
             "native:polygonstolines",

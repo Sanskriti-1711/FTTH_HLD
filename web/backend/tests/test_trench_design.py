@@ -161,7 +161,7 @@ def test_bridge_and_tunnel_segments_are_never_carriers(tmp_path=None):
     assert len(walk) == 1 and walk[0][1] == "footway"
     # both excluded parts stay crossable (they are still roads)
     assert len(veh) == 2
-    classes = sorted(c for _coords, c in veh)
+    classes = sorted(c for _coords, c, _tags in veh)
     assert classes == ["footway", "service"]
 
 
@@ -1081,3 +1081,107 @@ def test_main_component_pick_is_deterministic_and_largest():
     main = sg.main_component
     assert main, "a main component must always be picked"
     assert len(main) >= 3, "the 3-node chain must win over the 2-node island"
+
+
+# ── surface attribution from routing evidence ───────────────────────────────
+
+def test_surface_for_construction_types_are_unchanged():
+    assert td._surface_for("Feeder", "HDD") == ("Asphalt", "Full")
+    assert td._surface_for("Distribution", "Garden") == ("Garden", "Seed")
+    assert td._surface_for("Feeder", "Open Cut") == ("Footway", "Pavement")
+
+
+def test_surface_for_uses_dominant_road_class():
+    assert td._surface_for("Feeder", "Open Cut", "footway") == ("Footway", "Pavement")
+    assert td._surface_for("Feeder", "Open Cut", "residential") == ("Asphalt", "Full")
+    assert td._surface_for("Feeder", "Open Cut", "service") == ("Asphalt", "Full")
+    assert td._surface_for("Feeder", "Open Cut", "track") == ("Asphalt", "Full")
+
+
+def test_span_surface_class_prefers_longer_overlap():
+    intervals = [(0.0, 40.0, "footway"), (40.0, 100.0, "residential")]
+    span = {"arc0": 30.0, "arc1": 60.0}
+    assert td._span_surface_class(span, intervals) == "residential"
+    span = {"arc0": 10.0, "arc1": 35.0}
+    assert td._span_surface_class(span, intervals) == "footway"
+
+
+def test_run_class_intervals_match_edge_classes():
+    sg = td.StreetGraph(G=nx.Graph(), edge_coords={}, node_xy={},
+                        index=td.GridIndex(cell=50.0), node_keys=[],
+                        main_component=set())
+    pts = {"a": (0.0, 0.0), "b": (0.0, 30.0), "c": (30.0, 30.0)}
+    for k, (x, y) in pts.items():
+        sg.node_xy[k] = (x, y)
+        sg.G.add_node(k)
+    for u, v, cls in (("a", "b", "footway"), ("b", "c", "residential")):
+        ek = (u, v)
+        sg.edge_coords[ek] = [pts[u], pts[v]]
+        sg.G.add_edge(u, v, cls=cls)
+    run = td.Run(coords=[pts["a"], pts["b"], pts["c"]], tier="Feeder",
+                 edge_keys=[("a", "b"), ("b", "c")])
+    got = td._run_class_intervals(run, sg)
+    assert got == [(0.0, 30.0, "footway", {}), (30.0, 60.0, "residential", {})]
+
+
+def test_run_class_intervals_carry_edge_tags():
+    sg = td.StreetGraph(G=nx.Graph(), edge_coords={}, node_xy={},
+                        index=td.GridIndex(cell=50.0), node_keys=[],
+                        main_component=set())
+    pts = {"a": (0.0, 0.0), "b": (0.0, 30.0)}
+    for k, (x, y) in pts.items():
+        sg.node_xy[k] = (x, y)
+        sg.G.add_node(k)
+    sg.edge_coords[("a", "b")] = [pts["a"], pts["b"]]
+    sg.G.add_edge("a", "b", cls="residential",
+                  tags={"sidewalk": "no", "width": "7"})
+    run = td.Run(coords=[pts["a"], pts["b"]], tier="Feeder",
+                 edge_keys=[("a", "b")])
+    got = td._run_class_intervals(run, sg)
+    assert got == [(0.0, 30.0, "residential",
+                    {"sidewalk": "no", "width": "7"})]
+
+
+def test_surface_for_kerb_band_is_the_footway():
+    """kerb_offset_for(residential) = 4.5 m = carr_half 3.25 + 1.25 footway
+    inset — by construction the trench sits on the pavement, not the road."""
+    off = td.kerb_offset_for("residential")
+    assert off == pytest.approx(4.5)
+    # Untagged street: design intent is the pavement band.
+    assert td._surface_for("Distribution", "Open Cut", "residential",
+                           kerb_offset_m=off) == ("Footway", "Pavement")
+    # Explicit sidewalk: the cross-section resolves the offset into the
+    # footway band as well.
+    assert td._surface_for("Distribution", "Open Cut", "residential",
+                           kerb_offset_m=off,
+                           edge_tags={"sidewalk": "both"}
+                           ) == ("Footway", "Pavement")
+
+
+def test_surface_for_kerb_class_without_sidewalk_is_asphalt():
+    off = td.kerb_offset_for("residential")
+    assert td._surface_for("Distribution", "Open Cut", "residential",
+                           kerb_offset_m=off,
+                           edge_tags={"sidewalk": "no"}
+                           ) == ("Asphalt", "Full")
+
+
+def test_surface_for_flat_offset_inside_wide_road_is_asphalt():
+    """Flat kerb_offset_m on a wide road can land INSIDE the carriageway —
+    the cross-section model catches what a class lookup cannot."""
+    # primary: half-width 5.5 m; flat offset 4.5 m is still the road.
+    assert td._surface_for("Feeder", "Open Cut", "primary",
+                           kerb_offset_m=4.5,
+                           edge_tags={"sidewalk": "both"}
+                           ) == ("Asphalt", "Full")
+    # Same flat offset on a residential street is past the kerb → footway.
+    assert td._surface_for("Feeder", "Open Cut", "residential",
+                           kerb_offset_m=4.5,
+                           edge_tags={"sidewalk": "both"}
+                           ) == ("Footway", "Pavement")
+
+
+def test_surface_for_kerb_band_disabled_is_asphalt():
+    assert td._surface_for("Distribution", "Open Cut", "residential",
+                           kerb_offset_m=0.0) == ("Asphalt", "Full")
+

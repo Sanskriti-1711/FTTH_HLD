@@ -49,6 +49,11 @@ from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 import networkx as nx
 from osgeo import ogr, osr
 
+try:
+    from . import surface_cross_section as sx
+except ImportError:  # standalone script execution (python design/trench_design.py)
+    import surface_cross_section as sx
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Parameters
 # ─────────────────────────────────────────────────────────────────────────────
@@ -115,6 +120,13 @@ CLASS_FACTOR = {
     "cycleway": 1.05, "service": 1.05, "steps": 1.6, "bridleway": 1.3,
 }
 
+# Surface attribution is routing evidence + construction position, not a
+# lookup on the highway class alone: a kerb-class span's geometry is published
+# on the KERB BAND (kerb_offset_for(cls) = carriageway_half + 1.25 m — the
+# middle of the footway by design), so its surface is whatever band that offset
+# lands in, resolved through surface_cross_section. Only when the kerb band is
+# disabled is a carriageway-carried trench actually IN the road (Asphalt).
+
 # The street-avoidance ladder. A trench along a carriageway needs a road
 # opening permit and traffic management, so the cost is ordered by how big the
 # road is — a district road is far worse to dig than a residential street:
@@ -148,15 +160,33 @@ NON_CARRIER_FACTOR = CARRIAGE_FACTOR  # any carriageway not in the ladder
 # Where a street has no mapped pavement the router has only the carriageway
 # CENTRELINE to follow, so the published trench — and the duct and the cable
 # riding it — was drawn down the middle of the road. That geometry is laid at
-# the KERB instead: KERB_OFFSET_M out from the centreline, ramping back to the
-# exact OSM vertex at every end and at every junction, so no shared vertex, no
-# snap and no route moves (see _kerb_band / _kerb_side_sign).
+# the pavement band instead: KERB_OFFSET_M out from the centreline, ramping
+# back to the exact OSM vertex at every end and at every junction, so no shared
+# vertex, no snap and no route moves (see _kerb_band / _kerb_side_sign).
 #
-# KERB_OFFSET_M is deliberately the distance the network stage places its PDP
-# candidates at (trench_layer.SIDEWALK_OFFSET_M): a splitter is a street
-# cabinet, so laying the trench at the kerb leaves the cabinet BESIDE its own
-# trench. A test pins the two equal.
-KERB_OFFSET_M = 3.0          # centreline -> kerb (the pavement band)
+# The band is PER CLASS — half the carriageway plus a footway inset — so a
+# trench lands in the footway of a narrow street AND of a wide one. A flat 3 m
+# was measured wrong on the ground: on a 6.5 m residential road it is still ON
+# the carriageway, which is what "the trenches are not really placed on the
+# sidewalks" was. The same rule runs the derived pavement
+# (osm_source.pavement_offset_for) and the network stage's cabinet band
+# (trench_layer.SIDEWALK_OFFSET_M / network_layer.DEFAULT_SIDEWALK): a splitter
+# is a street cabinet, so the cabinet sits BESIDE its own trench. Tests pin
+# them equal.
+KERB_FOOTWAY_INSET_M = 1.25  # kerb -> trench band (the middle of the footway)
+
+
+def kerb_offset_for(cls: Optional[str]) -> float:
+    """Centreline -> trench band for a street class (metres).
+
+    Half the carriageway (``VEHICULAR_WIDTH_M``) plus the footway inset.
+    Unknown classes get the default 6 m street width.
+    """
+    width = VEHICULAR_WIDTH_M.get(str(cls or "").strip().lower(), 6.0)
+    return width / 2.0 + KERB_FOOTWAY_INSET_M
+
+
+KERB_OFFSET_M = kerb_offset_for("residential")  # the base street band (4.5 m)
 KERB_RAMP_M = 6.0            # over how many metres the offset flares in and out
 KERB_SIDE_SEARCH_M = 2.0     # radius that counts as "the pavement is here"
 KERB_ANCHOR_SEARCH_M = 6.0   # radius that counts as "the cabinet is here"
@@ -229,9 +259,14 @@ class Params:
     # is built aerial — drawn as an aerial drop, never excavated. 0 = length
     # rule off (zone layer only).
     aerial_max_leg_m: float = 0.0
-    # The kerb band (see KERB_OFFSET_M): geometry along a carriageway is drawn at
-    # the kerb instead of on the centreline. 0 disables the rule.
+    # The kerb band (see KERB_OFFSET_M / kerb_offset_for): geometry along a
+    # carriageway is drawn at the pavement band instead of on the centreline.
+    # 0 disables the rule. With kerb_offset_per_class the value only gates the
+    # rule (it must be > 0) and each class gets its own band from the width
+    # table; set kerb_offset_per_class=False to lay every class at this flat
+    # distance instead.
     kerb_offset_m: float = KERB_OFFSET_M
+    kerb_offset_per_class: bool = True
     kerb_ramp_m: float = KERB_RAMP_M
     # When enabled, longitudinal trench routing is restricted to actual OSM
     # footway/sidewalk classes. Carriageway classes remain in the separate
@@ -469,7 +504,8 @@ def _count_in(index: Dict[Tuple[int, int], List[Tuple[float, float]]],
 
 def _kerb_side_sign(coords: Sequence[Tuple[float, float]],
                     foot_index: Dict[Tuple[int, int], List[Tuple[float, float]]],
-                    anchor_index: Dict[Tuple[int, int], List[Tuple[float, float]]]
+                    anchor_index: Dict[Tuple[int, int], List[Tuple[float, float]]],
+                    offset_m: float = KERB_OFFSET_M
                     ) -> int:
     """Which side of a carriageway its kerb band is laid on (+1 = left of travel).
 
@@ -492,8 +528,8 @@ def _kerb_side_sign(coords: Sequence[Tuple[float, float]],
         return 1
     sides: Dict[int, Tuple[float, float, int, Optional[float]]] = {}
     for sign in (1, -1):
-        px = x + sign * nx_ * KERB_OFFSET_M
-        py = y + sign * ny_ * KERB_OFFSET_M
+        px = x + sign * nx_ * offset_m
+        py = y + sign * ny_ * offset_m
         foot = _count_in(foot_index, KERB_SIDE_SEARCH_M, px, py,
                          KERB_SIDE_SEARCH_M)
         anchor = _nearest_in(anchor_index, KERB_ANCHOR_SEARCH_M, px, py,
@@ -780,14 +816,19 @@ def _read_polygons_geom(path: str, target_epsg: int) -> Optional[ogr.Geometry]:
 
 
 def _read_road_parts(path: str, target_epsg: int, bbox=None
-                     ) -> Tuple[List[Tuple[List[Tuple[float, float]], str]],
-                                List[Tuple[List[Tuple[float, float]], str]]]:
-    """(walkable, vehicular) road parts, each with its fclass."""
+                     ) -> Tuple[List[Tuple[List[Tuple[float, float]], str, dict]],
+                                List[Tuple[List[Tuple[float, float]], str, dict]]]:
+    """(walkable, vehicular) road parts, each ``(coords, fclass, tags)``.
+
+    ``tags`` carries the optional surface-relevant OSM fields (``sidewalk``,
+    ``surface``, ``width``, ``lanes``) when the input layer has them; it is
+    empty otherwise. They drive surface attribution only — never routing.
+    """
     ds = ogr.Open(path)
     if ds is None:
         raise SystemExit(f"cannot open {path}")
-    walk: List[Tuple[List[Tuple[float, float]], str]] = []
-    veh: List[Tuple[List[Tuple[float, float]], str]] = []
+    walk: List[Tuple[List[Tuple[float, float]], str, dict]] = []
+    veh: List[Tuple[List[Tuple[float, float]], str, dict]] = []
     for li in range(ds.GetLayerCount()):
         lyr = ds.GetLayer(li)
         lyr_srs = lyr.GetSpatialRef()
@@ -800,6 +841,8 @@ def _read_road_parts(path: str, target_epsg: int, bbox=None
         i_cls = defn.GetFieldIndex("fclass")
         i_bridge = defn.GetFieldIndex("bridge")
         i_tunnel = defn.GetFieldIndex("tunnel")
+        tag_idx = {name: defn.GetFieldIndex(name)
+                   for name in ("sidewalk", "surface", "width", "lanes")}
 
         def _is_true(idx, feat) -> bool:
             if idx < 0:
@@ -815,24 +858,26 @@ def _read_road_parts(path: str, target_epsg: int, bbox=None
             if tr is not None:
                 g.Transform(tr)
             cls = str(f.GetField(i_cls) or "") if i_cls >= 0 else ""
+            tags = {name: str(f.GetField(idx)) for name, idx in tag_idx.items()
+                    if idx >= 0 and f.GetField(idx) not in (None, "")}
             # A trench cannot be dug on a bridge deck or through a tunnel, so
             # those segments are never carriers (they stay crossable).
             deck = _is_true(i_bridge, f) or _is_true(i_tunnel, f)
             for coords in _part_coords(g):
                 if deck:
-                    veh.append((coords, cls))
+                    veh.append((coords, cls, tags))
                     continue
                 if cls in WALKABLE_CLASSES:
-                    walk.append((coords, cls))
+                    walk.append((coords, cls, tags))
                     # Streets that are walkable *and* drivable (residential,
                     # service, living_street, track, unclassified) are both a
                     # carrier and a road to be crossed — the crossing test's
                     # angle filter keeps the parallel overlap from becoming a
                     # drill, while genuine crossings are picked up.
                     if cls not in PURE_FOOTWAY_CLASSES:
-                        veh.append((coords, cls))
+                        veh.append((coords, cls, tags))
                 else:
-                    veh.append((coords, cls))
+                    veh.append((coords, cls, tags))
     ds = None
     return walk, veh
 
@@ -925,6 +970,17 @@ class StreetGraph:
         return best
 
 
+def _part_unpack(part) -> Tuple[List[Tuple[float, float]], str, dict]:
+    """``(coords, cls, tags)`` from a road part of either tuple shape.
+
+    ``_read_road_parts`` emits 3-tuples; tests and legacy callers still pass
+    2-tuples. Both are accepted so the tag channel never breaks a caller.
+    """
+    coords, cls = part[0], part[1]
+    tags = part[2] if len(part) > 2 else None
+    return coords, cls, (tags or {})
+
+
 def build_street_graph(walkable: Sequence[Tuple[List[Tuple[float, float]], str]],
                        params: Params,
                        anchors: Sequence[Tuple[float, float]] = ()) -> StreetGraph:
@@ -1005,9 +1061,10 @@ def build_street_graph(walkable: Sequence[Tuple[List[Tuple[float, float]], str]]
     # A vertex used by two parts is a JUNCTION. The keys come from these OSM
     # coordinates and never from the kerb geometry below, so node identity — and
     # with it every junction, snap and route — is exactly as it was.
-    dense_parts: List[Tuple[List[Tuple[float, float]], str]] = []
+    dense_parts: List[Tuple[List[Tuple[float, float]], str, dict]] = []
     uses: Dict[Tuple[int, int], int] = {}
-    for coords, cls in walkable:
+    for part in walkable:
+        coords, cls, tags = _part_unpack(part)
         # density: no vertex spacing above 40 m so routes can bend realistically
         dense: List[Tuple[float, float]] = [coords[0]]
         for q in coords[1:]:
@@ -1020,7 +1077,7 @@ def build_street_graph(walkable: Sequence[Tuple[List[Tuple[float, float]], str]]
                     dense.append((prev[0] + t * (q[0] - prev[0]),
                                   prev[1] + t * (q[1] - prev[1])))
             dense.append(q)
-        dense_parts.append((dense, cls))
+        dense_parts.append((dense, cls, tags))
         for q in dense:
             rk = rkey(q[0], q[1])
             uses[rk] = uses.get(rk, 0) + 1
@@ -1031,7 +1088,7 @@ def build_street_graph(walkable: Sequence[Tuple[List[Tuple[float, float]], str]]
     foot_index: Dict[Tuple[int, int], List[Tuple[float, float]]] = {}
     anchor_index: Dict[Tuple[int, int], List[Tuple[float, float]]] = {}
     if kerb_on:
-        for dense, cls in dense_parts:
+        for dense, cls, _tags in dense_parts:
             if cls in PURE_FOOTWAY_CLASSES:
                 for x, y in dense:
                     foot_index.setdefault(_kerb_cell(x, y, KERB_SIDE_SEARCH_M),
@@ -1045,7 +1102,7 @@ def build_street_graph(walkable: Sequence[Tuple[List[Tuple[float, float]], str]]
     kerb_max = 0.0
     n_links = 0
     links_m = 0.0
-    for dense, cls in dense_parts:
+    for dense, cls, tags in dense_parts:
         # The geometry a RUN is drawn on. Where the only line along a street is
         # its carriageway centreline, that geometry moves onto the kerb band;
         # the keys and weights below still use the OSM coordinates, so which
@@ -1056,9 +1113,12 @@ def build_street_graph(walkable: Sequence[Tuple[List[Tuple[float, float]], str]]
             for i, q in enumerate(dense):
                 if uses.get(rkey(q[0], q[1]), 0) > 1:
                     anchors_i.add(i)
-            geom = _kerb_band(dense, anchors_i, params.kerb_offset_m,
+            band_m = (kerb_offset_for(cls) if params.kerb_offset_per_class
+                      else params.kerb_offset_m)
+            geom = _kerb_band(dense, anchors_i, band_m,
                               params.kerb_ramp_m,
-                              _kerb_side_sign(dense, foot_index, anchor_index))
+                              _kerb_side_sign(dense, foot_index, anchor_index,
+                                              band_m))
             moved = max(math.hypot(gx - qx, gy - qy)
                         for (qx, qy), (gx, gy) in zip(dense, geom))
             if moved > 0.01:
@@ -1075,7 +1135,7 @@ def build_street_graph(walkable: Sequence[Tuple[List[Tuple[float, float]], str]]
                 if w > 0:
                     ek = (prev_key, k) if prev_key < k else (k, prev_key)
                     if ek not in edge_coords:
-                        G.add_edge(prev_key, k, weight=w, cls=cls)
+                        G.add_edge(prev_key, k, weight=w, cls=cls, tags=tags)
                         edge_coords[ek] = [prev_gq, gq]
                         n_edges += 1
             prev_key, prev_pt, prev_gq = k, q, gq
@@ -1092,7 +1152,7 @@ def build_street_graph(walkable: Sequence[Tuple[List[Tuple[float, float]], str]]
     if params.sidewalk_link_m > 0.0:
         cap = params.sidewalk_link_m
         ends: List[Tuple[float, float, str, int]] = []
-        for pi, (dense, cls) in enumerate(dense_parts):
+        for pi, (dense, cls, _tags) in enumerate(dense_parts):
             if cls in PURE_FOOTWAY_CLASSES and len(dense) >= 2:
                 for p in (dense[0], dense[-1]):
                     ends.append((p[0], p[1], key(p[0], p[1]), pi))
@@ -1214,6 +1274,52 @@ def _edge_class_lengths(sg: StreetGraph, edge_keys) -> Dict[str, float]:
     return dict(out)
 
 
+def _run_class_intervals(run: Run, sg: StreetGraph
+                         ) -> List[Tuple[float, float, str, dict]]:
+    """Return (arc_start, arc_end, cls, tags) intervals along a run's edges."""
+    intervals: List[Tuple[float, float, str, dict]] = []
+    pos = 0.0
+    for ek in run.edge_keys or []:
+        if not sg.G.has_edge(*ek):
+            continue
+        cls = str(sg.G.edges[ek].get("cls") or "")
+        tags = sg.G.edges[ek].get("tags") or {}
+        coords = sg.edge_coords.get(ek) or []
+        length = _coords_len(coords) if len(coords) >= 2 else 0.0
+        intervals.append((pos, pos + length, cls, tags))
+        pos += length
+    return intervals
+
+
+def _span_surface_context(span: dict,
+                          class_intervals: Sequence[Tuple[float, float, str, dict]]
+                          ) -> Tuple[str, dict]:
+    """Dominant OSM highway class + its tags along a span's arc range."""
+    a0, a1 = span["arc0"], span["arc1"]
+    if a1 <= a0 or not class_intervals:
+        return "", {}
+    totals: Dict[str, float] = defaultdict(float)
+    tags_by_cls: Dict[str, dict] = {}
+    for iv in class_intervals:
+        s, e, cls = iv[0], iv[1], iv[2]
+        tags = iv[3] if len(iv) > 3 else {}
+        overlap = max(0.0, min(a1, e) - max(a0, s))
+        if overlap > 0:
+            totals[cls] += overlap
+            tags_by_cls.setdefault(cls, tags)
+    if not totals:
+        return "", {}
+    dom = max(totals.items(), key=lambda kv: kv[1])[0]
+    return dom, tags_by_cls.get(dom, {})
+
+
+def _span_surface_class(span: dict,
+                        class_intervals: Sequence[Tuple[float, float, str, dict]]
+                        ) -> str:
+    """Dominant OSM highway class along a span's arc range."""
+    return _span_surface_context(span, class_intervals)[0]
+
+
 def _orient(seg: Sequence[Tuple[float, float]], ref: Tuple[float, float]
             ) -> List[Tuple[float, float]]:
     """Return the segment pointing away from ``ref`` (its nearest endpoint)."""
@@ -1302,6 +1408,10 @@ class Run:
     polygon: Optional[str] = None
     src: str = "design"
     infra: str = "New"
+    # ── routing evidence ─────────────────────────────────────────────────
+    # Ordered street-graph edge keys this run was assembled from, so surface
+    # attribution can look up the OSM highway class of each walked segment.
+    edge_keys: Optional[List[Tuple[str, str]]] = None
     # ── premise attribution ──────────────────────────────────────────────
     # WHICH HOUSES THIS TRENCH EXISTS FOR. A Garden leg serves exactly one
     # house, but a distribution/feeder spine span is SHARED: one span on a
@@ -1494,7 +1604,8 @@ def design_garden_legs(network_parts: Sequence[List[Tuple[float, float]]],
 def detect_drills(vehicular: Sequence[Tuple[List[Tuple[float, float]], str]],
                   network: List[Run], params: Params, log) -> List[dict]:
     """Crossings of a designed line over a carriageway → perpendicular drills."""
-    veh_geoms = [( _make_line(c), c, cls) for c, cls in vehicular if len(c) >= 2]
+    veh_geoms = [(_make_line(c), c, cls) for c, cls, _tags in
+                 (_part_unpack(p) for p in vehicular) if len(c) >= 2]
     drills: List[dict] = []
     angle_lim = math.cos(math.radians(params.crossing_angle_deg))
     for run in network:
@@ -1963,11 +2074,51 @@ FIELD_DRILL = (
 )
 
 
-def _surface_for(tier: str, ttype: str) -> Tuple[str, str]:
+def _surface_for(tier: str, ttype: str,
+                 dominant_class: Optional[str] = None,
+                 kerb_offset_m: float = 0.0,
+                 edge_tags: Optional[dict] = None
+                 ) -> Tuple[str, str]:
+    """(SURFACE, REINSTATE) for a span, from construction class + routing
+    evidence + construction position.
+
+    ``kerb_offset_m`` is the offset the span's geometry was actually published
+    at (``kerb_offset_for(cls)`` per class, or the flat ``params.kerb_offset_m``;
+    0 when the kerb band is disabled). A kerb-class span's trench sits in
+    whatever cross-section band that offset lands in — by design the middle of
+    the footway — so "walked a residential street" only means Asphalt when the
+    band was off or the street has no sidewalk to sit on.
+    """
     if ttype == "HDD":
         return ("Asphalt", "Full")
     if ttype == "Garden":
         return ("Garden", "Seed")
+    cls = (dominant_class or "").strip().lower()
+    if cls in PURE_FOOTWAY_CLASSES:
+        return ("Footway", "Pavement")
+    if cls in KERB_CLASSES:
+        if kerb_offset_m <= 0.0:
+            # Kerb band disabled: the trench really is in the carriageway.
+            return ("Asphalt", "Full")
+        tags = edge_tags or {}
+        sidewalk = str(tags.get("sidewalk") or "").strip().lower()
+        if not sidewalk:
+            # Untagged: the kerb band IS the footway band by construction
+            # (kerb_offset_for = carr_half + footway inset), so the design
+            # intent — and the physical strip the trench is dug in — is the
+            # pavement beside the carriageway.
+            return ("Footway", "Pavement")
+        road = sx.RoadTags.from_osm(cls, tags)
+        bounds = sx.cross_section_bounds(road)
+        surf = sx.surface_at_offset(bounds, kerb_offset_m, road.surface)
+        if surf == sx.SURFACE_FOOTWAY:
+            return ("Footway", "Pavement")
+        if surf == sx.SURFACE_VERGE:
+            return ("Grass", "Seed")
+        # Carriageway (flat kerb offset landing inside a wide road), or beyond
+        # the bands on a street explicitly tagged sidewalk=no: road
+        # restoration is the honest conservative answer.
+        return ("Asphalt", "Full")
     return ("Footway", "Pavement")
 
 
@@ -2902,7 +3053,8 @@ def design(cfg: dict) -> dict:
 
     walkable, vehicular = _read_road_parts(cfg["roads"], params.target_epsg, bbox)
     osm_sidewalks = [
-        (coords, cls) for coords, cls in walkable
+        (coords, cls) for coords, cls, _tags in
+        (_part_unpack(p) for p in walkable)
         if cls in PURE_FOOTWAY_CLASSES
     ]
     routing_walkable = osm_sidewalks if params.sidewalk_only else walkable
@@ -2960,7 +3112,7 @@ def design(cfg: dict) -> dict:
             # cabling stage fan the shared trunk back out per address.
             addr, hh = houses_on_edges(ekeys, edge_houses, houses)
             runs.append(Run(coords=straight, tier=tier, pdp=pid,
-                            polygon=None, src="street-graph",
+                            polygon=None, src="street-graph", edge_keys=ekeys,
                             addr=addr, hh=hh, mfg=mfg_id))
     carrier_mix = _edge_class_lengths(sg, feeder_keys | dist_keys)
     log("carriers: " + ", ".join(
@@ -3107,8 +3259,28 @@ def design(cfg: dict) -> dict:
 
     spans: List[dict] = []
     for r in runs:
+        class_intervals = _run_class_intervals(r, sg)
+        r.class_intervals = class_intervals
         for sp in split_spans(r, nodes, params, getattr(r, "type_map", None)):
+            dom, dom_tags = _span_surface_context(sp, class_intervals)
+            # The offset this span's geometry was published at — the same rule
+            # build_street_graph used (per-class band, or the flat override).
+            if params.kerb_offset_m > 0.0 and dom in KERB_CLASSES:
+                kerb_off = (kerb_offset_for(dom) if params.kerb_offset_per_class
+                            else params.kerb_offset_m)
+            else:
+                kerb_off = 0.0
+            sp["surface"], sp["reinstate"] = _surface_for(
+                sp["tier"], sp["type"], dom, kerb_off, dom_tags)
+            sp["class_intervals"] = class_intervals
             spans.append(sp)
+    surf_mix: Dict[str, float] = defaultdict(float)
+    for sp in spans:
+        surf_mix[sp["surface"]] += sp["length"]
+    if surf_mix:
+        log("surfaces: " + ", ".join(
+            "%s %.0f m" % (k, v)
+            for k, v in sorted(surf_mix.items(), key=lambda kv: -kv[1])))
 
     # node ids
     for i, n in enumerate(nodes):
@@ -3117,7 +3289,10 @@ def design(cfg: dict) -> dict:
     for i, sp in enumerate(spans):
         sn = sp["start"]["NODE_ID"] if sp["start"] else ""
         en = sp["end"]["NODE_ID"] if sp["end"] else ""
-        surf, reinstate = _surface_for(sp["tier"], sp["type"])
+        if "surface" in sp:
+            surf, reinstate = sp["surface"], sp["reinstate"]
+        else:
+            surf, reinstate = _surface_for(sp["tier"], sp["type"])
         aerial_reason = _aerial_flag(aerial_polys, sp["coords"])
         span_rows.append({
             "TRENCH_ID": "TR-%06d" % (i + 1),
