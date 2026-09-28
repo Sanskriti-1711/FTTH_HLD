@@ -2538,17 +2538,71 @@ def unit_area_for(building_type: Optional[str]) -> float:
     return UNIT_AREA_M2["default"]
 
 
+def parse_height_m(value: Any) -> Optional[float]:
+    """Building height in metres from an OSM `building:height` tag.
+
+    Handles "12", "12.5 m" and imperial ("39 ft", "39'"). None when there is
+    nothing usable, so the caller falls through rather than inventing a floor.
+    """
+    if value is None:
+        return None
+    text = str(value).strip().lower().replace(",", ".")
+    m = re.search(r"(\d+(?:\.\d+)?)", text)
+    if not m:
+        return None
+    height = float(m.group(1))
+    if re.search(r"ft|feet|'", text):
+        height *= 0.3048
+    return height if height > 0 else None
+
+
+LEVEL_HEIGHT_M = 3.0   # metres per storey used to turn a height into levels
+
+
+def _tags_of(row: Dict[str, Any]) -> Dict[str, Any]:
+    """A store row's raw OSM tags (the `tags` JSONB column), as a dict."""
+    tags = row.get("tags")
+    if isinstance(tags, str):
+        try:
+            tags = json.loads(tags)
+        except (TypeError, ValueError):
+            return {}
+    return tags if isinstance(tags, dict) else {}
+
+
 def estimate_households(building: Dict[str, Any]) -> Tuple[Optional[int], Optional[str]]:
     """Dwellings for a building: OSM tags first, heuristic second.
 
-    Returns (count, method).  `method` travels with the number to every layer
-    downstream, so an estimate is never mistaken for a survey.
+    Reads BOTH the named columns and the raw `tags` JSON — the ingest does not
+    promote every tag to a column, and `building:flats` / `addr:flats` /
+    `building:height` are exactly the tags that carry real dwelling data.
+
+    Order: `building:flats`, then `addr:flats` (an explicit dwelling count on
+    the address), then `building:levels` x footprint, then `building:height` x
+    footprint. Returns (count, method). `method` travels with the number to
+    every layer downstream, so an estimate is never mistaken for a survey.
     """
-    tagged = parse_flats(building.get("building_flats"))
+    tags = _tags_of(building)
+
+    tagged = (parse_flats(building.get("building_flats"))
+              or parse_flats(tags.get("building:flats")))
     if tagged:
         return min(tagged, MAX_FLATS_PER_BUILDING), "building_flats"
 
-    levels = parse_flats(building.get("building_levels"))
+    addr_flats = (parse_flats(building.get("addr_flats"))
+                  or parse_flats(tags.get("addr:flats")))
+    if addr_flats:
+        return min(addr_flats, MAX_FLATS_PER_BUILDING), "addr_flats"
+
+    levels = (parse_flats(building.get("building_levels"))
+              or parse_flats(tags.get("building:levels")))
+    method = "levels_x_footprint"
+    if not levels:
+        height_m = parse_height_m(tags.get("building:height"))
+        if height_m:
+            levels = max(1, int(round(height_m / LEVEL_HEIGHT_M)))
+            method = "height_x_footprint"
+
     footprint = building.get("footprint_m2")
     try:
         footprint_f = float(footprint) if footprint is not None else 0.0
@@ -2558,7 +2612,7 @@ def estimate_households(building: Dict[str, Any]) -> Tuple[Optional[int], Option
     if levels and footprint_f > 0:
         per_floor = footprint_f / unit_area_for(building.get("building"))
         estimate = int(math.ceil(min(levels, 12) * per_floor))
-        return max(1, min(estimate, MAX_FLATS_PER_BUILDING)), "levels_x_footprint"
+        return max(1, min(estimate, MAX_FLATS_PER_BUILDING)), method
 
     return None, None
 
@@ -2577,6 +2631,37 @@ def distribution_for(total: int, keys: Sequence[str]) -> List[int]:
     base = max(1, total // n)
     out = [base] * n
     out[0] += total - base * n
+    return out
+
+
+def household_points(lon: float, lat: float, hh: int,
+                     footprint_m2: Optional[float] = None
+                     ) -> List[Tuple[float, float]]:
+    """One (lon, lat) per household of a multi-dwelling premise.
+
+    A golden-angle spiral over the building's equivalent disk — the same
+    dispersal `_unique_lonlat` uses for duplicates — so a 12-flat block gets 12
+    DISTINCT drop points inside its footprint instead of 12 identical
+    centroids. Without a known footprint (an address node with no building)
+    the points spread over a small patch of the parcel.
+    """
+    hh = max(1, int(hh))
+    if hh == 1:
+        return [(round(float(lon), 7), round(float(lat), 7))]
+    try:
+        area = float(footprint_m2) if footprint_m2 is not None else 0.0
+    except (TypeError, ValueError):
+        area = 0.0
+    r_max = math.sqrt(area / math.pi) * 0.8 if area > 0 else 2.0
+    r_max = max(1.5, min(r_max, 60.0))
+    mx = 111320.0 * math.cos(math.radians(float(lat)))
+    my = 110540.0
+    out: List[Tuple[float, float]] = []
+    for k in range(hh):
+        r = r_max * math.sqrt((k + 0.5) / hh)
+        theta = math.radians(k * 137.508)
+        out.append((round(float(lon) + r * math.cos(theta) / mx, 7),
+                    round(float(lat) + r * math.sin(theta) / my, 7)))
     return out
 
 
@@ -2612,6 +2697,7 @@ def assemble_premises(
         "duplicates_merged": 0,
         "buildings_excluded": 0,
         "boundary_buildings": 0,
+        "households_expanded": 0,
     }
 
     # --- 1/2. address points, grouped by the building they sit in -----------
@@ -2669,6 +2755,31 @@ def assemble_premises(
             "OSM_ID": oid if oid is not None else int(addr["osm_id"]),
         }
 
+    def _emit(addr: Dict[str, Any], building: Optional[Dict[str, Any]], hh: int,
+              method: str, suffix: str, lonlat: Tuple[float, float],
+              footprint_m2: Optional[float] = None) -> None:
+        """One row per HOUSEHOLD: a 9-flat building is 9 premises, not one.
+
+        Every household gets its own distinct point inside the building (see
+        household_points), so the pipeline lays one drop per home instead of
+        one drop per building. A single-dwelling premise keeps its historical
+        id and shape exactly.
+        """
+        try:
+            n = int(hh)
+        except (TypeError, ValueError):
+            n = 1
+        n = max(1, n)
+        if n == 1:
+            premises.append(_row(addr, building, 1, method, suffix,
+                                 _unique_lonlat(lonlat[0], lonlat[1])))
+            return
+        stats["households_expanded"] += 1
+        for j, (lo, la) in enumerate(
+                household_points(lonlat[0], lonlat[1], n, footprint_m2)):
+            premises.append(_row(addr, building, 1, method, f"{suffix}-H{j + 1}",
+                                 _unique_lonlat(lo, la)))
+
     for building_id, addr_list in grouped.items():
         building = by_id.get(building_id) if building_id is not None else None
         ordered = sorted(addr_list, key=lambda a: _sort_key_housenumber(a.get("addr_housenumber")))
@@ -2681,8 +2792,8 @@ def assemble_premises(
                 flats = parse_flats(addr.get("addr_flats"))
                 hh = min(flats, MAX_FLATS_PER_BUILDING) if flats else 1
                 method = "addr_flats" if flats else "fallback_one"
-                premises.append(_row(addr, None, hh, method, f"N{int(addr['osm_id'])}",
-                                     _unique_lonlat(addr["lon"], addr["lat"])))
+                _emit(addr, None, hh, method, f"N{int(addr['osm_id'])}",
+                      (addr["lon"], addr["lat"]))
             continue
 
         building_type = str(building.get("building") or "").strip().lower()
@@ -2714,8 +2825,8 @@ def assemble_premises(
                 suffix = f"W{building['osm_id']}-N{int(addr['osm_id'])}"
             else:
                 suffix = f"W{building['osm_id']}-P{i + 1}" if multi else f"W{building['osm_id']}"
-            premises.append(_row(addr, building, per[i], methods[i], suffix,
-                                 _unique_lonlat(addr["lon"], addr["lat"])))
+            _emit(addr, building, per[i], methods[i], suffix,
+                  (addr["lon"], addr["lat"]), building.get("footprint_m2"))
 
     # --- 3. buildings with no address node ---------------------------------
     with_addr_node = set(grouped.keys())
@@ -2740,8 +2851,8 @@ def assemble_premises(
             "addr_postcode": building.get("addr_postcode"),
             "addr_suburb": building.get("addr_suburb"),
         }
-        premises.append(_row(synthetic, building, total, method, f"W{bid}-C",
-                             _unique_lonlat(building["lon"], building["lat"])))
+        _emit(synthetic, building, total, method, f"W{bid}-C",
+              (building["lon"], building["lat"]), building.get("footprint_m2"))
         stats["boundary_buildings"] += 1
 
     return premises, stats
@@ -3528,13 +3639,49 @@ def write_roads_geojson(path: str, roads: Sequence[Dict[str, Any]]) -> str:
 # roads" was.
 #
 # So the roads layer this build writes carries the pavement network itself: every
-# carrier-class street is offset to BOTH kerbs at `PAVEMENT_OFFSET_M` (the same
-# 3 m the engine places its cabinets at, so a splitter ends up on its own trench
-# rather than 3 m off it), the derived lines are welded to each other and tied
-# into the mapped footways, and the result is written as ordinary `footway`
-# features. Nothing about the design changes: an arterial is still a carriageway
-# crossing, so crossing one is still a drill.
-PAVEMENT_OFFSET_M = 3.0
+# carrier-class street is offset to BOTH kerbs, the derived lines are welded to
+# each other and tied into the mapped footways, and the result is written as
+# ordinary `footway` features. Nothing about the design changes: an arterial is
+# still a carriageway crossing, so crossing one is still a drill.
+#
+# WHERE the band sits: half the carriageway plus a footway inset — per class,
+# not one flat number. A flat 3.0 m was measured wrong on the ground (North
+# Edgbaston): for a 6.5 m residential carriageway 3.0 m is still ON the road,
+# hard against the edge line, so the published trench was "not really on the
+# sidewalk". The same rule runs in the designer (trench_design.kerb_offset_for)
+# and in the network stage's cabinet band (DEFAULT_SIDEWALK), and tests pin the
+# three together — a trench, its pavement and its splitter cabinet sit on one
+# band.
+PAVEMENT_FOOTWAY_INSET_M = 1.25
+# Carriageway width by class for the band rule. MIRRORED from the designer's
+# VEHICULAR_WIDTH_M (HLDPlanning/design/trench_design.py) — the engine backend
+# cannot import plugin code, so the table is duplicated here and the two are
+# pinned together in tests/test_trench_basis.py.
+PAVEMENT_WIDTH_M: Dict[str, float] = {
+    "motorway": 14.0, "motorway_link": 6.0,
+    "trunk": 12.0, "trunk_link": 6.0,
+    "primary": 11.0, "primary_link": 5.0,
+    "secondary": 9.0, "secondary_link": 4.0,
+    "tertiary": 7.5, "tertiary_link": 4.0,
+    "residential": 6.5, "unclassified": 6.0,
+    "service": 5.0, "living_street": 5.5, "track": 4.0,
+}
+
+
+def pavement_offset_for(fclass: Optional[str]) -> float:
+    """Centreline -> pavement band for a street class (metres).
+
+    Half the carriageway plus the footway inset, so the trench lands in the
+    footway of a narrow street AND of a wide one. Unknown classes get the
+    default 6 m street width.
+    """
+    width = PAVEMENT_WIDTH_M.get(str(fclass or "").strip().lower(), 6.0)
+    return width / 2.0 + PAVEMENT_FOOTWAY_INSET_M
+
+
+# The base (residential) band. `pavement_offset_for()` is the rule; this stays
+# for the flat-override call sites and the documentation.
+PAVEMENT_OFFSET_M = pavement_offset_for("residential")
 # The carrier classes to derive a pavement beside -- exactly the classes the
 # designer itself treats as routable when `sidewalk_only` is off. Arterials
 # (primary/secondary/trunk/tertiary) are deliberately left alone: a derived
@@ -4003,26 +4150,29 @@ def _tie_loose_ends(lines: List[List[Tuple[float, float]]], tol: float) -> int:
 
 
 def pavement_carriers(roads: Sequence[Dict[str, Any]],
-                      offset_m: float = PAVEMENT_OFFSET_M
+                      offset_m: Optional[float] = None
                       ) -> Dict[str, Any]:
     """Derive the pavement network beside the carrier streets. Pure + testable.
 
-    Returns ``{"rows", "derived_km", "mapped_km", "total_km", "pieces",
-    "tied"}``. Only the DERIVED lines are returned as rows -- the mapped footways
-    are already in ``roads`` and stay exactly as OSM drew them; they are fed into
-    the welding pass so the derived pavement joins onto them.
+    The band follows the class width (``pavement_offset_for``) unless
+    ``offset_m`` forces one flat distance. Returns ``{"rows", "derived_km",
+    "mapped_km", "total_km", "pieces", "tied"}``. Only the DERIVED lines are
+    returned as rows -- the mapped footways are already in ``roads`` and stay
+    exactly as OSM drew them; they are fed into the welding pass so the derived
+    pavement joins onto them.
     """
     derived: List[Tuple[List[List[float]], Dict[str, Any], float]] = []
     mapped: List[Tuple[List[List[float]], Dict[str, Any]]] = []
     for row in roads:
         fclass = str(row.get("fclass") or "")
         if fclass in pavement_classes():
+            band = offset_m if offset_m is not None else pavement_offset_for(fclass)
             for coords in _polyline_parts(row):
                 if len(coords) >= 2:
                     # BOTH kerbs: the engine places its splitter cabinets on the
                     # sidewalk of either side, so a one-sided network leaves the
                     # far side's cabinets unreachable again.
-                    for dist in (offset_m, -offset_m):
+                    for dist in (band, -band):
                         derived.append((coords, row, dist))
         elif fclass in PAVEMENT_MAPPED_CLASSES:
             mapped.extend((coords, row) for coords in _polyline_parts(row))

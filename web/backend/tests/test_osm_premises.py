@@ -329,6 +329,40 @@ def test_estimate_is_capped_and_never_zero():
     assert hh >= 1
 
 
+def test_building_tags_json_counts_flats_the_columns_missed():
+    # The ingest stores the raw OSM tags; a tag that never became a column must
+    # still count — UK buildings tag flats far more often than the promoted
+    # columns catch.
+    hh, method = osm_source.estimate_households(
+        {"building": "apartments", "tags": '{"building:flats": "8"}',
+         "footprint_m2": 480})
+    assert (hh, method) == (8, "building_flats")
+
+
+def test_addr_flats_on_the_building_tags_count_too():
+    hh, method = osm_source.estimate_households(
+        {"building": "apartments", "tags": '{"addr:flats": "1-6"}',
+         "footprint_m2": 480})
+    assert (hh, method) == (6, "addr_flats")
+
+
+def test_building_height_stands_in_for_missing_levels():
+    # 12 m / 3 m per storey = 4 levels x 480 / 85 m^2 per flat = 22.6 -> 23
+    hh, method = osm_source.estimate_households(
+        {"building": "apartments", "tags": '{"building:height": "12 m"}',
+         "footprint_m2": 480})
+    assert method == "height_x_footprint"
+    assert hh == 23
+
+
+def test_parse_height_m_handles_metres_feet_and_junk():
+    assert osm_source.parse_height_m("12") == pytest.approx(12.0)
+    assert osm_source.parse_height_m("12.5 m") == pytest.approx(12.5)
+    assert osm_source.parse_height_m("39 ft") == pytest.approx(39 * 0.3048)
+    assert osm_source.parse_height_m("high") is None
+    assert osm_source.parse_height_m(None) is None
+
+
 def test_unit_area_follows_building_type():
     assert osm_source.unit_area_for("apartments") == osm_source.UNIT_AREA_M2["apartments"]
     assert osm_source.unit_area_for("terrace") == osm_source.UNIT_AREA_M2["terrace"]
@@ -386,17 +420,27 @@ def _address(osm_id, housenumber, **kwargs):
 
 
 def test_addresses_in_one_building_split_its_total():
+    # One row per HOUSEHOLD: 23 dwellings split 9/7/7 over the three addresses
+    # become 23 premises of 1 home each, so the pipeline lays one drop per home
+    # instead of one drop per building.
     buildings = [_building(1)]
     addresses = [_address(11, "2"), _address(12, "4"), _address(13, "6")]
     premises, stats = osm_source.assemble_premises(
         buildings, addresses, {11: 1, 12: 1, 13: 1}
     )
-    assert [p["HH"] for p in premises] == [9, 7, 7]
-    assert sum(p["HH"] for p in premises) == 23
+    counts = {}
+    for p in premises:
+        counts[p["Housenumber"]] = counts.get(p["Housenumber"], 0) + 1
+    assert [counts[h] for h in ("2", "4", "6")] == [9, 7, 7]
+    assert len(premises) == 23 and all(p["HH"] == 1 for p in premises)
     assert stats["duplicates_merged"] == 0
-    # Ordered by housenumber, addressed per premise, ids short and stable.
-    assert [p["Housenumber"] for p in premises] == ["2", "4", "6"]
-    assert [p["ADDR_ID"] for p in premises] == ["OSM-W1-P1", "OSM-W1-P2", "OSM-W1-P3"]
+    assert stats["households_expanded"] == 3
+    # Ordered by housenumber; ids short, stable and unique per household.
+    assert [p["Housenumber"] for p in premises] == ["2"] * 9 + ["4"] * 7 + ["6"] * 7
+    assert premises[0]["ADDR_ID"] == "OSM-W1-P1-H1"
+    assert len({p["ADDR_ID"] for p in premises}) == 23
+    # ...and every household has its own point.
+    assert len({(p["LONGITUDE"], p["LATITUDE"]) for p in premises}) == 23
 
 
 def test_premise_country_and_city_come_from_the_area_not_a_hardcoded_default():
@@ -434,13 +478,16 @@ def test_explicit_address_flats_beats_the_building_split():
     premises, _ = osm_source.assemble_premises(
         buildings, addresses, {11: 1, 12: 1}
     )
-    by_hno = {p["Housenumber"]: p for p in premises}
-    assert by_hno["4"]["HH"] == 9
-    assert by_hno["4"]["HH_METHOD"] == "addr_flats"
+    flats = [p for p in premises if p["Housenumber"] == "4"]
+    assert len(flats) == 9                        # one premise per flat
+    assert all(p["HH"] == 1 and p["HH_METHOD"] == "addr_flats" for p in flats)
+    assert len([p for p in premises if p["Housenumber"] == "2"]) == 12  # 23-9
 
 
 def test_building_without_any_address_becomes_a_centroid_premise():
-    premises, stats = osm_source.assemble_premises([_building(7)], [], {})
+    # A one-dwelling building: its centroid is the premise point, unchanged.
+    premises, stats = osm_source.assemble_premises(
+        [_building(7, building_levels="1", footprint_m2=60.0)], [], {})
     assert len(premises) == 1
     assert premises[0]["ADDR_ID"] == "OSM-W7-C"
     assert premises[0]["HH_METHOD"] == "levels_x_footprint"
@@ -448,7 +495,9 @@ def test_building_without_any_address_becomes_a_centroid_premise():
 
 
 def test_excluded_building_classes_are_dropped():
-    buildings = [_building(1, building="garage"), _building(2, building="apartments")]
+    buildings = [_building(1, building="garage"),
+                 _building(2, building="apartments",
+                           building_levels="1", footprint_m2=60.0)]
     premises, stats = osm_source.assemble_premises(buildings, [], {})
     assert [p["OSM_ID"] for p in premises] == [2]
     assert stats["buildings_excluded"] == 1
@@ -490,7 +539,8 @@ def test_identical_coordinates_are_micro_jittered_into_distinct_points():
 def test_same_building_same_housenumber_nodes_each_get_a_premise():
     # A terraced row where several address nodes sit in the same building
     # polygon with the same housenumber still yields one premise per node.
-    buildings = [_building(99, lon=13.38, lat=52.44)]
+    buildings = [_building(99, lon=13.38, lat=52.44,
+                          building_levels="1", footprint_m2=60.0)]
     addresses = [
         _address(11, "7", lon=13.381, lat=52.441),
         _address(12, "7", lon=13.381, lat=52.441),
@@ -517,14 +567,37 @@ def test_addr_id_never_exceeds_the_ogr_field_width():
     assert all(len(p["ADDR_ID"]) <= 48 for p in premises)
 
 
+def test_multi_dwelling_building_expands_to_one_premise_per_household():
+    premises, stats = osm_source.assemble_premises(
+        [_building(1, building_flats="3", building_levels=None)], [], {})
+    assert len(premises) == 3
+    assert all(p["HH"] == 1 for p in premises)
+    assert [p["ADDR_ID"] for p in premises] == [
+        "OSM-W1-C-H1", "OSM-W1-C-H2", "OSM-W1-C-H3"]
+    assert len({(p["LONGITUDE"], p["LATITUDE"]) for p in premises}) == 3
+    assert stats["households_expanded"] == 1
+
+
+def test_household_points_stay_inside_the_building():
+    pts = osm_source.household_points(13.38, 52.44, 12, 480.0)
+    assert len(pts) == 12 and len(set(pts)) == 12
+    mx = 111320.0 * math.cos(math.radians(52.44))
+    for lon, lat in pts:
+        d = math.hypot((lon - 13.38) * mx, (lat - 52.44) * 110540.0)
+        assert d <= math.sqrt(480.0 / math.pi)   # inside the footprint's disk
+
+
 def test_lowest_housenumber_absorbs_the_remainder_regardless_of_input_order():
     buildings = [_building(1)]
     addresses = [_address(13, "6"), _address(11, "2"), _address(12, "4")]
     premises, _ = osm_source.assemble_premises(
         buildings, addresses, {11: 1, 12: 1, 13: 1}
     )
-    assert [p["Housenumber"] for p in premises] == ["2", "4", "6"]
-    assert premises[0]["HH"] == 9
+    counts = {}
+    for p in premises:
+        counts[p["Housenumber"]] = counts.get(p["Housenumber"], 0) + 1
+    assert [counts[h] for h in ("2", "4", "6")] == [9, 7, 7]
+    assert premises[0]["Housenumber"] == "2"
 
 
 # ---------------------------------------------------------------------------
@@ -770,11 +843,36 @@ def test_pavement_carriers_paves_both_kerbs_at_the_kerb_distance():
     for row in result["rows"]:
         middle = json.loads(row["geom_json"])["coordinates"][1]
         assert _line_distance_m(street, middle) == pytest.approx(
-            osm_source.PAVEMENT_OFFSET_M, abs=0.2)
+            osm_source.pavement_offset_for("residential"), abs=0.2)
     # one line each side of the street, not two on the same side
     sides = {round(json.loads(r["geom_json"])["coordinates"][0][1] - 52.4400, 5)
              for r in result["rows"]}
     assert len(sides) == 2
+
+
+def test_pavement_band_follows_the_street_width_not_one_flat_constant():
+    # The flat 3.0 m put the "pavement" ON the carriageway of every wider
+    # street (measured: the trench sat 3.0 m off the centreline of a 6.5 m
+    # road — still on the road). The band is half the carriageway plus a
+    # footway inset, per class.
+    assert osm_source.pavement_offset_for("residential") == pytest.approx(4.5)
+    assert osm_source.pavement_offset_for("service") == pytest.approx(3.75)
+    roads = [
+        _road_row(1, "residential",
+                  [[13.3800, 52.4400], [13.3830, 52.4400], [13.3860, 52.4400]]),
+        _road_row(2, "service",
+                  [[13.3800, 52.4402], [13.3830, 52.4402], [13.3860, 52.4402]]),
+    ]
+    result = osm_source.pavement_carriers(roads)
+    assert len(result["rows"]) == 4
+    for row in result["rows"]:
+        middle = json.loads(row["geom_json"])["coordinates"][1]
+        if abs(middle[1] - 52.4400) < 0.0001:
+            assert _line_distance_m(roads[0], middle) == pytest.approx(
+                osm_source.pavement_offset_for("residential"), abs=0.2)
+        else:
+            assert _line_distance_m(roads[1], middle) == pytest.approx(
+                osm_source.pavement_offset_for("service"), abs=0.2)
 
 
 def test_crossing_streets_form_one_connected_pavement():
