@@ -498,6 +498,89 @@ def test_aerial_max_leg_rule_is_opt_in():
     assert on[0]["aerial_reason"] == "length"
 
 
+# ── aerial feasibility (A11a: the designer consults the shared scorer) ──────
+
+def test_crossing_a_major_road_moves_the_drop_aerial():
+    # house across a primary road from the mains
+    legs = [{"coords": [(0.0, -10.0), (0.0, 10.0)], "length": 20.0,
+             "type": "Garden", "house": {"ADDR_ID": "across"}}]
+    primary = [([(-50.0, 0.0), (50.0, 0.0)], "primary", {})]
+    trenched, aerial = td._split_drop_legs(
+        legs, None, td.Params(), lambda m: None, primary)
+    assert trenched == []
+    assert aerial[0]["aerial_reason"] == "major_road_crossing"
+
+
+def test_running_alongside_a_major_road_is_not_a_crossing():
+    legs = [{"coords": [(0.0, 5.0), (50.0, 5.0)], "length": 50.0,
+             "type": "Garden", "house": {"ADDR_ID": "along"}}]
+    primary = [([(-50.0, 0.0), (150.0, 0.0)], "primary", {})]
+    trenched, aerial = td._split_drop_legs(
+        legs, None, td.Params(), lambda m: None, primary)
+    assert [leg["house"]["ADDR_ID"] for leg in trenched] == ["along"]
+    assert aerial == []
+
+
+def test_minor_road_crossings_stay_trenched():
+    legs = [{"coords": [(0.0, -10.0), (0.0, 10.0)], "length": 20.0,
+             "type": "Garden", "house": {"ADDR_ID": "cross"}}]
+    residential = [([(-50.0, 0.0), (50.0, 0.0)], "residential", {})]
+    trenched, aerial = td._split_drop_legs(
+        legs, None, td.Params(), lambda m: None, residential)
+    assert len(trenched) == 1 and aerial == []
+
+
+def test_rocky_premise_ground_moves_the_drop_aerial():
+    legs = [{"coords": [(0.0, 0.0), (0.0, 10.0)], "length": 10.0,
+             "type": "Garden",
+             "house": {"ADDR_ID": "rock", "TERRAIN": "rock"}}]
+    _t, aerial = td._split_drop_legs(legs, None, td.Params(), lambda m: None)
+    assert aerial[0]["aerial_reason"] == "terrain_constraint"
+
+
+def test_distance_threshold_uses_max_ug_drop_m():
+    legs = [{"coords": [(0.0, 0.0), (0.0, 80.0)], "length": 80.0,
+             "type": "Open Cut", "house": {"ADDR_ID": "far"}}]
+    off, _ = td._split_drop_legs(legs, None, td.Params(), lambda m: None)
+    assert len(off) == 1                 # 80 m < 300 m economical default
+    _t, on = td._split_drop_legs(
+        legs, None, td.Params(max_ug_drop_m=50.0), lambda m: None)
+    assert on[0]["aerial_reason"] == "distance_threshold"
+
+
+def test_feasibility_reason_wins_over_the_length_threshold():
+    legs = [{"coords": [(0.0, -40.0), (0.0, 40.0)], "length": 80.0,
+             "type": "Open Cut", "house": {"ADDR_ID": "across"}}]
+    primary = [([(-50.0, 0.0), (50.0, 0.0)], "primary", {})]
+    _t, on = td._split_drop_legs(
+        legs, None, td.Params(aerial_max_leg_m=30.0), lambda m: None, primary)
+    assert on[0]["aerial_reason"] == "major_road_crossing"   # not "length"
+
+
+def test_zone_outranks_the_feasibility_rules():
+    legs = [{"coords": [(0.0, -10.0), (0.0, 10.0)], "length": 20.0,
+             "type": "Garden", "house": {"ADDR_ID": "in"}}]
+    primary = [([(-50.0, 0.0), (50.0, 0.0)], "primary", {})]
+    _t, aerial = td._split_drop_legs(
+        legs, td._zone_polygons(_zone([(-5, -15), (5, -15), (5, 15), (-5, 15)])),
+        td.Params(), lambda m: None, primary)
+    assert aerial[0]["aerial_reason"] == "zone"
+
+
+def test_chain_rule_still_catches_children_of_aerial_legs():
+    legs = [
+        {"coords": [(0.0, -10.0), (0.0, 10.0)], "length": 20.0,
+         "type": "Garden", "house": {"ADDR_ID": "parent"}, "parent": -1},
+        {"coords": [(0.0, 10.0), (40.0, 10.0)], "length": 40.0,
+         "type": "Garden", "house": {"ADDR_ID": "child"}, "parent": 0},
+    ]
+    primary = [([(-50.0, 0.0), (50.0, 0.0)], "primary", {})]
+    _t, aerial = td._split_drop_legs(
+        legs, None, td.Params(), lambda m: None, primary)
+    reasons = {leg["house"]["ADDR_ID"]: leg["aerial_reason"] for leg in aerial}
+    assert reasons == {"parent": "major_road_crossing", "child": "chain"}
+
+
 def test_aerial_flag_marks_spans_crossing_the_zone():
     zone = td._zone_polygons(_zone([(-5, -5), (5, -5), (5, 15), (-5, 15)]))
     assert td._aerial_flag(zone, [(0, 0), (0, 10)]) == "zone"

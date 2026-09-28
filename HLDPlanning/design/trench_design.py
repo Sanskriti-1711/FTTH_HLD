@@ -54,6 +54,17 @@ try:
 except ImportError:  # standalone script execution (python design/trench_design.py)
     import surface_cross_section as sx
 
+# The shared aerial decision table — the same rules the legacy
+# ``algorithms/trench_layer._eval_drop_feasibility`` consults, so both engines
+# classify the same drop the same way. Geometry is measured here; the rules
+# live there (A11a).
+try:
+    from .aerial_feasibility import (MAX_UG_DROP_M_DEFAULT, crossed_road_class,
+                                     evaluate_drop_feasibility)
+except ImportError:  # standalone script execution
+    from aerial_feasibility import (MAX_UG_DROP_M_DEFAULT, crossed_road_class,
+                                    evaluate_drop_feasibility)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Parameters
 # ─────────────────────────────────────────────────────────────────────────────
@@ -259,6 +270,12 @@ class Params:
     # is built aerial — drawn as an aerial drop, never excavated. 0 = length
     # rule off (zone layer only).
     aerial_max_leg_m: float = 0.0
+    # The shared scorer's economical limit for a buried drop
+    # (``design/aerial_feasibility.MAX_UG_DROP_M_DEFAULT`` — the same knob the
+    # legacy stage gets as MAX_UG_DROP_M): a house further than this from the
+    # network is served aerial. Independent of ``aerial_max_leg_m``: that rule
+    # is about one garden leg's length, this one about the whole drop.
+    max_ug_drop_m: float = MAX_UG_DROP_M_DEFAULT
     # The kerb band (see KERB_OFFSET_M / kerb_offset_for): geometry along a
     # carriageway is drawn at the pavement band instead of on the centreline.
     # 0 disables the rule. With kerb_offset_per_class the value only gates the
@@ -687,6 +704,8 @@ def _read_points(path: str, target_epsg: int, bbox=None) -> List[dict]:
                 "HH": _value(f, "HH"),
                 "MFG_ID": _value(f, "MFG_ID"),
                 "fclass": _value(f, "fclass"),
+                # ground condition (rock/water/...) for the aerial scorer
+                "TERRAIN": _value(f, "TERRAIN"),
             })
     ds = None
     return out
@@ -2187,7 +2206,34 @@ def _leg_in_zone(zone_polys, leg: dict, samples: int = 6) -> bool:
     return False
 
 
-def _split_drop_legs(legs: Sequence[dict], zone_polys, params: Params, log
+def _drop_feasibility_reason(leg: dict, params: Params,
+                             road_parts=None) -> str:
+    """The scorer's reason when this drop cannot be buried, else ``""``.
+
+    The facts are measured here (leg length = house-to-network distance; the
+    barrier-class carriageway the leg *crosses*, not merely runs alongside;
+    the premise's TERRAIN attribute), and the rules are applied by the shared
+    table in ``design/aerial_feasibility`` — the same one the legacy
+    ``trench_layer._eval_drop_feasibility`` consults (A11a). The designer has
+    no brownfield-duct or barrier-layer facts at this stage, so the scorer's
+    ``spare_duct_available`` and ``prohibited_crossing`` rules stay quiet
+    rather than being guessed.
+    """
+    house = leg.get("house") or {}
+    buried_ok, why = evaluate_drop_feasibility(
+        distance_m=leg.get("length"),
+        road_class=(crossed_road_class(leg["coords"], road_parts)
+                    if road_parts else None),
+        terrain=house.get("TERRAIN"),
+        has_spare_duct=False,
+        crosses_barrier=False,
+        max_ug_drop_m=params.max_ug_drop_m,
+    )
+    return "" if buried_ok else why
+
+
+def _split_drop_legs(legs: Sequence[dict], zone_polys, params: Params, log,
+                     road_parts=None
                      ) -> Tuple[List[dict], List[dict]]:
     """Split house drop legs into (trenched, aerial).
 
@@ -2195,12 +2241,21 @@ def _split_drop_legs(legs: Sequence[dict], zone_polys, params: Params, log
 
     1. ``zone``   — the leg lies inside an aerial zone: underground is not
        permitted there, so the drop is built aerial.
-    2. ``length`` — the leg is longer than ``aerial_max_leg_m`` (when set):
+    2. **feasibility** — the shared scorer (``_drop_feasibility_reason``)
+       says the drop cannot economically be buried. The leg then carries the
+       scorer's own reason: ``distance_threshold`` (further than
+       ``max_ug_drop_m`` from the network), ``major_road_crossing`` (it
+       crosses a motorway/trunk/primary/secondary carriageway), or
+       ``terrain_constraint`` (rocky / waterlogged premise ground).
+    3. ``length`` — the leg is longer than ``aerial_max_leg_m`` (when set):
        the spur can neither be a garden trench nor economically open-cut.
-    3. ``chain``  — the leg **branches off an aerial leg**: the drop already
+    4. ``chain``  — the leg **branches off an aerial leg**: the drop already
        went aerial further out, and a trench cannot start in mid-air. Legs are
        walked in creation order (nearest the mains first), so a parent is
        always classified before its children.
+
+    Rule 2 runs before rule 3 so a leg that both crosses a major road and runs
+    long reports the physical obstacle, not the threshold.
 
     An aerial leg is **not** a trench: it is published on the ``Aerial_Drops``
     layer and excluded from every excavated trench output and length.
@@ -2220,12 +2275,12 @@ def _split_drop_legs(legs: Sequence[dict], zone_polys, params: Params, log
             reason = "unreachable"
         elif _leg_in_zone(zone_polys, item):
             reason = "zone"
-        elif params.aerial_max_leg_m and item["length"] > params.aerial_max_leg_m:
-            reason = "length"
-        elif parent >= 0 and parent in aerial_idx:
-            reason = "chain"
         else:
-            reason = ""
+            reason = _drop_feasibility_reason(item, params, road_parts)
+        if not reason and params.aerial_max_leg_m and item["length"] > params.aerial_max_leg_m:
+            reason = "length"
+        if not reason and parent >= 0 and parent in aerial_idx:
+            reason = "chain"
         if reason:
             item["type"] = "Aerial"
             item["aerial_reason"] = reason
@@ -3162,7 +3217,8 @@ def design(cfg: dict) -> dict:
                 % (len(aerial_polys),
                    sum(g.GetArea() for g, _e in aerial_polys) / 10000.0))
     legs = design_garden_legs(network_parts, houses, params, log)
-    legs, aerial_legs = _split_drop_legs(legs, aerial_polys, params, log)
+    legs, aerial_legs = _split_drop_legs(legs, aerial_polys, params, log,
+                                         road_parts=vehicular)
     if aerial_legs:
         by_reason: Dict[str, int] = defaultdict(int)
         for leg in aerial_legs:
@@ -3577,6 +3633,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="optional aerial-zone polygons (never trenched)")
     ap.add_argument("--aerial-max-leg", type=float, default=0.0,
                     help="drop legs longer than this are built aerial (0 = off)")
+    ap.add_argument("--max-ug-drop", type=float, default=MAX_UG_DROP_M_DEFAULT,
+                    help="house-to-network distance beyond which a drop is "
+                         "built aerial instead of buried (economical UG limit)")
     ap.add_argument("--target-epsg", type=int, default=25833)
     ap.add_argument("--simplify-tol", type=float, default=2.5)
     ap.add_argument("--max-garden", type=float, default=60.0)
@@ -3601,6 +3660,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "polygons": args.polygons, "roads": args.roads, "out": args.out,
         "aerial": args.aerial,
         "aerial_max_leg_m": args.aerial_max_leg,
+        "max_ug_drop_m": args.max_ug_drop,
         "target_epsg": args.target_epsg, "simplify_tol_m": args.simplify_tol,
         "max_garden_m": args.max_garden,
         "crossing_merge_m": args.crossing_merge,

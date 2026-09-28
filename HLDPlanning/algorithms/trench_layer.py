@@ -104,20 +104,21 @@ def trench_road_filter_expr() -> str:
 # connection should be built underground or flagged for aerial routing.
 # ---------------------------------------------------------------------------
 
-_AERIAL_BARRIER_CLASSES = {
-    "motorway", "trunk", "primary", "secondary",
-    "motorway_link", "trunk_link", "primary_link", "secondary_link",
-}
-
-_AERIAL_TERRAIN_TYPES = {
-    "rock", "rocky", "scree", "boulder",
-    "water", "wetland", "marsh", "swamp", "flood",
-    "canal", "ditch",
-}
+# The decision table is SHARED with the designer's ``_split_drop_legs``
+# (``design/aerial_feasibility.py``) — one scorer, two callers, so the legacy
+# stage and the designer can never disagree about what makes a drop aerial.
+# Geometry stays here (QGIS); the rules live there.
+from ..design.aerial_feasibility import (  # noqa: E402
+    AERIAL_BARRIER_CLASSES as _AERIAL_BARRIER_CLASSES,
+    AERIAL_TERRAIN_TYPES as _AERIAL_TERRAIN_TYPES,
+    MAX_UG_DROP_M_DEFAULT as _MAX_UG_DROP_M_DEFAULT,
+    evaluate_drop_feasibility,
+)
 
 # Default max economical UG drop distance (metres).  Rural projects can
-# increase this via the algorithm parameter MAX_UG_DROP_M.
-_MAX_UG_DROP_M_DEFAULT = 300.0
+# increase this via the algorithm parameter MAX_UG_DROP_M. The value comes
+# from the shared table so both stages draw the same line.
+_MAX_UG_DROP_M_DEFAULT = _MAX_UG_DROP_M_DEFAULT
 
 # ---- Trench basis: which roads a trench may be dug in -----------------------
 # Operator rule (2026-09-21): the network is dug in the CARRIAGEWAY — never in a
@@ -198,36 +199,32 @@ def _eval_drop_feasibility(
       - ``terrain_constraint``            — rocky / waterlogged / protected
       - ``no_duct_no_pole_ug_required``   — no duct and no aerial option
     """
-    # 1. Existing spare duct → buried preferred
-    if has_spare_duct:
-        return (True, "spare_duct_available")
-
-    # 2. Distance to nearest network point
+    # Measured here (QGIS geometry), decided there (shared table). Keeping the
+    # rules in one place is what lets the designer reach the same conclusion
+    # without importing QGIS.
+    best_d = None
     if network_geoms:
         best_d = min(
             _approx_meters(premise_pt, g.nearestPoint(QgsGeometry.fromPointXY(premise_pt)).asPoint())
             for g in network_geoms
         )
-        if best_d > max_ug_drop_m:
-            return (False, "distance_threshold")
 
-    # 3. Barrier crossing check
-    if barrier_geoms:
+    crosses_barrier = False
+    if barrier_geoms and network_geoms:
         for bg in barrier_geoms:
             buf = bg.buffer(5.0, 5)
-            for ng in network_geoms:
-                if buf.intersects(ng):
-                    return (False, "prohibited_crossing")
+            if any(buf.intersects(ng) for ng in network_geoms):
+                crosses_barrier = True
+                break
 
-    # 4. Major road type → expensive restoration
-    if road_class_at_pt and road_class_at_pt.lower() in _AERIAL_BARRIER_CLASSES:
-        return (False, "major_road_crossing")
-
-    # 5. Terrain constraint
-    if terrain_at_pt and terrain_at_pt.lower() in _AERIAL_TERRAIN_TYPES:
-        return (False, "terrain_constraint")
-
-    return (True, "ug_default")
+    return evaluate_drop_feasibility(
+        distance_m=best_d,
+        road_class=road_class_at_pt,
+        terrain=terrain_at_pt,
+        has_spare_duct=has_spare_duct,
+        crosses_barrier=crosses_barrier,
+        max_ug_drop_m=max_ug_drop_m,
+    )
 
 
 # ---- trench-specific helpers (keep local here)
