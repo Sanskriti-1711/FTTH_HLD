@@ -3396,6 +3396,111 @@ def stamp_region_identity(out_dir, feedback=None):
     return written
 
 
+def verify_surface_geometry(out_dir, feedback=None, roads_source=None):
+    """Flag trenches whose drawn position contradicts the SURFACE they claim.
+
+    The attribute pass stamps ``SURFACE`` from routing evidence and the
+    construction position; this asks the geometry whether the span was really
+    drawn there, classifying every span against the road cross-section model
+    (``design.surface_geometry_check`` → ``surface_cross_section.classify_line``)
+    and reporting the classifier's own confidence. Runs at the end of every
+    run, next to ``verify_duct_continuity``.
+
+    Returns the report dict (also useful to tests): ``checked``, ``agreed``,
+    ``uncertain``, ``no_road``, ``no_claim``, ``flags``.
+    """
+    from ..design import surface_geometry_check as sgc
+    from ..design.surface_cross_section import RoadTags
+
+    report = {"checked": 0, "agreed": 0, "uncertain": 0, "no_road": 0,
+              "no_claim": 0, "flags": []}
+    trench_path = os.path.join(out_dir, "Final_Trenches.gpkg")
+    if not os.path.isfile(trench_path):
+        return report
+    if roads_source is None:
+        if feedback:
+            feedback.pushInfo("  [verify] Surfaces: no roads layer — skipped.")
+        return report
+
+    roads_lyr, roads_ds = _as_ogr_layer(roads_source)
+    roads = []
+    if roads_lyr is not None:
+        d = roads_lyr.GetLayerDefn()
+
+        def _idx(*names):
+            for name in names:
+                i = d.GetFieldIndex(name)
+                if i >= 0:
+                    return i
+            return -1
+
+        i_hw = _idx("highway", "HIGHWAY", "fclass", "FCLASS", "class", "CLASS")
+        i_lanes = _idx("lanes", "LANES")
+        i_width = _idx("width", "WIDTH")
+        i_sw = _idx("sidewalk", "SIDEWALK")
+        i_surf = _idx("surface", "SURFACE")
+        for feat in roads_lyr:
+            geom = feat.GetGeometryRef()
+            if geom is None or geom.IsEmpty():
+                continue
+            hw = str(feat.GetField(i_hw) or "") if i_hw >= 0 else ""
+            tags = {
+                "lanes": feat.GetField(i_lanes) if i_lanes >= 0 else None,
+                "sidewalk": feat.GetField(i_sw) if i_sw >= 0 else None,
+                "width": feat.GetField(i_width) if i_width >= 0 else None,
+                "surface": feat.GetField(i_surf) if i_surf >= 0 else None,
+            }
+            for coords in _line_parts(geom):
+                if len(coords) >= 2:
+                    roads.append(sgc.Road(
+                        centerline=coords,
+                        tags=RoadTags.from_osm(hw, tags),
+                    ))
+    roads_ds = None
+    if not roads:
+        if feedback:
+            feedback.pushInfo("  [verify] Surfaces: roads layer has no lines — skipped.")
+        return report
+
+    ds, lyr = _open_lyr(trench_path)
+    if lyr is None:
+        return report
+    d = lyr.GetLayerDefn()
+    i_id = d.GetFieldIndex("TRENCH_ID")
+    i_surf = d.GetFieldIndex("SURFACE")
+    spans = []
+    for feat in lyr:
+        geom = feat.GetGeometryRef()
+        if geom is None or geom.IsEmpty():
+            continue
+        parts = [c for c in _line_parts(geom) if len(c) >= 2]
+        if not parts:
+            continue
+        line = max(parts, key=len)
+        sid = (str(feat.GetField(i_id)) if (i_id >= 0 and feat.GetField(i_id))
+               else str(feat.GetFID()))
+        surf = str(feat.GetField(i_surf)) if (i_surf >= 0 and feat.GetField(i_surf)) else ""
+        spans.append(sgc.Span(span_id=sid, line=line, surface=surf))
+    ds = None
+    if not spans:
+        if feedback:
+            feedback.pushInfo("  [verify] Surfaces: no trench spans — skipped.")
+        return report
+
+    report = sgc.check_spans(spans, roads)
+    if feedback:
+        feedback.pushInfo(
+            "  [verify] Surfaces: %d span(s) checked — %d agree, %d "
+            "contradiction(s), %d uncertain, %d off-road, %d without a claim."
+            % (report.get("checked", 0), report.get("agreed", 0),
+               len(report.get("flags", [])), report.get("uncertain", 0),
+               report.get("no_road", 0), report.get("no_claim", 0)))
+        for f in report.get("flags", [])[:8]:
+            feedback.pushWarning(
+                "  [verify] SURFACE %s: %s" % (f.get("span_id"), f.get("message")))
+    return report
+
+
 def enrich_all(out_dir, feedback=None, roads_lyr=None):
     """Enrich every pipeline GPKG inside out_dir (no-op when out_dir is empty).
 
@@ -3507,6 +3612,13 @@ def enrich_all(out_dir, feedback=None, roads_lyr=None):
     # Every run states whether the ducts actually flow: one feeder chain from
     # the MFG to every PDP, and couplers sitting on the distribution duct.
     verify_duct_continuity(out_dir, feedback)
+    # A verification pass must never fail the run — a surface that disagrees
+    # with its geometry is reported, loudly, and the run still publishes.
+    try:
+        verify_surface_geometry(out_dir, feedback, roads_source=roads_lyr)
+    except Exception as exc:
+        if feedback:
+            feedback.pushInfo(f"  [verify] Surface geometry check skipped: {exc}")
     # The coupler is the joint between the distribution and the drop duct, so
     # it has to name both — it could only carry the drop side when it was
     # created, before the distribution network existed.
