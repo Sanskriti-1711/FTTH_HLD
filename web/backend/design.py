@@ -306,6 +306,35 @@ def derive_aerial_zones(landuse, anchor_paths, out_path: Path
     return out_path
 
 
+def _restricted_landuse_classes(landuse: Optional[str]) -> List[str]:
+    """The restricted classes present in a landuse layer, for reporting only.
+
+    Reads the same `fclass` field the derivation reads, so "the area has
+    restricted land" and "the zones were derived from it" are decided by one
+    rule.  Returns [] for a missing/unreadable layer, which is deliberately
+    silent: no landuse means no claim either way.
+    """
+    if not landuse:
+        return []
+    from osgeo import ogr
+    try:
+        ds = ogr.Open(str(landuse))
+        if ds is None:
+            return []
+        lyr = ds.GetLayer(0)
+        idx = lyr.GetLayerDefn().GetFieldIndex("fclass")
+        if idx < 0:
+            return []
+        found = set()
+        for feat in lyr:
+            cls = (feat.GetField(idx) or "").strip()
+            if cls in RESTRICTED_LANDUSE:
+                found.add(cls)
+    except Exception:  # noqa: BLE001 - reporting must never fail a design
+        return []
+    return sorted(found)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # run
 # ─────────────────────────────────────────────────────────────────────────────
@@ -331,6 +360,12 @@ def run_design(project_id: str, force: bool = False) -> Dict[str, Any]:
         _set_status(project_id, status="running", stage="Resolving aerial zones")
         aerial_path = src["aerial"]
         zones_out = target / "Aerial_Zones.geojson"
+        # Whether the landuse the area supplied actually CONTAINS restricted
+        # ground.  This is the difference between "there is nothing here worth
+        # protecting" and "the layer was unreadable / the derivation failed",
+        # and only the first is a reason to have no zones.
+        restricted = _restricted_landuse_classes(src["landuse"])
+        zone_note = None
         if aerial_path is None and src["landuse"] is not None:
             try:
                 derived = derive_aerial_zones(
@@ -339,8 +374,9 @@ def run_design(project_id: str, force: bool = False) -> Dict[str, Any]:
                     zones_out)
                 if derived is not None:
                     aerial_path = derived
-            except Exception:
+            except Exception as exc:  # noqa: BLE001
                 aerial_path = None  # zones are optional; design without them
+                zone_note = f"the aerial-zone derivation failed ({type(exc).__name__})"
         elif aerial_path is not None:
             try:
                 shutil.copyfile(str(aerial_path), str(zones_out))
@@ -357,12 +393,29 @@ def run_design(project_id: str, force: bool = False) -> Dict[str, Any]:
             "target_epsg": 25833,
         }
         report = td.design(cfg)
+        # Say so when the design could not be protected, and only then. A drop
+        # leg is classified aerial on `zone` only when a zone exists, so an area
+        # whose landuse layer was missing or unreadable is indistinguishable
+        # downstream from an area with no restricted land — the trenching is
+        # legal-looking either way, and the run log is the only place the
+        # difference is still visible.
+        if restricted and not aerial_path:
+            zone_note = zone_note or "the landuse layer could not be read"
         return _set_status(
             project_id, status="completed", stage="Complete", error=None,
             spans=report.get("spans"), runs=report.get("runs"),
             total_length_m=report.get("total_length_m"),
             aerial_legs=report.get("aerial_legs", 0),
             aerial_length_m=report.get("aerial_length_m", 0),
+            aerial_zones=bool(aerial_path),
+            restricted_landuse=restricted,
+            aerial_zone_note=(
+                f"No aerial zones were derived, because {zone_note}. Drop legs were "
+                f"therefore classified on length and chain only, and any leg in "
+                f"restricted ground ({', '.join(restricted)}) was trenched rather "
+                f"than built overhead."
+                if restricted and not aerial_path else None
+            ),
             drills=report.get("drills"))
     except Exception as exc:  # surfaced to the client instead of a 500
         return _set_status(project_id, status="failed", stage="Failed",

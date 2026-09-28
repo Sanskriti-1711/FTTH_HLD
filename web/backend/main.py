@@ -1389,6 +1389,11 @@ def _osm_health() -> Dict[str, Any]:
         "loaded": status.get("loaded"),
         "tables": status.get("tables") or {},
         "extract": status.get("extract"),
+        # The register is an off-by-default operator step, so "loaded but not
+        # in use" is a state a probe has to be able to see: without it, an
+        # operator who has loaded ONSPD and still gets heuristic household
+        # counts has no way to tell that from never having loaded it.
+        "household_register": status.get("household_register"),
     }
 
 

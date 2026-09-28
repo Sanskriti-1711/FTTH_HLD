@@ -55,6 +55,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import postgis
+import household_register
 from countries import country_name, country_options, normalize_country_code
 
 # ---------------------------------------------------------------------------
@@ -208,7 +209,9 @@ def own_area_values(resolution: Dict[str, Any], postcode: str = "") -> List[str]
 
 
 def sub_area_kinds_that_narrow(
-    resolution: Dict[str, Any], loaded_kinds: Sequence[str] = ()
+    resolution: Dict[str, Any],
+    loaded_kinds: Sequence[str] = (),
+    postcode_verified: Optional[bool] = None,
 ) -> List[str]:
     """Which sub-area buckets a planner can actually narrow to, from here.
 
@@ -225,6 +228,17 @@ def sub_area_kinds_that_narrow(
     the ward.  Typing it back returns the same 3.396 km² ward.  From anywhere else
     (an OSM polygon, the enclosing administrative area, a rectangle) a containing
     polygon is strictly smaller, so the suggestion stands.
+
+    `postcode_verified` is the measured answer for a country with no loaded
+    dataset, and it exists because the argument above is only valid when there is
+    a containing polygon to resolve through.  Where there is none, a postcode
+    resolves to whatever Nominatim returns for it, and in India that is a single
+    building: `421201` and `421202` both returned the same State Bank of India
+    branch at **0.0 km²**.  A bank is "strictly smaller" than the 55.474 km²
+    Dombivli city by every size comparison and is not a design area at all, so
+    the chip would have looked valid and led nowhere.  Pass the probed result
+    (see `postcode_narrows_to_area`); None means "not probed" and keeps the
+    previous inference, which is what the GB and US cases rely on.
     """
     boundary_is_dataset = str(resolution.get("polygon_source") or "") == "dataset"
     boundary_kind = str(resolution.get("boundary_kind") or "")
@@ -234,8 +248,13 @@ def sub_area_kinds_that_narrow(
     # 4.38 km² against the 9.343 km² Mariendorf it sits in), or to a loaded
     # postcode dataset.  A postcode dataset is a strictly smaller polygon than a
     # ward, which is what breaks the loop there.
+    #
+    # With NO dataset loaded for the country, that "own polygon in OSM" is the
+    # only way through, and whether it exists is a fact about the country rather
+    # than something this can infer -- so it is probed instead of assumed.
     if not boundary_is_dataset or boundary_kind == "postcode" or "postcode" in kinds:
-        offered.append("postcode")
+        if postcode_verified is None or postcode_verified:
+            offered.append("postcode")
     # A district is DELIBERATELY stricter, because a district name has no polygon
     # of its own to resolve to: measured, the Mariendorf preview offered "or
     # Tempelhof (13 premises)" from a 13-premise bucket inside it, and Tempelhof
@@ -250,7 +269,9 @@ def sub_area_kinds_that_narrow(
     return offered
 
 
-def sub_area_kinds_offered(resolution: Dict[str, Any]) -> List[str]:
+def sub_area_kinds_offered(
+    resolution: Dict[str, Any], postcode_verified: Optional[bool] = None
+) -> List[str]:
     """`sub_area_kinds_that_narrow` with the country's loaded kinds looked up.
 
     Always looked up, because whether a DISTRICT can be offered depends on it in
@@ -260,7 +281,7 @@ def sub_area_kinds_offered(resolution: Dict[str, Any]) -> List[str]:
     difference between a suggestion and a wrong suggestion.
     """
     loaded: Sequence[str] = boundary_dataset_kinds(str(resolution.get("country_code") or ""))
-    return sub_area_kinds_that_narrow(resolution, loaded)
+    return sub_area_kinds_that_narrow(resolution, loaded, postcode_verified)
 
 
 def narrowing_hint(
@@ -2674,23 +2695,218 @@ def _sort_key_housenumber(value: Any) -> Tuple[int, float, str]:
     return (1, 0.0, text)
 
 
+def _premise_postcode(item: Dict[str, Any]) -> str:
+    """The postcode of a queued premise, from its address or its building.
+
+    Address first, then building: a building polygon often carries a postcode
+    that its address nodes do not, and vice versa, so either can be the only one
+    present. Normalised through the register's own function, because a join that
+    misses on `B113SA` vs `B11 3SA` is a join that silently returns nothing.
+    """
+    addr = item.get("addr") or {}
+    building = item.get("building") or {}
+    return household_register.normalize_postcode(
+        addr.get("addr_postcode") or building.get("addr_postcode")
+    )
+
+
+def _premise_uprn(item: Dict[str, Any]) -> str:
+    """A UPRN on the premise, from either row's tags.
+
+    UPRN is a `ref:uprn` (or `uprn`) tag in OSM, so it is read from the raw tag
+    bag rather than from a promoted column -- the ingest does not promote every
+    tag, and this is one of the tags that carries real addressing data.
+    """
+    for row in (item.get("addr") or {}, item.get("building") or {}):
+        tags = _tags_of(row)
+        for key in ("ref:uprn", "uprn", "addr:uprn"):
+            value = str(tags.get(key) or "").strip()
+            if value:
+                return value
+    return ""
+
+
+def _apply_household_register(
+    pending: List[Dict[str, Any]], register: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Replace heuristic household counts with register counts, in place.
+
+    Mutates the queued premises' `hh` / `method`, and returns the stats the
+    preview and the run log carry.  The per-premise logic itself lives in
+    `household_register.apply_register` -- this is only the adapter that turns a
+    queued premise into the flat dict that function works on and copies the
+    result back.
+    """
+    by_postcode = register.get("by_postcode") or {}
+    by_uprn = register.get("by_uprn") or {}
+    flat: List[Dict[str, Any]] = [
+        {
+            "HH": int(item["hh"]),
+            "HH_METHOD": item["method"],
+            "Postcode": _premise_postcode(item),
+            "UPRN": _premise_uprn(item),
+        }
+        for item in pending
+    ]
+    resolved, stats = household_register.apply_register(flat, by_postcode, by_uprn)
+    for item, row in zip(pending, resolved):
+        item["hh"] = int(row.get("HH") or 1)
+        item["method"] = str(row.get("HH_METHOD") or item["method"])
+    stats["source"] = register.get("source")
+    stats["licence"] = register.get("licence")
+    stats["vintage"] = register.get("vintage")
+    return stats
+
+
+def _register_payload(
+    stats: Optional[Dict[str, Any]], register: Optional[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """What a preview/build payload says about the household register.
+
+    None when no register was consulted, rather than a block of falses: "the
+    register was not used" and "the register was used and matched nothing" are
+    different answers, and a client should be able to tell them apart.
+    """
+    if not stats or not stats.get("enabled"):
+        return None
+    payload = {
+        "enabled": True,
+        "premises_registered": stats.get("premises_registered"),
+        "postcodes_matched": stats.get("postcodes_matched"),
+        "postcodes_seen": stats.get("postcodes_seen"),
+        "households_before": stats.get("heuristic_households_before"),
+        "households_after": stats.get("heuristic_households_after"),
+        "caveat": household_register.REGISTER_CAVEAT,
+    }
+    for key in ("source", "licence", "vintage"):
+        value = stats.get(key) or (register or {}).get(key)
+        if value:
+            payload[key] = value
+    if stats.get("below_premise_count"):
+        payload["below_premise_count"] = stats["below_premise_count"]
+        payload["shortfall"] = stats.get("shortfall", 0)
+    return payload
+
+
+def household_register_for(
+    country_code: str, postcodes: Sequence[str]
+) -> Optional[Dict[str, Any]]:
+    """The external household register's lookup for this area, or None.
+
+    Takes the area's POSTCODES rather than its premises, because the register is
+    consulted while the premises are being built (inside `assemble_premises`) --
+    it decides the household count, so it cannot need the finished rows first.
+    The postcodes come from the same address/building rows, so they are available
+    a moment earlier.
+
+    Returns None -- meaning "carry on with the OSM heuristic" -- in every case
+    that is not a usable register: the knob is off, the country is not one the
+    register covers, nothing is loaded, or none of this area's postcodes match.
+    The distinction matters, because a register that matched nothing and a
+    register that was never loaded are very different things for a planner to be
+    told, and `build_inputs` reports which happened.
+    """
+    if not household_register.REGISTER_ENABLED:
+        return None
+    code = normalize_country_code(country_code)
+    if code not in household_register.REGISTER_COUNTRIES:
+        return None
+    by_postcode, by_uprn, meta = household_register.load_register(code, postcodes)
+    if not by_postcode and not by_uprn:
+        return None
+    return {
+        "by_postcode": by_postcode,
+        "by_uprn": by_uprn,
+        "source": meta.get("source"),
+        "licence": meta.get("licence"),
+        "vintage": meta.get("vintage"),
+        "meta": meta,
+    }
+
+
+def area_postcodes(
+    buildings: Sequence[Dict[str, Any]], addresses: Sequence[Dict[str, Any]]
+) -> List[str]:
+    """Every postcode on the area's address and building rows, deduplicated."""
+    out: List[str] = []
+    for row in list(addresses) + list(buildings):
+        value = row.get("addr_postcode")
+        if value:
+            out.append(str(value))
+    return out
+
+
+def household_register_warning(stats: Optional[Dict[str, Any]]) -> Optional[str]:
+    """The sentence a planner needs when a register did NOT decide the answer.
+
+    Returns None when there is nothing to say -- no register, or one that
+    covered the area cleanly.  A register is a change to the number the cable
+    sizing and the BOQ are computed from, so where it applied, where it did not,
+    and where it disagreed with the premise set all have to be visible rather
+    than inferred from a total that quietly moved.
+    """
+    if not stats or not stats.get("enabled"):
+        return None
+    matched = int(stats.get("postcodes_matched") or 0)
+    seen = int(stats.get("postcodes_seen") or 0)
+    registered = int(stats.get("premises_registered") or 0)
+    before = int(stats.get("heuristic_households_before") or 0)
+    after = int(stats.get("heuristic_households_after") or 0)
+    if not registered:
+        return None
+    parts = [
+        f"Household counts for {registered} premise(s) across {matched} postcode(s) "
+        f"come from the external household register"
+        + (f" ({stats.get('source')})" if stats.get("source") else "")
+        + f", not from the OpenStreetMap building heuristic: the area's household "
+        f"total moves from {before} to {after}."
+    ]
+    if seen > matched:
+        parts.append(
+            f"{seen - matched} postcode(s) in this area are not in the register, "
+            "so their premises keep the heuristic count."
+        )
+    if stats.get("below_premise_count"):
+        parts.append(
+            f"In {stats['below_premise_count']} postcode(s) the register counts "
+            f"FEWER households than the area has premises ({stats.get('shortfall', 0)} "
+            "in total), so each premise there is floored at 1 and the register's "
+            "total is not reproduced -- the register and the premise set disagree."
+        )
+    parts.append(household_register.REGISTER_CAVEAT)
+    return " ".join(parts)
+
+
 def assemble_premises(
     buildings: Sequence[Dict[str, Any]],
     addresses: Sequence[Dict[str, Any]],
     addr_to_building: Dict[int, int],
     country: str = "",
     city: str = "",
+    register: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Build premise rows from the OSM store.
 
     PURE: takes plain dicts plus a {address_osm_id: building_osm_id} map (built
     by a SQL spatial join in `read_area_rows`), so it is testable without a
-    database.
+    database.  `register` is the external household register's already-loaded
+    lookup (see `household_register.load_register`); it is passed in rather than
+    read here so this function stays database-free.
 
     Source priority, first match wins:
       1. an `addr:housenumber` NODE inside the area
       2. an `addr:housenumber` BUILDING polygon with no node
       3. a building CENTROID, for a residential building with no address at all
+
+    The household number for each of those is the OSM heuristic, and the
+    register is applied to those numbers BEFORE they are expanded into one row
+    per household (see below).  That ordering is deliberate: the register is
+    keyed on the postcode, so it can only say how many households a postcode
+    has, not which building they are in -- and the per-building estimate is
+    still the best available answer to that second question.  Applying it after
+    the expansion would apportion the postcode total across rows that had
+    already been given 1 household each, throwing away exactly the shape
+    information the estimate carries.
     """
     by_id = {int(b["osm_id"]): b for b in buildings}
     stats = {
@@ -2755,30 +2971,29 @@ def assemble_premises(
             "OSM_ID": oid if oid is not None else int(addr["osm_id"]),
         }
 
+    # Premises are COLLECTED first and expanded to one row per household only
+    # after the register has had its say (see _flush).  A register is keyed on
+    # the postcode, so it can only give a postcode total; the per-building
+    # estimate is the weight that decides the shape within that total.
+    pending: List[Dict[str, Any]] = []
+
     def _emit(addr: Dict[str, Any], building: Optional[Dict[str, Any]], hh: int,
               method: str, suffix: str, lonlat: Tuple[float, float],
               footprint_m2: Optional[float] = None) -> None:
-        """One row per HOUSEHOLD: a 9-flat building is 9 premises, not one.
-
-        Every household gets its own distinct point inside the building (see
-        household_points), so the pipeline lays one drop per home instead of
-        one drop per building. A single-dwelling premise keeps its historical
-        id and shape exactly.
-        """
+        """Queue one premise, to be expanded into per-household rows at the end."""
         try:
             n = int(hh)
         except (TypeError, ValueError):
             n = 1
-        n = max(1, n)
-        if n == 1:
-            premises.append(_row(addr, building, 1, method, suffix,
-                                 _unique_lonlat(lonlat[0], lonlat[1])))
-            return
-        stats["households_expanded"] += 1
-        for j, (lo, la) in enumerate(
-                household_points(lonlat[0], lonlat[1], n, footprint_m2)):
-            premises.append(_row(addr, building, 1, method, f"{suffix}-H{j + 1}",
-                                 _unique_lonlat(lo, la)))
+        pending.append({
+            "addr": addr,
+            "building": building,
+            "hh": max(1, n),
+            "method": method,
+            "suffix": suffix,
+            "lonlat": lonlat,
+            "footprint_m2": footprint_m2,
+        })
 
     for building_id, addr_list in grouped.items():
         building = by_id.get(building_id) if building_id is not None else None
@@ -2855,6 +3070,33 @@ def assemble_premises(
               (building["lon"], building["lat"]), building.get("footprint_m2"))
         stats["boundary_buildings"] += 1
 
+    # --- 4. the register, then one row per household ------------------------
+    #
+    # Applied HERE, on the per-premise counts, and not after the expansion
+    # below.  A register row is keyed on a postcode, so it fixes how many
+    # households a postcode has and cannot say which building they are in; the
+    # per-building estimate is the weight that answers that second question. If
+    # the register were applied after expansion, every row would already carry
+    # HH=1 and the apportionment would be uniform -- a 12-storey block and a
+    # bungalow would each get the same share of the postcode.
+    if register and (register.get("by_postcode") or register.get("by_uprn")):
+        stats["household_register"] = _apply_household_register(pending, register)
+
+    for item in pending:
+        n = max(1, int(item["hh"]))
+        addr, building = item["addr"], item["building"]
+        method, suffix = item["method"], item["suffix"]
+        lonlat, footprint = item["lonlat"], item["footprint_m2"]
+        if n == 1:
+            premises.append(_row(addr, building, 1, method, suffix,
+                                 _unique_lonlat(lonlat[0], lonlat[1])))
+            continue
+        stats["households_expanded"] += 1
+        for j, (lo, la) in enumerate(
+                household_points(lonlat[0], lonlat[1], n, footprint)):
+            premises.append(_row(addr, building, 1, method, f"{suffix}-H{j + 1}",
+                                 _unique_lonlat(lo, la)))
+
     return premises, stats
 
 
@@ -2899,9 +3141,18 @@ def household_summary(premises: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             buckets["5-12"] = buckets.get("5-12", 0) + 1
         else:
             buckets["13+"] = buckets.get("13+", 0) + 1
+    # A REGISTER count is a published figure, not a rule applied to a building,
+    # so it counts as measured here for the same reason an `addr:flats` tag does:
+    # both answer "how many homes" with a number somebody stated.  The caveat
+    # that a register figure is DWELLINGS rather than occupied households is
+    # carried in the register's own note and preview warning, not by pretending
+    # the number is a household survey.
+    measured_methods = ("building_flats", "addr_flats") + tuple(
+        household_register.REGISTER_METHODS
+    )
     estimated = total - sum(
         int(p.get("HH") or 0) for p in premises
-        if str(p.get("HH_METHOD")) in ("building_flats", "addr_flats")
+        if str(p.get("HH_METHOD")) in measured_methods
     )
     return {
         "total": total,
@@ -2914,6 +3165,80 @@ def household_summary(premises: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Reading the store
 # ---------------------------------------------------------------------------
+
+# A narrowing chip has to land on a real design AREA, not merely on something
+# smaller.  Measured: 421201 and 421202 in Dombivli both resolve to the same
+# State Bank of India branch, 0.0 km² -- which is "strictly smaller" than the
+# 55.474 km² city by every comparison and is not a place to design anything.
+#
+# The floor sits far below any real neighbourhood (the smallest polygon measured
+# anywhere in this feature is a 1.565 km² ward, and a good OSM postcode is
+# 4.38 km²) and far above the largest single object measured (0.008 km² for the
+# Birmingham `B1` office block).  Two orders of magnitude of clearance on both
+# sides, so it does not depend on where the real values happen to sit.
+MIN_NARROWING_AREA_KM2 = 0.05
+
+
+def postcode_narrows_to_area(
+    resolution: Dict[str, Any], postcode: str
+) -> bool:
+    """Would typing this postcode back resolve to a real area smaller than this one?
+
+    One Nominatim lookup, served from `area_cache` after the first time.  It
+    exists only for a country with no loaded boundary dataset, which is the only
+    case where whether a postcode narrows is a fact about that country rather
+    than a consequence of the boundary we are standing on -- Germany has real
+    postcode relations in OSM, India resolves one to a bank.
+
+    True only when the result is both a real area (above the floor) and
+    genuinely smaller, so a chip that leads back to the area being previewed is
+    rejected as firmly as one that leads nowhere.
+    """
+    pc = str(postcode or "").strip()
+    if not pc:
+        return False
+    try:
+        probe = resolve_area(
+            pc,
+            country_code=str(resolution.get("country_code") or ""),
+            input_type="postcode",
+            postcode=pc,
+        )
+    except Exception:  # noqa: BLE001 - a failed probe must not fail the preview
+        return False
+    area = probe.get("area_km2")
+    try:
+        area_f = float(area)
+    except (TypeError, ValueError):
+        return False
+    if area_f < MIN_NARROWING_AREA_KM2:
+        return False
+    current = resolution.get("area_km2")
+    try:
+        current_f = float(current)
+    except (TypeError, ValueError):
+        return True
+    return area_f < current_f
+
+
+def resolvable_kinds(
+    resolution: Dict[str, Any], sub_areas: Dict[str, List[Dict[str, Any]]]
+) -> List[str]:
+    """Which buckets a client may offer as narrowing chips, for this area.
+
+    One place, because the preview and the run's refusal message must not
+    disagree about what a chip is worth: a run that refuses with "narrow to
+    postcode 421201" while the preview showed no such chip is a contradiction the
+    planner has to notice.  Probes the biggest postcode bucket when the country
+    has no loaded dataset to reason from (see `postcode_narrows_to_area`).
+    """
+    verified: Optional[bool] = None
+    if not boundary_dataset_kinds(str(resolution.get("country_code") or "")):
+        top = (sub_areas.get("postcode") or [{}])[0].get("value")
+        if top:
+            verified = postcode_narrows_to_area(resolution, str(top))
+    return sub_area_kinds_offered(resolution, verified)
+
 
 def read_area_rows(polygon: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[int, int], List[Dict[str, Any]]]:
     """Buildings, address nodes, the address->building map, and roads, for a polygon.
@@ -3165,6 +3490,67 @@ def input_layer_geojson(
             "layer": key, "feature_count": len(features)}
 
 
+def write_landuse_geojson(path: str, polygon: Dict[str, Any]) -> Optional[str]:
+    """Write `inputs/osm/landuse/landuse.geojson` from the area's own OSM store.
+
+    This is the THIRD file an area run writes, and it exists for exactly one
+    consumer: `design.derive_aerial_zones` reads this path to build
+    `Aerial_Zones`, which is what makes `AERIAL_REASON = "zone"` reachable. Until
+    it was written here, only a manual multi-layer upload could supply landuse,
+    so every area-generated run derived no zones at all and silently trenched
+    houses standing in parks, nature reserves and cemeteries — the derivation is
+    wrapped in a bare `except`, and a design without zones is a valid design.
+
+    The `fclass` property is the contract, not a convenience: the consumer reads
+    that field and nothing else, and the store has no such column (it keeps
+    `landuse` / `natural` / `leisure` / `boundary` separately, because OSM does).
+    So fclass is resolved here, most-specific tag first, and a row whose tags
+    resolve to nothing is left out rather than written as an empty class.
+
+    Returns the path, or None when the area holds no landuse at all — an area
+    with no parks is not an error, and writing an empty file would make "the
+    derivation ran and found nothing" indistinguishable from "there was nothing
+    to look at".
+    """
+    try:
+        rows = _query(
+            f"SELECT osm_id, landuse, \"natural\", leisure, boundary, "
+            f"       ST_AsGeoJSON(geom) AS geom_json "
+            f"FROM {OSM_SCHEMA}.landuse WHERE ST_Intersects({_POLYGON_JSON}, geom)",
+            (json.dumps(polygon),),
+        )
+    except Exception:  # noqa: BLE001 - optional input, never fails a run
+        return None
+    features: List[Dict[str, Any]] = []
+    for row in rows:
+        fclass = str(row.get("landuse") or row.get("leisure")
+                     or row.get("natural") or "").strip()
+        if not fclass:
+            continue
+        geom = _json_geometry(row.get("geom_json"))
+        if not geom:
+            continue
+        features.append({
+            "type": "Feature",
+            "geometry": geom,
+            "properties": {
+                "fclass": fclass,
+                "landuse": row.get("landuse"),
+                "natural": row.get("natural"),
+                "leisure": row.get("leisure"),
+                "boundary": row.get("boundary"),
+                "osm_id": row.get("osm_id"),
+            },
+        })
+    if not features:
+        return None
+    payload = {"type": "FeatureCollection", "features": features}
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f)
+    return path
+
+
 def road_summary(roads: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     """Road kilometres by fclass -- also the sanity check on the fclass contract."""
     by_class: Dict[str, float] = {}
@@ -3314,20 +3700,30 @@ def preview_area(
 
     extract = ensure_area_data(area, bbox)
     buildings, addresses, join, roads = read_area_rows(resolution["polygon"])
+    register = household_register_for(
+        resolution.get("country_code") or "", area_postcodes(buildings, addresses)
+    )
     premises, stats = assemble_premises(
         buildings, addresses, join,
         country=resolution.get("country") or "",
         city=resolution.get("city") or "",
+        register=register,
     )
 
-    # Opt-in only.  Nothing here refuses a large area by default, because the
-    # refusal is what used to hide the narrowing chips below.
+    # The register decided (or did not decide) part of the household total.  It
+    # goes in the warnings, not only in a stats field: this is the number the
+    # cable sizing and the BOQ are computed from, and a total that moved has to
+    # say so on the page a planner is reading.
+    register_warning = household_register_warning(stats.get("household_register"))
+    if register_warning:
+        warnings.append(register_warning)
     if max_premises is not None and len(premises) > max_premises:
+        breakdown = sub_area_breakdown(premises)
         raise TooManyPremises(
             len(premises), max_premises,
             narrowing_hint(
-                sub_area_breakdown(premises),
-                kinds=sub_area_kinds_offered(resolution),
+                breakdown,
+                kinds=resolvable_kinds(resolution, breakdown),
                 exclude=own_area_values(resolution, postcode),
             ),
         )
@@ -3441,11 +3837,12 @@ def preview_area(
     # and offer a narrower area taken from the data, not a vague suggestion.
     sub_areas = sub_area_breakdown(premises)
     # Which buckets are worth OFFERING is a property of the boundary we are
-    # standing on, not of the premises inside it -- see sub_area_kinds_that_narrow.
-    # The breakdown itself is still reported: it is a fact about the area.
-    resolvable_kinds = sub_area_kinds_offered(resolution)
+    # standing on, not of the premises inside it -- see sub_area_kinds_that_narrow
+    # and `resolvable_kinds`.  The breakdown itself is still reported: it is a
+    # fact about the area.
+    chip_kinds = resolvable_kinds(resolution, sub_areas)
     hint = narrowing_hint(
-        sub_areas, kinds=resolvable_kinds,
+        sub_areas, kinds=chip_kinds,
         exclude=own_area_values(resolution, postcode),
     )
     over_run_cap = len(premises) > MAX_PREMISES
@@ -3455,14 +3852,14 @@ def preview_area(
             f"{len(premises) // 285}x the largest design the pipeline has run "
             f"(285 premises), and above the {MAX_PREMISES}-premise per-run cap — "
             f"no run can start until it is narrowed. Design a narrower area "
-            f"instead —{hint or narrowing_fallback(resolvable_kinds)}."
+            f"instead —{hint or narrowing_fallback(chip_kinds)}."
         )
     elif len(premises) >= SCALE_GUIDE_PREMISES:
         warnings.append(
             f"This area yields {len(premises)} premises, about "
             f"{len(premises) // 285}x the largest design the pipeline has run "
             f"(285 premises). Design a narrower area instead —"
-            f"{hint or narrowing_fallback(resolvable_kinds)}."
+            f"{hint or narrowing_fallback(chip_kinds)}."
         )
 
     # Whether a RUN can start is a different question from whether the area can
@@ -3477,7 +3874,7 @@ def preview_area(
     elif over_run_cap:
         blocked_reason = (
             f"{len(premises)} premises is above the {MAX_PREMISES}-premise per-run "
-            f"cap. Narrow the area first —{hint or narrowing_fallback(resolvable_kinds)}."
+            f"cap. Narrow the area first —{hint or narrowing_fallback(chip_kinds)}."
         )
     elif not roads:
         blocked_reason = (
@@ -3491,6 +3888,7 @@ def preview_area(
     return {
         **base,
         "extract": extract,
+        "household_register": _register_payload(stats.get("household_register"), register),
         "premises": {
             "count": len(premises),
             "from_address_node": sum(1 for p in premises if not str(p["ADDR_ID"]).endswith("-C")),
@@ -3510,7 +3908,7 @@ def preview_area(
         # Which of the buckets above the resolver can actually reach.  The page
         # offers chips from these only, so a chip is never a round trip to the
         # area it was clicked from.
-        "sub_areas_resolvable": resolvable_kinds,
+        "sub_areas_resolvable": chip_kinds,
         "roads": road_summary(roads),
         "warnings": warnings,
         # The review can always be shown; these say whether a design can start.
@@ -3529,6 +3927,11 @@ def osm_status() -> Dict[str, Any]:
         "postgis": postgis.is_available(),
         "tables": {},
         "extract": None,
+        # Reported here because the register is an OFF-BY-DEFAULT operator step:
+        # an empty one is a deliberate configuration, not a broken install, and
+        # `enabled: false` with rows loaded is exactly the combination that
+        # otherwise looks like the feature is broken.
+        "household_register": household_register.register_status("GB"),
     }
     if not schema_ready():
         return status
@@ -4341,10 +4744,14 @@ def build_inputs(
         raise RuntimeError("postgis_unavailable")
     extract = ensure_area_data(area, bbox)
     buildings, addresses, join, roads = read_area_rows(resolution["polygon"])
+    register = household_register_for(
+        resolution.get("country_code") or "", area_postcodes(buildings, addresses)
+    )
     premises, stats = assemble_premises(
         buildings, addresses, join,
         country=resolution.get("country") or "",
         city=resolution.get("city") or "",
+        register=register,
     )
     if len(premises) < MIN_PREMISES:
         raise ValueError("no_premises")
@@ -4353,11 +4760,12 @@ def build_inputs(
     if len(premises) > MAX_PREMISES:
         # Carry the narrowing hint too: this refusal is the one that stops an
         # actual run, so it is the one that most needs to say where to go next.
+        breakdown = sub_area_breakdown(premises)
         raise TooManyPremises(
             len(premises), MAX_PREMISES,
             hint=narrowing_hint(
-                sub_area_breakdown(premises),
-                kinds=sub_area_kinds_offered(resolution),
+                breakdown,
+                kinds=resolvable_kinds(resolution, breakdown),
                 exclude=own_area_values(resolution, postcode),
             ),
         )
@@ -4380,11 +4788,24 @@ def build_inputs(
         os.path.join(inputs_dir, "roads.geojson"),
         kept_roads + list(pavement["rows"]),
     )
+    # The landuse the aerial-zones derivation needs.  Written from the store we
+    # already fetched, so an area run produces the same constraint inputs a
+    # manual multi-layer upload does; without it the designer falls back to
+    # classifying drop legs on length and chain alone and a house in a park gets
+    # trenched (see `write_landuse_geojson`).
+    landuse_path = write_landuse_geojson(
+        os.path.join(inputs_dir, "osm", "landuse", "landuse.geojson"),
+        resolution["polygon"],
+    )
 
     hh = household_summary(premises)
     return {
         "excel_path": excel_path,
         "roads_path": roads_path,
+        # Not one of the pipeline's two input files: the designer reads this to
+        # derive aerial zones, and `landuse_path: null` is the honest signal that
+        # it had no land to work with.
+        "landuse_path": landuse_path,
         "area": area,
         "input_type": resolution.get("input_type") or input_type or "area",
         "matched": resolution.get("matched"),
@@ -4408,6 +4829,9 @@ def build_inputs(
         "resolution_key": resolution_key(area, country_code),
         "premises": len(premises),
         "households": hh,
+        "household_register": _register_payload(
+            stats.get("household_register"), register
+        ),
         "roads_km": streets_km,
         # The pavement network the designer actually routes on: what OSM mapped,
         # what had to be derived beside the carrier streets, and how many pieces

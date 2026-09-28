@@ -18,6 +18,7 @@ import sys
 import pytest
 
 ogr = pytest.importorskip("osgeo.ogr")
+osr = pytest.importorskip("osgeo.osr")
 ogr.UseExceptions()
 
 _HLD_ROOT = pathlib.Path(__file__).resolve().parents[3]
@@ -116,3 +117,66 @@ def test_a_mixed_flag_reports_the_mix(tmp_path):
     got = _surfaces(tmp_path, [("mixed", "Open Cut")])
     assert got["Open Cut"] == ("Mixed (Footpath + Asphalt)",
                                "Mixed (Sidewalk + Road)")
+
+
+# ── surface geometry check: the roads are WGS84, the design is projected ─────
+# The OSM roads bundle ships in WGS84 while the design is EPSG:25833. The check
+# compared the two raw, so every span sat "kilometres" from every road and the
+# first production run reported the whole network off-road (456 of 456) — the
+# check had no evidence and flagged nothing.
+
+def _layer_with_srs(path, srs, rows, fields):
+    drv = ogr.GetDriverByName("GPKG")
+    if path.exists():
+        drv.DeleteDataSource(str(path))
+    ds = drv.CreateDataSource(str(path))
+    lyr = ds.CreateLayer(path.stem, srs=srs, geom_type=ogr.wkbMultiLineString)
+    for name, typ in fields:
+        lyr.CreateField(ogr.FieldDefn(name, typ))
+    for geom, props in rows:
+        f = ogr.Feature(lyr.GetLayerDefn())
+        f.SetGeometry(geom)
+        for k, v in props.items():
+            f.SetField(k, v)
+        lyr.CreateFeature(f)
+    ds = None
+    return path
+
+
+def test_surface_check_reprojects_wgs84_roads_to_the_trench_crs(tmp_path):
+    utm = osr.SpatialReference()
+    utm.ImportFromEPSG(25833)
+    wgs = osr.SpatialReference()
+    wgs.ImportFromEPSG(4326)
+    wgs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+
+    # One 100 m trench along a primary road, claimed as asphalt.
+    out_dir = tmp_path / "run"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    trench = out_dir / "Final_Trenches.gpkg"
+    _layer_with_srs(trench, utm, [
+        (_line_pts((389000.0, 5815000.0), (389100.0, 5815000.0)),
+         {"TRENCH_ID": "TR-1", "SURFACE": "Asphalt"}),
+    ], [("TRENCH_ID", ogr.OFTString), ("SURFACE", ogr.OFTString)])
+
+    # The same ground as the roads bundle supplies it: WGS84 lon/lat.
+    to_wgs = osr.CoordinateTransformation(utm, wgs)
+    x0, y0, _ = to_wgs.TransformPoint(389000.0, 5815000.0)
+    x1, y1, _ = to_wgs.TransformPoint(389100.0, 5815000.0)
+    roads = _layer_with_srs(tmp_path / "roads.gpkg", wgs, [
+        (_line_pts((x0, y0), (x1, y1)), {"fclass": "primary"}),
+    ], [("fclass", ogr.OFTString)])
+
+    report = attr_enrich.verify_surface_geometry(str(out_dir), None, str(roads))
+
+    assert report["checked"] == 1
+    assert report["no_road"] == 0, "the road is under the span, not 1000 km away"
+
+
+def _line_pts(a, b):
+    ls = ogr.Geometry(ogr.wkbLineString)
+    ls.AddPoint_2D(float(a[0]), float(a[1]))
+    ls.AddPoint_2D(float(b[0]), float(b[1]))
+    ml = ogr.Geometry(ogr.wkbMultiLineString)
+    ml.AddGeometry(ls)
+    return ml

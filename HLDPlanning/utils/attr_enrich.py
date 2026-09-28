@@ -26,10 +26,11 @@ import os
 from collections import deque
 
 try:
-    from osgeo import ogr
+    from osgeo import ogr, osr
     _HAS_OGR = True
 except Exception:  # pragma: no cover
     ogr = None
+    osr = None
     _HAS_OGR = False
 
 
@@ -532,6 +533,36 @@ def _as_ogr_layer(source):
                 return lyr, ds
             ds = None
     return None, None
+
+
+def _to_srs(geom, dst_srs, src_srs):
+    """A clone of ``geom`` reprojected from ``src_srs`` into ``dst_srs``.
+
+    ``src_srs`` is required: an OGR geometry carries no CRS of its own (and
+    this build's Geometry cannot even report one), so the caller must name the
+    CRS its layer was read with. Best effort — the original geometry comes
+    back when either CRS is missing or the transform fails, so a caller
+    without CRS information degrades to "no evidence" rather than to broken
+    coordinates. Both sides are forced to traditional (x, y) axis order: the
+    OSM data and the design are both lon/lat-ordered on the ground, and an
+    authority-compliant EPSG:4326 would transpose the whole transform.
+    """
+    try:
+        if geom is None or dst_srs is None or src_srs is None:
+            return geom
+        src = src_srs.Clone()
+        dst = dst_srs.Clone()
+        src.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        dst.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        g = geom.Clone()
+        # Geometry.Transform() takes a CoordinateTransformation in this GDAL;
+        # handing it an SRS raises, and swallowing that would silently leave
+        # every road in degrees while the trenches are in metres.
+        if g.Transform(osr.CoordinateTransformation(src, dst)) != 0:
+            return geom
+        return g
+    except Exception:
+        return geom
 
 
 def _aoi_of(layer, margin=_ROAD_MARGIN):
@@ -2337,6 +2368,20 @@ def merge_ducts_per_chamber_span(path, feedback=None, label="Feeder ducts"):
         ("capacity_used", ogr.OFTReal),
         ("capacity_spare", ogr.OFTReal),
         ("DUCTS_MERGED", ogr.OFTInteger),
+        # The fold stamps the FULL union set (see _fold_duct_group), and the
+        # published tier schemas do not carry it (none has cables_carried,
+        # only feeder has pdp_ids). Every such write then failed with OGR
+        # "Invalid index : -1" — harmless on a plain GDAL, but QGIS enables
+        # exceptions, so the first fold aborted the whole enrichment
+        # half-way and silently lost every verification pass after it. The
+        # types mirror duct_layer's route-based schema.
+        ("cables_carried", ogr.OFTString, 240),
+        ("pdp_ids", ogr.OFTString, 240),
+        ("N_DUCTS", ogr.OFTInteger),
+        ("capacity_total", ogr.OFTInteger),
+        ("ways_used", ogr.OFTInteger),
+        ("WAYS_TOTAL", ogr.OFTInteger),
+        ("REVIEW", ogr.OFTInteger),
     ])
     groups: Dict[Tuple[str, str], List] = {}
     order: List[Tuple[str, str]] = []
@@ -2510,9 +2555,16 @@ def absorb_chamber_stubs(path, feedback=None,
         # These fields are not guaranteed on legacy or distribution outputs.
         # The stub pass writes them when it relabels a non-span, so create them
         # here rather than allowing an OGR Invalid index error to abort all
-        # subsequent NetworkManager propagation.
+        # subsequent NetworkManager propagation. The absorbed-stub block below
+        # stamps the same union set as _fold_duct_group, so it needs the same
+        # full list — cable/pdp unions and the re-sized capacity columns.
         ("capacity_used", ogr.OFTReal),
         ("capacity_spare", ogr.OFTReal),
+        ("capacity_total", ogr.OFTInteger),
+        ("ways_used", ogr.OFTInteger),
+        ("WAYS_TOTAL", ogr.OFTInteger),
+        ("cables_carried", ogr.OFTString, 240),
+        ("pdp_ids", ogr.OFTString, 240),
         ("REVIEW", ogr.OFTInteger),
         ("SPAN_KIND", ogr.OFTString, 24),
         ("END_CHAMBER", ogr.OFTString, 24),
@@ -3422,6 +3474,17 @@ def verify_surface_geometry(out_dir, feedback=None, roads_source=None):
             feedback.pushInfo("  [verify] Surfaces: no roads layer — skipped.")
         return report
 
+    # The trenches are the authority on units: the OSM roads bundle is WGS84
+    # while the design is projected (EPSG:25833), so comparing the two raw
+    # compares degrees with metres — every span lands kilometres from every
+    # road and the whole network is reported "off-road", i.e. the check sees
+    # no evidence and flags nothing. Reproject the roads into the trench CRS.
+    t_ds, t_lyr = _open_lyr(trench_path)
+    if t_lyr is None:
+        return report
+    trench_srs = t_lyr.GetSpatialRef()
+    t_ds = None
+
     roads_lyr, roads_ds = _as_ogr_layer(roads_source)
     roads = []
     if roads_lyr is not None:
@@ -3443,6 +3506,7 @@ def verify_surface_geometry(out_dir, feedback=None, roads_source=None):
             geom = feat.GetGeometryRef()
             if geom is None or geom.IsEmpty():
                 continue
+            geom = _to_srs(geom, trench_srs, roads_lyr.GetSpatialRef())
             hw = str(feat.GetField(i_hw) or "") if i_hw >= 0 else ""
             tags = {
                 "lanes": feat.GetField(i_lanes) if i_lanes >= 0 else None,
@@ -3611,7 +3675,13 @@ def enrich_all(out_dir, feedback=None, roads_lyr=None):
     n += propagate_duct_pdp_id(p("Distribution_Ducts.gpkg"), feedback)
     # Every run states whether the ducts actually flow: one feeder chain from
     # the MFG to every PDP, and couplers sitting on the distribution duct.
-    verify_duct_continuity(out_dir, feedback)
+    # A verification pass must never fail the run — nor hide the passes after
+    # it: reported loudly, the design still publishes.
+    try:
+        verify_duct_continuity(out_dir, feedback)
+    except Exception as exc:
+        if feedback:
+            feedback.pushInfo(f"  [verify] Duct continuity check skipped: {exc}")
     # A verification pass must never fail the run — a surface that disagrees
     # with its geometry is reported, loudly, and the run still publishes.
     try:

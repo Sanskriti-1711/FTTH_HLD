@@ -1035,6 +1035,19 @@ def _stub_area(monkeypatch, premises, roads=({},), resolution=None):
     `resolution` overrides the boundary facts a caller wants to exercise -- the
     rung, the input type, what was matched -- so the postcode warnings can be
     driven without a Nominatim call.
+
+    A POSTCODE input resolves smaller than the area being previewed, because
+    that is what the real service does and because the preview now probes it
+    (see `postcode_narrows_to_area`): a stub that handed back the same polygon
+    would make every postcode chip look like a loop, which is the India case
+    rather than the German one.  Measured: 12107 is 4.38 km² inside the 9.343 km²
+    Mariendorf it sits in.
+
+    Keyed on the CALLER's `input_type` and not the resolution's, because the
+    probe is what passes `input_type="postcode"`; the preview's own call passes
+    "" unless the request carried one.  Keying on the resolution would overwrite
+    the very facts a test is exercising -- the 0.008 km² Birmingham office block,
+    for instance.
     """
     base = {
         "polygon": {"type": "Polygon", "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 0]]]},
@@ -1044,7 +1057,15 @@ def _stub_area(monkeypatch, premises, roads=({},), resolution=None):
         "matched": "Mariendorf, Berlin", "input_type": "area",
     }
     base.update(resolution or {})
-    monkeypatch.setattr(osm_source, "resolve_area", lambda *a, **k: dict(base))
+
+    def _resolve(area="", *a, **k):
+        out = dict(base)
+        if str(k.get("input_type") or "") == "postcode":
+            out["area_km2"] = 1.2   # a real, smaller postcode polygon
+            out["matched"] = f"{area} (postcode polygon)"
+        return out
+
+    monkeypatch.setattr(osm_source, "resolve_area", _resolve)
     monkeypatch.setattr(osm_source.postgis, "is_available", lambda: True)
     monkeypatch.setattr(osm_source, "ensure_area_data", lambda *a, **k: {"source": "cache"})
     monkeypatch.setattr(osm_source, "read_area_rows", lambda poly: ([], [], {}, list(roads)))
@@ -1459,6 +1480,99 @@ def test_preview_offers_no_district_where_no_named_dataset_is_loaded(monkeypatch
     out = osm_source.preview_area("Mariendorf, Berlin, Germany")
 
     assert out["sub_areas_resolvable"] == ["postcode"]
+
+
+def test_a_postcode_chip_is_not_offered_when_it_resolves_to_a_single_object(monkeypatch):
+    """The India case, measured.
+
+    Dombivli previews as the whole 55.474 km2 city, and the platform offered
+    "e.g. postcode 421201 (913 premises)".  Typing 421201 back resolved to a
+    State Bank of India branch at 0.0 km2 -- the same object 421202 resolved to.
+    The chip was strictly "smaller" by every size comparison and was not a place
+    to design anything, which is the exact failure the chip logic exists to
+    prevent, so the offer must be withdrawn rather than left to look valid.
+    """
+    _stub_area(monkeypatch, [_premise(i) for i in range(3)], resolution={
+        "polygon_source": "administrative", "area_km2": 55.474,
+        "boundary_name": "Dombivali, Kalyan Subdistrict, Thane",
+        "country": "India", "city": "Kalyan-Dombivli",
+        "matched": "Vishnunagar Police Station", "input_type": "area",
+    })
+    monkeypatch.setattr(osm_source, "boundary_dataset_kinds", lambda cc: [])
+    # The probe: a postcode with no dataset behind it resolves to this object.
+    monkeypatch.setattr(
+        osm_source, "postcode_narrows_to_area", lambda res, pc: False)
+
+    out = osm_source.preview_area("Vishnunagar, Dombivli, India")
+
+    assert out["sub_areas"]["postcode"], "the buckets are still reported as facts"
+    assert out["sub_areas_resolvable"] == [], (
+        "a chip was offered that resolves to a 0.0 km2 bank: %s"
+        % out["sub_areas_resolvable"])
+
+
+def test_a_postcode_chip_is_kept_when_the_probe_says_it_narrows(monkeypatch):
+    """The same country path, where the probe says the postcode IS a real area."""
+    _stub_area(monkeypatch, [_premise(i) for i in range(3)], resolution={
+        "polygon_source": "administrative", "area_km2": 55.474,
+        "country": "India", "city": "Kalyan-Dombivli",
+        "matched": "Dombivli", "input_type": "area",
+    })
+    monkeypatch.setattr(osm_source, "boundary_dataset_kinds", lambda cc: [])
+    monkeypatch.setattr(
+        osm_source, "postcode_narrows_to_area", lambda res, pc: True)
+
+    out = osm_source.preview_area("Dombivli, India")
+
+    assert out["sub_areas_resolvable"] == ["postcode"]
+
+
+def test_no_probe_where_a_dataset_can_answer(monkeypatch):
+    """A loaded dataset answers the question geometrically, so nothing is probed."""
+    _stub_area(monkeypatch, [_premise(i) for i in range(2)])
+    monkeypatch.setattr(osm_source, "boundary_dataset_kinds", lambda cc: ["ward"])
+    calls = []
+    monkeypatch.setattr(
+        osm_source, "postcode_narrows_to_area",
+        lambda res, pc: calls.append(pc) or True)
+
+    out = osm_source.preview_area("B11 3SA, Birmingham, United Kingdom")
+
+    assert "postcode" in out["sub_areas_resolvable"]
+    assert calls == [], "a Nominatim probe ran for a country that has the data"
+
+
+def test_postcode_narrows_needs_a_real_area_and_a_smaller_one(monkeypatch):
+    """The rule itself, without a database or the network."""
+    base = {"country_code": "IN", "area_km2": 55.474}
+
+    def _resolving_to(area_km2):
+        monkeypatch.setattr(
+            osm_source, "resolve_area",
+            lambda *a, **k: {"area_km2": area_km2})
+
+    # A point-sized object and a single building both fail the floor, even
+    # though each is "strictly smaller" than the city it would replace.
+    for tiny in (0.0, 0.008, 0.04):
+        _resolving_to(tiny)
+        assert osm_source.postcode_narrows_to_area(base, "421201") is False
+    # A real area smaller than where we stand: offered.
+    _resolving_to(1.2)
+    assert osm_source.postcode_narrows_to_area(base, "421201") is True
+    # The area we are already in is a loop, and is refused like one.
+    _resolving_to(55.474)
+    assert osm_source.postcode_narrows_to_area(base, "421201") is False
+    # A bigger area would widen the design.
+    _resolving_to(120.0)
+    assert osm_source.postcode_narrows_to_area(base, "421201") is False
+    # No postcode, and a failing lookup, are both a refusal to offer.
+    _resolving_to(1.2)
+    assert osm_source.postcode_narrows_to_area(base, "") is False
+
+    def _boom(*a, **k):
+        raise RuntimeError("nominatim_unavailable")
+    monkeypatch.setattr(osm_source, "resolve_area", _boom)
+    assert osm_source.postcode_narrows_to_area(base, "421201") is False
 
 
 def test_narrowing_hint_names_the_largest_buckets_of_each_kind():

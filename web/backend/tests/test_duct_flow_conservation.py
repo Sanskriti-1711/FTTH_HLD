@@ -212,3 +212,59 @@ def test_absorb_still_removes_a_stub_that_lies_on_the_span(tmp_path):
     assert len(rows) == 1, "a covered stub is still absorbed"
     assert "FEEDER-CABLE-002" in str(rows[0]["cables_carried"]), \
         "the absorbed stub hands its cables to the span"
+
+
+# ── the PUBLISHED (narrow) duct schema ──────────────────────────────────────
+# Every test above uses DUP_FIELDS, a schema that carries the whole union set
+# (the route-based one). The layers the pipeline actually publishes do not:
+# none has `cables_carried`, only feeder has `pdp_ids`. Writing those columns
+# anyway fails with OGR "Invalid index : -1" — with `ogr.UseExceptions()` (on
+# here, and on in QGIS) that is a raise, not a warning, and it aborted
+# `enrich_all` half-way through a Berlin run: the coupler links, the cable
+# attributes and BOTH verification passes (the ones this work shipped) were
+# silently lost. The fold and the stub absorb must create what they stamp.
+
+PUBLISHED_FIELDS = [
+    ("START_CHAMBER", ogr.OFTString), ("END_CHAMBER", ogr.OFTString),
+    ("WAYS", ogr.OFTInteger), ("OCCUPANCY_PCT", ogr.OFTReal),
+    ("SPARE_PCT", ogr.OFTReal), ("length_m", ogr.OFTReal),
+]
+
+
+def test_fold_stamps_the_union_on_the_published_schema(tmp_path):
+    path = tmp_path / "Feeder_Ducts.gpkg"
+    _write_layer(path, [
+        (_polyline([(0, 0), (0, 100)]), {"START_CHAMBER": "DHH-1",
+                                         "END_CHAMBER": "DHH-2", "WAYS": 4}),
+        (_polyline([(0, 0), (0, 100)]), {"START_CHAMBER": "DHH-1",
+                                         "END_CHAMBER": "DHH-2", "WAYS": 4}),
+    ], PUBLISHED_FIELDS)
+
+    merged = attr_enrich.merge_ducts_per_chamber_span(str(path), None)
+
+    assert merged == 1
+    rows, _ds = _read(path)
+    assert len(rows) == 1
+    assert rows[0]["DUCTS_MERGED"] == 2
+    for col in ("cables_carried", "pdp_ids", "ways_used", "WAYS_TOTAL"):
+        assert col in rows[0], f"{col} is created, not written blind"
+
+
+def test_stub_absorb_stamps_the_union_on_the_published_schema(tmp_path):
+    path = tmp_path / "Feeder_Ducts.gpkg"
+    _write_layer(path, [
+        (_polyline([(0, 0), (0, 100)]), {"START_CHAMBER": "DHH-1",
+                                         "END_CHAMBER": "DHH-2", "WAYS": 4}),
+        # a stub lying on the span it would be absorbed into
+        (_polyline([(0, 0), (0, 30)]), {"START_CHAMBER": "DHH-1",
+                                       "END_CHAMBER": "DHH-1", "WAYS": 4}),
+    ], PUBLISHED_FIELDS)
+
+    absorbed = attr_enrich.absorb_chamber_stubs(str(path), None, "Feeder ducts")
+
+    assert absorbed == 1
+    rows, _ds = _read(path)
+    assert len(rows) == 1
+    assert (rows[0]["START_CHAMBER"], rows[0]["END_CHAMBER"]) == ("DHH-1", "DHH-2")
+    for col in ("cables_carried", "pdp_ids", "capacity_total", "ways_used"):
+        assert col in rows[0], f"{col} is created, not written blind"
