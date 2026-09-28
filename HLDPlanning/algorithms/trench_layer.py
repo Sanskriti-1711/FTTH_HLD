@@ -2281,9 +2281,9 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                 # and is now used only to say so in the report).
                 #
                 # The leg is KEPT and flagged, not dropped: the duct and cable
-                # tiers build exactly one drop per premise off this layer, so
-                # removing a row would silently leave that premise unserved
-                # (D8 — 295 rows for 295 premises).
+                # tiers build one drop per physical service location off this
+                # layer, so removing a row would silently leave that location
+                # unserved (D8).
                 drop_dist_m = _approx_meters(hpt, best_pt)
                 aerial_leg = drop_dist_m > AERIAL_LEG_MAX_M
                 if aerial_leg:

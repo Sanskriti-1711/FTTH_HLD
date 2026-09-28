@@ -3,8 +3,8 @@
 The household rule in `osm_source` is a heuristic and is honest about it: on
 real Berlin data it was ~100 % `fallback_one` / `levels_x_footprint`, because
 OpenStreetMap carries `building:flats` on 1 building in 15,583 and `addr:flats`
-on none.  Every downstream number -- `max(48, households + 2)` trunk sizing,
-`max(12, dwellings + 2)` drop sizing, the BOQ -- rests on that heuristic, and
+on none.  Trunk sizing, HH-based physical-location drop capacity, and the BOQ rest on
+that heuristic, and
 `HH_METHOD` travels with each row so nobody mistakes it for a survey.
 
 The UK is the case where this is *fixable with real data*, because the UK
@@ -642,29 +642,29 @@ def apply_register(
     A COPY of the premise list is returned; the input is not mutated, because a
     caller may want the heuristic for comparison (and the tests do).
 
-    Precedence, per premise:
+    Precedence, per physical service-location record:
 
-      1. a UPRN match (register row keyed on this premise's UPRN) --
+      1. a UPRN match (register row keyed on this location's UPRN) --
          `HH_METHOD = register_uprn`, and its households are taken OUT of the
          postcode total so the two cannot double-count
       2. the register's postcode total, less whatever the UPRN matches already
          claimed, apportioned across that postcode's remaining premises by their
          existing estimate -- `HH_METHOD = register_postcode`
-      3. otherwise the premise is left exactly as OSM produced it
+      3. otherwise the physical location is left exactly as OSM produced it
 
     Why apportion rather than assign: a register is keyed on the POSTCODE, and
-    one postcode is typically tens to hundreds of premises, so there is no
-    per-premise number to read off. Assigning the postcode total to each premise
-    would multiply the households by the premise count. The register therefore
-    fixes the postcode's TOTAL, and the existing per-premise estimate only
+    one postcode is typically tens to hundreds of service locations, so there is
+    no per-location number to read off. Assigning the postcode total to each
+    location would multiply the households by the location count. The register
+    therefore fixes the postcode's TOTAL, and the existing per-location estimate only
     decides the shape within it -- the estimator keeps doing the one job it is
     good at (a 12-storey block really is more homes than a bungalow) and stops
     deciding the thing it is bad at (how many homes a postcode has).
 
     `stats` reports what happened, including the cases that must not be silent:
     a postcode where the register has fewer households than the area has
-    premises (`below_premise_count`) cannot be honoured without either zeroing a
-    premise or inflating the total, so the total wins where it can and the
+    service locations (`below_premise_count`) cannot be honoured without either
+    zeroing a location or inflating the total, so the total wins where it can and the
     shortfall is reported.
     """
     rows = [dict(p) for p in premises]
@@ -721,8 +721,8 @@ def apply_register(
         if not pool:
             continue
         if remaining_total < len(pool):
-            # The register has fewer households than the area has premises in
-            # this postcode.  Honour the total's floor (1 each) and report the
+            # The register has fewer households than the area has service
+            # locations in this postcode. Honour the total's floor (1 each) and report the
             # gap rather than quietly inflating: the register is right and the
             # premise set is the thing that disagrees.
             stats["below_premise_count"] += 1

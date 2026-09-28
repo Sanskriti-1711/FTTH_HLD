@@ -314,9 +314,9 @@ def test_the_register_reaches_the_premises_the_pipeline_actually_writes():
     assert stats["household_register"]["premises_registered"] == 2
 
 
-def test_no_register_means_byte_identical_premises_to_before():
-    # The feature is off by default, so with nothing loaded the output must be
-    # exactly what it was -- otherwise turning it off would not be a real option.
+def test_no_register_means_deterministic_physical_locations_with_estimated_load():
+    # The feature is off by default; records still preserve the estimated HH on
+    # each unchanged physical location.
     buildings = [_building(1), _building(2)]
     addresses = [_address(11, "1"), _address(12, "2")]
     join = {11: 1, 12: 2}
@@ -325,13 +325,14 @@ def test_no_register_means_byte_identical_premises_to_before():
         buildings, addresses, join, register=None)
     assert plain == none_passed
     assert plain_stats == none_stats
+    assert [p["HH"] for p in plain] == [1, 1]
+    assert [p["ADDR_ID"] for p in plain] == ["OSM-W1", "OSM-W2"]
     assert "household_register" not in plain_stats
 
 
-def test_the_register_is_applied_before_the_per_household_expansion():
-    # A 12-flat block and a bungalow in one postcode must not each get the same
-    # share of the register's total. If the register were applied after the
-    # expansion every row would already be HH=1 and the split would be uniform.
+def test_the_register_is_applied_to_physical_locations_using_estimates_as_weights():
+    # A 12-storey block and a bungalow in one postcode must not each get the same
+    # share of the register's total. Their physical rows retain apportioned HH.
     tall = _building(1, building="apartments", footprint_m2=1000.0,
                      building_levels="12")
     bungalow = _building(2, building="house", footprint_m2=80.0)
@@ -341,8 +342,11 @@ def test_the_register_is_applied_before_the_per_household_expansion():
         [tall, bungalow], addresses, join, country="United Kingdom",
         register={"by_postcode": {"B11 3SA": 50}, "by_uprn": {}},
     )
-    tall_hh = sum(p["HH"] for p in rows if p["OSM_ID"] == 1)
-    bungalow_hh = sum(p["HH"] for p in rows if p["OSM_ID"] == 2)
+    tall_rows = [p for p in rows if p["OSM_ID"] == 1]
+    bungalow_rows = [p for p in rows if p["OSM_ID"] == 2]
+    tall_hh = sum(p["HH"] for p in tall_rows)
+    bungalow_hh = sum(p["HH"] for p in bungalow_rows)
+    assert len(tall_rows) == len(bungalow_rows) == 1
     assert tall_hh > bungalow_hh
     assert tall_hh + bungalow_hh == 50
 

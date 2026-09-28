@@ -419,28 +419,25 @@ def _address(osm_id, housenumber, **kwargs):
     return row
 
 
-def test_addresses_in_one_building_split_its_total():
-    # One row per HOUSEHOLD: 23 dwellings split 9/7/7 over the three addresses
-    # become 23 premises of 1 home each, so the pipeline lays one drop per home
-    # instead of one drop per building.
+def test_addresses_in_one_building_keep_physical_locations_and_weighted_hh():
+    # One feature per actual address/service location; the allocated dwelling
+    # load stays on HH instead of turning into synthetic per-unit coordinates.
     buildings = [_building(1)]
     addresses = [_address(11, "2"), _address(12, "4"), _address(13, "6")]
     premises, stats = osm_source.assemble_premises(
         buildings, addresses, {11: 1, 12: 1, 13: 1}
     )
-    counts = {}
-    for p in premises:
-        counts[p["Housenumber"]] = counts.get(p["Housenumber"], 0) + 1
-    assert [counts[h] for h in ("2", "4", "6")] == [9, 7, 7]
-    assert len(premises) == 23 and all(p["HH"] == 1 for p in premises)
+    assert len(premises) == 3
+    assert [p["Housenumber"] for p in premises] == ["2", "4", "6"]
+    assert [p["HH"] for p in premises] == [9, 7, 7]
+    assert sum(p["HH"] for p in premises) == 23
     assert stats["duplicates_merged"] == 0
-    assert stats["households_expanded"] == 3
-    # Ordered by housenumber; ids short, stable and unique per household.
-    assert [p["Housenumber"] for p in premises] == ["2"] * 9 + ["4"] * 7 + ["6"] * 7
-    assert premises[0]["ADDR_ID"] == "OSM-W1-P1-H1"
-    assert len({p["ADDR_ID"] for p in premises}) == 23
-    # ...and every household has its own point.
-    assert len({(p["LONGITUDE"], p["LATITUDE"]) for p in premises}) == 23
+    assert premises[0]["ADDR_ID"] == "OSM-W1-P1"
+    assert len({p["ADDR_ID"] for p in premises}) == 3
+    assert [(p["LONGITUDE"], p["LATITUDE"]) for p in premises] == [
+        (13.381, 52.441), (13.381, 52.441), (13.381, 52.441)
+    ]
+    assert "households_expanded" not in stats
 
 
 def test_premise_country_and_city_come_from_the_area_not_a_hardcoded_default():
@@ -478,10 +475,11 @@ def test_explicit_address_flats_beats_the_building_split():
     premises, _ = osm_source.assemble_premises(
         buildings, addresses, {11: 1, 12: 1}
     )
-    flats = [p for p in premises if p["Housenumber"] == "4"]
-    assert len(flats) == 9                        # one premise per flat
-    assert all(p["HH"] == 1 and p["HH_METHOD"] == "addr_flats" for p in flats)
-    assert len([p for p in premises if p["Housenumber"] == "2"]) == 12  # 23-9
+    assert len(premises) == 2
+    assert [p["HH"] for p in premises] == [14, 9]
+    tagged = next(p for p in premises if p["Housenumber"] == "4")
+    assert tagged["HH_METHOD"] == "addr_flats"
+    assert sum(p["HH"] for p in premises) == 23
 
 
 def test_building_without_any_address_becomes_a_centroid_premise():
@@ -503,9 +501,9 @@ def test_excluded_building_classes_are_dropped():
     assert stats["buildings_excluded"] == 1
 
 
-def test_every_house_gets_its_own_premise_even_with_same_street_and_number():
-    # Each OSM address node is a house — two nodes with the same street+number
-    # at the same coordinates still produce two premises at two distinct points.
+def test_distinct_service_locations_keep_stable_ids_without_geometry_jitter():
+    # Distinct OSM address nodes with identical labels/coordinates stay separate
+    # physical records. Their locations are not nudged to imply surveyed offsets.
     buildings = []
     addresses = [
         _address(11, "12", addr_street="Mariendorfer Damm"),
@@ -514,12 +512,11 @@ def test_every_house_gets_its_own_premise_even_with_same_street_and_number():
     premises, stats = osm_source.assemble_premises(buildings, addresses, {})
     assert len(premises) == 2
     assert stats["duplicates_merged"] == 0
-    assert stats["points_jittered"] == 1
     assert len({p["ADDR_ID"] for p in premises}) == 2
-    assert len({(p["LONGITUDE"], p["LATITUDE"]) for p in premises}) == 2
+    assert {(p["LONGITUDE"], p["LATITUDE"]) for p in premises} == {(13.381, 52.441)}
 
 
-def test_identical_coordinates_are_micro_jittered_into_distinct_points():
+def test_identical_coordinates_are_preserved_as_the_same_physical_location():
     buildings = []
     addresses = [
         _address(11, "1", lon=13.381, lat=52.441),
@@ -528,12 +525,7 @@ def test_identical_coordinates_are_micro_jittered_into_distinct_points():
     ]
     premises, stats = osm_source.assemble_premises(buildings, addresses, {})
     assert len(premises) == 3
-    assert len({(p["LONGITUDE"], p["LATITUDE"]) for p in premises}) == 3
-    assert stats["points_jittered"] == 2
-    # ~0.5 m dispersal, not metres-away — still on the same parcel
-    for p in premises:
-        assert abs(p["LONGITUDE"] - 13.381) < 0.001
-        assert abs(p["LATITUDE"] - 52.441) < 0.001
+    assert {(p["LONGITUDE"], p["LATITUDE"]) for p in premises} == {(13.381, 52.441)}
 
 
 def test_same_building_same_housenumber_nodes_each_get_a_premise():
@@ -548,7 +540,7 @@ def test_same_building_same_housenumber_nodes_each_get_a_premise():
     premises, stats = osm_source.assemble_premises(buildings, addresses, {11: 99, 12: 99})
     assert len(premises) == 2
     assert len({p["ADDR_ID"] for p in premises}) == 2
-    assert len({(p["LONGITUDE"], p["LATITUDE"]) for p in premises}) == 2
+    assert {(p["LONGITUDE"], p["LATITUDE"]) for p in premises} == {(13.381, 52.441)}
 
 
 def test_address_without_a_building_falls_back_to_one_household():
@@ -567,37 +559,25 @@ def test_addr_id_never_exceeds_the_ogr_field_width():
     assert all(len(p["ADDR_ID"]) <= 48 for p in premises)
 
 
-def test_multi_dwelling_building_expands_to_one_premise_per_household():
+def test_multi_dwelling_building_is_one_physical_feature_with_hh_load():
     premises, stats = osm_source.assemble_premises(
         [_building(1, building_flats="3", building_levels=None)], [], {})
-    assert len(premises) == 3
-    assert all(p["HH"] == 1 for p in premises)
-    assert [p["ADDR_ID"] for p in premises] == [
-        "OSM-W1-C-H1", "OSM-W1-C-H2", "OSM-W1-C-H3"]
-    assert len({(p["LONGITUDE"], p["LATITUDE"]) for p in premises}) == 3
-    assert stats["households_expanded"] == 1
+    assert len(premises) == 1
+    assert premises[0]["HH"] == 3
+    assert premises[0]["ADDR_ID"] == "OSM-W1-C"
+    assert (premises[0]["LONGITUDE"], premises[0]["LATITUDE"]) == (13.38, 52.44)
+    assert "households_expanded" not in stats
 
 
-def test_household_points_stay_inside_the_building():
-    pts = osm_source.household_points(13.38, 52.44, 12, 480.0)
-    assert len(pts) == 12 and len(set(pts)) == 12
-    mx = 111320.0 * math.cos(math.radians(52.44))
-    for lon, lat in pts:
-        d = math.hypot((lon - 13.38) * mx, (lat - 52.44) * 110540.0)
-        assert d <= math.sqrt(480.0 / math.pi)   # inside the footprint's disk
-
-
-def test_lowest_housenumber_absorbs_the_remainder_regardless_of_input_order():
+def test_lowest_housenumber_gets_building_load_remainder_deterministically():
     buildings = [_building(1)]
     addresses = [_address(13, "6"), _address(11, "2"), _address(12, "4")]
     premises, _ = osm_source.assemble_premises(
         buildings, addresses, {11: 1, 12: 1, 13: 1}
     )
-    counts = {}
-    for p in premises:
-        counts[p["Housenumber"]] = counts.get(p["Housenumber"], 0) + 1
-    assert [counts[h] for h in ("2", "4", "6")] == [9, 7, 7]
-    assert premises[0]["Housenumber"] == "2"
+    assert [p["Housenumber"] for p in premises] == ["2", "4", "6"]
+    assert [p["HH"] for p in premises] == [9, 7, 7]
+    assert sum(p["HH"] for p in premises) == 23
 
 
 # ---------------------------------------------------------------------------

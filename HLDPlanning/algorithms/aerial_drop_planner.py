@@ -58,6 +58,8 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
                                      # premise before it is a house-to-house span
     LEG_MATCH_M = 5.0                # how close a premise must sit to the
                                      # classified aerial leg it belongs to
+    RESERVED_SPARE_FIBERS = 2
+    DROP_FIBER_MIN = 12
 
     # ── QGIS Processing boilerplate ──────────────────────────────────────────
 
@@ -183,6 +185,7 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
             COMMON_FIELDS.CONSTRUCTION_METHOD,
             COMMON_FIELDS.CABLE_TYPE,
             COMMON_FIELDS.FIBER_COUNT,
+            "HH_COUNT",
             COMMON_FIELDS.LENGTH_M,
             COMMON_FIELDS.POLE_SPACING_M,
             COMMON_FIELDS.CROSSINGS,
@@ -195,6 +198,10 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
         cable_fields = build_fields([
             COMMON_FIELDS.CABLE_TYPE,
             COMMON_FIELDS.FIBER_COUNT,
+            "HH_COUNT",
+            "RESERVED_SPARE_FIBERS",
+            "ACTIVE_FIBERS",
+            "AVAILABLE_FIBERS",
             COMMON_FIELDS.LENGTH_M,
             COMMON_FIELDS.SOURCE_NODE,
             COMMON_FIELDS.UTIL_PCT,
@@ -467,6 +474,9 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
         addr_field = first_field_case_insensitive(
             premises, ["ADDR_ID", "addr_id", "SRC_ID"]
         )
+        hh_field = first_field_case_insensitive(
+            premises, ["HH", "hhs", "HH_COUNT"]
+        )
 
         for f in premises.getFeatures():
             g = f.geometry()
@@ -533,8 +543,12 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
                     if anchor_geom.wkbType() == QgsWkbTypes.PointGeometry
                     else anchor_geom.asPoint())
 
+            try:
+                hh_count = max(1, int(float(f[hh_field] or 1))) if hh_field else 1
+            except (TypeError, ValueError):
+                hh_count = 1
             aerial_premises.append({
-                "f": f, "pt": pt, "addr": addr,
+                "f": f, "pt": pt, "addr": addr, "hh_count": hh_count,
                 "anchor_id": anchor_id, "anchor_pt": anchor_pt,
                 "anchor_dist": anchor_dist, "path": path,
             })
@@ -632,6 +646,8 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
 
         for item in aerial_premises:
             f, pt = item["f"], item["pt"]
+            hh_count = item["hh_count"]
+            fiber_count = max(self.DROP_FIBER_MIN, hh_count + self.RESERVED_SPARE_FIBERS)
             anchor_id = item["anchor_id"]
 
             if item["path"]:
@@ -688,7 +704,8 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
                 COMMON_FIELDS.TRENCH_TYPE: "Aerial_Drop",
                 COMMON_FIELDS.CONSTRUCTION_METHOD: "Overhead",
                 COMMON_FIELDS.CABLE_TYPE: "Aerial",
-                COMMON_FIELDS.FIBER_COUNT: 12,
+                COMMON_FIELDS.FIBER_COUNT: fiber_count,
+                "HH_COUNT": hh_count,
                 COMMON_FIELDS.LENGTH_M: round(length_m, 1),
                 COMMON_FIELDS.POLE_SPACING_M: spacing,
                 COMMON_FIELDS.CROSSINGS: 0,
@@ -708,10 +725,14 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
 
             cable_props = {
                 COMMON_FIELDS.CABLE_TYPE: "Aerial",
-                COMMON_FIELDS.FIBER_COUNT: 12,
+                COMMON_FIELDS.FIBER_COUNT: fiber_count,
+                "HH_COUNT": hh_count,
+                "RESERVED_SPARE_FIBERS": 2,
+                "ACTIVE_FIBERS": hh_count,
+                "AVAILABLE_FIBERS": max(0, fiber_count - hh_count - 2),
                 COMMON_FIELDS.LENGTH_M: round(length_m, 1),
                 COMMON_FIELDS.SOURCE_NODE: str(anchor_id or ""),
-                COMMON_FIELDS.UTIL_PCT: 100.0,
+                COMMON_FIELDS.UTIL_PCT: round((hh_count / float(fiber_count)) * 100.0, 1),
                 COMMON_FIELDS.INFRA_STATUS: "Proposed",
                 COMMON_FIELDS.VERIFY_STATUS: "Assumed",
                 COMMON_FIELDS.STAGE: "HLD",

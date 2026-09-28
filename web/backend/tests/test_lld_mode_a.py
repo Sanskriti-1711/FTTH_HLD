@@ -92,8 +92,11 @@ def _asv():
         }),
         _feature("distribution_cable", _line([[13.4000, 52.5000], [13.40025, 52.5000], [13.4005, 52.5000]]), {
             "feature_id": "DC-1",
-            "CABLE_TYPE": "Distribution",
-            "FIBER_COUNT": 8,
+            "CABLE_TYPE": "Drop",
+            "CONNECTION_TYPE": "Drop (garden leg)",
+            "FIBER_COUNT": 12,
+            "HH_COUNT": 1,
+            "ADDR_ID": "A-2",
             "ADDR_IDS": "A-2",
             "HH": 1,
         }),
@@ -131,7 +134,7 @@ def _asv():
             "feature_id": "O-1",
             "approved": True,
             "change_id": "chg-premise-1",
-            "HH": 1,
+            "HH": 18,
             "ADDR_ID": "A-1",
         }),
         _feature("objects", _point(13.40008, 52.50012), {
@@ -256,7 +259,7 @@ def test_mode_a_purges_old_reroute_region(mode_a_env):
 
 
 def test_mode_a_drop_planning_connects_new_premises(mode_a_env):
-    """New/unsurveyed premises get a garden trench + drop duct + cable."""
+    """Each new service location gets one garden trench + drop duct/cable."""
     task = _run(mode_a_env)
 
     drops = _load_output(mode_a_env, "e2e-test-project", "LLD-TEST01", "drop_ducts")
@@ -265,7 +268,7 @@ def test_mode_a_drop_planning_connects_new_premises(mode_a_env):
         f for f in drops["features"]
         if (f.get("properties") or {}).get("lld_created")
     ]
-    # One per premise that lacked a drop (O-1 and O-2 both started without one).
+    # One per physical service location that lacked a drop (O-1 and O-2).
     assert len(created_drops) == 2, "expected 2 auto-created drop ducts"
 
     trenches = _load_output(mode_a_env, "e2e-test-project", "LLD-TEST01", "final_trenches")
@@ -280,7 +283,27 @@ def test_mode_a_drop_planning_connects_new_premises(mode_a_env):
         f for f in cables["features"]
         if (f.get("properties") or {}).get("lld_created")
     ]
-    assert len(serving) == 2, "expected serving distribution cables for the new premises"
+    assert len(serving) == 2, "expected serving cables for the two physical service locations"
+    by_addr = {
+        (f.get("properties") or {}).get("ADDR_ID"): f.get("properties") or {}
+        for f in serving
+    }
+    assert by_addr["A-1"]["CABLE_TYPE"] == "Drop"
+    assert by_addr["A-1"]["HH_COUNT"] == 18
+    assert by_addr["A-1"]["FIBER_COUNT"] == 20
+    assert by_addr["A-2"]["CABLE_TYPE"] == "Drop"
+    assert by_addr["A-2"]["HH_COUNT"] == 1
+    assert by_addr["A-2"]["FIBER_COUNT"] == 12
+    assert len(created_drops) == 2  # still one civil route per physical location
+
+    trenches = _load_output(mode_a_env, "e2e-test-project", "LLD-TEST01", "final_trenches")
+    garden_by_addr = {
+        (f.get("properties") or {}).get("addr_id"): f
+        for f in trenches["features"]
+        if (f.get("properties") or {}).get("trench_type") == "Garden"
+    }
+    assert len(garden_by_addr) == 2
+    assert set(garden_by_addr) == {"A-1", "A-2"}
 
 
 def test_mode_a_propagates_missing_support_layers(mode_a_env):
@@ -294,6 +317,46 @@ def test_mode_a_propagates_missing_support_layers(mode_a_env):
         and (f.get("properties") or {}).get("lld_source_layer") in ("feeder_ducts", "feeder_cable")
     ]
     assert auto, "expected an auto-created trench under the feeder duct/cable"
+
+
+def test_lld_enrichment_preserves_drop_cables_and_sizes_from_location_hh():
+    """A building's HH load changes cable capacity, not its single drop record."""
+    from lld_cable_geometry import cable_fiber_capacity
+
+    drop_geometry = _line([[13.4, 52.5], [13.4001, 52.5]])
+    cables = [
+        _feature("distribution_cable", drop_geometry, {
+            "ADDR_ID": "BLDG-1", "addr_id": "BLDG-1", "CABLE_TYPE": "Drop",
+            "CONNECTION_TYPE": "Drop (garden leg)", "HH_COUNT": 18,
+        }),
+        _feature("distribution_cable", _line([[13.4, 52.5], [13.4002, 52.5]]), {
+            "ADDR_ID": "BLDG-2", "addr_id": "BLDG-2", "HH_COUNT": 60,
+        }),
+    ]
+    assert engine._enrich_lld_distribution_cables({"distribution_cable": cables}) == 2
+    assert len(cables) == 2
+    assert cables[0]["properties"]["CABLE_TYPE"] == "Drop"
+    assert cables[0]["properties"]["HH_COUNT"] == 18
+    assert cables[0]["properties"]["FIBER_COUNT"] == 20
+    assert cables[0]["properties"]["CONNECTION_TYPE"] == "Drop (garden leg)"
+    assert cables[0]["geometry"] == drop_geometry
+    assert cables[1]["properties"]["FIBER_COUNT"] == 62
+    assert cables[1]["properties"]["CABLE_TYPE"] == "Distribution"
+
+    dropped = [
+        _feature("distribution_cable", _line([[13.4, 52.5], [13.4002, 52.5]]), {
+            "ADDR_ID": "OLD-DROP", "addr_id": "OLD-DROP",
+            "CONNECTION_TYPE": "Dedicated drop", "HH_COUNT": 3,
+        }),
+    ]
+    engine._enrich_lld_distribution_cables({"distribution_cable": dropped})
+    assert len(dropped) == 1
+    assert dropped[0]["properties"]["CABLE_TYPE"] == "Drop"
+    assert dropped[0]["properties"]["FIBER_COUNT"] == 12
+    assert cables[1]["properties"]["CABLE_TYPE"] == "Distribution"
+    assert cables[1]["properties"]["FIBER_COUNT"] == 62
+    assert cable_fiber_capacity(1, 12) == 12
+    assert cable_fiber_capacity(18, 12) == 20
 
 
 def test_mode_a_output_contract(mode_a_env):

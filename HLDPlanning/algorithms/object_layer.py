@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-import math
 import os, re, json, warnings
 # pandas is imported lazily inside _get_pd() -- must stay lazy for qgis_process embedded Python
 def _get_pd():
@@ -431,66 +430,9 @@ class BuildObjectLayer(QgsProcessingAlgorithm):
         else:
             gdf = _get_gpd().GeoDataFrame(df, geometry=geometries, crs="EPSG:4326")
 
-        # Guarantee distinct geometry per house: when geocoding collapses houses
-        # onto the same coordinate, micro-jitter so each house is a discrete
-        # object on its own trench endpoint rather than a stack on one point.
-        coord_counts: dict = {}
-        dup_idx = 0
-        for i, geom in enumerate(list(geometries)):
-            if geom is None or getattr(geom, "is_empty", False):
-                continue
-            try:
-                x, y = float(geom.x), float(geom.y)
-            except Exception:
-                continue
-            # Key in the geometry's own CRS so projected and degree coords never collide
-            key = (source_crs_values[i], round(x, 7), round(y, 7))
-            n = coord_counts.get(key, 0)
-            coord_counts[key] = n + 1
-            if n > 0:
-                # Not-found sentinel at (0,85) is intentionally stacked — keep it.
-                if lats[i] is None or lons[i] is None:
-                    continue
-                dup_idx += 1
-                angle = (n * 137.508) * math.pi / 180.0
-                if source_crs_values[i] == "EPSG:4326":
-                    # ~0.5 m per duplicate in degrees
-                    d = 0.0000045 * n
-                    nlons = round(float(lons[i]) + math.cos(angle) * d, 7)
-                    nlats = round(float(lats[i]) + math.sin(angle) * d, 7)
-                    lons[i] = nlons
-                    lats[i] = nlats
-                    geometries[i] = _mk_point(nlons, nlats)
-                else:
-                    # Projected CRS (e.g. EPSG:25833) — jitter in metres.
-                    dx = math.cos(angle) * (0.5 * n)
-                    dy = math.sin(angle) * (0.5 * n)
-                    geometries[i] = _mk_point(float(geom.x) + dx, float(geom.y) + dy)
-                    # Keep attribute LAT/LON distinct as well (~0.5 m in degrees).
-                    d_deg = 0.0000045 * n
-                    lons[i] = round(float(lons[i]) + math.cos(angle) * d_deg, 7)
-                    lats[i] = round(float(lats[i]) + math.sin(angle) * d_deg, 7)
-        if dup_idx:
-            feedback.pushInfo(f"Micro-jittered {dup_idx} duplicate house point(s) so every house has a distinct object.")
-            # rebuild dataframe longitude/latitude after jitter
-            df[FIELD.LAT] = lats
-            df[FIELD.LON] = lons
-            # reflect jittered coords back into the GeoDataFrame's geometries
-            if any(crs == out_epsg for crs in source_crs_values):
-                # rebuild gdf so jitter lands in the right CRS part
-                parts = []
-                for src_crs in sorted(set(source_crs_values)):
-                    idxs = [j for j, crs in enumerate(source_crs_values) if crs == src_crs]
-                    part_df = df.iloc[idxs].copy()
-                    part_geoms = [geometries[j] for j in idxs]
-                    part = _get_gpd().GeoDataFrame(part_df, geometry=part_geoms, crs=src_crs)
-                    if src_crs != out_epsg:
-                        part = part.to_crs(out_epsg)
-                    parts.append(part)
-                gdf = _get_pd().concat(parts).sort_index()
-                gdf = _get_gpd().GeoDataFrame(gdf, geometry="geometry", crs=out_epsg)
-            else:
-                gdf = _get_gpd().GeoDataFrame(df, geometry=list(geometries), crs="EPSG:4326")
+        # Preserve coincident source/geocoder locations. Moving duplicate
+        # coordinates invents service-entry geometry and can create artificial
+        # civil drop endpoints; distinct physical objects remain distinct by ID.
 
         # keep all or drop missing geometries
         gdf_ok = gdf.copy() if include_all else gdf[gdf["geometry"].notna()].copy()

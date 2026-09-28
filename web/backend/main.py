@@ -3322,7 +3322,12 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
             "ADDR_ID": str(props.get("ADDR_ID") or props.get("addr_id") or ""),
             "INFRA_STATUS": "Proposed",
         }
-        hh = str(props.get("HH") or props.get("hhs") or "1")
+        try:
+            hh_count = max(1, int(float(props.get("HH") or props.get("hhs") or 1)))
+        except (TypeError, ValueError):
+            hh_count = 1
+        hh = str(hh_count)
+        drop_fibers = max(12, hh_count + LLD_RESERVED_SPARE_FIBERS)
         addr = str(props.get("ADDR_ID") or props.get("addr_id") or props.get("SRC_ID") or "")
 
         # ── Aerial drop: engineer explicitly flagged aerial_required ──────────
@@ -3345,7 +3350,8 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
                                 "TRENCH_TYPE": "Aerial_Drop",
                                 "CONSTRUCTION_METHOD": "Overhead",
                                 "CABLE_TYPE": "Aerial",
-                                "FIBRE_COUNT": 12,
+                                "FIBRE_COUNT": drop_fibers,
+                                "HH_COUNT": hh_count,
                                 "FROM_POLE": pole_id,
                                 "TO_PREMISE": addr,
                                 "POLE_SPACING_M": 50.0,
@@ -3360,7 +3366,12 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
                             {
                                 **common,
                                 "CABLE_TYPE": "Aerial",
-                                "FIBER_COUNT": 12,
+                                "FIBER_COUNT": drop_fibers,
+                                "HH_COUNT": hh_count,
+                                "RESERVED_SPARE_FIBERS": LLD_RESERVED_SPARE_FIBERS,
+                                "ACTIVE_FIBERS": hh_count,
+                                "AVAILABLE_FIBERS": max(0, drop_fibers - hh_count - LLD_RESERVED_SPARE_FIBERS),
+                                "UTIL_PCT": round((hh_count / float(drop_fibers)) * 100.0, 1),
                                 "SOURCE_NODE": pole_id,
                                 "hhs": hh,
                                 "length_m": length_m,
@@ -3377,9 +3388,9 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
             )
 
         if not has_drop:
-            # 3a. Drop duct + its garden trench. The garden trench is mirrored
-            #     into final_trenches exactly like the HLD pipeline does
-            #     (trench_type=Garden, micro trench specs) so the construction
+            # 3a. One physical-location drop duct + its garden trench. The garden
+            #     trench is mirrored into final_trenches exactly like the HLD
+            #     pipeline does (trench_type=Garden, micro trench specs) so the construction
             #     plan + BOQ include the garden digging — the standalone
             #     garden_trench layer is NOT emitted in the LLD output.
             make_feature(
@@ -3412,6 +3423,7 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
                     "SIDE": "left",
                     "DUCT_UID": max_uid,
                     "HH_ID": hh,
+                    "HH_COUNT": hh_count,
                     "LENGTH_M": length_m,
                     "SPARE_PCT": 0.0,
                     "OCCUPANCY_PCT": 100.0,
@@ -3420,17 +3432,22 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
             )
 
         if not has_cable:
-            # 3b. Serving distribution cable (only when one does not already
-            #     end at the premise — avoids duplicating survey-drawn cables).
+            # 3b. Serving physical-location drop cable when no existing cable
+            #     ends at the service entry; preserve one route per location.
             #     Same geometry as the drop duct: the cable flows THROUGH it.
             make_feature(
                 "distribution_cable",
                 {"type": "LineString", "coordinates": path},
                 {
                     **common,
-                    "CABLE_TYPE": "Distribution",
-                    "FIBER_COUNT": 8,
-                    "UTIL_PCT": 100.0,
+                    "CABLE_TYPE": "Drop",
+                    "CONNECTION_TYPE": "Drop (garden leg)",
+                    "FIBER_COUNT": drop_fibers,
+                    "HH_COUNT": hh_count,
+                    "RESERVED_SPARE_FIBERS": LLD_RESERVED_SPARE_FIBERS,
+                    "ACTIVE_FIBERS": hh_count,
+                    "AVAILABLE_FIBERS": max(0, drop_fibers - hh_count - LLD_RESERVED_SPARE_FIBERS),
+                    "UTIL_PCT": round((hh_count / float(drop_fibers)) * 100.0, 1),
                     "SOURCE_NODE": str(pdp_id or ""),
                     "hhs": hh,
                     "length_m": length_m,
@@ -3453,8 +3470,11 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
 
 
 def _enrich_lld_distribution_cables(by_layer: Dict[str, List[Dict[str, Any]]]) -> int:
-    """Rebuild grouped cable geometry and apply final LLD capacity fields."""
-    from lld_cable_geometry import regroup_distribution_cables
+    """Rebuild grouped cable geometry and apply HH-based trunk/drop capacity."""
+    from lld_cable_geometry import (
+        cable_fiber_capacity,
+        regroup_distribution_cables,
+    )
 
     cables = by_layer.get("distribution_cable") or []
     regroup_distribution_cables(cables)
@@ -3466,13 +3486,29 @@ def _enrich_lld_distribution_cables(by_layer: Dict[str, List[Dict[str, Any]]]) -
             hh_count = int(float(props.get("HH_COUNT") or props.get("hhs") or len(members) or 1))
         except (TypeError, ValueError):
             hh_count = max(1, len(members))
+        is_drop = (
+            str(props.get("CABLE_TYPE") or "").strip().lower() == "drop"
+            or str(props.get("CONNECTION_TYPE") or "").strip().lower().startswith("drop")
+            or str(props.get("CONNECTION_TYPE") or "").strip().lower() == "dedicated drop"
+        )
+        minimum = 12 if is_drop else LLD_DISTRIBUTION_FIBERS
+        fiber_count = cable_fiber_capacity(hh_count, minimum)
         props["ADDR_IDS"] = ",".join(members)
         props["HH_COUNT"] = hh_count
-        props["FIBER_COUNT"] = LLD_DISTRIBUTION_FIBERS
+        if is_drop or str(props.get("CABLE_TYPE") or "").strip().lower() in ("", "distribution"):
+            props["CABLE_TYPE"] = "Drop" if is_drop else "Distribution"
+        props["FIBER_COUNT"] = fiber_count
         props["RESERVED_SPARE_FIBERS"] = LLD_RESERVED_SPARE_FIBERS
         props["ACTIVE_FIBERS"] = hh_count
-        props["AVAILABLE_FIBERS"] = max(0, LLD_DISTRIBUTION_FIBERS - LLD_RESERVED_SPARE_FIBERS - hh_count)
-        props["CONNECTION_TYPE"] = "Shared trunk + branches" if len(members) > 1 else "Dedicated drop"
+        props["AVAILABLE_FIBERS"] = max(
+            0, fiber_count - LLD_RESERVED_SPARE_FIBERS - hh_count
+        )
+        props["UTIL_PCT"] = round((hh_count / float(fiber_count)) * 100.0, 1)
+        if is_drop:
+            props["CONNECTION_TYPE"] = "Drop (garden leg)"
+        elif not str(props.get("CONNECTION_TYPE") or "").strip() or \
+                str(props.get("CONNECTION_TYPE") or "").strip().lower() == "dedicated drop":
+            props["CONNECTION_TYPE"] = "Shared trunk + branches"
         updated += 1
     return updated
 

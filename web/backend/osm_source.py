@@ -24,13 +24,13 @@ Design notes that matter:
   remains a supported way to fill the same tables in bulk (see
   docs/subprojects/ftth-engine/OSM_AREA_INPUTS.md) -- it is an optimisation, not
   a prerequisite.
-* **Premises are NOT geocoded one by one.**  They come out of the OSM store,
-  which is why an area costs a single Nominatim lookup.  The old manual path
+* **Premises are NOT geocoded one by one.** They come out of the OSM store,
+  which is why an area costs a single Nominatim lookup. The old manual path
   geocoded 285 addresses at 1.2 s each inside stage 01.
-* **The household rule is the accuracy risk.**  It drives cable sizing
-  (`max(48, households + 2)` / `max(12, dwellings + 2)`) and the BOQ, so every
-  premise carries the method that produced its number and the preview reports
-  the mix.  It is never presented as measured.
+* **The household rule is the accuracy risk.** It drives trunk sizing, the
+  HH-based capacity on each physical-location drop cable, and the BOQ, so every
+  service-location record carries the method that produced its load and the
+  preview reports the mix. It is never presented as measured.
 * The premise -> household logic is deliberately split into PURE functions
   (`parse_flats`, `estimate_buildings`, `distribution_for`, `assemble_premises`)
   that take dicts and a mapping, so they are unit-testable with no database and
@@ -2655,37 +2655,6 @@ def distribution_for(total: int, keys: Sequence[str]) -> List[int]:
     return out
 
 
-def household_points(lon: float, lat: float, hh: int,
-                     footprint_m2: Optional[float] = None
-                     ) -> List[Tuple[float, float]]:
-    """One (lon, lat) per household of a multi-dwelling premise.
-
-    A golden-angle spiral over the building's equivalent disk — the same
-    dispersal `_unique_lonlat` uses for duplicates — so a 12-flat block gets 12
-    DISTINCT drop points inside its footprint instead of 12 identical
-    centroids. Without a known footprint (an address node with no building)
-    the points spread over a small patch of the parcel.
-    """
-    hh = max(1, int(hh))
-    if hh == 1:
-        return [(round(float(lon), 7), round(float(lat), 7))]
-    try:
-        area = float(footprint_m2) if footprint_m2 is not None else 0.0
-    except (TypeError, ValueError):
-        area = 0.0
-    r_max = math.sqrt(area / math.pi) * 0.8 if area > 0 else 2.0
-    r_max = max(1.5, min(r_max, 60.0))
-    mx = 111320.0 * math.cos(math.radians(float(lat)))
-    my = 110540.0
-    out: List[Tuple[float, float]] = []
-    for k in range(hh):
-        r = r_max * math.sqrt((k + 0.5) / hh)
-        theta = math.radians(k * 137.508)
-        out.append((round(float(lon) + r * math.cos(theta) / mx, 7),
-                    round(float(lat) + r * math.sin(theta) / my, 7)))
-    return out
-
-
 def _sort_key_housenumber(value: Any) -> Tuple[int, float, str]:
     """Order addresses numerically so '2' sorts before '10'."""
     text = str(value or "")
@@ -2898,54 +2867,36 @@ def assemble_premises(
       2. an `addr:housenumber` BUILDING polygon with no node
       3. a building CENTROID, for a residential building with no address at all
 
-    The household number for each of those is the OSM heuristic, and the
-    register is applied to those numbers BEFORE they are expanded into one row
-    per household (see below).  That ordering is deliberate: the register is
-    keyed on the postcode, so it can only say how many households a postcode
-    has, not which building they are in -- and the per-building estimate is
-    still the best available answer to that second question.  Applying it after
-    the expansion would apportion the postcode total across rows that had
-    already been given 1 household each, throwing away exactly the shape
-    information the estimate carries.
+    The household estimate or register allocation is stored as `HH` on each
+    physical building/service-location record. Multiple address nodes inside a
+    building remain separate service locations; they are not multiplied by the
+    household count to invent unit geometries.
     """
     by_id = {int(b["osm_id"]): b for b in buildings}
     stats = {
         "duplicates_merged": 0,
         "buildings_excluded": 0,
         "boundary_buildings": 0,
-        "households_expanded": 0,
     }
 
     # --- 1/2. address points, grouped by the building they sit in -----------
-    # Every OSM address node is a premise — no street+number deduplication.
-    # The old key on (street, housenumber) collapsed two distinct houses that
-    # share an address string into a single object point (measured on North
-    # Edgbaston: 95 of 2616 premises merged). The design needs one trench /
-    # garden leg per house, so each node gets its own premise. Identical
-    # coordinates are micro-jittered so every premise has a distinct point.
+    # Each OSM address node is a physical service location. Keep distinct nodes
+    # (including repeated street/number values), but never replicate a location
+    # for each logical household.
+
+
     grouped: Dict[Optional[int], List[Dict[str, Any]]] = {}
     for addr in addresses:
         housenumber = str(addr.get("addr_housenumber") or "").strip()
         if not housenumber:
             continue
         grouped.setdefault(addr_to_building.get(int(addr["osm_id"])), []).append(addr)
-    # kept for API compat — no merging any more
+    # Kept for API compatibility; no merging or coordinate jitter is performed.
     stats["duplicates_merged"] = 0
-    stats["points_jittered"] = 0
-    coord_counts: Dict[Tuple[int, int], int] = {}
 
-    def _unique_lonlat(lon: float, lat: float) -> Tuple[float, float]:
-        lon_f = round(float(lon), 7)
-        lat_f = round(float(lat), 7)
-        key = (int(round(lon_f * 1e7)), int(round(lat_f * 1e7)))
-        n = coord_counts.get(key, 0)
-        coord_counts[key] = n + 1
-        if n == 0:
-            return lon_f, lat_f
-        stats["points_jittered"] += 1
-        angle = (n * 137.508) * math.pi / 180.0
-        radius_deg = 0.0000045 * n  # ~0.5 m per duplicate, golden-angle dispersal
-        return round(lon_f + math.cos(angle) * radius_deg, 7), round(lat_f + math.sin(angle) * radius_deg, 7)
+    def _source_lonlat(lon: float, lat: float) -> Tuple[float, float]:
+        """Keep the source service-entry coordinate; coincident points are valid."""
+        return round(float(lon), 7), round(float(lat), 7)
 
     premises: List[Dict[str, Any]] = []
 
@@ -2971,16 +2922,14 @@ def assemble_premises(
             "OSM_ID": oid if oid is not None else int(addr["osm_id"]),
         }
 
-    # Premises are COLLECTED first and expanded to one row per household only
-    # after the register has had its say (see _flush).  A register is keyed on
-    # the postcode, so it can only give a postcode total; the per-building
-    # estimate is the weight that decides the shape within that total.
+    # Physical service locations are collected first. Register allocation is
+    # weighted by each location's building/address estimate, then HH stays as a
+    # logical load attribute on that same physical feature.
     pending: List[Dict[str, Any]] = []
 
     def _emit(addr: Dict[str, Any], building: Optional[Dict[str, Any]], hh: int,
-              method: str, suffix: str, lonlat: Tuple[float, float],
-              footprint_m2: Optional[float] = None) -> None:
-        """Queue one premise, to be expanded into per-household rows at the end."""
+              method: str, suffix: str, lonlat: Tuple[float, float]) -> None:
+        """Queue one physical building or address/service location."""
         try:
             n = int(hh)
         except (TypeError, ValueError):
@@ -2992,7 +2941,6 @@ def assemble_premises(
             "method": method,
             "suffix": suffix,
             "lonlat": lonlat,
-            "footprint_m2": footprint_m2,
         })
 
     for building_id, addr_list in grouped.items():
@@ -3024,13 +2972,21 @@ def assemble_premises(
             per = [min(f, MAX_FLATS_PER_BUILDING) if f else 1 for f in addr_flats]
             methods = ["addr_flats" if f else "fallback_one" for f in addr_flats]
         else:
-            per = distribution_for(total, ordered)
-            # An explicit address tag still wins for its own row.
-            methods = [method] * len(ordered)
-            for i, f in enumerate(addr_flats):
-                if f:
-                    per[i] = min(f, MAX_FLATS_PER_BUILDING)
-                    methods[i] = "addr_flats"
+            # Explicit address counts are fixed loads; distribute the remainder
+            # of the building total only across locations without an address
+            # count, so the resulting location HH still reconciles to the
+            # building estimate whenever its minimum-one floor permits it.
+            fixed = [min(f, MAX_FLATS_PER_BUILDING) if f else None for f in addr_flats]
+            open_indices = [i for i, value in enumerate(fixed) if value is None]
+            per = [int(value) if value is not None else 1 for value in fixed]
+            methods = ["addr_flats" if f else method for f in addr_flats]
+            if open_indices:
+                remaining = max(len(open_indices), int(total) - sum(
+                    int(value) for value in fixed if value is not None
+                ))
+                shares = distribution_for(remaining, [str(i) for i in open_indices])
+                for i, value in zip(open_indices, shares):
+                    per[i] = value
 
         multi = len(ordered) > 1
         for i, addr in enumerate(ordered):
@@ -3041,7 +2997,7 @@ def assemble_premises(
             else:
                 suffix = f"W{building['osm_id']}-P{i + 1}" if multi else f"W{building['osm_id']}"
             _emit(addr, building, per[i], methods[i], suffix,
-                  (addr["lon"], addr["lat"]), building.get("footprint_m2"))
+                  (addr["lon"], addr["lat"]))
 
     # --- 3. buildings with no address node ---------------------------------
     with_addr_node = set(grouped.keys())
@@ -3067,35 +3023,23 @@ def assemble_premises(
             "addr_suburb": building.get("addr_suburb"),
         }
         _emit(synthetic, building, total, method, f"W{bid}-C",
-              (building["lon"], building["lat"]), building.get("footprint_m2"))
+              (building["lon"], building["lat"]))
         stats["boundary_buildings"] += 1
 
-    # --- 4. the register, then one row per household ------------------------
+    # --- 4. allocate register totals across physical locations -------------
     #
-    # Applied HERE, on the per-premise counts, and not after the expansion
-    # below.  A register row is keyed on a postcode, so it fixes how many
-    # households a postcode has and cannot say which building they are in; the
-    # per-building estimate is the weight that answers that second question. If
-    # the register were applied after expansion, every row would already carry
-    # HH=1 and the apportionment would be uniform -- a 12-storey block and a
-    # bungalow would each get the same share of the postcode.
+    # A postcode total cannot identify which building owns each dwelling. The
+    # existing per-location estimate supplies the apportionment weights while
+    # the resulting HH stays on each location as logical demand.
     if register and (register.get("by_postcode") or register.get("by_uprn")):
         stats["household_register"] = _apply_household_register(pending, register)
 
     for item in pending:
-        n = max(1, int(item["hh"]))
         addr, building = item["addr"], item["building"]
-        method, suffix = item["method"], item["suffix"]
-        lonlat, footprint = item["lonlat"], item["footprint_m2"]
-        if n == 1:
-            premises.append(_row(addr, building, 1, method, suffix,
-                                 _unique_lonlat(lonlat[0], lonlat[1])))
-            continue
-        stats["households_expanded"] += 1
-        for j, (lo, la) in enumerate(
-                household_points(lonlat[0], lonlat[1], n, footprint)):
-            premises.append(_row(addr, building, 1, method, f"{suffix}-H{j + 1}",
-                                 _unique_lonlat(lo, la)))
+        premises.append(_row(
+            addr, building, max(1, int(item["hh"])), item["method"],
+            item["suffix"], _source_lonlat(item["lonlat"][0], item["lonlat"][1]),
+        ))
 
     return premises, stats
 

@@ -270,9 +270,9 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
     SAME_FOOTWAY_TOL_M = 0.5
     RESERVED_SPARE_FIBERS = 2
     # Distribution sizing (docs/stages/HLD.md §Duct & cable rules): the shared
-    # trunk is sized from the households riding it (never below the 48F
-    # distribution floor); the one-to-one garden-leg DROP cable is a 12F
-    # cable, because it serves exactly one premise.
+    # trunk is sized from logical households riding it (never below the 48F
+    # distribution floor); each physical-location drop cable has a 12F garden
+    # minimum plus HH demand and reserved spare, without duplicating geometry.
     DIST_FIBER_MIN    = 12
     DIST_FIBER_LADDER = (12, 24, 48)
     GARDEN_FIBER_COUNT = 12
@@ -1278,7 +1278,12 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
                 of["hhs"] = str(hh_count)
                 of["HH_COUNT"] = hh_count
                 demand = hh_count + self.RESERVED_SPARE_FIBERS
-                of["FIBER_COUNT"] = next((size for size in self.DIST_FIBER_LADDER if demand <= self.DIST_SPARE_RATIO * size), self.DIST_FIBER_LADDER[-1])
+                # This reference-compatible route is still emitted as a
+                # Distribution cable. Keep its 48F floor, but never clip the
+                # physical capacity below the service location's aggregate
+                # logical HH load plus reserved spare. The catalogue ladder /
+                # maximum remains an operator design decision.
+                of["FIBER_COUNT"] = max(48, demand)
                 of["RESERVED_SPARE_FIBERS"] = self.RESERVED_SPARE_FIBERS
                 of["AVAILABLE_FIBERS"] = max(0, of["FIBER_COUNT"] - demand)
                 of["UTIL_PCT"] = round((demand / float(of["FIBER_COUNT"])) * 100.0, 1)
@@ -1440,11 +1445,10 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
                 made += 1
                 made_trunks += 1
 
-        # ── drop cables: ONE per premise along its garden leg ────────────
-        # The garden leg already runs footway → house; the drop cable is that
-        # geometry with the premise's attributes. It joins the trunk at the
-        # footway end (which the trunk span covers) — this is what the survey
-        # app and the LLD compare, per premise.
+        # ── drop cables: ONE per physical service location ───────────────
+        # The garden leg already runs footway → building/service entry; the
+        # drop cable is that geometry with the location's attributes. It joins
+        # the trunk at the footway end (which the trunk span covers).
         for gf in garden_t.getFeatures():
             gg = gf.geometry()
             if not gg or gg.isEmpty():
@@ -1471,10 +1475,11 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
             of["ADDR_IDS"]   = addr or ""
             of["hhs"]        = str(hh_count)
             of["HH_COUNT"]   = hh_count
-            # A drop cable serves exactly one premise: the Garden sizing rule
-            # (12F) applies instead of the 48F distribution floor.
+            # One drop cable follows this physical service location. Its HH
+            # attribute records the logical load, but must not fabricate
+            # unit-level geometry or duplicate the civil drop path.
             demand = hh_count + self.RESERVED_SPARE_FIBERS
-            of["FIBER_COUNT"] = self.GARDEN_FIBER_COUNT
+            of["FIBER_COUNT"] = max(self.GARDEN_FIBER_COUNT, demand)
             of["RESERVED_SPARE_FIBERS"] = self.RESERVED_SPARE_FIBERS
             of["AVAILABLE_FIBERS"] = max(0, of["FIBER_COUNT"] - demand)
             of["UTIL_PCT"] = round((demand / float(of["FIBER_COUNT"])) * 100.0, 1)
@@ -1501,7 +1506,7 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
         feedback.pushInfo(
             f"Distribution: {made_trunks} spine trunk cable(s) (48F floor, "
             f"households + {self.RESERVED_SPARE_FIBERS} spare) + "
-            f"{made_drops} drop cable(s) ({self.GARDEN_FIBER_COUNT}F garden "
+            f"{made_drops} physical-location drop cable(s) (garden floor "
             f"leg) = {made} total")
         return {
             self.O_FEEDER: outFeederId,

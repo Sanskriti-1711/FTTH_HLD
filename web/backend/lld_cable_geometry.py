@@ -14,6 +14,15 @@ RESERVED_SPARE_FIBERS = 2
 DISTRIBUTION_FIBERS = 48
 
 
+def cable_fiber_capacity(hh_count: Any, minimum: int) -> int:
+    """Return a physical cable's fibre count for logical HH load plus spare."""
+    try:
+        households = max(0, int(float(hh_count or 0)))
+    except (TypeError, ValueError):
+        households = 0
+    return max(int(minimum), households + RESERVED_SPARE_FIBERS)
+
+
 def _lines(geometry: Optional[Dict[str, Any]]) -> List[List[List[float]]]:
     if not geometry:
         return []
@@ -35,17 +44,21 @@ def _same_footway(a: List[float], b: List[float], tolerance: float) -> bool:
 
 
 def _is_drop(props: Dict[str, Any]) -> bool:
-    """True for the one-per-premise garden-leg cable of a distribution layer.
+    """True for the one-per-physical-service-location garden-leg cable.
 
     A drop is not a co-routed trunk: it TAPS the spine at the footway, so its
     end coordinate is within the grouping tolerance of the trunk span it hangs
-    off. Grouping it would fold a 12F drop into the trunk and relabel it as a
-    shared trunk cable, which is exactly the sizing error
+    off. Grouping it would fold a location drop into the trunk and relabel it as
+    a shared trunk cable, which is exactly the sizing error
     ``regroup_distribution_cables`` exists to avoid elsewhere.
     """
     cable_type = str(props.get("CABLE_TYPE") or "").strip().lower()
     connection = str(props.get("CONNECTION_TYPE") or "").strip().lower()
-    return cable_type == "drop" or connection.startswith("drop")
+    return (
+        cable_type == "drop"
+        or connection.startswith("drop")
+        or connection == "dedicated drop"
+    )
 
 
 def regroup_distribution_cables(
@@ -114,12 +127,14 @@ def regroup_distribution_cables(
         base_props["ADDR_IDS"] = ",".join(members)
         base_props["HH_COUNT"] = hh_count
         base_props["hhs"] = str(hh_count)
-        # Same rule as the HLD cable stage: a shared trunk is sized from the
-        # households riding it, never below the 48F distribution floor.
-        base_props["FIBER_COUNT"] = max(DISTRIBUTION_FIBERS, hh_count + RESERVED_SPARE_FIBERS)
+        # Match the HLD capacity rule: trunk floor 48F, location-drop floor
+        # 12F, and enough fibres for its HH load plus reserved spare.
+        base_props["FIBER_COUNT"] = cable_fiber_capacity(hh_count, DISTRIBUTION_FIBERS)
         base_props["RESERVED_SPARE_FIBERS"] = RESERVED_SPARE_FIBERS
         base_props["ACTIVE_FIBERS"] = hh_count
-        base_props["AVAILABLE_FIBERS"] = max(0, DISTRIBUTION_FIBERS - RESERVED_SPARE_FIBERS - hh_count)
+        base_props["AVAILABLE_FIBERS"] = max(
+            0, base_props["FIBER_COUNT"] - RESERVED_SPARE_FIBERS - hh_count
+        )
         base_props["CONNECTION_TYPE"] = "Shared trunk + branches"
         base_props["length_m"] = sum(
             _line_length(line) for line in coordinates

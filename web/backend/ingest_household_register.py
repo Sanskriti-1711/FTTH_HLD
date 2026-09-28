@@ -8,9 +8,9 @@ make on its own.
 
 Why it exists: the household rule in `osm_source` is a heuristic, and on real
 UK data it is almost entirely `fallback_one` -- OpenStreetMap carries
-`building:flats` on 1 building in 15,583 and `addr:flats` on none, so cable
-sizing (`max(48, households + 2)`) and the BOQ for a generated UK area rest on
-`UNIT_AREA_M2` rather than on a count. The UK publishes the count: ONSPD carries
+`building:flats` on 1 building in 15,583 and `addr:flats` on none, so trunk
+sizing and the BOQ for a generated UK area rest on `UNIT_AREA_M2` rather than
+on a count. The UK publishes the count: ONSPD carries
 a `Dwellings` figure for every postcode, and a UPRN extract carries one per
 addressable location. This loads either, and `OSM_HH_REGISTER=1` then makes the
 loaded number win over the heuristic for the postcodes it covers.
