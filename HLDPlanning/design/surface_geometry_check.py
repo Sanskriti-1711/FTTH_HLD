@@ -115,23 +115,97 @@ def project_local_m(coords: Sequence[Tuple[float, float]],
             for lon, lat in coords]
 
 
-def _dist_point_polyline(x: float, y: float,
-                         poly: Sequence[Tuple[float, float]]) -> float:
-    best = float("inf")
-    for i in range(len(poly) - 1):
-        ax, ay = poly[i]
-        bx, by = poly[i + 1]
-        dx, dy = bx - ax, by - ay
-        seg2 = dx * dx + dy * dy
-        if seg2 <= 0.0:
-            d = math.hypot(x - ax, y - ay)
-        else:
-            t = ((x - ax) * dx + (y - ay) * dy) / seg2
-            t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
-            d = math.hypot(x - (ax + t * dx), y - (ay + t * dy))
-        if d < best:
-            best = d
-    return best
+def _dist_point_segment(x: float, y: float,
+                        a: Tuple[float, float],
+                        b: Tuple[float, float]) -> float:
+    """Distance from a point to one projected-metre segment."""
+    ax, ay = a
+    bx, by = b
+    dx, dy = bx - ax, by - ay
+    seg2 = dx * dx + dy * dy
+    if seg2 <= 0.0:
+        return math.hypot(x - ax, y - ay)
+    t = ((x - ax) * dx + (y - ay) * dy) / seg2
+    t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+    return math.hypot(x - (ax + t * dx), y - (ay + t * dy))
+
+
+def _segment_samples(a: Tuple[float, float], b: Tuple[float, float],
+                     max_step: float):
+    """Yield points no farther than ``max_step`` apart along a segment.
+
+    The grid stores a long segment in cells along its path, rather than filling
+    every cell in its potentially huge rectangular envelope. Nearest lookup
+    expands its cell search by half a step, so every segment within the requested
+    radius is still a candidate; distance is then measured against the exact
+    segment, not these samples.
+    """
+    length = math.hypot(b[0] - a[0], b[1] - a[1])
+    count = max(1, int(math.ceil(length / max_step)))
+    for i in range(count + 1):
+        t = i / count
+        yield (a[0] + t * (b[0] - a[0]),
+               a[1] + t * (b[1] - a[1]))
+
+
+class _SegmentRoadIndex:
+    """Uniform grid of road segments for local nearest-road lookup.
+
+    Segment samples are spaced by at most half a grid cell, avoiding the large
+    empty rectangles a whole-road bbox index creates on long or diagonal roads.
+    Each candidate is still checked against the exact segment geometry.
+    """
+
+    def __init__(self, roads_m: Sequence[Tuple[str, "sx.RoadTags",
+                                               Sequence[Tuple[float, float]]]],
+                 cell: float = 100.0):
+        self._roads = list(roads_m)
+        self._cell = max(float(cell), 1.0)
+        self._segments: List[Tuple[int, Tuple[float, float],
+                                   Tuple[float, float]]] = []
+        self._grid: Dict[Tuple[int, int], List[int]] = {}
+        sample_step = self._cell / 2.0
+        for road_i, (_rid, _tags, line) in enumerate(self._roads):
+            for i in range(len(line) - 1):
+                a, b = line[i], line[i + 1]
+                if a == b:
+                    continue
+                segment_i = len(self._segments)
+                self._segments.append((road_i, a, b))
+                for x, y in _segment_samples(a, b, sample_step):
+                    cell_key = (int(x // self._cell), int(y // self._cell))
+                    bucket = self._grid.setdefault(cell_key, [])
+                    # Several samples from one segment can land in one cell.
+                    if not bucket or bucket[-1] != segment_i:
+                        bucket.append(segment_i)
+
+    def _candidate_segments(self, x: float, y: float,
+                            max_dist_m: float) -> set:
+        # The nearest point on a candidate segment can be up to half a sample
+        # step from an indexed sample. Search that margin as well as the radius.
+        margin = max_dist_m + self._cell / 2.0
+        min_cx = int((x - margin) // self._cell)
+        max_cx = int((x + margin) // self._cell)
+        min_cy = int((y - margin) // self._cell)
+        max_cy = int((y + margin) // self._cell)
+        candidates = set()
+        for cx in range(min_cx, max_cx + 1):
+            for cy in range(min_cy, max_cy + 1):
+                candidates.update(self._grid.get((cx, cy), ()))
+        return candidates
+
+    def nearest(self, x: float, y: float,
+                max_dist_m: float = SNAP_M):
+        """Nearest road within ``max_dist_m`` as (road_id, tags, line), else None."""
+        best = None
+        best_d = float(max_dist_m)
+        for segment_i in sorted(self._candidate_segments(x, y, max_dist_m)):
+            road_i, a, b = self._segments[segment_i]
+            d = _dist_point_segment(x, y, a, b)
+            if d < best_d:
+                best_d = d
+                best = self._roads[road_i]
+        return best
 
 
 def _polyline_length_m(poly: Sequence[Tuple[float, float]]) -> float:
@@ -158,50 +232,17 @@ class Span:
     surface: str                          # claimed SURFACE value
 
 
-class RoadIndex:
-    """Coarse grid over projected road centrelines for nearest-road lookup."""
-
-    def __init__(self, roads_m: Sequence[Tuple[str, "sx.RoadTags",
-                                               Sequence[Tuple[float, float]]]],
-                 cell: float = 100.0):
-        self._roads = list(roads_m)
-        self._cell = float(cell) or 100.0
-        self._grid: Dict[Tuple[int, int], List[int]] = {}
-        for i, (_rid, _tags, line) in enumerate(self._roads):
-            if not line:
-                continue
-            xs = [p[0] for p in line]
-            ys = [p[1] for p in line]
-            for cx in range(int(min(xs) // self._cell),
-                            int(max(xs) // self._cell) + 1):
-                for cy in range(int(min(ys) // self._cell),
-                                int(max(ys) // self._cell) + 1):
-                    self._grid.setdefault((cx, cy), []).append(i)
-
-    def nearest(self, x: float, y: float,
-                max_dist_m: float = SNAP_M):
-        """Nearest road within ``max_dist_m`` as (road_id, tags, line), else None."""
-        best = None
-        best_d = float(max_dist_m)
-        span = int(max_dist_m // self._cell) + 1
-        cx0 = int(x // self._cell)
-        cy0 = int(y // self._cell)
-        for cx in range(cx0 - span, cx0 + span + 1):
-            for cy in range(cy0 - span, cy0 + span + 1):
-                for i in self._grid.get((cx, cy), ()):
-                    _rid, _tags, line = self._roads[i]
-                    d = _dist_point_polyline(x, y, line)
-                    if d < best_d:
-                        best_d = d
-                        best = self._roads[i]
-        return best
+# The optimized segment grid is defined above, before the classifier. Keep this
+# public name for callers and tests.
+RoadIndex = _SegmentRoadIndex
 
 
 # ── The check ───────────────────────────────────────────────────────────────
 
 def check_spans(spans: Iterable[Span], roads: Iterable[Road], *,
                 snap_m: float = SNAP_M, min_covered: float = MIN_COVERED,
-                step_m: float = STEP_M) -> dict:
+                step_m: float = STEP_M,
+                coordinates_are_projected: bool = False) -> dict:
     """Compare every span's drawn position with the surface it claims.
 
     Returns::
@@ -223,10 +264,17 @@ def check_spans(spans: Iterable[Span], roads: Iterable[Road], *,
     if not spans or not roads:
         return report
 
-    # One local metric frame for the whole check (the layers are lon/lat).
-    origin = tuple(spans[0].line[0]) if spans[0].line else tuple(roads[0].centerline[0])
+    # The public geometry-only API defaults to WGS84 lon/lat and projects to a
+    # local metric frame. The engine's OGR adapter already reprojects both
+    # layers into the trench CRS (EPSG:25833 metres), so it opts out here rather
+    # than treating metre coordinates as degrees and scaling them by 111 km.
+    if coordinates_are_projected:
+        metric = lambda coords: [(float(x), float(y)) for x, y in coords]
+    else:
+        origin = tuple(spans[0].line[0]) if spans[0].line else tuple(roads[0].centerline[0])
+        metric = lambda coords: project_local_m(coords, origin)
     index = RoadIndex([
-        (r.road_id, r.tags, project_local_m(r.centerline, origin))
+        (r.road_id, r.tags, metric(r.centerline))
         for r in roads
     ])
 
@@ -239,7 +287,7 @@ def check_spans(spans: Iterable[Span], roads: Iterable[Road], *,
             report["no_claim"] += 1
             continue
 
-        line_m = project_local_m(span.line, origin)
+        line_m = metric(span.line)
         mid = line_m[len(line_m) // 2]
         road = index.nearest(mid[0], mid[1], snap_m)
         if road is None:

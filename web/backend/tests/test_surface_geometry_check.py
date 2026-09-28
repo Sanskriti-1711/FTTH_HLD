@@ -178,3 +178,33 @@ def test_no_roads_or_no_spans_never_raises():
     span = sgc.Span("TR-12", _line((0, 1.0), (50, 1.0)), "Asphalt")
     assert sgc.check_spans([span], [])["checked"] == 0
     assert sgc.check_spans([], [ROAD_NO_SW])["checked"] == 0
+
+
+def test_spatial_index_handles_long_diagonal_roads_without_filling_the_bbox():
+    # A whole-road bbox grid would have to fill roughly 10,000 x 10,000 cells
+    # for this diagonal. Segment indexing follows the geometry instead.
+    index = sgc.RoadIndex([
+        ("diagonal", ROAD_NO_SW.tags, [(0.0, 0.0), (10000.0, 10000.0)]),
+    ])
+    assert len(index._grid) < 500
+    assert index.nearest(5000.0, 5004.0, max_dist_m=10.0)[0] == "diagonal"
+
+
+def test_nearest_lookup_only_checks_local_segment_candidates():
+    roads = [
+        (f"R-{i}", ROAD_NO_SW.tags, [(0.0, i * 100.0), (80.0, i * 100.0)])
+        for i in range(1000)
+    ]
+    index = sgc.RoadIndex(roads)
+    candidates = index._candidate_segments(40.0, 1.0, 10.0)
+    assert len(candidates) < 10
+    assert index.nearest(40.0, 1.0, max_dist_m=10.0)[0] == "R-0"
+
+
+def test_spatial_index_checks_exact_segment_distance_not_sample_distance():
+    index = sgc.RoadIndex([
+        ("R-exact", ROAD_NO_SW.tags, [(0.0, 0.0), (100.0, 0.0)]),
+    ])
+    # Midpoint between indexing samples, still 4 m from the exact road.
+    assert index.nearest(24.0, 0.0, max_dist_m=5.0)[0] == "R-exact"
+    assert index.nearest(24.0, 6.0, max_dist_m=5.0) is None

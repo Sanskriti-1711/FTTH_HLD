@@ -171,6 +171,8 @@ def test_surface_check_reprojects_wgs84_roads_to_the_trench_crs(tmp_path):
 
     assert report["checked"] == 1
     assert report["no_road"] == 0, "the road is under the span, not 1000 km away"
+    assert report["agreed"] == 1, "projected metres must not be rescaled as lon/lat"
+    assert report["flags"] == []
 
 
 def _line_pts(a, b):

@@ -3551,7 +3551,7 @@ def verify_surface_geometry(out_dir, feedback=None, roads_source=None):
             feedback.pushInfo("  [verify] Surfaces: no trench spans — skipped.")
         return report
 
-    report = sgc.check_spans(spans, roads)
+    report = sgc.check_spans(spans, roads, coordinates_are_projected=True)
     if feedback:
         feedback.pushInfo(
             "  [verify] Surfaces: %d span(s) checked — %d agree, %d "
