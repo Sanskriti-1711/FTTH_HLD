@@ -33,6 +33,61 @@ except Exception:  # pragma: no cover
     osr = None
     _HAS_OGR = False
 
+try:
+    from HLDPlanning.utils.cable_capacity import (
+        DISTRIBUTION_FIBER_LADDER,
+        DROP_FIBER_LADDER,
+        DROP_FIBER_MAX,
+        RESERVED_SPARE_FIBERS,
+        distribution_fiber_capacity,
+        drop_capacity_warning,
+        drop_fiber_capacity,
+    )
+except ImportError:  # QGIS may load the module under the plugin package name.
+    from ..utils.cable_capacity import (
+        DISTRIBUTION_FIBER_LADDER,
+        DROP_FIBER_LADDER,
+        DROP_FIBER_MAX,
+        RESERVED_SPARE_FIBERS,
+        distribution_fiber_capacity,
+        drop_capacity_warning,
+        drop_fiber_capacity,
+    )
+
+CAPACITY_FIELDS = [
+    ("RESERVED_SPARE_FIBERS", ogr.OFTInteger if _HAS_OGR else None),
+    ("AVAILABLE_FIBERS", ogr.OFTInteger if _HAS_OGR else None),
+    ("CAPACITY_STATUS", ogr.OFTString if _HAS_OGR else None),
+    ("CAPACITY_WARNING", ogr.OFTString if _HAS_OGR else None),
+    ("REVIEW", ogr.OFTInteger if _HAS_OGR else None),
+]
+
+
+def _capacity_fields():
+    """OGR fields needed to persist the shared HLD cable-capacity contract."""
+    return [(name, kind, 255 if name == "CAPACITY_WARNING" else 0)
+            for name, kind in CAPACITY_FIELDS]
+
+
+def _cable_type(feature):
+    return str(_get(feature.GetLayer() if hasattr(feature, "GetLayer") else None,
+                    feature, "CABLE_TYPE") or "").strip().lower()
+
+
+def _set_capacity_metadata(feature, hh_count, capacity, is_drop):
+    demand = max(0, int(hh_count or 0)) + RESERVED_SPARE_FIBERS
+    warning = drop_capacity_warning(hh_count) if is_drop else None
+    status = "OVER_CAPACITY" if warning else "OK"
+    feature.SetField("RESERVED_SPARE_FIBERS", RESERVED_SPARE_FIBERS)
+    feature.SetField("AVAILABLE_FIBERS", max(0, int(capacity) - demand))
+    feature.SetField("CAPACITY_STATUS", status)
+    feature.SetField("CAPACITY_WARNING", warning or "")
+    feature.SetField("REVIEW", 1 if warning else 0)
+    return warning
+
+
+if _HAS_OGR:
+    _capacity_fields()
 
 # ── Catalogue defaults (per-deployment tuning points) ───────────────────────
 
@@ -2934,6 +2989,7 @@ def enrich_cables(feeder_path, dist_path, objects_path, mfg_path, feedback=None)
             ("SOURCE_NODE", ogr.OFTString, 24),
             ("UTIL_PCT", ogr.OFTReal),
             ("INFRA_STATUS", ogr.OFTString, 24),
+            *_capacity_fields(),
         ])
         prof = CABLE_PROFILE["Distribution"]
         lyr.StartTransaction()
@@ -2949,22 +3005,26 @@ def enrich_cables(feeder_path, dist_path, objects_path, mfg_path, feedback=None)
                 conn.strip().lower() == "dedicated drop" or \
                 str(_get(lyr, f, "CABLE_TYPE") or "").strip().lower() == "drop"
             if is_drop:
-                own = _num(lyr, f, "FIBER_COUNT", 0)
                 hh_load = int(_num(lyr, f, "HH_COUNT", 0))
-                fc = max(int(own) if own else 0, 12, hh_load + 2)
+                standard_size = drop_fiber_capacity(hh_load)
+                fc = standard_size or DROP_FIBER_MAX
                 f.SetField("CABLE_TYPE", "Drop")
             else:
                 own = _num(lyr, f, "FIBER_COUNT", 0)
-                fc = int(own) if own else prof["fiber_count"]
+                hh_load = int(_num(lyr, f, "HH_COUNT", 0))
+                fc = int(own) if own else distribution_fiber_capacity(hh_load)
                 f.SetField("CABLE_TYPE", "Distribution")
             f.SetField("FIBER_COUNT", fc)
+            warning = _set_capacity_metadata(f, hh_load, fc, is_drop)
+            if warning and feedback:
+                feedback.pushWarning(f"Distribution drop exceeds {DROP_FIBER_MAX}F: {warning}")
             f.SetField("LENGTH_M", round(_geom_len_m(f), 1))
             pid = str(_get(lyr, f, "pdp_id") or _get(lyr, f, "PDP_ID") or "").upper()
             f.SetField("SOURCE_NODE", pid)
             # Drop utilisation uses this physical service location's HH load;
             # the PDP-wide household total is meaningless for one drop route.
             hh = _num(lyr, f, "HH_COUNT", 0) if is_drop else hh_by_pdp.get(pid, 0)
-            util = min(100.0, (hh / fc) * 100.0) if fc else 0.0
+            util = min(100.0, ((hh + RESERVED_SPARE_FIBERS) / fc) * 100.0) if fc else 0.0
             f.SetField("UTIL_PCT", round(util, 1))
             f.SetField("INFRA_STATUS", "Proposed")
             lyr.SetFeature(f)
@@ -3088,6 +3148,10 @@ def enrich_equipment(pdp_path, mfg_path, feedback=None):
 # and expensive to notice by eye, so every run now states them in its log —
 # the dedupe passes above were silently deleting duct until this check existed.
 _DUCT_SNAP_M = 0.5
+# Point-on-network guards; matching a remote anchor to its nearest node anyway
+# can collapse an off-network MFG onto an unrelated exchange area's root.
+PDP_ON_DUCT_TOL_M = 1.0
+MFG_ON_DUCT_TOL_M = 1.5
 
 
 def _is_empty(geom) -> bool:
@@ -3120,13 +3184,22 @@ def _line_segments(path, feedback=None):
     return out
 
 
-def _point_xy(path, id_fields=("SRC_ID", "PDP_ID", "MFG_ID", "id")):
+def _point_xy(path, id_fields=("SRC_ID", "PDP_ID", "MFG_ID", "id"),
+              assignment_fields=()):
+    """Read point coordinates, stable IDs and (optionally) an assigned root ID.
+
+    Most callers need ``(xy, id)``. Feeder continuity passes
+    ``assignment_fields=("MFG_ID", ...)`` and receives ``(xy, id, assigned)``
+    so it can verify each PDP against the MFG the network stage assigned, not
+    merely against whichever MFG happens to be closest/reachable.
+    """
     ds, lyr = _open_lyr(path)
     if lyr is None:
         return []
     names = [lyr.GetLayerDefn().GetFieldDefn(i).GetName()
              for i in range(lyr.GetLayerDefn().GetFieldCount())]
     idf = next((n for n in id_fields if n in names), None)
+    assigned_field = next((n for n in assignment_fields if n in names), None)
     out = []
     for f in lyr:
         g = f.geometry()
@@ -3142,14 +3215,25 @@ def _point_xy(path, id_fields=("SRC_ID", "PDP_ID", "MFG_ID", "id")):
                 x, y = g.GetX(0), g.GetY(0)
             except Exception:
                 continue
-        out.append(((x, y), str(f.GetField(idf)) if idf else str(f.GetFID())))
+        rec = ((x, y), str(f.GetField(idf)) if idf else str(f.GetFID()))
+        if assignment_fields:
+            assigned = str(f.GetField(assigned_field) or "").strip() if assigned_field else ""
+            rec += (assigned,)
+        out.append(rec)
     return out
 
 
 def _components(segments, snap_m=_DUCT_SNAP_M):
-    """Union-find over segment endpoints snapped within ``snap_m``."""
+    """Union-find over segment endpoints snapped within ``snap_m``.
+
+    Endpoint lookup is bucketed spatially; a full scan made the per-run
+    verifier quadratic in the number of duct vertices on city-scale outputs.
+    """
     nodes: List[Tuple[float, float]] = []
     parent: Dict[int, int] = {}
+    cells: Dict[Tuple[int, int], List[int]] = {}
+    segment_nodes: List[Tuple[int, int]] = []
+    cell_size = max(float(snap_m), 1e-6)
 
     def find(i):
         while parent[i] != i:
@@ -3163,78 +3247,218 @@ def _components(segments, snap_m=_DUCT_SNAP_M):
             parent[rb] = ra
 
     def node_at(pt):
-        for i, q in enumerate(nodes):
-            if math.hypot(pt[0] - q[0], pt[1] - q[1]) <= snap_m:
-                return i
+        cx, cy = int(math.floor(pt[0] / cell_size)), int(math.floor(pt[1] / cell_size))
+        for ix in range(cx - 1, cx + 2):
+            for iy in range(cy - 1, cy + 2):
+                for i in cells.get((ix, iy), ()):
+                    q = nodes[i]
+                    if math.hypot(pt[0] - q[0], pt[1] - q[1]) <= snap_m:
+                        return i
+        i = len(nodes)
         nodes.append(pt)
-        parent[len(nodes) - 1] = len(nodes) - 1
-        return len(nodes) - 1
+        parent[i] = i
+        cells.setdefault((cx, cy), []).append(i)
+        return i
 
     for a, b in segments:
         ia, ib = node_at(a), node_at(b)
+        segment_nodes.append((ia, ib))
         if ia != ib:
             union(ia, ib)
     groups: Dict[int, List[int]] = {}
     for i in range(len(nodes)):
         groups.setdefault(find(i), []).append(i)
-    return nodes, groups
+    return nodes, groups, segment_nodes
 
 
-def verify_duct_continuity(out_dir, feedback=None):
-    """Log the feeder chain and the distribution/coupler reach of a run.
+def verify_duct_continuity(out_dir, feedback=None, include_distribution=True):
+    """Log feeder reach and, optionally, distribution/coupler reach.
 
     Returns a dict with the numbers (also useful to tests): ``feeder_parts``,
-    ``pdp_reached``, ``pdp_total``, ``couplers_off``, ``coupler_total``.
+    ``mfg_parts``, ``pdp_reached``, ``pdp_total``, ``pdp_stranded``,
+    ``pdp_off_network``, ``couplers_off``, ``coupler_total``. The distribution
+    check is independent and can be skipped when a targeted feeder audit is
+    needed on a large run.
     """
     p = lambda n: os.path.join(out_dir, n)  # noqa: E731
     report = {}
-    mfg = _point_xy(p("MFG.gpkg"))
-    pdps = _point_xy(p("PDPs.gpkg"))
+    mfg = _point_xy(
+        p("MFG.gpkg"), ("MFG_ID", "mfg_id", "SRC_ID", "id"))
+    pdps = _point_xy(
+        p("PDPs.gpkg"), ("PDP_ID", "pdp_id", "SRC_ID", "id"),
+        assignment_fields=("MFG_ID", "mfg_id"))
     segs = _line_segments(p("Feeder_Ducts.gpkg"), feedback)
     if mfg and pdps and segs:
-        nodes, groups = _components(segs)
-        mi = min(range(len(nodes)),
-                 key=lambda i: math.hypot(mfg[0][0][0] - nodes[i][0],
-                                          mfg[0][0][1] - nodes[i][1]))
-        parent_root = next(r for r, mem in groups.items() if mi in mem)
-        reached, stranded = 0, []
-        for pt, pid in pdps:
-            pi = min(range(len(nodes)),
-                     key=lambda i: math.hypot(pt[0] - nodes[i][0],
-                                              pt[1] - nodes[i][1]))
-            rr = next((r for r, mem in groups.items() if pi in mem), None)
-            if rr == parent_root:
+        _nodes, groups, segment_nodes = _components(segs)
+
+        # Materialise the endpoint -> component lookup once. Searching each
+        # component's member list for every MFG/PDP turned a city-scale audit
+        # into O(anchor_count × node_count).
+        node_root = {i: component for component, members in groups.items()
+                     for i in members}
+        segment_root = [node_root.get(a) for a, _b in segment_nodes]
+
+        # Index segment samples into a coarse grid. Half-cell sample spacing
+        # ensures every point within the snap radius checks the segment from an
+        # adjacent cell without allocating a long diagonal's full bounding box.
+        cell_size = 25.0
+        segment_cells: Dict[Tuple[int, int], List[int]] = {}
+        for si, ((ax, ay), (bx, by)) in enumerate(segs):
+            length = math.hypot(bx - ax, by - ay)
+            # Index samples along the segment, not its whole bounding box: a
+            # long diagonal would otherwise allocate every empty cell inside
+            # the bbox (quadratic in its length). Half-cell spacing guarantees
+            # every point within tolerance checks one of the adjacent cells.
+            steps = max(1, int(math.ceil(length / (cell_size * 0.5))))
+            for step in range(steps + 1):
+                t = step / steps
+                sx, sy = ax + t * (bx - ax), ay + t * (by - ay)
+                key = (int(math.floor(sx / cell_size)),
+                       int(math.floor(sy / cell_size)))
+                bucket = segment_cells.setdefault(key, [])
+                if not bucket or bucket[-1] != si:
+                    bucket.append(si)
+
+        def nearest_network_segment(x, y):
+            """Return exact nearest-segment distance and its duct component.
+
+            An anchor halfway along a segment belongs to that segment's
+            component, even when an unrelated component has a closer endpoint.
+            """
+            cx, cy = int(math.floor(x / cell_size)), int(math.floor(y / cell_size))
+            candidates = set()
+            for ix in range(cx - 1, cx + 2):
+                for iy in range(cy - 1, cy + 2):
+                    candidates.update(segment_cells.get((ix, iy), ()))
+            best, best_component = float("inf"), None
+            for si in candidates:
+                (ax, ay), (bx, by) = segs[si]
+                dx, dy = bx - ax, by - ay
+                dd = dx * dx + dy * dy
+                t = 0.0 if dd <= 0.0 else max(
+                    0.0, min(1.0, ((x - ax) * dx + (y - ay) * dy) / dd))
+                px, py = ax + t * dx, ay + t * dy
+                d = math.hypot(x - px, y - py)
+                if d < best:
+                    best, best_component = d, segment_root[si]
+            return best, best_component
+
+        # Every MFG is a valid root, but a PDP must reach its assigned MFG,
+        # not just any root. The network stage's PDPs.MFG_ID is authoritative.
+        mfg_root_by_id = {}
+        for pt, mid in mfg:
+            distance, component = nearest_network_segment(pt[0], pt[1])
+            if distance <= MFG_ON_DUCT_TOL_M:
+                mfg_root_by_id[mid] = component
+        mfg_roots = set(mfg_root_by_id.values())
+        reached, stranded, off_net, no_assigned_root = 0, [], [], []
+        assigned_checked = 0
+        for rec in pdps:
+            pt, pid = rec[0], rec[1]
+            assigned_mfg = rec[2] if len(rec) > 2 else ""
+            distance, component = nearest_network_segment(pt[0], pt[1])
+            if distance > PDP_ON_DUCT_TOL_M:
+                # Snapping an arbitrary point to the nearest node would call
+                # any PDP "reached" as long as one duct existed, so a PDP
+                # nowhere near the network is reported as off it.
+                off_net.append(pid)
+            elif assigned_mfg:
+                assigned_checked += 1
+                assigned_root = mfg_root_by_id.get(assigned_mfg)
+                if assigned_root is None:
+                    no_assigned_root.append(pid)
+                elif component == assigned_root:
+                    reached += 1
+                else:
+                    stranded.append(pid)
+            elif component in mfg_roots:
+                # Compatibility for older layers with no PDP.MFG_ID.
                 reached += 1
             else:
                 stranded.append(pid)
         report["feeder_parts"] = len(groups)
+        report["mfg_parts"] = len(mfg_roots)
         report["pdp_reached"] = reached
         report["pdp_total"] = len(pdps)
-        report["pdp_stranded"] = stranded
+        report["pdp_stranded"] = stranded + off_net + no_assigned_root
+        report["pdp_off_network"] = off_net
+        report["pdp_no_assigned_mfg_root"] = no_assigned_root
+        report["pdp_assigned_mfg_checked"] = assigned_checked
+        report["pdp_no_assigned_mfg_root_ids"] = {
+            rec[1]: rec[2] for rec in pdps
+            if len(rec) > 2 and rec[1] in no_assigned_root
+        }
         if feedback:
             feedback.pushInfo(
-                f"  [verify] Feeder ducts: {len(groups)} connected part(s), "
-                f"MFG reaches {reached}/{len(pdps)} PDP(s).")
+                f"  [verify] Feeder ducts: {len(groups)} connected part(s) "
+                f"({len(mfg_roots)} of them carry an MFG), "
+                f"assigned MFG reaches {reached}/{len(pdps)} PDP(s).")
+            off_mfg = [mid for _pt, mid in mfg
+                       if nearest_network_segment(_pt[0], _pt[1])[0] > MFG_ON_DUCT_TOL_M]
+            if off_mfg:
+                feedback.pushWarning(
+                    "  [verify] Feeder ducts: %d MFG point(s) are more than "
+                    "%.1f m from every feeder duct (%s)."
+                    % (len(off_mfg), MFG_ON_DUCT_TOL_M, ", ".join(off_mfg[:8])))
+            if off_net:
+                feedback.pushWarning(
+                    "  [verify] Feeder ducts: %d PDP(s) are not on the duct "
+                    "network at all (%s) — beyond the %.1f m snap."
+                    % (len(off_net), ", ".join(off_net[:8]), PDP_ON_DUCT_TOL_M))
             if stranded:
                 feedback.pushWarning(
-                    "  [verify] Feeder ducts: %d PDP(s) are on a duct network the "
-                    "MFG does not reach (%s) — the chain is broken, check the "
-                    "chamber-to-chamber spans." % (len(stranded),
-                                                   ", ".join(stranded[:8])))
-    couplers = _point_xy(p("Coupleurs.gpkg"), ("DUCT_UID", "SRC_ID", "id"))
-    dsegs = _line_segments(p("Distribution_Ducts.gpkg"), feedback)
+                    "  [verify] Feeder ducts: %d PDP(s) sit on a duct component "
+                    "not rooted at their assigned MFG (%s) — the assigned feeder "
+                    "chain is broken, check the chamber-to-chamber spans."
+                    % (len(stranded), ", ".join(stranded[:8])))
+            if no_assigned_root:
+                feedback.pushWarning(
+                    "  [verify] Feeder ducts: %d PDP(s) name an MFG_ID with no "
+                    "feeder-duct root (%s)."
+                    % (len(no_assigned_root), ", ".join(no_assigned_root[:8])))
+    couplers = (_point_xy(p("Coupleurs.gpkg"), ("DUCT_UID", "SRC_ID", "id"))
+                if include_distribution else [])
+    dsegs = (_line_segments(p("Distribution_Ducts.gpkg"), feedback)
+             if include_distribution else [])
     if couplers and dsegs:
+        # Candidate segments are bucketed along their length. Scanning every
+        # distribution segment for every coupler was O(C×S) and made a normal
+        # multi-thousand-span output take minutes to audit.
+        cell_size = 25.0
+        segment_cells: Dict[Tuple[int, int], List[int]] = {}
+        for si, (a, b) in enumerate(dsegs):
+            length = math.hypot(b[0] - a[0], b[1] - a[1])
+            steps = max(1, int(math.ceil(length / (cell_size * 0.5))))
+            for step in range(steps + 1):
+                t = step / steps
+                x = a[0] + t * (b[0] - a[0])
+                y = a[1] + t * (b[1] - a[1])
+                key = (int(math.floor(x / cell_size)),
+                       int(math.floor(y / cell_size)))
+                bucket = segment_cells.setdefault(key, [])
+                if not bucket or bucket[-1] != si:
+                    bucket.append(si)
+
         off, worst = 0, 0.0
         for pt, _cid in couplers:
-            best = float("inf")
-            for a, b in dsegs:
-                d = _dist_point_seg(pt[0], pt[1], a[0], a[1], b[0], b[1])
-                if d < best:
-                    best = d
-                    if best <= 1.0:
-                        break
+            cx = int(math.floor(pt[0] / cell_size))
+            cy = int(math.floor(pt[1] / cell_size))
+            candidates = set()
+            for ix in range(cx - 1, cx + 2):
+                for iy in range(cy - 1, cy + 2):
+                    candidates.update(segment_cells.get((ix, iy), ()))
+            best = min((_dist_point_seg(pt[0], pt[1], dsegs[si][0][0],
+                                        dsegs[si][0][1], dsegs[si][1][0],
+                                        dsegs[si][1][1]) for si in candidates),
+                       default=float("inf"))
             if best > 1.0:
                 off += 1
+                # The grid is complete within the acceptance radius, but an
+                # off-network point can have its true nearest segment farther
+                # away than the indexed neighborhood. Fall back for these few
+                # rows so the reported worst distance remains exact.
+                best = min((_dist_point_seg(pt[0], pt[1], a[0], a[1], b[0], b[1])
+                            for a, b in dsegs), default=float("inf"))
             worst = max(worst, best)
         report["couplers_off"] = off
         report["coupler_total"] = len(couplers)
@@ -3449,6 +3673,466 @@ def stamp_region_identity(out_dir, feedback=None):
     return written
 
 
+# ── MFG identity on every layer ─────────────────────────────────────────────
+# The MFG is a *service area*, so "which MFG owns this row" is a question every
+# network component has to be able to answer: the BOM, the permit pack and the
+# map all group by it. The allocation itself already exists — the partition
+# decides it and the network stage records it on PDPs — but it was only repeated
+# onto some components, and the region polygons themselves (Polygons.gpkg)
+# carried none at all. These are the layers that ship a component the MFG owns,
+# with the geometry kind used for the last-resort spatial question.
+_MFG_IDENTITY_LAYERS = (
+    ("Polygons.gpkg", "polygon"),
+    ("MFG_Service_Areas.gpkg", "polygon"),
+    ("MFG.gpkg", "point"),
+    ("PDPs.gpkg", "point"),
+    ("Objects.gpkg", "point"),
+    ("Pseudo_HH.gpkg", "point"),
+    ("Served_Premises.gpkg", "point"),
+    ("Chambers.gpkg", "point"),
+    ("Poles.gpkg", "point"),
+    ("Trench_Nodes.gpkg", "point"),
+    ("Coupleurs.gpkg", "point"),
+    ("Feeder_Trench.gpkg", "line"),
+    ("Distribution_Trench.gpkg", "line"),
+    ("Garden_Trench.gpkg", "line"),
+    ("Final_Trenches.gpkg", "line"),
+    ("Tangent_Crossings.gpkg", "line"),
+    ("Feeder_Ducts.gpkg", "line"),
+    ("Distribution_Ducts.gpkg", "line"),
+    ("Drop_Ducts.gpkg", "line"),
+    ("Feeder_Cable.gpkg", "line"),
+    ("Distribution_Cable.gpkg", "line"),
+    ("Aerial_Drops.gpkg", "line"),
+    ("Aerial_Spans.gpkg", "line"),
+    ("Aerial_Cable.gpkg", "line"),
+)
+
+# The tag itself, in the spellings the pipeline writes, and the legacy short
+# name the polygon stage uses. The first name present is created/populated.
+_MFG_TAG_FIELDS = ("MFG_ID", "mfg_id", "MFG")
+# Evidence, most authoritative first. The region a row sits in, then the PDP it
+# hangs off, then the address it serves, then the trench it is built on. Each is
+# a list because a span legitimately names several regions.
+_MFG_REGION_FIELDS = ("POLYGON_ID", "pDp_POL_ID", "pdp_pol_id")
+_MFG_PDP_FIELDS = ("PDP_ID", "PDP_IDS", "pdp_id", "EQUIPMENT", "SOURCE_NODE")
+_MFG_ADDR_FIELDS = ("ADDR_ID", "addr_id", "ADDR_IDS", "TO_PREMISE", "PREMISE_ID", "hh_id")
+# A structure or span built within this distance of a trench is on that trench.
+_MFG_TRENCH_SNAP_M = 5.0
+# Cell size of the trench-segment grid: a few times the snap tolerance, so the
+# neighbours of a cell cover every segment that could be within tolerance.
+_MFG_GRID_CELL_M = 50.0
+
+
+def _field_index(defn, names):
+    """Case-insensitive field index for the first of ``names`` present, else -1."""
+    lowered = {}
+    for i in range(defn.GetFieldCount()):
+        lowered.setdefault(defn.GetFieldDefn(i).GetName().lower(), i)
+    for name in names:
+        i = lowered.get(name.lower())
+        if i is not None:
+            return i
+    return -1
+
+
+def _split_ids(value):
+    """Every id named in a possibly multi-valued field.
+
+    POLYGON_ID is comma-joined when a span crosses regions and ADDR_IDS is
+    comma-joined when a distribution span serves several premises, so a single
+    value always means a single id — never split on other punctuation and turn
+    one id into two.
+    """
+    text = str(value or "").replace(";", ",").replace("|", ",").replace("->", ",")
+    return [chunk.strip() for chunk in text.split(",") if chunk.strip()]
+
+
+def _read_map(path, key_fields, value_field_names):
+    """{key: value} from one layer, keyed on the first non-blank key field."""
+    out = {}
+    if not path or not os.path.isfile(path):
+        return out
+    try:
+        ds = ogr.Open(path, 0)
+    except Exception:
+        return out
+    if ds is None:
+        return out
+    lyr = ds.GetLayer(0)
+    if lyr is not None:
+        defn = lyr.GetLayerDefn()
+        i_val = _field_index(defn, value_field_names)
+        i_keys = [_field_index(defn, (name,)) for name in key_fields]
+        if i_val >= 0:
+            for ft in lyr:
+                val = str(ft.GetField(i_val) or "").strip()
+                if not val:
+                    continue
+                for i_key in i_keys:
+                    if i_key < 0:
+                        continue
+                    key = str(ft.GetField(i_key) or "").strip()
+                    if key:
+                        out.setdefault(key, val)
+    ds = None
+    return out
+
+
+def _mfg_lookup(out_dir):
+    """(by_polygon, by_pdp, by_address) for this run's MFG allocation.
+
+    ``PDPs.gpkg`` is the allocation's own record — the network stage gave every
+    service polygon exactly one PDP and every PDP one MFG — so it is the
+    authority and the polygon map is read from those same rows rather than
+    re-derived from a partition that is no longer in memory. An older run whose
+    PDPs predate ``MFG_ID`` falls back to the legacy tag the polygon stage left
+    on ``Polygons.gpkg``, so the stamp is available rather than silently absent.
+    """
+    by_poly = {}
+    by_pdp = _read_map(os.path.join(out_dir, "PDPs.gpkg"),
+                       ("PDP_ID",), _MFG_TAG_FIELDS)
+    by_poly.update(_read_map(os.path.join(out_dir, "PDPs.gpkg"),
+                             ("POLYGON_ID",), _MFG_TAG_FIELDS))
+    if not by_poly:
+        by_poly.update(_read_map(os.path.join(out_dir, "Polygons.gpkg"),
+                                 ("POLYGON_ID", "SRC_ID"), _MFG_TAG_FIELDS))
+    by_addr = _read_map(os.path.join(out_dir, "Objects.gpkg"),
+                        ("ADDR_ID", "OSM_ID", "SRC_ID"), _MFG_TAG_FIELDS)
+    return by_poly, by_pdp, by_addr
+
+
+def _trench_mfg_segments(out_dir):
+    """[(ax, ay, bx, by, MFG_ID)] for the trenches that state their MFG.
+
+    The published trenches carry the most complete MFG coverage of any layer, so
+    they are the bridge for civil structures that name no region and no address
+    — a pole, a tangent crossing, an aerial span: whatever is built on a trench
+    belongs to the MFG that trench serves.
+    """
+    out = []
+    path = os.path.join(out_dir, "Final_Trenches.gpkg")
+    if not os.path.isfile(path):
+        return out
+    try:
+        ds = ogr.Open(path, 0)
+    except Exception:
+        return out
+    if ds is None:
+        return out
+    lyr = ds.GetLayer(0)
+    if lyr is not None:
+        defn = lyr.GetLayerDefn()
+        i_mfg = _field_index(defn, _MFG_TAG_FIELDS)
+        if i_mfg >= 0:
+            for ft in lyr:
+                mfg = str(ft.GetField(i_mfg) or "").strip()
+                if not mfg:
+                    continue
+                geom = ft.GetGeometryRef()
+                if _is_empty(geom):
+                    continue
+                for xy in _line_parts(geom):
+                    for i in range(len(xy) - 1):
+                        out.append((xy[i][0], xy[i][1],
+                                    xy[i + 1][0], xy[i + 1][1], mfg))
+    ds = None
+    return out
+
+
+def _segment_grid(segments):
+    """Bucket segment indices by 50 m cell — a nearest-segment question.
+
+    A plain scan is O(features × segments) and the trench layer is thousands of
+    segments, so the grid keeps the last-resort attribution linear in the
+    handful of rows that actually reach it.
+    """
+    grid = {}
+    for i, (ax, ay, bx, by, _mfg) in enumerate(segments):
+        for cx in range(int(min(ax, bx) // _MFG_GRID_CELL_M),
+                        int(max(ax, bx) // _MFG_GRID_CELL_M) + 1):
+            for cy in range(int(min(ay, by) // _MFG_GRID_CELL_M),
+                            int(max(ay, by) // _MFG_GRID_CELL_M) + 1):
+                grid.setdefault((cx, cy), []).append(i)
+    return grid
+
+
+def _nearest_segment_mfg(segments, grid, x, y, tol_m):
+    """MFG of the nearest trench segment within ``tol_m`` of (x, y), else ""."""
+    if not segments or not grid:
+        return ""
+    cx, cy = int(x // _MFG_GRID_CELL_M), int(y // _MFG_GRID_CELL_M)
+    best_i, best_d = -1, None
+    # The neighbouring cells as well: a segment touching the point can be
+    # indexed under the cell one over when it spans the boundary.
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for i in grid.get((cx + dx, cy + dy), ()):
+                ax, ay, bx, by, _mfg = segments[i]
+                d = _dist_point_seg(x, y, ax, ay, bx, by)
+                if best_d is None or d < best_d:
+                    best_i, best_d = i, d
+    if best_i < 0 or best_d is None or best_d > tol_m:
+        return ""
+    return segments[best_i][4]
+
+
+_POLYGON_GEOM_TYPES = ()
+if _HAS_OGR:
+    _POLYGON_GEOM_TYPES = (ogr.wkbPolygon, ogr.wkbMultiPolygon,
+                           ogr.wkbPolygon25D, ogr.wkbMultiPolygon25D)
+
+
+def _mfg_from_regions(geom, region_ids, by_poly, polys):
+    """The MFG owning the region(s) named, resolving a cross-region span.
+
+    A row naming one region answers immediately. A row naming several (a feeder
+    duct crossing two catchments) is decided by which region its geometry
+    actually runs in for longer — the same dominant-overlap rule the POLYGON_ID
+    stamp uses, and it must be geometry, not list order: the ids are sorted by
+    overlap but a single span can legitimately be listed either way.
+    """
+    owners = []
+    for rid in region_ids:
+        mfg = by_poly.get(rid)
+        if mfg and mfg not in owners:
+            owners.append(mfg)
+    if len(owners) == 1:
+        return owners[0]
+    if not owners or _is_empty(geom):
+        return owners[0] if owners else ""
+    lengths = {}
+    for rid, rgeom in polys:
+        if rid not in region_ids:
+            continue
+        try:
+            inter = rgeom.Intersection(geom)
+        except Exception:
+            continue
+        if _is_empty(inter):
+            continue
+        measure = inter.GetArea() if geom.GetGeometryType() in _POLYGON_GEOM_TYPES else inter.Length()
+        lengths[rid] = lengths.get(rid, 0.0) + measure
+    if not lengths:
+        return owners[0]
+    dominant = max(sorted(lengths), key=lambda rid: lengths[rid])
+    return by_poly.get(dominant) or owners[0]
+
+
+def _mfg_from_nearest_trench(segments, grid, geom):
+    """MFG of the first trench this line's ends sit on.
+
+    The ends, not every vertex: a span built on a trench touches it where it
+    starts and finishes, and walking every vertex of a long polyline against
+    the grid costs far more for no more evidence. A row this does not reach
+    falls through to the region overlap.
+    """
+    for xy in _line_parts(geom):
+        for x, y in (xy[0], xy[-1]) if len(xy) > 1 else ():
+            mfg = _nearest_segment_mfg(segments, grid, x, y, _MFG_TRENCH_SNAP_M)
+            if mfg:
+                return mfg
+    return ""
+
+
+def _mfg_from_geometry(geom, kind, by_poly, polys):
+    """The MFG of the region this geometry sits in or runs through the most."""
+    if _is_empty(geom) or not polys:
+        return ""
+    if kind == "point":
+        pg = _point_geom(geom.GetX(), geom.GetY())
+        best, best_d = "", None
+        for rid, rgeom in polys:
+            if rgeom.Contains(pg):
+                return by_poly.get(rid, "")
+            d = rgeom.Distance(pg)
+            if d <= _REGION_POINT_TOL_M and (best_d is None or d < best_d):
+                best, best_d = rid, d
+        return by_poly.get(best, "")
+    # Area for an area, length for a line: a polygon's OGR length is its own
+    # perimeter, and ranking by that would prefer a small region over the one
+    # the feature actually occupies.
+    polygonal = geom.GetGeometryType() in _POLYGON_GEOM_TYPES
+    floor = _REGION_MIN_OVERLAP_M ** 2 if polygonal else _REGION_MIN_OVERLAP_M
+    overlaps = []
+    for rid, rgeom in polys:
+        try:
+            inter = rgeom.Intersection(geom)
+        except Exception:
+            continue
+        if _is_empty(inter):
+            continue
+        measure = inter.GetArea() if polygonal else inter.Length()
+        if measure >= floor:
+            overlaps.append((measure, rid))
+    if not overlaps:
+        return ""
+    overlaps.sort(reverse=True)
+    return by_poly.get(overlaps[0][1], "")
+
+
+def stamp_mfg_identity(out_dir, feedback=None):
+    """Put the owning MFG on every published component.
+
+    The partition sizes each MFG service area and the network stage records it
+    on the PDPs, but a component's own attribute table is where the question is
+    actually asked — *which MFG does this chamber / duct / span belong to* — and
+    on the North Edgbaston run 4,076 of the 10,917 distribution duct rows and
+    every chamber, pole, aerial span and tangent crossing answered nothing.
+    ``Polygons.gpkg`` was worse: it is the region layer the whole allocation is
+    built from, and its legacy ``MFG`` column was blank on all 45 rows.
+
+    Attribution is by evidence, never by guess, in this order: the region(s) the
+    row names, the PDP it hangs off, the address it serves, the trench it is
+    built on, and only then the region its geometry falls in. A row already
+    carrying a tag is never overwritten — the producer of that layer knows its
+    own component better than a post-pass — and a row that no evidence reaches
+    is left blank and counted, so the log states coverage instead of implying
+    it. Returns the number of values written.
+    """
+    if not out_dir or not os.path.isdir(out_dir) or not _HAS_OGR:
+        return 0
+    by_poly, by_pdp, by_addr = _mfg_lookup(out_dir)
+    if not by_poly and not by_pdp:
+        if feedback:
+            feedback.pushInfo(
+                "  [mfg] No PDP allocation found — MFG identity cannot be "
+                "stamped (PDPs.gpkg carries the partition).")
+        return 0
+    polys = _polygon_index(out_dir)
+    mfg_ids = set(by_poly.values()) | set(by_pdp.values())
+    segments = _trench_mfg_segments(out_dir)
+    grid = _segment_grid(segments)
+
+    written = 0
+    report = []
+    for fname, kind in _MFG_IDENTITY_LAYERS:
+        path = os.path.join(out_dir, fname)
+        if not os.path.isfile(path):
+            continue
+        ds, lyr = _open_lyr(path)
+        if lyr is None:
+            continue
+        _create_fields(lyr, [("MFG_ID", ogr.OFTString, 24)])
+        defn = lyr.GetLayerDefn()
+        i_out = _field_index(defn, ("MFG_ID",))
+        # The polygon stage's legacy short column is a duplicate of the same
+        # fact and was blank on every row; fill it too where it exists.
+        i_legacy = (_field_index(defn, ("MFG",))
+                    if fname == "Polygons.gpkg" else -1)
+        i_region = [_field_index(defn, (name,)) for name in _MFG_REGION_FIELDS]
+        i_pdp = [_field_index(defn, (name,)) for name in _MFG_PDP_FIELDS]
+        i_addr = [_field_index(defn, (name,)) for name in _MFG_ADDR_FIELDS]
+        filled = blank = 0
+        # Every write is one UPDATE, and a layer that has never carried the tag
+        # (the 7,938 distribution ducts) is therefore thousands of them —
+        # 200 s of individual commits against a few seconds inside one. The
+        # transaction is best-effort: a driver that refuses it still writes,
+        # just one row at a time.
+        in_tx = False
+        try:
+            # Success is OGRERR_NONE, which is 0 — testing the truth of the
+            # return value leaves the transaction open and the whole layer's
+            # writes uncommitted when the dataset closes.
+            in_tx = ds.StartTransaction() == ogr.OGRERR_NONE
+        except Exception:
+            in_tx = False
+        try:
+            for ft in lyr:
+                if i_out >= 0 and str(ft.GetField(i_out) or "").strip():
+                    continue                   # never overwrite what is known
+                geom = ft.GetGeometryRef()
+                value = ""
+                for i_f in i_region:
+                    if i_f < 0:
+                        continue
+                    ids = _split_ids(ft.GetField(i_f))
+                    if ids:
+                        value = _mfg_from_regions(geom, ids, by_poly, polys)
+                        if value:
+                            break
+                if not value:
+                    for i_f in i_pdp:
+                        if i_f < 0:
+                            continue
+                        for token in _split_ids(ft.GetField(i_f)):
+                            # SOURCE_NODE is documented as "MFG id / PDP id" and
+                            # EQUIPMENT as a PDP id, so accept either shape.
+                            if token in mfg_ids or token in by_pdp:
+                                value = token if token in mfg_ids else by_pdp[token]
+                                break
+                        if value:
+                            break
+                if not value:
+                    for i_f in i_addr:
+                        if i_f < 0:
+                            continue
+                        for token in _split_ids(ft.GetField(i_f)):
+                            if token in by_addr:
+                                value = by_addr[token]
+                                break
+                        if value:
+                            break
+                if not value and not _is_empty(geom):
+                    # The civil structures that name no region and no address (a
+                    # pole, a tangent crossing, an aerial span) are still built
+                    # on something: whatever they sit on decides whose MFG they
+                    # are.
+                    if kind == "point":
+                        value = _nearest_segment_mfg(segments, grid, geom.GetX(),
+                                                     geom.GetY(), _MFG_TRENCH_SNAP_M)
+                    elif kind == "line":
+                        value = _mfg_from_nearest_trench(segments, grid, geom)
+                if not value:
+                    value = _mfg_from_geometry(geom, kind, by_poly, polys)
+                if value:
+                    if i_out >= 0:
+                        ft.SetField(i_out, value)
+                    if i_legacy >= 0 and not str(ft.GetField(i_legacy) or "").strip():
+                        ft.SetField(i_legacy, value)
+                    lyr.SetFeature(ft)
+                    filled += 1
+                else:
+                    blank += 1
+        finally:
+            if in_tx:
+                try:
+                    ds.CommitTransaction()
+                except Exception:
+                    pass
+        written += filled
+        report.append((fname, filled, blank))
+        ds = None
+
+    if feedback:
+        parts = ["%s %d/%d" % (name[:-5], ok, ok + miss)
+                 for name, ok, miss in report if ok or miss]
+        feedback.pushInfo("  [mfg] MFG_ID on: " + (",".join(parts) or "-"))
+        missing = [name[:-5] for name, _ok, miss in report if miss]
+        if missing:
+            feedback.pushInfo(
+                "  [mfg] left blank (no region, PDP, address or trench reaches "
+                "them): " + ", ".join(missing))
+    return written
+
+
+def _previous_surface_review(path):
+    """Load a prior surface AI review artifact, or None when there is none.
+
+    Feeding the previous artifact back into the review lets a rerun resume the
+    spans a rate-limited batch left unanswered instead of paying for the whole
+    list again. An unreadable or malformed file just means "start fresh".
+    """
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as stream:
+            data = json.load(stream)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def verify_surface_geometry(out_dir, feedback=None, roads_source=None):
     """Flag trenches whose drawn position contradicts the SURFACE they claim.
 
@@ -3460,13 +4144,14 @@ def verify_surface_geometry(out_dir, feedback=None, roads_source=None):
     run, next to ``verify_duct_continuity``.
 
     Returns the report dict (also useful to tests): ``checked``, ``agreed``,
-    ``uncertain``, ``no_road``, ``no_claim``, ``flags``.
+    ``uncertain``, ``no_road``, ``no_claim``, ``flags``, and uncertain-span
+    inputs for the opt-in, separate imagery-review artifact.
     """
     from ..design import surface_geometry_check as sgc
     from ..design.surface_cross_section import RoadTags
 
     report = {"checked": 0, "agreed": 0, "uncertain": 0, "no_road": 0,
-              "no_claim": 0, "flags": []}
+              "no_claim": 0, "flags": [], "uncertain_spans": []}
     trench_path = os.path.join(out_dir, "Final_Trenches.gpkg")
     if not os.path.isfile(trench_path):
         return report
@@ -3552,7 +4237,56 @@ def verify_surface_geometry(out_dir, feedback=None, roads_source=None):
             feedback.pushInfo("  [verify] Surfaces: no trench spans — skipped.")
         return report
 
-    report = sgc.check_spans(spans, roads, coordinates_are_projected=True)
+    trench_crs_name = None
+    try:
+        authority, code = trench_srs.GetAuthorityName(None), trench_srs.GetAuthorityCode(None)
+        if authority and code:
+            trench_crs_name = "%s:%s" % (authority, code)
+        elif trench_srs.GetUserInput():
+            trench_crs_name = trench_srs.GetUserInput()
+    except Exception:
+        pass
+    report = sgc.check_spans(
+        spans, roads, coordinates_are_projected=True,
+        coordinates_crs=trench_crs_name)
+
+    # The optional imagery pass is a separate review artifact. Until an imagery
+    # source is configured it records eligible geometry-uncertain spans as
+    # awaiting imagery; it never writes to or changes Final_Trenches.gpkg.
+    ai_enabled = os.environ.get("SURFACE_AI_REVIEW", "").strip().lower() in ("1", "true", "yes", "on")
+    review_path = os.path.join(out_dir, "surface_ai_review.json")
+    if not ai_enabled:
+        # A reused output directory must not expose a previous run's review as
+        # evidence for this run. Delete only our own sidecar, best-effort.
+        try:
+            if os.path.isfile(review_path):
+                os.remove(review_path)
+        except OSError:
+            pass
+    if ai_enabled:
+        try:
+            from ..design import surface_ai_review as ai_review
+            review = ai_review.review_uncertain_spans(
+                report.get("uncertain_spans", []),
+                image_provider=ai_review.configured_image_provider(),
+                enabled=True,
+                previous=_previous_surface_review(review_path))
+            ai_review.write_review_report(out_dir, review)
+            report["ai_review"] = {
+                "status": review.get("status"),
+                "candidate_count": review.get("candidate_count", 0),
+                "resumed_count": review.get("resumed_count", 0),
+                "artifact": "surface_ai_review.json",
+            }
+            if feedback:
+                feedback.pushInfo(
+                    "  [verify] Surface AI review: %d uncertain span(s), status %s."
+                    % (review.get("candidate_count", 0), review.get("status")))
+        except Exception as exc:
+            # Optional review must never fail or modify the design run.
+            if feedback:
+                feedback.pushWarning(
+                    "  [verify] Surface AI review skipped: %s" % type(exc).__name__)
     if feedback:
         feedback.pushInfo(
             "  [verify] Surfaces: %d span(s) checked — %d agree, %d "
@@ -3707,6 +4441,16 @@ def enrich_all(out_dir, feedback=None, roads_lyr=None):
     # after all geometry/duct/coupler edits so the final attributes describe
     # the final published spans rather than an earlier pre-segmentation layer.
     n += stamp_region_identity(out_dir, feedback)
+    # The region each row belongs to is known everywhere now, so the MFG that
+    # owns that region can travel with it: every component ships the service
+    # area it is built for, and the BOM / permit pack can group by it without
+    # re-deriving the partition. Runs last on purpose — it is additive and must
+    # describe the final published rows.
+    try:
+        n += stamp_mfg_identity(out_dir, feedback)
+    except Exception as exc:
+        if feedback:
+            feedback.pushInfo(f"  [mfg] MFG identity stamp skipped: {exc}")
     if feedback:
         feedback.pushInfo(
             "  [enrich] Final NetworkManager identity propagation complete."

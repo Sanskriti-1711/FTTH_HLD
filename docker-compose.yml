@@ -25,6 +25,14 @@ services:
       QGIS_PLUGINPATH: /app
       QT_QPA_PLATFORM: offscreen
       QGIS_EXECUTABLE: /usr/bin/qgis_process
+      # Optional, review-only surface AI. Enable SURFACE_AI_REVIEW=1 explicitly;
+      # the run is limited to fifty candidates by default. The Gemini key is
+      # passed through from the host environment rather than committed here.
+      SURFACE_AI_REVIEW: 1
+      SURFACE_AI_PROVIDER: gemini
+      SURFACE_AI_IMAGE_PROVIDER: HLDPlanning.design.surface_ai_review:ign_bd_ortho_image
+      SURFACE_AI_MAX_SPANS: 50
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
     depends_on:
       postgis:
         condition: service_healthy

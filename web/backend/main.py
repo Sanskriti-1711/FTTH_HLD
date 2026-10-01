@@ -61,6 +61,7 @@ ONECLICK_OUTPUTS: List[Tuple[str, str, str]] = [
     ("polygons", "Polygons.gpkg", "Polygons.geojson"),
     ("pdps", "PDPs.gpkg", "PDPs.geojson"),
     ("mfg", "MFG.gpkg", "MFG.geojson"),
+    ("mfg_service_areas", "MFG_Service_Areas.gpkg", "MFG_Service_Areas.geojson"),
     # ONE trench layer (user spec): the published trench network is a single
     # Final_Trenches layer whose features carry the construction sub-category
     # (Open Cut / HDD / Garden). The old per-tier Feeder/Distribution/Garden
@@ -84,8 +85,14 @@ ONECLICK_OUTPUTS: List[Tuple[str, str, str]] = [
     # Aerial_Drops (the designer's decision not to dig), so they publish
     # separately — before this the aerial chain ran and its output was
     # invisible on the platform because nothing served those two layers.
-    ("aerial_drop_trenches", "Aerial_Drop_Trenches.gpkg",
-     "Aerial_Drop_Trenches.geojson"),
+    # Overhead spans the pole + aerial stage BUILDS for the aerial legs the
+    # trench stage classified. Renamed from `aerial_drop_trenches` /
+    # `Aerial_Drop_Trenches.gpkg`: a trench is an excavation and these are not
+    # (EXCAVATION=0, CONSTRUCTION_METHOD=Overhead), so the old name invited
+    # reading them as civil trench. The old public name is still accepted as an
+    # alias in postgis.LAYER_TABLES so a stored project keeps resolving.
+    ("aerial_spans", "Aerial_Spans.gpkg",
+     "Aerial_Spans.geojson"),
     ("aerial_cable", "Aerial_Cable.gpkg", "Aerial_Cable.geojson"),
     # NOTE: Trench_Nodes (the trench designer's STRUCTURAL NODES — the HDD
     # drill openings, junctions, splitter positions, bends and pull points) is
@@ -1925,6 +1932,71 @@ def get_trench_design(project_id: str, layers: bool = True) -> Dict[str, Any]:
     return design.payload(project_id, include_layers=layers)
 
 
+def _project_output_dir(project_id: str) -> Path:
+    """Resolve one project's output directory, rejecting traversal attempts."""
+    if not project_id or project_id in (".", "..") or "/" in project_id or "\\" in project_id:
+        raise HTTPException(status_code=404, detail="Project not found")
+    output_dir = (OUTPUT_DIR / project_id).resolve()
+    if OUTPUT_DIR.resolve() not in output_dir.parents:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return output_dir
+
+
+@app.get("/ftth/hld/results/{project_id}/surface-ai-review")
+def get_surface_ai_review(project_id: str) -> Dict[str, Any]:
+    """Read the optional surface AI review artifact without changing the design."""
+    output_dir = _project_output_dir(project_id)
+    review_path = output_dir / "surface_ai_review.json"
+    if not review_path.is_file():
+        raise HTTPException(status_code=404, detail="Surface AI review is not available")
+    try:
+        with review_path.open("r", encoding="utf-8") as stream:
+            return json.load(stream)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=500, detail="Surface AI review is unreadable") from exc
+
+
+@app.post("/ftth/hld/results/{project_id}/surface-ai-review/classify")
+def classify_surface_at_point(project_id: str,
+                              payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    """Suggest the surface at one clicked map coordinate (advisory only).
+
+    Suggestion-only, exactly like the batch review artifact: it fetches fresh
+    imagery for the clicked point and asks the configured vision model. It
+    never edits ``Final_Trenches.gpkg`` or any other design output. The call is
+    synchronous, so a slow local model is bounded by SURFACE_AI_OLLAMA_TIMEOUT
+    rather than by the HTTP layer.
+    """
+    output_dir = _project_output_dir(project_id)
+    if not output_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Unknown project")
+    try:
+        from HLDPlanning.design import surface_ai_review as surface_review
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=503, detail="Surface review module is unavailable"
+        ) from exc
+
+    coordinates = payload.get("coordinates")
+    try:
+        coordinates = [float(coordinates[0]), float(coordinates[1])]
+    except (TypeError, ValueError, IndexError):
+        raise HTTPException(status_code=400, detail="coordinates must be [x, y]") from None
+    options: Dict[str, Any] = {}
+    if payload.get("length_m") is not None:
+        options["length_m"] = payload["length_m"]
+    if payload.get("bearing") is not None:
+        options["bearing"] = payload["bearing"]
+
+    try:
+        return surface_review.classify_point(
+            coordinates, payload.get("crs") or "EPSG:4326", **options)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
 @app.get("/ftth/hld/download/{project_id}/{file_path:path}")
 def download(project_id: str, file_path: str) -> FileResponse:
     task = tasks.get(project_id)
@@ -2051,7 +2123,7 @@ LLD_LAYER_ORDER = [
     "feeder_ducts", "distribution_ducts", "drop_ducts",
     "coupleurs",
     "chambers", "poles", "trench_nodes",
-    "aerial_drop_trenches", "aerial_drops",
+    "aerial_spans", "aerial_drops",
     "existing_infrastructure", "existing_infrastructure_points",
     "brownfield",
 ]
@@ -2907,7 +2979,7 @@ def _normalize_trench_construction_class(
     tier used for reroute propagation is read earlier in the pipeline — this is
     a publication-time normalisation, not a routing input.
 
-    ``aerial_drop_trenches`` is deliberately excluded: it keeps its own
+    ``aerial_spans`` is deliberately excluded: it keeps its own
     ``Aerial_Drop`` class. Returns the number of normalised features.
     """
     names = ["final_trenches"] + sorted(TRENCH_SUB_LAYERS)
@@ -3120,12 +3192,14 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
         "drop_ducts": 0,
         "distribution_cable": 0,
         "final_trenches": 0,
-        "aerial_drop_trenches": 0,
+        "aerial_spans": 0,
         "aerial_cable": 0,
     }
     objects = by_layer.get("objects") or []
     if not objects:
         return created
+
+    from lld_cable_geometry import drop_capacity_warning, drop_fiber_capacity
 
     # Existing drop-duct endpoints — a drop duct ends AT its premise.
     drop_ends: List[Any] = []
@@ -3327,7 +3401,8 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
         except (TypeError, ValueError):
             hh_count = 1
         hh = str(hh_count)
-        drop_fibers = max(12, hh_count + LLD_RESERVED_SPARE_FIBERS)
+        capacity_warning = drop_capacity_warning(hh_count)
+        drop_fibers = drop_fiber_capacity(hh_count) or 288
         addr = str(props.get("ADDR_ID") or props.get("addr_id") or props.get("SRC_ID") or "")
 
         # ── Aerial drop: engineer explicitly flagged aerial_required ──────────
@@ -3343,7 +3418,7 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
                     if aerial_path and len(aerial_path) >= 2:
                         length_m = _approx_meters(aerial_path)
                         make_feature(
-                            "aerial_drop_trenches",
+                            "aerial_spans",
                             {"type": "LineString", "coordinates": aerial_path},
                             {
                                 **common,
@@ -3351,7 +3426,14 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
                                 "CONSTRUCTION_METHOD": "Overhead",
                                 "CABLE_TYPE": "Aerial",
                                 "FIBRE_COUNT": drop_fibers,
+                                "FIBER_COUNT": drop_fibers,
                                 "HH_COUNT": hh_count,
+                                "RESERVED_SPARE_FIBERS": LLD_RESERVED_SPARE_FIBERS,
+                                "AVAILABLE_FIBERS": max(0, drop_fibers - hh_count - LLD_RESERVED_SPARE_FIBERS),
+                                "UTIL_PCT": min(100.0, round(((hh_count + LLD_RESERVED_SPARE_FIBERS) / float(drop_fibers)) * 100.0, 1)),
+                                "CAPACITY_STATUS": "OVER_CAPACITY" if capacity_warning else "OK",
+                                "CAPACITY_WARNING": capacity_warning or "",
+                                "REVIEW": 1 if capacity_warning else 0,
                                 "FROM_POLE": pole_id,
                                 "TO_PREMISE": addr,
                                 "POLE_SPACING_M": 50.0,
@@ -3371,7 +3453,10 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
                                 "RESERVED_SPARE_FIBERS": LLD_RESERVED_SPARE_FIBERS,
                                 "ACTIVE_FIBERS": hh_count,
                                 "AVAILABLE_FIBERS": max(0, drop_fibers - hh_count - LLD_RESERVED_SPARE_FIBERS),
-                                "UTIL_PCT": round((hh_count / float(drop_fibers)) * 100.0, 1),
+                                "CAPACITY_STATUS": "OVER_CAPACITY" if capacity_warning else "OK",
+                                "CAPACITY_WARNING": capacity_warning or "",
+                                "REVIEW": 1 if capacity_warning else 0,
+                                "UTIL_PCT": min(100.0, round(((hh_count + LLD_RESERVED_SPARE_FIBERS) / float(drop_fibers)) * 100.0, 1)),
                                 "SOURCE_NODE": pole_id,
                                 "hhs": hh,
                                 "length_m": length_m,
@@ -3447,7 +3532,11 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
                     "RESERVED_SPARE_FIBERS": LLD_RESERVED_SPARE_FIBERS,
                     "ACTIVE_FIBERS": hh_count,
                     "AVAILABLE_FIBERS": max(0, drop_fibers - hh_count - LLD_RESERVED_SPARE_FIBERS),
-                    "UTIL_PCT": round((hh_count / float(drop_fibers)) * 100.0, 1),
+                    "UTIL_PCT": min(100.0, round(((hh_count + LLD_RESERVED_SPARE_FIBERS) / float(drop_fibers)) * 100.0, 1)),
+                    "CAPACITY_STATUS": "OVER_CAPACITY" if capacity_warning else "OK",
+                    "CAPACITY_WARNING": capacity_warning or "",
+                    "REVIEW": 1 if capacity_warning else 0,
+                    "UTIL_PCT": min(100.0, round(((hh_count + LLD_RESERVED_SPARE_FIBERS) / float(drop_fibers)) * 100.0, 1)),
                     "SOURCE_NODE": str(pdp_id or ""),
                     "hhs": hh,
                     "length_m": length_m,
@@ -3472,7 +3561,9 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
 def _enrich_lld_distribution_cables(by_layer: Dict[str, List[Dict[str, Any]]]) -> int:
     """Rebuild grouped cable geometry and apply HH-based trunk/drop capacity."""
     from lld_cable_geometry import (
-        cable_fiber_capacity,
+        distribution_fiber_capacity,
+        drop_capacity_warning,
+        drop_fiber_capacity,
         regroup_distribution_cables,
     )
 
@@ -3491,19 +3582,29 @@ def _enrich_lld_distribution_cables(by_layer: Dict[str, List[Dict[str, Any]]]) -
             or str(props.get("CONNECTION_TYPE") or "").strip().lower().startswith("drop")
             or str(props.get("CONNECTION_TYPE") or "").strip().lower() == "dedicated drop"
         )
-        minimum = 12 if is_drop else LLD_DISTRIBUTION_FIBERS
-        fiber_count = cable_fiber_capacity(hh_count, minimum)
+        capacity_warning = drop_capacity_warning(hh_count) if is_drop else None
+        fiber_count = (
+            drop_fiber_capacity(hh_count) if is_drop
+            else distribution_fiber_capacity(hh_count)
+        )
+        if fiber_count is None:
+            fiber_count = 288
         props["ADDR_IDS"] = ",".join(members)
         props["HH_COUNT"] = hh_count
         if is_drop or str(props.get("CABLE_TYPE") or "").strip().lower() in ("", "distribution"):
             props["CABLE_TYPE"] = "Drop" if is_drop else "Distribution"
         props["FIBER_COUNT"] = fiber_count
+        props["CAPACITY_STATUS"] = "OVER_CAPACITY" if capacity_warning else "OK"
+        props["CAPACITY_WARNING"] = capacity_warning or ""
+        props["REVIEW"] = 1 if capacity_warning else 0
         props["RESERVED_SPARE_FIBERS"] = LLD_RESERVED_SPARE_FIBERS
         props["ACTIVE_FIBERS"] = hh_count
         props["AVAILABLE_FIBERS"] = max(
             0, fiber_count - LLD_RESERVED_SPARE_FIBERS - hh_count
         )
-        props["UTIL_PCT"] = round((hh_count / float(fiber_count)) * 100.0, 1)
+        props["UTIL_PCT"] = round(
+            min(100.0, (hh_count / float(fiber_count)) * 100.0), 1
+        )
         if is_drop:
             props["CONNECTION_TYPE"] = "Drop (garden leg)"
         elif not str(props.get("CONNECTION_TYPE") or "").strip() or \
@@ -3841,7 +3942,7 @@ _REPLAN_OUTPUT_MAP = [
     ("Final_Trenches", "final_trenches"),
     ("Feeder_Cable", "feeder_cable"),
     ("Distribution_Cable", "distribution_cable"),
-    ("Aerial_Drop_Trenches", "aerial_drop_trenches"),
+    ("Aerial_Spans", "aerial_spans"),
     ("Aerial_Drops", "aerial_drops"),
     ("Aerial_Cable", "aerial_cable"),
     ("Feeder_Ducts", "feeder_ducts"),

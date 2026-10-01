@@ -182,3 +182,20 @@ def _line_pts(a, b):
     ml = ogr.Geometry(ogr.wkbMultiLineString)
     ml.AddGeometry(ls)
     return ml
+
+
+def test_previous_surface_review_loads_a_valid_artifact(tmp_path):
+    path = tmp_path / "surface_ai_review.json"
+    path.write_text('{"suggestions": [{"span_id": "T-1"}]}', encoding="utf-8")
+    loaded = attr_enrich._previous_surface_review(str(path))
+    assert loaded == {"suggestions": [{"span_id": "T-1"}]}
+
+
+def test_previous_surface_review_starts_fresh_when_unusable(tmp_path):
+    assert attr_enrich._previous_surface_review(str(tmp_path / "absent.json")) is None
+    broken = tmp_path / "broken.json"
+    broken.write_text("{not json", encoding="utf-8")
+    assert attr_enrich._previous_surface_review(str(broken)) is None
+    wrong_shape = tmp_path / "list.json"
+    wrong_shape.write_text("[1, 2]", encoding="utf-8")
+    assert attr_enrich._previous_surface_review(str(wrong_shape)) is None
