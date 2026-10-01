@@ -152,6 +152,25 @@ class SurfaceAIQuotaExceeded(RuntimeError):
     """
 
 
+class SurfaceAIReplyError(ValueError):
+    """A model's reply could not be read as a surface classification.
+
+    Carries the model's own ``raw_reply`` so a rejected span can be diagnosed
+    from the artifact — "a ValueError happened" says nothing about whether the
+    model answered off-vocabulary, wrapped its answer, or refused the image.
+    """
+
+    def __init__(self, message: str, raw_reply: str = ""):
+        super().__init__(message)
+        self.raw_reply = str(raw_reply or "")
+
+
+# How much of a rejected reply to carry into the artifact. Enough to see the
+# family/confidence a model returned, without bloating the review for every
+# failed span.
+MAX_ERROR_DETAIL = 500
+
+
 def configure_image_provider(provider: Optional[Callable[[dict], Optional[dict]]]) -> None:
     """Register the deployment's approved imagery source for run-time reviews."""
     if provider is not None and not callable(provider):
@@ -260,6 +279,7 @@ def _queued_item(candidate: dict, status: str, reason: str) -> dict:
         "review_status": status,
         "review_required": True,
         "reason": reason,
+        "error_detail": None,
     }
 
 
@@ -317,28 +337,49 @@ def _classification_prompt() -> str:
     )
 
 
+def _reply_error(message: str, raw_reply) -> SurfaceAIReplyError:
+    """Build the rejection error, carrying the model's own reply for diagnosis."""
+    if not isinstance(raw_reply, str):
+        try:
+            raw_reply = json.dumps(raw_reply, ensure_ascii=False)
+        except (TypeError, ValueError):
+            raw_reply = str(raw_reply)
+    return SurfaceAIReplyError(message, str(raw_reply or "")[:MAX_ERROR_DETAIL])
+
+
 def _parse_classification_json(text: str) -> dict:
     try:
         result = json.loads(text)
     except (TypeError, json.JSONDecodeError) as exc:
-        raise ValueError("Vision model returned invalid JSON") from exc
+        raise _reply_error("Vision model returned invalid JSON", text) from exc
     # Constrained JSON output may still arrive wrapped in a one-item list, so
     # unwrap it rather than failing the span on a valid answer.
     if isinstance(result, list):
         if len(result) != 1:
-            raise ValueError("Vision model returned an unsupported response shape")
+            raise _reply_error(
+                "Vision model returned an unsupported response shape", text)
         result = result[0]
     if not isinstance(result, dict):
-        raise ValueError("Vision model returned an unsupported response shape")
+        raise _reply_error(
+            "Vision model returned an unsupported response shape", text)
     family = result.get("ai_surface")
+    # Models spell the "cannot determine" answer as a string far more often than
+    # as real JSON null — Gemini answered `"ai_surface": "null"` on a roof,
+    # which is a legitimate abstention, not an invalid family. Read it as one.
+    if isinstance(family, str):
+        family = family.strip()
+        if family.lower() in ("", "null", "none", "n/a", "na", "unknown"):
+            family = None
     if family not in FAMILIES and family is not None:
-        raise ValueError("Vision model returned an unsupported surface family")
+        raise _reply_error(
+            "Vision model returned an unsupported surface family", text)
     try:
         confidence = float(result.get("confidence", 0.0))
     except (TypeError, ValueError) as exc:
-        raise ValueError("Vision model returned invalid confidence") from exc
+        raise _reply_error("Vision model returned invalid confidence", text) from exc
     if not 0.0 <= confidence <= 1.0:
-        raise ValueError("Vision model confidence must be between 0 and 1")
+        raise _reply_error(
+            "Vision model confidence must be between 0 and 1", text)
     return {
         "ai_surface": family,
         "confidence": round(confidence, 3),
@@ -351,7 +392,7 @@ def _parse_model_response(payload: dict) -> dict:
     try:
         text = payload["candidates"][0]["content"]["parts"][0]["text"]
     except (KeyError, IndexError, TypeError) as exc:
-        raise ValueError("Gemini returned an invalid structured response") from exc
+        raise _reply_error("Gemini returned an invalid structured response", payload) from exc
     return _parse_classification_json(text)
 
 
@@ -887,6 +928,7 @@ def review_uncertain_spans(
             "imagery_date": None,
             "imagery_route_overlaid": None,
             "reason": None,
+            "error_detail": None,
         }
         try:
             if throttle > 0:
@@ -938,7 +980,8 @@ def review_uncertain_spans(
             break
         except Exception as exc:
             item.update(review_status="error", review_required=True,
-                        reason=type(exc).__name__)
+                        reason=type(exc).__name__,
+                        error_detail=getattr(exc, "raw_reply", None))
         else:
             last_call = time.monotonic()
         processed[id(candidate)] = item
@@ -1004,6 +1047,7 @@ def classify_point(coordinates, crs: str = "EPSG:4326", *,
         "provider": _report_provider(),
         "model": _model_name(),
         "reason": None,
+        "error_detail": None,
     }
 
     enabled = (os.environ.get("SURFACE_AI_REVIEW", "").strip().lower()
@@ -1072,7 +1116,8 @@ def classify_point(coordinates, crs: str = "EPSG:4326", *,
         item["review_required"] = True
     except Exception as exc:
         item.update(review_status="error", review_required=True,
-                    reason=type(exc).__name__)
+                    reason=type(exc).__name__,
+                    error_detail=getattr(exc, "raw_reply", None))
     return item
 
 

@@ -809,3 +809,110 @@ def test_review_ignores_a_previous_item_without_a_span_id(monkeypatch):
     previous = {"suggestions": ["not-a-dict", {"review_status": "pending"}]}
     assert review._processed_items(previous) == {}
     assert review._processed_items(None) == {}
+
+
+def test_rejected_reply_carries_the_models_own_text():
+    payload = json.dumps({"ai_surface": "roof", "confidence": 0.9,
+                          "reason": "the clicked point is on a roof"})
+    try:
+        review._parse_classification_json(payload)
+    except review.SurfaceAIReplyError as exc:
+        assert isinstance(exc, ValueError)
+        assert '"roof"' in exc.raw_reply
+    else:
+        raise AssertionError("an off-vocabulary family must be rejected")
+    # The raw reply is bounded so one bad answer cannot bloat the artifact.
+    huge = "x" * (review.MAX_ERROR_DETAIL * 3)
+    try:
+        review._parse_classification_json(huge)
+    except review.SurfaceAIReplyError as exc:
+        assert len(exc.raw_reply) == review.MAX_ERROR_DETAIL
+    else:
+        raise AssertionError("invalid JSON must be rejected")
+
+
+def test_a_string_null_reply_is_read_as_an_abstention():
+    # Gemini answered `"ai_surface": "null"` on a span sitting over a roof:
+    # "cannot determine" is a legitimate answer, not an invalid family.
+    payload = json.dumps({"ai_surface": "null", "confidence": 0.9,
+                          "reason": "The centre sits on a building roof."})
+    result = review._parse_classification_json(payload)
+    assert result["ai_surface"] is None
+    assert result["confidence"] == 0.9
+    assert review._parse_classification_json(
+        json.dumps({"ai_surface": " none ", "confidence": 0.4}))["ai_surface"] is None
+    # A real family is still honoured, and a wrong one is still rejected.
+    assert review._parse_classification_json(
+        json.dumps({"ai_surface": "garden", "confidence": 0.7}))["ai_surface"] == "garden"
+    try:
+        review._parse_classification_json(
+            json.dumps({"ai_surface": "roof", "confidence": 0.7}))
+    except review.SurfaceAIReplyError:
+        pass
+    else:
+        raise AssertionError("an off-vocabulary family must still be rejected")
+
+
+def test_gemini_reply_with_no_candidate_text_is_recorded():
+    try:
+        review._parse_model_response({"candidates": []})
+    except review.SurfaceAIReplyError as exc:
+        assert "candidates" in exc.raw_reply
+    else:
+        raise AssertionError("an empty Gemini payload must be rejected")
+
+
+def test_review_error_item_keeps_the_rejected_reply(monkeypatch):
+    monkeypatch.setenv("SURFACE_AI_PROVIDER", "gemini")
+    monkeypatch.setenv("GEMINI_API_KEY", "key")
+
+    def classifier(*_args):
+        raise review._reply_error(
+            "Vision model returned an unsupported surface family",
+            '{"ai_surface": "roof", "confidence": 0.9}')
+
+    result = review.review_uncertain_spans(
+        [{"span_id": "TR-001033"}],
+        lambda _candidate: {"image_bytes": b"x", "source": "local", "date": None},
+        enabled=True, classifier=classifier)
+    item = result["suggestions"][0]
+    assert item["review_status"] == "error"
+    assert item["reason"] == "SurfaceAIReplyError"
+    assert '"roof"' in item["error_detail"]
+
+
+def test_a_failure_without_a_reply_reports_no_detail(monkeypatch):
+    monkeypatch.setenv("SURFACE_AI_PROVIDER", "gemini")
+    monkeypatch.setenv("GEMINI_API_KEY", "key")
+
+    def classifier(*_args):
+        raise RuntimeError("transport died")
+
+    result = review.review_uncertain_spans(
+        [{"span_id": "TR-1"}],
+        lambda _candidate: {"image_bytes": b"x", "source": "local", "date": None},
+        enabled=True, classifier=classifier)
+    item = result["suggestions"][0]
+    assert item["reason"] == "RuntimeError"
+    assert item["error_detail"] is None
+
+
+def test_point_classify_keeps_the_rejected_reply(monkeypatch):
+    monkeypatch.setenv("SURFACE_AI_REVIEW", "1")
+    monkeypatch.setenv("SURFACE_AI_PROVIDER", "ollama")
+
+    def classifier(*_args):
+        raise review._reply_error("invalid JSON", "not json at all")
+
+    item = review.classify_point(
+        [1.5249, 49.0762],
+        image_provider=lambda _c: {"image_bytes": b"patch", "mime_type": "image/jpeg",
+                                   "source": "IGN BD ORTHO", "date": None},
+        classifier=classifier)
+    assert item["review_status"] == "error"
+    assert item["reason"] == "SurfaceAIReplyError"
+    assert item["error_detail"] == "not json at all"
+
+
+def test_queued_items_carry_a_null_error_detail():
+    assert review._not_processed({"span_id": "T-1"})["error_detail"] is None
