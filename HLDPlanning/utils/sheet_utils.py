@@ -82,6 +82,82 @@ def ensure_households_column(df: pd.DataFrame, mapping: dict, out_name: str = "H
     elif out_name not in df.columns:
         df[out_name] = 0
 
+def household_method_label(values) -> str:
+    """One label for the estimating methods behind a building's total.
+
+    A building's premises can be counted by more than one method (one address
+    node with `addr:flats`, the rest `fallback_one`), and the label says so
+    rather than picking one: reporting `fallback_one` on a building whose total
+    is really a mix would present a measured number as a guess and a guess as
+    measured.  Mirrors `osm_source.household_method_label` so the pre-run review
+    layer and the served object layer word a mixed building the same way.
+    """
+    unique = sorted({str(v).strip() for v in values if str(v or "").strip()})
+    if not unique:
+        return ""
+    return unique[0] if len(unique) == 1 else "mixed(" + ",".join(unique) + ")"
+
+
+# The household aggregate columns the object layer carries on every row.  Named
+# lower-case so they read identically on the pre-run review layer and on the
+# served design output.
+HOUSEHOLD_AGGREGATE_COLUMNS = ("households", "premises", "household_method")
+
+
+def add_household_aggregates(
+    df: pd.DataFrame,
+    *,
+    building_col: str = "OSM_ID",
+    hh_col: str = "HH",
+    method_col: str = "HH_METHOD",
+) -> pd.DataFrame:
+    """Carry each building's household aggregate on its premises' rows.
+
+    The object layer writes ONE ROW PER PREMISE, which is the right granularity
+    for the design (every premise needs its own service entry) but the wrong one
+    for reading a household count off the layer: a block that became five
+    premises appears as five rows of one household, and a reader summing `HH` by
+    eye can read a five-home block as five one-home buildings.  So every row also
+    carries its building's aggregate:
+
+      households        sum of HH over the premises that share the building
+      premises          how many premises that building became
+      household_method  the single HH_METHOD, or ``mixed(a,b)`` when they differ
+
+    Building identity is ``building_col`` (OSM_ID -- the source building the
+    premise came from).  A row with no identity is its own object: pooling it
+    with unrelated rows would invent a household count for a building we cannot
+    name, so its own HH is the honest answer.  When the frame has no building
+    column at all, every row is treated that way and the schema still appears.
+    """
+    if df.empty:
+        for col in HOUSEHOLD_AGGREGATE_COLUMNS:
+            df[col] = pd.Series(pd.array([], dtype="int64" if col != "household_method" else "object"), index=df.index)
+        return df
+
+    hh = (
+        pd.to_numeric(df[hh_col], errors="coerce").fillna(0)
+        if hh_col in df.columns else pd.Series(0, index=df.index)
+    )
+    method = (
+        df[method_col].fillna("").astype(str)
+        if method_col in df.columns else pd.Series("", index=df.index)
+    )
+
+    own_row = pd.Series([f"__row_{i}" for i in df.index], index=df.index)
+    if building_col in df.columns:
+        key = df[building_col].astype("object")
+        blank = key.isna() | (key.astype(str).str.strip() == "")
+        key = key.where(~blank, own_row)
+    else:
+        key = own_row
+
+    df["households"] = hh.groupby(key).transform("sum").astype(int)
+    df["premises"] = hh.groupby(key).transform("size").astype(int)
+    df["household_method"] = method.groupby(key).transform(household_method_label)
+    return df
+
+
 def generate_addr_ids(df: pd.DataFrame, prefix: str):
     if "ADDR_ID" not in df.columns:
         df["ADDR_ID"] = ""

@@ -62,6 +62,7 @@ from ..utils.address_utils import build_structured_query, NominatimClient
 from ..utils.sheet_utils import (
     EXPECTED_MAP, fix_header_row, autodetect_mapping,
     ensure_households_column, generate_addr_ids,
+    add_household_aggregates, HOUSEHOLD_AGGREGATE_COLUMNS,
 )
 from ..utils.geo_utils import valid_xy as _valid_xy
 from ..utils.file_io import write_vector_geopandas
@@ -406,6 +407,13 @@ class BuildObjectLayer(QgsProcessingAlgorithm):
         else:
             df[COMMON_FIELDS.SRC_ID] = (df.index + 1).astype(str)
 
+        # The object layer writes one row per PREMISE, but a building can become
+        # several premises (address nodes, or a block with several doors). Each
+        # row also carries its building's household aggregate, so a planner can
+        # read the count the block really stands for instead of summing HH by
+        # eye -- the same fields the pre-run review layer shows.
+        add_household_aggregates(df)
+
         # --- Build GeoDataFrame + write
         if not _GEO_OK:
             raise QgsProcessingException(self.tr(
@@ -450,6 +458,7 @@ class BuildObjectLayer(QgsProcessingAlgorithm):
                 COMMON_FIELDS.SRC_ID,
                 COMMON_FIELDS.STAGE,
             ]
+            thin_keep += list(HOUSEHOLD_AGGREGATE_COLUMNS)
             thin_keep += [c for c in ("Address", "street", "city", "postcode", "house number") if c in gdf_ok.columns]
             thin_keep = [c for c in thin_keep if c in gdf_ok.columns]
             if thin_keep:
