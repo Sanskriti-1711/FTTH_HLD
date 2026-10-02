@@ -6,3 +6,13 @@ outputs/
 backend.log
 frontend.log
 .DS_Store
+
+# Run markers: the last project/pid the launcher touched, rewritten every
+# start. Runtime state, never source.
+.last_pid
+*.pid
+
+# OSM area-fetch progress mirror. Lives under outputs/ by default; named here
+# so an HLD_AREA_FETCH_STATE override cannot land it in the tree.
+area_fetch_state.json
+area_fetch_state.json.tmp
