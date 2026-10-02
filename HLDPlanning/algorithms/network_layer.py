@@ -1186,7 +1186,7 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
         # Carry the homes count and full splitter plan onto each PDP (one PDP per
         # polygon), so the splitter sizing is available directly on the network layer.
         _pdp_extra = [
-            ("HH", QMetaType.Type.Int), ("SPLIT_SIZE", QMetaType.Type.QString), ("SPLIT_CNT", QMetaType.Type.Int),
+            ("households", QMetaType.Type.Int), ("SPLIT_SIZE", QMetaType.Type.QString), ("SPLIT_CNT", QMetaType.Type.Int),
             ("SPLIT_UTIL", QMetaType.Type.Double), ("SPLIT_OK", QMetaType.Type.Int), ("SPL_PLAN", QMetaType.Type.QString),
             ("SPL_PORTS", QMetaType.Type.Int), ("SPL_4", QMetaType.Type.Int), ("SPL_8", QMetaType.Type.Int),
             ("SPL_16", QMetaType.Type.Int), ("SPL_32", QMetaType.Type.Int), ("SPL_64", QMetaType.Type.Int),
@@ -1203,7 +1203,7 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
         polygon_loads = {}
         polygon_geometries = {}
         hh_field = first_field_case_insensitive(
-            polys_valid, ["HH", "SUM_HOMES", "homes", "hh_count"]
+            polys_valid, ["households", "HH", "SUM_HOMES", "homes", "hh_count"]
         )
         polygon_id_field = first_field_case_insensitive(
             polys_valid, ["POLYGON_ID", "polygon_id"]
@@ -1580,7 +1580,7 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
                 # Splitter plan for this PDP, derived from the polygon's homes.
                 _hh = 0
                 _hh_field = first_field_case_insensitive(
-                    polys_valid, ["HH", "SUM_HOMES", "homes", "hh_count"]
+                    polys_valid, ["households", "HH", "SUM_HOMES", "homes", "hh_count"]
                 )
                 if _hh_field:
                     try:
@@ -1591,7 +1591,7 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
                 _plan = plan_splitters(_hh)
                 _c = _plan["counts"]
                 for _k, _v in [
-                    ("HH", _hh),
+                    ("households", _hh),
                     ("SPLIT_SIZE", f"1:{_plan['primary']}" if _plan["primary"] else "-"),
                     ("SPLIT_CNT", _plan["total"]),
                     ("SPLIT_UTIL", _plan["util"]),

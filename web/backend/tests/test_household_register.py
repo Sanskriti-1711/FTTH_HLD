@@ -253,16 +253,16 @@ def test_apportionment_gives_equal_weights_equal_shares():
 
 def _premises():
     return [
-        {"Postcode": "B11 3SA", "HH": 1, "HH_METHOD": "fallback_one"},
-        {"Postcode": "B11 3SA", "HH": 1, "HH_METHOD": "fallback_one"},
-        {"Postcode": "B11 3SA", "HH": 1, "HH_METHOD": "fallback_one"},
+        {"Postcode": "B11 3SA", "households": 1, "household_method": "fallback_one"},
+        {"Postcode": "B11 3SA", "households": 1, "household_method": "fallback_one"},
+        {"Postcode": "B11 3SA", "households": 1, "household_method": "fallback_one"},
     ]
 
 
 def test_a_register_count_replaces_the_heuristic_and_the_row_says_so():
     rows, stats = hr.apply_register(_premises(), {"B11 3SA": 30}, {})
-    assert sum(r["HH"] for r in rows) == 30
-    assert {r["HH_METHOD"] for r in rows} == {"register_postcode"}
+    assert sum(r["households"] for r in rows) == 30
+    assert {r["household_method"] for r in rows} == {"register_postcode"}
     assert stats["premises_registered"] == 3
     assert stats["register_households"] == 30
 
@@ -277,8 +277,8 @@ def test_the_heuristic_count_is_reported_before_and_after():
 
 def test_a_postcode_the_register_does_not_cover_keeps_the_heuristic():
     rows, _ = hr.apply_register(_premises(), {"SW1A 1AA": 30}, {})
-    assert all(r["HH_METHOD"] == "fallback_one" for r in rows)
-    assert sum(r["HH"] for r in rows) == 3
+    assert all(r["household_method"] == "fallback_one" for r in rows)
+    assert sum(r["households"] for r in rows) == 3
 
 
 def test_the_input_rows_are_not_mutated():
@@ -286,7 +286,7 @@ def test_the_input_rows_are_not_mutated():
     hr.apply_register(original, {"B11 3SA": 30}, {})
     # A caller may want the heuristic for comparison -- and the preview's
     # before/after numbers depend on it not being overwritten underneath them.
-    assert all(p["HH"] == 1 for p in original)
+    assert all(p["households"] == 1 for p in original)
 
 
 def test_an_empty_register_leaves_the_heuristic_completely_alone():
@@ -302,32 +302,32 @@ def test_a_register_with_fewer_households_than_premises_is_reported_not_hidden()
     rows, stats = hr.apply_register(_premises(), {"B11 3SA": 2}, {})
     assert stats["below_premise_count"] == 1
     assert stats["shortfall"] == 1
-    assert all(r["HH"] == 1 for r in rows)
+    assert all(r["households"] == 1 for r in rows)
 
 
 def test_a_upprn_wins_over_the_postcode_and_leaves_the_postcode_pool():
     rows, stats = hr.apply_register(
-        [{"Postcode": "B11 3SA", "UPRN": "100012345", "HH": 1, "HH_METHOD": "fallback_one"},
-         {"Postcode": "B11 3SA", "HH": 1, "HH_METHOD": "fallback_one"}],
+        [{"Postcode": "B11 3SA", "UPRN": "100012345", "households": 1, "household_method": "fallback_one"},
+         {"Postcode": "B11 3SA", "households": 1, "household_method": "fallback_one"}],
         {"B11 3SA": 10},
         {"100012345": 4},
     )
     # The UPRN row is per-premise and exact; the other takes the remainder.
-    assert rows[0]["HH"] == 4
-    assert rows[0]["HH_METHOD"] == "register_uprn"
-    assert rows[1]["HH"] == 6
-    assert rows[1]["HH_METHOD"] == "register_postcode"
-    assert sum(r["HH"] for r in rows) == 10
+    assert rows[0]["households"] == 4
+    assert rows[0]["household_method"] == "register_uprn"
+    assert rows[1]["households"] == 6
+    assert rows[1]["household_method"] == "register_postcode"
+    assert sum(r["households"] for r in rows) == 10
 
 
 def test_postcodes_are_matched_after_normalisation():
     # OSM spells it one way, the register another. A miss here is silent.
     rows, _ = hr.apply_register(
-        [{"Postcode": "b113sa", "HH": 1, "HH_METHOD": "fallback_one"}],
+        [{"Postcode": "b113sa", "households": 1, "household_method": "fallback_one"}],
         {"B11 3SA": 42}, {},
     )
-    assert rows[0]["HH"] == 42
-    assert rows[0]["HH_METHOD"] == "register_postcode"
+    assert rows[0]["households"] == 42
+    assert rows[0]["household_method"] == "register_postcode"
 
 
 # ---------------------------------------------------------------------------
@@ -365,9 +365,9 @@ def test_the_register_reaches_the_premises_the_pipeline_actually_writes():
         buildings, addresses, join, country="United Kingdom",
         register={"by_postcode": {"B11 3SA": 80}, "by_uprn": {}},
     )
-    assert sum(p["HH"] for p in without) == 2
-    assert sum(p["HH"] for p in with_reg) == 80
-    assert all(p["HH_METHOD"] == "register_postcode" for p in with_reg)
+    assert sum(p["households"] for p in without) == 2
+    assert sum(p["households"] for p in with_reg) == 80
+    assert all(p["household_method"] == "register_postcode" for p in with_reg)
     assert stats["household_register"]["premises_registered"] == 2
 
 
@@ -382,7 +382,7 @@ def test_no_register_means_deterministic_physical_locations_with_estimated_load(
         buildings, addresses, join, register=None)
     assert plain == none_passed
     assert plain_stats == none_stats
-    assert [p["HH"] for p in plain] == [1, 1]
+    assert [p["households"] for p in plain] == [1, 1]
     assert [p["ADDR_ID"] for p in plain] == ["OSM-W1", "OSM-W2"]
     assert "household_register" not in plain_stats
 
@@ -401,8 +401,8 @@ def test_the_register_is_applied_to_physical_locations_using_estimates_as_weight
     )
     tall_rows = [p for p in rows if p["OSM_ID"] == 1]
     bungalow_rows = [p for p in rows if p["OSM_ID"] == 2]
-    tall_hh = sum(p["HH"] for p in tall_rows)
-    bungalow_hh = sum(p["HH"] for p in bungalow_rows)
+    tall_hh = sum(p["households"] for p in tall_rows)
+    bungalow_hh = sum(p["households"] for p in bungalow_rows)
     assert len(tall_rows) == len(bungalow_rows) == 1
     assert tall_hh > bungalow_hh
     assert tall_hh + bungalow_hh == 50
@@ -415,8 +415,8 @@ def test_a_uprn_tag_on_the_building_is_used_when_the_register_has_one():
         [building], addresses, {11: 1}, country="United Kingdom",
         register={"by_postcode": {"B11 3SA": 40}, "by_uprn": {"100012345": 9}},
     )
-    assert sum(p["HH"] for p in rows) == 9
-    assert rows[0]["HH_METHOD"] == "register_uprn"
+    assert sum(p["households"] for p in rows) == 9
+    assert rows[0]["household_method"] == "register_uprn"
 
 
 def test_the_register_is_ignored_for_a_country_it_does_not_cover():
@@ -445,7 +445,7 @@ def test_a_register_count_counts_as_measured_not_estimated():
 
 def test_a_partly_covered_area_reports_the_share_that_is_still_estimated():
     rows = _premises() + [
-        {"Postcode": "SW1A 1AA", "HH": 1, "HH_METHOD": "fallback_one"},
+        {"Postcode": "SW1A 1AA", "households": 1, "household_method": "fallback_one"},
     ]
     rows, _ = hr.apply_register(rows, {"B11 3SA": 30}, {})
     summary = osm_source.household_summary(rows)

@@ -492,7 +492,7 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
             premises, ["ADDR_ID", "addr_id", "SRC_ID"]
         )
         hh_field = first_field_case_insensitive(
-            premises, ["HH", "hhs", "HH_COUNT"]
+            premises, ["households", "HH", "hhs", "HH_COUNT"]
         )
 
         for f in premises.getFeatures():

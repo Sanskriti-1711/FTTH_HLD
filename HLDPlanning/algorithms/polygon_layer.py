@@ -270,7 +270,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
             ("pDp_POL_ID", QMetaType.Type.QString),
             ("OLT_POL_ID", QMetaType.Type.QString),
             ("CLUSTER_ID", QMetaType.Type.QString),
-            ("HH", QMetaType.Type.Int),
+            ("households", QMetaType.Type.Int),
             ("MFG", QMetaType.Type.QString),
             (COMMON_FIELDS.SRC_ID, QMetaType.Type.QString),
             (COMMON_FIELDS.STAGE, QMetaType.Type.QString),
@@ -303,7 +303,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
         """Return a reduced output schema for downstream-safe polygon export."""
         keep = {
             "POLYGON_ID", "area_m2", "SUM_OBJECT", "SUM_HOMES", "pDp_POL_ID", "OLT_POL_ID",
-            "CLUSTER_ID", "HH", "MFG", COMMON_FIELDS.SRC_ID, COMMON_FIELDS.STAGE,
+            "CLUSTER_ID", "households", "MFG", COMMON_FIELDS.SRC_ID, COMMON_FIELDS.STAGE,
             # growth-builder fields (present only when that method ran)
             "CENTR_X", "CENTR_Y", "DENSITY", "SPLIT_SIZE", "SPLIT_CNT", "SPLIT_UTIL",
             "SPLIT_OK", "SPL_PLAN", "SPL_PORTS", "SPL_4", "SPL_8", "SPL_16", "SPL_32",
@@ -676,9 +676,11 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
         # areas; use Seeded Growth (default) for rule-compliant, capacity-sized
         # polygons. Attributes here are descriptive of whatever the hull covers.
         _legacy_hh_name = self._detect_hh_field(src.fields())
+        _legacy_obj_name = self._detect_object_field(src.fields())
         _legacy_pt_index = QgsSpatialIndex()
         _legacy_pt_geoms = {}
         _legacy_pt_hh = {}
+        _legacy_building_of = {}
         for _lf in src.getFeatures():
             _lg = _lf.geometry()
             if _lg is None or _lg.isEmpty():
@@ -692,7 +694,30 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                 except Exception:
                     _hh = 0
             _legacy_pt_hh[_lf.id()] = _hh
-            _lft = QgsFeature(_lf.id())
+            if _legacy_obj_name:
+                try:
+                    _oid = _lf[_legacy_obj_name]
+                except Exception:
+                    _oid = None
+                if _oid not in (None, ""):
+                    _legacy_building_of[_lf.id()] = str(_oid)
+        # Same rule as the growth path: a building's homes are counted once, not
+        # once per address row.
+        if _legacy_hh_name:
+            _legacy_by_building = {}
+            for _fid in _legacy_pt_hh:
+                _legacy_by_building.setdefault(
+                    _legacy_building_of.get(_fid, f"__row_{_fid}"), _legacy_pt_hh[_fid]
+                )
+            for _fid in _legacy_pt_hh:
+                _legacy_pt_hh[_fid] = _legacy_by_building[
+                    _legacy_building_of.get(_fid, f"__row_{_fid}")
+                ]
+
+        # Index every usable premise (not just the last one of the loop, which is
+        # all a feature added inside it could ever have reached).
+        for _fid, _lg in _legacy_pt_geoms.items():
+            _lft = QgsFeature(_fid)
             _lft.setGeometry(_lg)
             _legacy_pt_index.addFeature(_lft)
 
@@ -739,8 +764,8 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                 if k in names and e.get(k) is not None:
                     feat[k] = e[k]
 
-            if "HH" in names and e.get("SUM_HOMES") is not None:
-                feat["HH"] = e["SUM_HOMES"]
+            if "households" in names and e.get("SUM_HOMES") is not None:
+                feat["households"] = e["SUM_HOMES"]
             if "MFG" in names and e.get("OLT_POL_ID") is not None:
                 feat["MFG"] = e["OLT_POL_ID"]
 
@@ -946,7 +971,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
         c = plan["counts"]
         area = geom.area() if (geom is not None and not geom.isEmpty()) else 0.0
         vals = {
-            "SUM_OBJECT": n_obj, "HH": hh, "SUM_HOMES": hh, "area_m2": area,
+            "SUM_OBJECT": n_obj, "households": hh, "SUM_HOMES": hh, "area_m2": area,
             "DENSITY": round(hh / (area / 10000.0), 2) if area > 0 else 0.0,
             "SPLIT_SIZE": f"1:{plan['primary']}" if plan["primary"] else "-",
             "SPLIT_CNT": plan["total"], "SPLIT_UTIL": plan["util"], "SPLIT_OK": plan["ok"],
@@ -996,9 +1021,28 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
     # ------------- seeded-growth (splitter-driven) builder -------------
 
     def _detect_hh_field(self, fields):
-        """Case-insensitive lookup of a homes/households column on the INPUT."""
+        """Case-insensitive lookup of a homes/households column on the INPUT.
+
+        `households` first: it is the canonical name now, and it is the BUILDING
+        total (the object layer puts it on every row of a building).  `HH` stays
+        accepted so a workbook or an older output still reads.
+        """
         by_lower = {f.name().lower(): f.name() for f in fields}
-        for cand in ("hh", "sum_homes", "homes", "households", "hh_count"):
+        for cand in ("households", "hh", "sum_homes", "homes", "hh_count"):
+            if cand in by_lower:
+                return by_lower[cand]
+        return None
+
+    def _detect_object_field(self, fields):
+        """Case-insensitive lookup of the BUILDING identity column on the INPUT.
+
+        `households` repeats a building's total on each of its rows, so homes
+        must be counted once per building; this is the field that identifies the
+        building.  Falls back through the same names the ADDR_ID detection uses.
+        """
+        by_lower = {f.name().lower(): f.name() for f in fields}
+        for cand in ("osm_id", "osm_object_id", "building_id", "addr_id",
+                     "addrid", "address_id", "adr_id", "obj_id", "uid"):
             if cand in by_lower:
                 return by_lower[cand]
         return None
@@ -1292,10 +1336,19 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
 
         # ---- collect premises (membership units) ----
         hh_name = self._detect_hh_field(src.fields())
+        obj_name = self._detect_object_field(src.fields())
         if hh_name:
-            feedback.pushInfo(f"Growth: homes read from INPUT field '{hh_name}'.")
+            feedback.pushInfo(
+                f"Growth: homes read from INPUT field '{hh_name}'"
+                + (f", counted once per building via '{obj_name}'." if obj_name else ".")
+            )
+            if not obj_name:
+                feedback.pushWarning(
+                    "Growth: no building identity column on INPUT — a multi-address "
+                    "building's households would be counted once per address."
+                )
         else:
-            feedback.pushWarning("Growth: no HH field found on INPUT — each premise counts as 1 home.")
+            feedback.pushWarning("Growth: no households field found on INPUT — each premise counts as 1 home.")
 
         addr_name = self._detect_addr_field(src.fields())
         if addr_name:
@@ -1306,6 +1359,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
         pts = {}
         hh_of = {}
         addr_of = {}                                   # fid -> ADDR_ID (building identity)
+        building_of = {}                               # fid -> building identity (OSM_ID)
         for f in src.getFeatures():
             g = f.geometry()
             if g is None or g.isEmpty():
@@ -1325,6 +1379,34 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                     hh = 1
             hh_of[f.id()] = hh
             addr_of[f.id()] = f[addr_name] if addr_name else f.id()
+            if obj_name:
+                try:
+                    _oid = f[obj_name]
+                except Exception:
+                    _oid = None
+                if _oid not in (None, ""):
+                    building_of[f.id()] = str(_oid)
+
+        # ---- Count homes once per BUILDING (Home Count Rule) ----
+        # `households` is the building's total, repeated on each of its rows, so
+        # adding the column up counts a five-address block five times.  Homes are
+        # summed over the building identities, then put back on every one of that
+        # building's premises -- so the clubbing, the splitter plan and the
+        # per-PDP threshold all see the real demand.
+        if hh_name:
+            by_building = {}
+            for fid in pts:
+                by_building.setdefault(
+                    building_of.get(fid, f"__row_{fid}"), hh_of[fid]
+                )
+            total_homes = sum(by_building.values())
+            if total_homes != sum(hh_of.values()):
+                feedback.pushInfo(
+                    f"Growth: {total_homes} homes over {len(by_building)} building(s); "
+                    "households counted once per building."
+                )
+            for fid in pts:
+                hh_of[fid] = by_building[building_of.get(fid, f"__row_{fid}")]
 
         if not pts:
             raise QgsProcessingException("Growth: INPUT contains no usable premise geometries.")
@@ -2280,7 +2362,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                 ("POLYGON_ID", poly_id),
                 (COMMON_FIELDS.SRC_ID, poly_id),
                 ("area_m2", area),
-                ("HH", cl["hh"]),
+                ("households", cl["hh"]),
                 ("SUM_HOMES", cl["hh"]),
                 ("SUM_OBJECT", len(cl["members"])),
                 ("CENTR_X", float(cpt.x())),

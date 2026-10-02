@@ -5,7 +5,7 @@ real Berlin data it was ~100 % `fallback_one` / `levels_x_footprint`, because
 OpenStreetMap carries `building:flats` on 1 building in 15,583 and `addr:flats`
 on none.  Trunk sizing, HH-based physical-location drop capacity, and the BOQ rest on
 that heuristic, and
-`HH_METHOD` travels with each row so nobody mistakes it for a survey.
+`household_method` travels with each row so nobody mistakes it for a survey.
 
 The UK is the case where this is *partly fixable with authoritative data*:
 
@@ -50,7 +50,7 @@ not a decision this code should make on its own.
 
 What "wins" means is stated precisely in `apply_register`, and it is the whole
 point of the module: a register count REPLACES the heuristic for the premises it
-covers, `HH_METHOD` says so (`register_postcode` / `register_uprn`), and the
+covers, `household_method` says so (`register_postcode` / `register_uprn`), and the
 register's own source, licence and vintage travel with the run.
 """
 
@@ -738,7 +738,7 @@ def register_status(country_code: str = "GB") -> Dict[str, Any]:
 # Applying it -- the part that decides what "wins" means
 # ---------------------------------------------------------------------------
 
-# Provenance values written to HH_METHOD. They are deliberately distinct from
+# Provenance values written to household_method. They are deliberately distinct from
 # the OSM-derived methods, so `household_summary` can tell a REGISTERED
 # household from a tagged one from a guessed one -- which is the whole point:
 # the preview reports `estimated_share`, and a register count is not an estimate
@@ -801,11 +801,11 @@ def apply_register(
     Precedence, per physical service-location record:
 
       1. a UPRN match (register row keyed on this location's UPRN) --
-         `HH_METHOD = register_uprn`, and its households are taken OUT of the
+         `household_method = register_uprn`, and its households are taken OUT of the
          postcode total so the two cannot double-count
       2. the register's postcode total, less whatever the UPRN matches already
          claimed, apportioned across that postcode's remaining premises by their
-         existing estimate -- `HH_METHOD = register_postcode`
+         existing estimate -- `household_method = register_postcode`
       3. otherwise the physical location is left exactly as OSM produced it
 
     Why apportion rather than assign: a register is keyed on the POSTCODE, and
@@ -840,7 +840,7 @@ def apply_register(
 
     by_uprn = by_uprn or {}
     stats["enabled"] = True
-    stats["heuristic_households_before"] = sum(int(p.get("HH") or 0) for p in rows)
+    stats["heuristic_households_before"] = sum(int(p.get("households") or 0) for p in rows)
 
     # Group the premise indices by normalised postcode, preserving order.
     groups: Dict[str, List[int]] = {}
@@ -868,8 +868,8 @@ def apply_register(
         for i in list(idxs):
             uprn = str(rows[i].get("UPRN") or "").strip()
             if uprn and uprn in by_uprn:
-                rows[i]["HH"] = int(by_uprn[uprn])
-                rows[i]["HH_METHOD"] = "register_uprn"
+                rows[i]["households"] = int(by_uprn[uprn])
+                rows[i]["household_method"] = "register_uprn"
                 registered.add(i)
                 claimed += int(by_uprn[uprn])
                 pool.remove(i)
@@ -883,16 +883,16 @@ def apply_register(
             # premise set is the thing that disagrees.
             stats["below_premise_count"] += 1
             stats["shortfall"] += len(pool) - remaining_total
-        weights = [int(rows[i].get("HH") or 0) or 1 for i in pool]
+        weights = [int(rows[i].get("households") or 0) or 1 for i in pool]
         parts = _weighted_split(remaining_total, weights)
         for i, value in zip(pool, parts):
-            rows[i]["HH"] = int(value)
-            rows[i]["HH_METHOD"] = "register_postcode"
+            rows[i]["households"] = int(value)
+            rows[i]["household_method"] = "register_postcode"
             registered.add(i)
 
     stats["premises_registered"] = len(registered)
-    stats["register_households"] = sum(int(rows[i].get("HH") or 0) for i in registered)
-    stats["heuristic_households_after"] = sum(int(p.get("HH") or 0) for p in rows)
+    stats["register_households"] = sum(int(rows[i].get("households") or 0) for i in registered)
+    stats["heuristic_households_after"] = sum(int(p.get("households") or 0) for p in rows)
     return rows, stats
 
 

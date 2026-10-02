@@ -223,8 +223,11 @@ class BuildObjectLayer(QgsProcessingAlgorithm):
         # --- Column mapping & canonical fields
         mapping = autodetect_mapping(df)
 
-        # Ensure HH exists (canonical households field)
-        ensure_households_column(df, mapping, out_name="HH")
+        # Ensure the canonical households field exists.  It is named for what it
+        # is -- `HH` read as a household COUNT was routinely mistaken for an
+        # identifier, and `households` is the name the whole pipeline and the
+        # served layer now use.
+        ensure_households_column(df, mapping, out_name="households")
 
         # Ensure ADDR_ID exists and generate missing values using shared helper
         if "ADDR_ID" not in df.columns:
@@ -407,12 +410,12 @@ class BuildObjectLayer(QgsProcessingAlgorithm):
         else:
             df[COMMON_FIELDS.SRC_ID] = (df.index + 1).astype(str)
 
-        # The object layer writes one row per PREMISE, but a building can become
-        # several premises (address nodes, or a block with several doors). Each
-        # row also carries its building's household aggregate, so a planner can
-        # read the count the block really stands for instead of summing HH by
-        # eye -- the same fields the pre-run review layer shows.
-        add_household_aggregates(df)
+        # One row per PREMISE, but the household count belongs to the BUILDING: a
+        # block with five addresses is one building with five homes. Collapse the
+        # per-location spread into the building total and put it on every row, so
+        # the layer states the count the block really stands for.  Consumers sum
+        # it once per building (`households_by_object`), never per row.
+        add_household_aggregates(df, hh_col="households")
 
         # --- Build GeoDataFrame + write
         if not _GEO_OK:
@@ -448,7 +451,8 @@ class BuildObjectLayer(QgsProcessingAlgorithm):
         if thin_export:
             thin_keep = [
                 FIELD.ADDR_ID,
-                "HH",
+                "households",
+                "household_method",
                 COMMON_FIELDS.POLYGON_ID,
                 COMMON_FIELDS.PDP_ID,
                 FIELD.LAT,

@@ -16,7 +16,11 @@ class LAYERNAMES:
 
 class FIELD:
     ADDR_ID = "ADDR_ID"
-    HH = "HH"
+    # The household count.  Named for what it is: `HH` read as a household
+    # COUNT was routinely mistaken for an identifier, and the served layer
+    # states each building's total under `households`.  `HH` remains accepted
+    # as a legacy INPUT alias (see sheet_utils.EXPECTED_MAP).
+    HH = "households"
     LAT = "LATITUDE"
     LON = "LONGITUDE"
     GEOCODE_STATUS = "GEOCODE_STATUS"

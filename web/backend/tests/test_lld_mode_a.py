@@ -105,7 +105,7 @@ def _asv():
             "HH_COUNT": 1,
             "ADDR_ID": "A-2",
             "ADDR_IDS": "A-2",
-            "HH": 1,
+            "households": 1,
         }),
         # Feeder on a FAR side path (base of the fixture, ~700 m south) with no
         # trench beneath it — outside the 50 m coverage tolerance, so the
@@ -141,12 +141,12 @@ def _asv():
             "feature_id": "O-1",
             "approved": True,
             "change_id": "chg-premise-1",
-            "HH": 18,
+            "households": 18,
             "ADDR_ID": "A-1",
         }),
         _feature("objects", _point(13.40008, 52.50012), {
             "feature_id": "O-2",
-            "HH": 1,
+            "households": 1,
             "ADDR_ID": "A-2",
         }),
         # Chamber + brownfield evidence.

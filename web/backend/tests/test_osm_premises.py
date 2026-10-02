@@ -30,7 +30,7 @@ SHEET_UTILS = Path(__file__).resolve().parents[3] / "HLDPlanning" / "utils" / "s
 
 # Headers object_layer MUST detect for a generated workbook to be consumable.
 CORE_HEADERS = ("ADDR_ID", "Address", "Housenumber", "City", "Postcode",
-                "Country", "District", "HH", "LATITUDE", "LONGITUDE")
+                "Country", "District", "households", "LATITUDE", "LONGITUDE")
 
 
 # ---------------------------------------------------------------------------
@@ -429,8 +429,8 @@ def test_addresses_in_one_building_keep_physical_locations_and_weighted_hh():
     )
     assert len(premises) == 3
     assert [p["Housenumber"] for p in premises] == ["2", "4", "6"]
-    assert [p["HH"] for p in premises] == [9, 7, 7]
-    assert sum(p["HH"] for p in premises) == 23
+    assert [p["households"] for p in premises] == [9, 7, 7]
+    assert sum(p["households"] for p in premises) == 23
     assert stats["duplicates_merged"] == 0
     assert premises[0]["ADDR_ID"] == "OSM-W1-P1"
     assert len({p["ADDR_ID"] for p in premises}) == 3
@@ -476,10 +476,10 @@ def test_explicit_address_flats_beats_the_building_split():
         buildings, addresses, {11: 1, 12: 1}
     )
     assert len(premises) == 2
-    assert [p["HH"] for p in premises] == [14, 9]
+    assert [p["households"] for p in premises] == [14, 9]
     tagged = next(p for p in premises if p["Housenumber"] == "4")
-    assert tagged["HH_METHOD"] == "addr_flats"
-    assert sum(p["HH"] for p in premises) == 23
+    assert tagged["household_method"] == "addr_flats"
+    assert sum(p["households"] for p in premises) == 23
 
 
 def test_building_without_any_address_becomes_a_centroid_premise():
@@ -488,7 +488,7 @@ def test_building_without_any_address_becomes_a_centroid_premise():
         [_building(7, building_levels="1", footprint_m2=60.0)], [], {})
     assert len(premises) == 1
     assert premises[0]["ADDR_ID"] == "OSM-W7-C"
-    assert premises[0]["HH_METHOD"] == "levels_x_footprint"
+    assert premises[0]["household_method"] == "levels_x_footprint"
     assert stats["boundary_buildings"] == 1
 
 
@@ -545,8 +545,8 @@ def test_same_building_same_housenumber_nodes_each_get_a_premise():
 
 def test_address_without_a_building_falls_back_to_one_household():
     premises, _ = osm_source.assemble_premises([], [_address(11, "5")], {})
-    assert premises[0]["HH"] == 1
-    assert premises[0]["HH_METHOD"] == "fallback_one"
+    assert premises[0]["households"] == 1
+    assert premises[0]["household_method"] == "fallback_one"
     assert premises[0]["ADDR_ID"] == "OSM-N11"
 
 
@@ -563,7 +563,7 @@ def test_multi_dwelling_building_is_one_physical_feature_with_hh_load():
     premises, stats = osm_source.assemble_premises(
         [_building(1, building_flats="3", building_levels=None)], [], {})
     assert len(premises) == 1
-    assert premises[0]["HH"] == 3
+    assert premises[0]["households"] == 3
     assert premises[0]["ADDR_ID"] == "OSM-W1-C"
     assert (premises[0]["LONGITUDE"], premises[0]["LATITUDE"]) == (13.38, 52.44)
     assert "households_expanded" not in stats
@@ -576,8 +576,8 @@ def test_lowest_housenumber_gets_building_load_remainder_deterministically():
         buildings, addresses, {11: 1, 12: 1, 13: 1}
     )
     assert [p["Housenumber"] for p in premises] == ["2", "4", "6"]
-    assert [p["HH"] for p in premises] == [9, 7, 7]
-    assert sum(p["HH"] for p in premises) == 23
+    assert [p["households"] for p in premises] == [9, 7, 7]
+    assert sum(p["households"] for p in premises) == 23
 
 
 # ---------------------------------------------------------------------------
@@ -586,8 +586,8 @@ def test_lowest_housenumber_gets_building_load_remainder_deterministically():
 
 def test_household_summary_reports_the_estimated_share():
     premises = [
-        {"HH": 10, "HH_METHOD": "building_flats"},
-        {"HH": 10, "HH_METHOD": "levels_x_footprint"},
+        {"households": 10, "household_method": "building_flats"},
+        {"households": 10, "household_method": "levels_x_footprint"},
     ]
     summary = osm_source.household_summary(premises)
     assert summary["total"] == 20
@@ -607,10 +607,10 @@ def test_household_summary_of_no_premises_is_not_a_division_error():
 
 def test_sub_areas_group_by_postcode_and_district():
     premises = [
-        {"Postcode": "12107", "District": "Mariendorf", "HH": 5},
-        {"Postcode": "12107", "District": "Mariendorf", "HH": 3},
-        {"Postcode": "12109", "District": "Mariendorf", "HH": 1},
-        {"Postcode": "12279", "District": "Lankwitz", "HH": 9},
+        {"Postcode": "12107", "District": "Mariendorf", "households": 5},
+        {"Postcode": "12107", "District": "Mariendorf", "households": 3},
+        {"Postcode": "12109", "District": "Mariendorf", "households": 1},
+        {"Postcode": "12279", "District": "Lankwitz", "households": 9},
     ]
     breakdown = osm_source.sub_area_breakdown(premises)
     assert [p["value"] for p in breakdown["postcode"]] == ["12107", "12109", "12279"]
@@ -620,8 +620,8 @@ def test_sub_areas_group_by_postcode_and_district():
 
 
 def test_sub_areas_skip_blank_values_and_limit_results():
-    premises = [{"Postcode": "", "District": None, "HH": 1}]
-    premises += [{"Postcode": f"12{i:03d}", "District": "D", "HH": 1} for i in range(12)]
+    premises = [{"Postcode": "", "District": None, "households": 1}]
+    premises += [{"Postcode": f"12{i:03d}", "District": "D", "households": 1} for i in range(12)]
     breakdown = osm_source.sub_area_breakdown(premises, limit=5)
     assert len(breakdown["postcode"]) == 5
     assert all(p["value"] for p in breakdown["postcode"])
@@ -697,7 +697,7 @@ def test_every_key_the_object_layer_needs_is_produced(tmp_path):
     assert alias_map, "EXPECTED_MAP could not be parsed out of sheet_utils.py"
 
     premise = {h: "x" for h in osm_source.EXCEL_HEADERS}
-    premise.update({"LATITUDE": 52.441, "LONGITUDE": 13.381, "HH": 9})
+    premise.update({"LATITUDE": 52.441, "LONGITUDE": 13.381, "households": 9})
     path = osm_source.write_address_workbook(
         str(tmp_path / "out" / "Main_DataSet.xlsx"), [premise]
     )
@@ -748,7 +748,7 @@ def test_write_address_workbook_round_trips(tmp_path):
     premises = [{
         "ADDR_ID": "OSM-W1-P1", "Address": "Mariendorfer Damm", "Housenumber": "2",
         "City": "Berlin", "Postcode": "12107", "Country": "Germany",
-        "District": "Mariendorf", "HH": 9, "HH_METHOD": "levels_x_footprint",
+        "District": "Mariendorf", "households": 9, "household_method": "levels_x_footprint",
         "LATITUDE": 52.441, "LONGITUDE": 13.381, "OSM_ID": 1,
     }]
     path = osm_source.write_address_workbook(str(tmp_path / "out" / "Main_DataSet.xlsx"), premises)
@@ -757,7 +757,7 @@ def test_write_address_workbook_round_trips(tmp_path):
     rows = list(wb.active.iter_rows(values_only=True))
     assert list(rows[0]) == list(osm_source.EXCEL_HEADERS)
     assert rows[1][0] == "OSM-W1-P1"
-    assert rows[1][osm_source.EXCEL_HEADERS.index("HH")] == 9
+    assert rows[1][osm_source.EXCEL_HEADERS.index("households")] == 9
     assert len(rows) == 2
 
 
@@ -1004,7 +1004,7 @@ def _premise(i, postcode="12107", district="Mariendorf", hh=1):
     return {
         "ADDR_ID": f"OSM-W{i}", "Address": "Mariendorfer Damm", "Housenumber": str(i),
         "City": "Berlin", "Postcode": postcode, "Country": "Germany",
-        "District": district, "HH": hh, "HH_METHOD": "levels_x_footprint",
+        "District": district, "households": hh, "household_method": "levels_x_footprint",
         "LATITUDE": 52.44, "LONGITUDE": 13.38, "OSM_ID": i,
     }
 
@@ -1079,7 +1079,7 @@ def test_preview_does_not_refuse_where_it_used_to(monkeypatch):
     257,127-premise area could not be previewed at all.  That threshold is gone:
     only the run refuses, and it says so in the response instead."""
     bulk = [{"ADDR_ID": f"OSM-W{i}", "Postcode": "B1", "District": "",
-             "HH": 1, "HH_METHOD": "fallback_one"} for i in range(50_001)]
+             "households": 1, "household_method": "fallback_one"} for i in range(50_001)]
     _stub_area(monkeypatch, bulk)
 
     out = osm_source.preview_area("Mariendorf, Berlin, Germany")
@@ -1208,13 +1208,13 @@ def test_preview_centroid_warning_counts_what_the_workbook_will_carry(monkeypatc
     building_with_address = {
         "ADDR_ID": "OSM-W7-C", "Address": "High Street", "Housenumber": "7",
         "City": "Asheville", "Postcode": "28801", "Country": "United States",
-        "District": "", "HH": 1, "HH_METHOD": "fallback_one",
+        "District": "", "households": 1, "household_method": "fallback_one",
         "LATITUDE": 35.58, "LONGITUDE": -82.55, "OSM_ID": 7,
     }
     bare_building = {
         "ADDR_ID": "OSM-W8-C", "Address": "", "Housenumber": "",
         "City": "Kenya", "Postcode": "", "Country": "Kenya",
-        "District": "", "HH": 1, "HH_METHOD": "fallback_one",
+        "District": "", "households": 1, "household_method": "fallback_one",
         "LATITUDE": -0.02, "LONGITUDE": 37.07, "OSM_ID": 8,
     }
     _stub_area(monkeypatch, [building_with_address, bare_building])
@@ -1237,7 +1237,7 @@ def test_preview_colours_a_fully_addressed_centroid_as_the_building_not_anonymou
         {
             "ADDR_ID": f"OSM-W{i}-C", "Address": "Kaiserstrasse", "Housenumber": str(i),
             "City": "Berlin", "Postcode": "12105", "Country": "Germany",
-            "District": "", "HH": 1, "HH_METHOD": "fallback_one",
+            "District": "", "households": 1, "household_method": "fallback_one",
             "LATITUDE": 52.44, "LONGITUDE": 13.38, "OSM_ID": 100 + i,
         }
         for i in (17, 18)
@@ -2554,7 +2554,7 @@ def test_objects_layer_carries_the_household_count_of_each_building(monkeypatch)
     assert len(out["features"]) == 2
     expected = {}
     for p in osm_source.assemble_premises(buildings, [], {})[0]:
-        expected[p["OSM_ID"]] = expected.get(p["OSM_ID"], 0) + int(p["HH"])
+        expected[p["OSM_ID"]] = expected.get(p["OSM_ID"], 0) + int(p["households"])
     got = {f["properties"]["osm_object_id"]: f["properties"]["households"]
            for f in out["features"]}
     assert got == expected
@@ -2618,8 +2618,8 @@ def test_objects_and_premises_reviews_use_the_loaded_household_register(monkeypa
 
     premises = osm_source.input_layer_geojson(
         _review_polygon(), "premises", country_code="GB")
-    assert sum(f["properties"]["HH"] for f in premises["features"]) == 9
-    assert {f["properties"]["HH_METHOD"] for f in premises["features"]} == {"register_postcode"}
+    assert sum(f["properties"]["households"] for f in premises["features"]) == 9
+    assert {f["properties"]["household_method"] for f in premises["features"]} == {"register_postcode"}
 
 
 def test_a_building_with_no_premises_carries_no_households(monkeypatch):

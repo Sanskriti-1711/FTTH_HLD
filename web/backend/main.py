@@ -3473,7 +3473,7 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
             "INFRA_STATUS": "Proposed",
         }
         try:
-            hh_count = max(1, int(float(props.get("HH") or props.get("hhs") or 1)))
+            hh_count = max(1, int(float(props.get("households") or props.get("HH") or props.get("hhs") or 1)))
         except (TypeError, ValueError):
             hh_count = 1
         hh = str(hh_count)

@@ -253,7 +253,7 @@ def full_one(cand: Dict[str, str], out_root: Path) -> Dict[str, Any]:
             return round(filled(name) / n, 3)
 
         methods: Dict[str, int] = {}
-        for v in col("HH_METHOD"):
+        for v in col("household_method"):
             key = str(v or "").strip() or "(blank)"
             methods[key] = methods.get(key, 0) + 1
 

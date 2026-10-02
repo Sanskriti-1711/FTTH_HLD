@@ -703,7 +703,7 @@ def _read_points(path: str, target_epsg: int, bbox=None) -> List[dict]:
                 "PDP_ID": _value(f, "PDP_ID"),
                 "POLYGON_ID": _value(f, "POLYGON_ID"),
                 "ADDR_ID": _value(f, "ADDR_ID") or _value(f, "SRC_ID"),
-                "HH": _value(f, "HH"),
+                "households": _value(f, "households") or _value(f, "HH"),
                 "MFG_ID": _value(f, "MFG_ID"),
                 "fclass": _value(f, "fclass"),
                 # ground condition (rock/water/...) for the aerial scorer
@@ -725,7 +725,7 @@ def _addr_of(pt: dict) -> Optional[str]:
 def _hh_of(pt: dict) -> float:
     """Household count of a premise (1.0 when the plan does not state one)."""
     try:
-        hh = float(pt.get("HH"))
+        hh = float(pt.get("households") or pt.get("HH"))
     except (TypeError, ValueError):
         return 1.0
     return hh if hh > 0 else 1.0
@@ -2154,7 +2154,7 @@ FIELD_LINE = (
     # Premise attribution (see Run.addr): the address(es) the span serves and
     # their household count. "" when the span serves no premise (pure
     # backbone), so a blank value means "not attributed", not "one house".
-    ("ADDR_ID", ogr.OFTString), ("HH", ogr.OFTReal),
+    ("ADDR_ID", ogr.OFTString), ("households", ogr.OFTReal),
     # Origin of the network: cable_layer plans the shared feeder from it.
     ("MFG_ID", ogr.OFTString),
     # AERIAL_ZONE: the span runs through an aerial zone (restricted land where
@@ -2171,7 +2171,7 @@ FIELD_LINE = (
 )
 FIELD_AERIAL = (
     ("DROP_ID", ogr.OFTString), ("POLYGON_ID", ogr.OFTString),
-    ("ADDR_ID", ogr.OFTString), ("HH", ogr.OFTReal),
+    ("ADDR_ID", ogr.OFTString), ("households", ogr.OFTReal),
     ("TRENCH_TIER", ogr.OFTString), ("TRENCH_TYPE", ogr.OFTString),
     # Aerial is a METHOD, not just a type string: ``CONSTRUCTION_METHOD =
     # "Overhead"`` and ``EXCAVATION = 0`` are what the BOQ, the platform and
@@ -3555,7 +3555,7 @@ def design(cfg: dict) -> dict:
             # Premise attribution — which house(s) this chamber-to-chamber
             # span was dug for. A drop leg names one address; a shared spine
             # span names every address that rides it (comma-joined).
-            "ADDR_ID": sp.get("addr"), "HH": sp.get("hh"),
+            "ADDR_ID": sp.get("addr"), "households": sp.get("hh"),
             "MFG_ID": sp.get("mfg"),
             "SRC": sp["src"],
             # Corridor restriction evidence (NOT a construction class — see
@@ -3630,7 +3630,7 @@ def design(cfg: dict) -> dict:
     _garden_unattributed = [r for r in span_rows
                             if r["TRENCH_TIER"] == "Garden"
                             and not r.get("ADDR_ID")]
-    _hh_billed = sum(float(r.get("HH") or 0.0)
+    _hh_billed = sum(float(r.get("households") or 0.0)
                      for r in span_rows if r["TRENCH_TIER"] == "Garden")
     log("premise attribution: %d/%d span(s) name the address(es) they serve "
         "(%d Garden span(s) without an address, %.0f household(s) on the "
@@ -3682,7 +3682,7 @@ def design(cfg: dict) -> dict:
         aerial_rows.append({
             "DROP_ID": "AD-%05d" % (i + 1),
             "POLYGON_ID": leg["house"].get("POLYGON_ID") or None,
-            "ADDR_ID": _addr_of(leg["house"]), "HH": _hh_of(leg["house"]),
+            "ADDR_ID": _addr_of(leg["house"]), "households": _hh_of(leg["house"]),
             # An aerial leg replaces the DROP leg it would have been dug as
             # (docs/aerial planning.docx: aerial is only ever evaluated at the
             # customer-connection stage), so its tier is the Drop network —

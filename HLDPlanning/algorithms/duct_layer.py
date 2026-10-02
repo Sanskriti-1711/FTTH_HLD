@@ -3080,7 +3080,7 @@ class DuctLayer(QgsProcessingAlgorithm):
         
         # Guard: required inputs present?
         _missing = [k for k, v in {
-            "PDP": pdp_lyr, "HH": dist_objs, "LEFT": side_l, "RIGHT": side_r, "TAN": final_tan
+            "PDP": pdp_lyr, "households": dist_objs, "LEFT": side_l, "RIGHT": side_r, "TAN": final_tan
         }.items() if v is None]
         if _missing:
             for m in _missing:

@@ -100,7 +100,7 @@ class ServedPremisesAlgorithm(QgsProcessingAlgorithm):
             ("POLYGON_ID", QMetaType.Type.QString),
             ("PDP_ID", QMetaType.Type.QString),
             ("MFG_ID", QMetaType.Type.QString),
-            ("HH", QMetaType.Type.Double),
+            ("households", QMetaType.Type.Double),
             ("SERVICE_STATUS", QMetaType.Type.QString),
             ("SERVICE_METHOD", QMetaType.Type.QString),
             ("SERVICE_REASON", QMetaType.Type.QString),
@@ -117,7 +117,7 @@ class ServedPremisesAlgorithm(QgsProcessingAlgorithm):
         pdp_field = first_field_case_insensitive(objects, ["PDP_ID", "pdp_id"])
         polygon_field = first_field_case_insensitive(objects, ["POLYGON_ID", "polygon_id"])
         mfg_field = first_field_case_insensitive(objects, ["MFG_ID", "mfg_id"])
-        hh_field = first_field_case_insensitive(objects, ["HH", "HHS", "households"])
+        hh_field = first_field_case_insensitive(objects, ["households", "HH", "HHS"])
         written = 0
         linked = 0
         for obj in objects.getFeatures():
@@ -144,9 +144,9 @@ class ServedPremisesAlgorithm(QgsProcessingAlgorithm):
             feature["PDP_ID"] = str(obj[pdp_field]) if pdp_field and obj[pdp_field] not in (None, "") else None
             feature["MFG_ID"] = str(obj[mfg_field]) if mfg_field and obj[mfg_field] not in (None, "") else None
             try:
-                feature["HH"] = float(obj[hh_field]) if hh_field and obj[hh_field] not in (None, "") else 1.0
+                feature["households"] = float(obj[hh_field]) if hh_field and obj[hh_field] not in (None, "") else 1.0
             except (TypeError, ValueError):
-                feature["HH"] = 1.0
+                feature["households"] = 1.0
             feature["SERVICE_STATUS"] = status
             feature["SERVICE_METHOD"] = method
             feature["SERVICE_REASON"] = reason

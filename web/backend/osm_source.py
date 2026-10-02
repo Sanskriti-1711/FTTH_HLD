@@ -3008,8 +3008,8 @@ def _apply_household_register(
     by_uprn = register.get("by_uprn") or {}
     flat: List[Dict[str, Any]] = [
         {
-            "HH": int(item["hh"]),
-            "HH_METHOD": item["method"],
+            "households": int(item["hh"]),
+            "household_method": item["method"],
             "Postcode": _premise_postcode(item),
             "UPRN": _premise_uprn(item),
         }
@@ -3017,8 +3017,8 @@ def _apply_household_register(
     ]
     resolved, stats = household_register.apply_register(flat, by_postcode, by_uprn)
     for item, row in zip(pending, resolved):
-        item["hh"] = int(row.get("HH") or 1)
-        item["method"] = str(row.get("HH_METHOD") or item["method"])
+        item["hh"] = int(row.get("households") or 1)
+        item["method"] = str(row.get("household_method") or item["method"])
     stats["source"] = register.get("source")
     stats["licence"] = register.get("licence")
     stats["vintage"] = register.get("vintage")
@@ -3213,8 +3213,8 @@ def assemble_premises(
             "Postcode": addr.get("addr_postcode") or (building or {}).get("addr_postcode") or "",
             "Country": country,
             "District": addr.get("addr_suburb") or (building or {}).get("addr_suburb") or "",
-            "HH": int(hh),
-            "HH_METHOD": method,
+            "households": int(hh),
+            "household_method": method,
             "LATITUDE": round(float(lonlat[1]), 7),
             "LONGITUDE": round(float(lonlat[0]), 7),
             "OSM_ID": oid if oid is not None else int(addr["osm_id"]),
@@ -3358,7 +3358,7 @@ def sub_area_breakdown(premises: Sequence[Dict[str, Any]], limit: int = 10) -> D
                 continue
             slot = buckets[key].setdefault(value, {"premises": 0, "households": 0})
             slot["premises"] += 1
-            slot["households"] += int(p.get("HH") or 0)
+            slot["households"] += int(p.get("households") or 0)
     out: Dict[str, List[Dict[str, Any]]] = {}
     for key, bucket in buckets.items():
         ordered = sorted(bucket.items(), key=lambda kv: -kv[1]["premises"])[:limit]
@@ -3372,9 +3372,9 @@ def household_summary(premises: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     buckets: Dict[str, int] = {}
     total = 0
     for p in premises:
-        hh = int(p.get("HH") or 0)
+        hh = int(p.get("households") or 0)
         total += hh
-        by_method[str(p.get("HH_METHOD"))] = by_method.get(str(p.get("HH_METHOD")), 0) + 1
+        by_method[str(p.get("household_method"))] = by_method.get(str(p.get("household_method")), 0) + 1
         if hh == 1:
             buckets["1"] = buckets.get("1", 0) + 1
         elif hh <= 4:
@@ -3393,8 +3393,8 @@ def household_summary(premises: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         household_register.REGISTER_METHODS
     )
     estimated = total - sum(
-        int(p.get("HH") or 0) for p in premises
-        if str(p.get("HH_METHOD")) in measured_methods
+        int(p.get("households") or 0) for p in premises
+        if str(p.get("household_method")) in measured_methods
     )
     return {
         "total": total,
@@ -3730,9 +3730,9 @@ def input_layer_geojson(
                 except (TypeError, ValueError):
                     continue
                 slot = by_building.setdefault(bid, {"households": 0, "premises": 0, "methods": []})
-                slot["households"] += int(p.get("HH") or 0)
+                slot["households"] += int(p.get("households") or 0)
                 slot["premises"] += 1
-                slot["methods"].append(str(p.get("HH_METHOD") or ""))
+                slot["methods"].append(str(p.get("household_method") or ""))
             for row in buildings:
                 props = object_properties(row)
                 try:
@@ -4281,7 +4281,7 @@ def osm_status() -> Dict[str, Any]:
 # these breaks the read silently, so a test asserts they are still present there.
 EXCEL_HEADERS = (
     "ADDR_ID", "Address", "Housenumber", "City", "Postcode", "Country",
-    "District", "HH", "HH_METHOD", "LATITUDE", "LONGITUDE", "OSM_ID",
+    "District", "households", "household_method", "LATITUDE", "LONGITUDE", "OSM_ID",
 )
 
 ROADS_PROPERTIES = ("fclass", "highway", "name", "ref", "oneway", "bridge",

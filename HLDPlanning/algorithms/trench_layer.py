@@ -771,8 +771,9 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
             pdps, pdp_id_field_in,
             ["pdp_id", "PDP_ID", "PDP", "pdp", "pdp_pol_id", "PDP_POL_ID", "pDp_POL_ID"]
         )
-        # HH id on HH layer (addr-like fields first — 'HH' is a household COUNT,
-        # not an identifier, so it is deliberately not auto-detected)
+        # Premise id on the HH layer (addr-like fields first — a household COUNT
+        # is not an identifier, so 'households'/'HH' is deliberately not
+        # auto-detected here)
         hh_id_field = _pick(
             hh, hh_id_field_in,
             ["addr_id", "ADDR_ID", "address_id", "ADDRESS_ID", "hh_id", "HH_ID", "name", "NAME", "id", "ID"]
@@ -784,8 +785,9 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
         )
 
         # ---------- Validate user field choices by their VALUES ----------
-        # A field can exist and still be the wrong one (e.g. 'HH' = household
-        # count, or 'pDp_POL_ID' = source group ids that don't match PDP_ID).
+        # A field can exist and still be the wrong one (e.g. 'households' = a
+        # household count, or 'pDp_POL_ID' = source group ids that don't match
+        # PDP_ID).
         # These mistakes silently produce 0 distribution paths, so detect them.
         def _field_vals(layer, fld, limit=10000):
             out = set()
@@ -2244,7 +2246,7 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
             # Find household count field (number of households)
             hh_hhs_field = _first_field_case_insensitive(
                 hh,
-                ["HH", "HOUSEHOLD_S", "HOUSEHOLD", "hhs", "HH_ID", "households"]
+                ["households", "HH", "HOUSEHOLD_S", "HOUSEHOLD", "hhs", "HH_ID"]
             )
 
             created_garden = 0

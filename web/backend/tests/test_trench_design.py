@@ -993,7 +993,7 @@ def test_junction_end_is_not_a_loose_end():
 # nothing can be cabled through. These tests pin the identity, not the geometry.
 
 def _house(addr, x, y, hh=1, pid="P1", poly="POLY1"):
-    return {"ADDR_ID": addr, "HH": hh, "x": x, "y": y,
+    return {"ADDR_ID": addr, "households": hh, "x": x, "y": y,
             "PDP_ID": pid, "POLYGON_ID": poly}
 
 
@@ -1028,14 +1028,14 @@ def test_houses_on_edges_unions_across_the_edges_of_one_run():
 
 
 def test_houses_on_edges_defaults_a_missing_household_count_to_one():
-    houses = [{"ADDR_ID": "A1", "HH": None}, {"ADDR_ID": "A2"}]
+    houses = [{"ADDR_ID": "A1", "households": None}, {"ADDR_ID": "A2"}]
     addr, hh = td.houses_on_edges([("e", "f")], {("e", "f"): {0, 1}}, houses)
     assert addr == "A1,A2" and hh == pytest.approx(2.0)
 
 
 def test_houses_on_edges_dedupes_an_address_but_still_counts_its_houses():
     houses = [_house("A1", 0, 0, hh=2), _house("A1", 1, 0, hh=2),
-              {"ADDR_ID": None, "HH": 1}]
+              {"ADDR_ID": None, "households": 1}]
     addr, hh = td.houses_on_edges([("e", "f")], {("e", "f"): {0, 1, 2}}, houses)
     assert addr == "A1"            # one address, listed once
     assert hh == pytest.approx(5.0)  # a NULL-address premise still carries HH
@@ -1081,9 +1081,9 @@ def test_trimming_a_run_keeps_its_premise_attribution():
 
 def test_trench_and_aerial_fields_publish_the_premise_attribution():
     line = [n for n, _t in td.FIELD_LINE]
-    assert "ADDR_ID" in line and "HH" in line
+    assert "ADDR_ID" in line and "households" in line
     aerial = [n for n, _t in td.FIELD_AERIAL]
-    assert "ADDR_ID" in aerial and "HH" in aerial
+    assert "ADDR_ID" in aerial and "households" in aerial
 
 
 def test_addr_of_normalises_blank_null_and_missing():
@@ -1095,10 +1095,10 @@ def test_addr_of_normalises_blank_null_and_missing():
 
 
 def test_hh_of_defaults_to_one():
-    assert td._hh_of({"HH": 3}) == pytest.approx(3.0)
-    assert td._hh_of({"HH": "2.5"}) == pytest.approx(2.5)
-    assert td._hh_of({"HH": 0}) == pytest.approx(1.0)
-    assert td._hh_of({"HH": None}) == pytest.approx(1.0)
+    assert td._hh_of({"households": 3}) == pytest.approx(3.0)
+    assert td._hh_of({"households": "2.5"}) == pytest.approx(2.5)
+    assert td._hh_of({"households": 0}) == pytest.approx(1.0)
+    assert td._hh_of({"households": None}) == pytest.approx(1.0)
     assert td._hh_of({}) == pytest.approx(1.0)
 
 

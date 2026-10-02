@@ -10,7 +10,7 @@ EXPECTED_MAP = {
     "postcode":     ["Postcode","PLZ","postal code","Zip","postal cod"],
     "country":      ["Country","Land","country"],
     "district":     ["District","Ortsteil","Bezirk","borough"],
-    "household":    ["HH","HHS","HOUSEHOLDS","HOUSEHOLD","HOUSEHOLD_S","WE","WE_anzahl","Wohneinheiten","No. of HH","Anzahl WE"],
+    "household":    ["households","HH","HHS","HOUSEHOLDS","HOUSEHOLD","HOUSEHOLD_S","WE","WE_anzahl","Wohneinheiten","No. of HH","Anzahl WE"],
     "addr_id":      ["ADDR_ID","Adress_ID","Address ID","Adress ID","Address_ID"],
     "latitude":     ["LATITUDE","latitude","Lat","Y","y","Y_COORD","YCOORD","POINT_Y","northing","NORTHING"],
     "longitude":    ["LONGITUDE","longitude","Lon","Lng","X","x","X_COORD","XCOORD","POINT_X","easting","EASTING"],
@@ -75,7 +75,7 @@ def autodetect_mapping(df: pd.DataFrame) -> dict:
             mapping.pop("longitude", None)
     return mapping
 
-def ensure_households_column(df: pd.DataFrame, mapping: dict, out_name: str = "HH"):
+def ensure_households_column(df: pd.DataFrame, mapping: dict, out_name: str = "households"):
     col = mapping.get("household")
     if col and col in df.columns:
         df[out_name] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
@@ -108,40 +108,57 @@ def add_household_aggregates(
     df: pd.DataFrame,
     *,
     building_col: str = "OSM_ID",
-    hh_col: str = "HH",
-    method_col: str = "HH_METHOD",
+    hh_col: str = "households",
+    method_col: str = "household_method",
+    drop_source: bool = True,
 ) -> pd.DataFrame:
-    """Carry each building's household aggregate on its premises' rows.
+    """State each building's household total on every object row.
 
-    The object layer writes ONE ROW PER PREMISE, which is the right granularity
-    for the design (every premise needs its own service entry) but the wrong one
-    for reading a household count off the layer: a block that became five
-    premises appears as five rows of one household, and a reader summing `HH` by
-    eye can read a five-home block as five one-home buildings.  So every row also
-    carries its building's aggregate:
+    The object layer writes ONE ROW PER PREMISE (a physical service location),
+    and the pipeline's own stages need one row per location.  The HOUSEHOLD
+    COUNT, however, belongs to the building: a block with five addresses is one
+    building with five homes, not five one-home buildings.  So the per-location
+    spread is collapsed into the building total and every row of that building
+    carries it:
 
-      households        sum of HH over the premises that share the building
-      premises          how many premises that building became
-      household_method  the single HH_METHOD, or ``mixed(a,b)`` when they differ
+      households        the building's homes (its whole total, on every row)
+      premises          how many service locations that building became
+      household_method  the single method, or ``mixed(a,b)`` when they differ
+
+    The old per-location column (`HH`) is dropped, so `households` is the one
+    place a household number lives.  Because the total repeats across a
+    building's rows, a consumer that sums the column per row would count a
+    five-address block five times -- `households_by_object` is the helper that
+    counts each building once, and the pipeline's demand stages use it.
 
     Building identity is ``building_col`` (OSM_ID -- the source building the
     premise came from).  A row with no identity is its own object: pooling it
-    with unrelated rows would invent a household count for a building we cannot
-    name, so its own HH is the honest answer.  When the frame has no building
-    column at all, every row is treated that way and the schema still appears.
+    with unrelated rows would invent a count for a building we cannot name.
     """
+    # Drop only what this call recomputes.  `households` is the SOURCE here (the
+    # object layer hands it over already renamed), so it is never dropped.
+    df.drop(
+        columns=[c for c in HOUSEHOLD_AGGREGATE_COLUMNS
+                 if c != "households" and c in df.columns],
+        inplace=True,
+    )
     if df.empty:
-        for col in HOUSEHOLD_AGGREGATE_COLUMNS:
-            df[col] = pd.Series(pd.array([], dtype="int64" if col != "household_method" else "object"), index=df.index)
+        df["households"] = pd.Series([], dtype="int64", index=df.index)
+        df["premises"] = pd.Series([], dtype="int64", index=df.index)
+        df["household_method"] = pd.Series([], dtype="object", index=df.index)
         return df
 
+    # Accept the legacy `HH` / `HH_METHOD` spellings too, so an older workbook or
+    # a frame written before the rename still produces the aggregates.
+    hh_src = hh_col if hh_col in df.columns else "HH"
+    method_src = method_col if method_col in df.columns else "HH_METHOD"
     hh = (
-        pd.to_numeric(df[hh_col], errors="coerce").fillna(0)
-        if hh_col in df.columns else pd.Series(0, index=df.index)
+        pd.to_numeric(df[hh_src], errors="coerce").fillna(0)
+        if hh_src in df.columns else pd.Series(1, index=df.index)
     )
     method = (
-        df[method_col].fillna("").astype(str)
-        if method_col in df.columns else pd.Series("", index=df.index)
+        df[method_src].fillna("").astype(str)
+        if method_src in df.columns else pd.Series("", index=df.index)
     )
 
     own_row = pd.Series([f"__row_{i}" for i in df.index], index=df.index)
@@ -155,7 +172,52 @@ def add_household_aggregates(
     df["households"] = hh.groupby(key).transform("sum").astype(int)
     df["premises"] = hh.groupby(key).transform("size").astype(int)
     df["household_method"] = method.groupby(key).transform(household_method_label)
+    if drop_source:
+        # Only the LEGACY per-location columns go; the canonical output columns
+        # are the ones just written above.
+        df.drop(
+            columns=[c for c in (hh_src, method_src)
+                     if c in df.columns and c not in HOUSEHOLD_AGGREGATE_COLUMNS],
+            inplace=True,
+        )
     return df
+
+
+def households_by_object(
+    rows,
+    *,
+    hh_key: str = "households",
+    object_key: str = "OSM_ID",
+    fallback_key: str = "ADDR_ID",
+) -> dict:
+    """{object identity: homes}, counting each building once.
+
+    `households` repeats a building's total on each of its rows, so a plain sum
+    over the rows inflates a multi-address block.  Every stage that sizes
+    something from homes -- polygon growth and clubbing, the splitter plan, the
+    per-PDP threshold -- has to ask this instead of adding the column up.
+
+    Identity is the building (`object_key`); a row with none falls back to its
+    own id, then to its position, so it is still counted exactly once.
+    """
+    out: dict = {}
+    for i, row in enumerate(rows or []):
+        if not isinstance(row, dict):
+            continue
+        try:
+            homes = int(float(row.get(hh_key) or 0))
+        except (TypeError, ValueError):
+            homes = 0
+        ident = row.get(object_key)
+        if ident in (None, ""):
+            ident = row.get(fallback_key)
+        if ident in (None, ""):
+            ident = f"__row_{i}"
+        # The first row of a building carries the same total as the rest, so
+        # whichever one lands first sets the value; later rows are the same
+        # building and must not add to it.
+        out.setdefault(str(ident), homes)
+    return out
 
 
 def generate_addr_ids(df: pd.DataFrame, prefix: str):

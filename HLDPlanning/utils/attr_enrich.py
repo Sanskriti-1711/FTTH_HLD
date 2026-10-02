@@ -2927,8 +2927,14 @@ def _hh_per_pdp(objects_path):
     PDP ids are normalised to UPPERCASE: the Objects layer carries 'PDP00001'
     while distribution cables/ducts carry lowercase 'pdp00001'.  Without the
     normalisation every utilization lookup misses and reports 0%.
+
+    Homes are counted ONCE PER BUILDING: `households` is a building's total
+    repeated on each of its address rows, so adding the column up per row would
+    report a five-address block as five times its demand and make the splitter
+    utilisation read over 100%.
     """
     out = {}
+    seen = set()
     ds, lyr = _open_lyr(objects_path)
     if lyr is None:
         return out
@@ -2936,8 +2942,16 @@ def _hh_per_pdp(objects_path):
         pid = str(_get(lyr, f, "PDP_ID") or "").upper()
         if not pid:
             continue
-        hh = _num(lyr, f, "HH", 0)
-        out[pid] = out.get(pid, 0) + hh
+        building = _get(lyr, f, "OSM_ID")
+        if building in (None, ""):
+            building = _get(lyr, f, "ADDR_ID")
+        key = (pid, str(building) if building not in (None, "") else f"__row_{f.id()}")
+        if key in seen:
+            continue
+        seen.add(key)
+        out[pid] = out.get(pid, 0) + _num(
+            lyr, f, "households", _num(lyr, f, "HH", 0)
+        )
     ds = None
     return out
 
@@ -3076,7 +3090,7 @@ def enrich_equipment(pdp_path, mfg_path, feedback=None):
             split = split if split in {"1:8", "1:16", "1:32", "1:64"} else "1:32"
             module_count = int(_num(lyr, f, "SPLIT_CNT", 0))
             total_ports = int(_num(lyr, f, "SPL_PORTS", 0))
-            used_ports = int(_num(lyr, f, "HH", 0))
+            used_ports = int(_num(lyr, f, "households", _num(lyr, f, "HH", 0)))
             if total_ports <= 0:
                 total_ports = cap
             if module_count <= 0:

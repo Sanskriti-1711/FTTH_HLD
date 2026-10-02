@@ -395,7 +395,7 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
                     return max(1, v // 64)
             except Exception:
                 pass
-        fld_hh = first_field_case_insensitive(pdp_lyr, ["HH", "hh"])
+        fld_hh = first_field_case_insensitive(pdp_lyr, ["households", "HH", "hh"])
         if fld_hh:
             try:
                 hh = int(float(f[fld_hh] or 0))
@@ -1163,7 +1163,7 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
         # runs PDP → the SAME footway point. Both carry the object's addr_id.
         fld_g_addr = first_field_case_insensitive(garden, ["addr_id", "ADDR_ID", "hh_id", "object_id", "OBJ_ID"])
         fld_d_addr = first_field_case_insensitive(distr, ["addr_id", "ADDR_ID", "obj_id", "object_id"])
-        fld_g_hhs = first_field_case_insensitive(garden, ["hhs", "hh", "HH", "households", "HOUSEHOLDS"])
+        fld_g_hhs = first_field_case_insensitive(garden, ["households", "hhs", "hh", "HH", "HOUSEHOLDS"])
         fld_g_pdp = first_field_case_insensitive(garden, ["PDP_ID", "pdp_id", "pdp_pol_id", "pDp_POL_ID"])
         fld_g_poly = first_field_case_insensitive(garden, ["POLYGON_ID", "polygon_id"])
         fld_g_mfg = first_field_case_insensitive(garden, ["MFG_ID", "mfg_id"])

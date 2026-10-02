@@ -32,19 +32,19 @@ POINT_SIZE_MM = 2.0                   # uniform point size
 
 # ---------- Helpers ----------
 def _pick_hh_field(layer: QgsVectorLayer) -> str:
-    """Pick the best field to represent households (HH)."""
+    """Pick the best field to represent households."""
     fields = layer.fields()
     names = [f.name() for f in fields]
     if not names:
-        return "HH"
+        return "households"
 
-    # 1) exact 'HH'
+    # 1) exact 'households' (the canonical name)
     for n in names:
-        if n.lower() == "hh":
+        if n.lower() == "households":
             return n
 
-    # 2) common variants
-    for cand in ("households", "anz_hh", "anzahl_hh", "hh_count"):
+    # 2) common variants, including the legacy 'HH'
+    for cand in ("hh", "anz_hh", "anzahl_hh", "hh_count"):
         for n in names:
             if n.lower() == cand:
                 return n

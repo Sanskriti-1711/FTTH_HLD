@@ -119,7 +119,7 @@ _FINAL_FIELDS: Tuple[Tuple[str, object], ...] = (
     ("obj_id", QMetaType.Type.QString),
     ("addr_id", QMetaType.Type.QString),
     ("hhs", QMetaType.Type.QString),
-    ("HH", QMetaType.Type.Double),
+    ("households", QMetaType.Type.Double),
     ("length_m", QMetaType.Type.Double),
     ("SPAN_LEN_M", QMetaType.Type.Double),
     ("PDP_ID", QMetaType.Type.QString),
@@ -183,7 +183,7 @@ _AERIAL_FIELDS: Tuple[Tuple[str, object], ...] = (
     ("PDP_ID", QMetaType.Type.QString),
     ("MFG_ID", QMetaType.Type.QString),
     ("addr_id", QMetaType.Type.QString),
-    ("HH", QMetaType.Type.Double),
+    ("households", QMetaType.Type.Double),
     ("TRENCH_TIER", QMetaType.Type.QString),
     ("TRENCH_TYPE", QMetaType.Type.QString),
     # Aerial is a METHOD: Overhead, never excavated. All the fields are carried
@@ -1298,7 +1298,7 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
                 "USAGE_TYPE": cls,
                 "CONSTRUCT": cls,
                 "addr_id": None, "obj_id": None,
-                "hhs": None, "HH": None,
+                "hhs": None, "households": None,
                 "START_CHAMBER": None, "END_CHAMBER": None,
                 "length_m": round(geom.length(), 2),
                 "SPAN_LEN_M": round(geom.length(), 2),
@@ -1421,7 +1421,7 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
                 tier = "Distribution"
             addr = g(f, "ADDR_ID")
             addr_s = str(addr).strip() if addr is not None and str(addr).strip() else None
-            hh = _as_float(g(f, "HH"))
+            hh = _as_float(g(f, "households"))
             start = str(g(f, "START_NODE") or "").strip() or None
             end = str(g(f, "END_NODE") or "").strip() or None
             rows.append({
@@ -1442,7 +1442,7 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
                 "obj_id": addr_s,
                 "addr_id": addr_s,
                 "hhs": None if hh is None else str(int(hh)),
-                "HH": hh,
+                "households": hh,
                 "length_m": _as_float(g(f, "length_m")),
                 "SPAN_LEN_M": _as_float(g(f, "length_m")),
                 "PDP_ID": g(f, "PDP_ID"),
@@ -2094,7 +2094,7 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
                 "PDP_ID": g(f, "PDP_ID"),
                 "MFG_ID": g(f, "MFG_ID"),
                 "addr_id": g(f, "ADDR_ID"),
-                "HH": g(f, "HH"),
+                "households": g(f, "households"),
                 # Tier: the drop leg this aerial span replaces ("Drop"), never
                 # "Garden" — Garden is the excavated micro-trench class.
                 "TRENCH_TIER": g(f, "TRENCH_TIER", "Drop") or "Drop",
