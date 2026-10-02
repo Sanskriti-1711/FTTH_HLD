@@ -1357,6 +1357,11 @@ def classify_span(span_id, coordinates, coordinates_crs: str = "EPSG:4326", *,
         raise ValueError("A span needs an id")
     points = _route_points(coordinates)
     crs_name = str(coordinates_crs or "").strip() or "EPSG:4326"
+    # Validate the route's CRS here rather than leaving it to the imagery
+    # provider: a projected route mislabelled as WGS84 (the default) must be a
+    # clear rejection before anything is fetched or spent, not a patch of
+    # nowhere or a generic "error" item.
+    _coords_to_lonlat(points, crs_name)
     item = _review_item(span_id)
     item["claimed_surface"] = claimed_surface
     item["geometry_reason"] = geometry_reason
@@ -1394,6 +1399,9 @@ def preview_imagery(coordinates, crs: str = "EPSG:4326", *,
             and isinstance(coordinates[0], (list, tuple))):
         points = _route_points(coordinates)
         crs_name = str(crs or "").strip() or "EPSG:4326"
+        # Same up-front check as ``classify_span``: reject a mislabelled CRS with
+        # a clear ValueError instead of previewing imagery of nowhere.
+        _coords_to_lonlat(points, crs_name)
         item["coordinates"] = points
         item["coordinates_crs"] = crs_name
         candidate = {"span_id": item["span_id"], "claimed": None,
