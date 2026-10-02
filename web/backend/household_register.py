@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import math
 import os
 import re
@@ -227,6 +228,37 @@ UPRN_SOURCE: Dict[str, Any] = {
 }
 
 
+# EPC (Energy Performance Certificate) domestic certificates.  NOT a census or a
+# dwelling register: it is one certificate per DWELLING, published at address
+# level (postcode + UPRN), so counting distinct dwellings per postcode gives a
+# real postcode figure -- which is exactly what the ONSPD and OS Open UPRN
+# cannot (they carry no count at all).  England & Wales only; Scotland publishes
+# separately.  The bulk archive needs a GOV.UK One Login, and the developer API
+# a registered key, so this reads an operator-supplied file.
+EPC_SOURCE: Dict[str, Any] = {
+    "name": "EPC domestic certificates (Energy Performance of Buildings Data)",
+    "kind": "epc",
+    "country_code": "GB",
+    "vintage": "operator-supplied release",
+    "publisher": "Department for Energy Security and Net Zero / DLUHC",
+    "url": "https://get-energy-performance-data.communities.gov.uk/",
+    "licence": "Open Government Licence v3.0 (EPC open data)",
+    "note": (
+        "One certificate per dwelling, at address level (postcode + UPRN), so "
+        "counting DISTINCT dwellings is counting homes -- the one free source "
+        "that is genuinely postcode-keyed. It measures DWELLINGS, not occupied "
+        "households, and only those that have been assessed (a property never "
+        "sold or let since 2008 may be absent), so it can undercount. England & "
+        "Wales only; Scotland is a separate publication."
+    ),
+    # EPC bulk CSVs carry `POSTCODE`, `UPRN` and `LMK_KEY` (the certificate id).
+    "fields": {"postcode": "postcode", "uprn": "uprn", "certificate": "lmk_key"},
+    # The archive ships as a zip of per-area CSVs, so the reader looks inside one.
+    "zip_member_glob": "*.csv",
+    "aggregates_to_postcode": True,
+}
+
+
 
 # Column spellings accepted for each field, lower-cased and stripped. Legacy
 # ONSPD/count files may spell them `pcd` / `Dwellings` / `Pop01`; an operator's
@@ -306,6 +338,7 @@ REGISTER_SOURCES: Dict[str, Dict[str, Any]] = {
     "onspd": ONSPD_SOURCE,
     "onspd_area": ONSPD_AREA_SOURCE,
     "uprn": UPRN_SOURCE,
+    "epc": EPC_SOURCE,
 }
 
 REGISTER_COLUMN_ALIASES: Dict[str, Tuple[str, ...]] = {
@@ -314,6 +347,10 @@ REGISTER_COLUMN_ALIASES: Dict[str, Tuple[str, ...]] = {
     "dwellings": ("dwellings", "dwellings_count", "dwell", "households", "household",
                   "hh", "hh_count", "no_of_dwellings", "num_dwellings", "units"),
     "population": ("pop01", "pop", "population", "pop21", "residents"),
+    # EPC certificates are identified by LMK_KEY; the other spellings appear in
+    # the API/derived extracts of the same archive.
+    "certificate": ("lmk_key", "lmkkey", "certificate_number", "certificate",
+                    "epc_id", "energy_performance_certificate_number"),
 }
 
 
@@ -325,15 +362,17 @@ def _match_column(header: Sequence[str], field: str) -> Optional[str]:
     the shortest and most specific name is tried first.
     """
     wanted = sorted(REGISTER_COLUMN_ALIASES.get(field, ()) + (field,), key=len)
-    cells = [str(h or "").strip().lower() for h in header]
+    # Match case-insensitively but return the header's OWN spelling: the caller
+    # indexes a DictReader, whose keys are case-sensitive.  (EPC files shout
+    # (`POSTCODE`, `UPRN`), ONSPD files do not (`pcd`), and both must resolve.)
+    exact = {str(h or "").strip().lower(): str(h or "").strip() for h in header}
     for alias in wanted:
-        for cell in cells:
-            if cell == alias:
-                return cell
+        if alias in exact:
+            return exact[alias]
     for alias in wanted:
-        for cell in cells:
-            if cell.startswith(alias):
-                return cell
+        for lower, original in exact.items():
+            if lower.startswith(alias):
+                return original
     return None
 
 
@@ -399,8 +438,105 @@ def read_register_csv(
         yield rec
 
 
+def aggregate_epc(
+    rows: Iterable[Dict[str, Any]],
+    *,
+    areas: Optional[Sequence[str]] = None,
+    keep_uprn: bool = True,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Turn address-level EPC certificates into postcode register records.
+
+    A certificate is one DWELLING, but a dwelling is re-certified over its life
+    (a new boiler, a loft conversion), so counting certificates counts
+    assessments, not homes.  The dwelling is identified by its UPRN, so the
+    postcode figure is the number of DISTINCT UPRNs; rows with no UPRN fall back
+    to distinct certificate ids, and how many did is reported rather than hidden.
+
+    Returns `(records, stats)` where each record is either
+      ``{postcode, households: <postcode total>}``            (one per postcode)
+    or, when ``keep_uprn`` and the row carries one,
+      ``{postcode, uprn, households: 1}``                     (one per dwelling)
+    so a premise can be matched exactly by UPRN as well as apportioned by
+    postcode.  `areas` filters to postcodes with any of those prefixes (e.g.
+    ``["B16"]``), which is how a national archive is loaded for one project.
+    """
+    prefixes = tuple(str(a).strip().upper().replace(" ", "") for a in (areas or []) if a)
+    dwellings: Dict[str, set] = {}
+    certificates_without_uprn = 0
+    kept = 0
+    for row in rows:
+        postcode = normalize_postcode(row.get("postcode"))
+        if not postcode:
+            continue
+        if prefixes and not postcode.startswith(prefixes):
+            continue
+        uprn = str(row.get("uprn") or "").strip()
+        cert = str(row.get("certificate") or "").strip()
+        if not uprn and not cert:
+            continue
+        if not uprn:
+            certificates_without_uprn += 1
+        dwellings.setdefault(postcode, set()).add(uprn or f"cert:{cert}")
+        kept += 1
+
+    records: List[Dict[str, Any]] = []
+    uprns: List[Dict[str, Any]] = []
+    for postcode in sorted(dwellings):
+        identities = dwellings[postcode]
+        records.append({"postcode": postcode, "households": len(identities)})
+        if keep_uprn:
+            for ident in sorted(identities):
+                if ident.startswith("cert:"):
+                    continue
+                uprns.append({"postcode": postcode, "uprn": ident, "households": 1})
+    stats = {
+        "certificates_read": kept,
+        "postcodes": len(dwellings),
+        "dwellings": sum(len(v) for v in dwellings.values()),
+        "with_uprn": sum(1 for v in dwellings.values()
+                         for i in v if not i.startswith("cert:")),
+        "certificates_without_uprn": certificates_without_uprn,
+    }
+    # UPRN rows first so `load_register`'s first-row-wins postcode lookup still
+    # sees a postcode TOTAL rather than one dwelling's `1`.
+    return records + uprns, stats
+
+
+def read_epc_csv(
+    handle: Any,
+    source: Dict[str, Any],
+    areas: Optional[Sequence[str]] = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Aggregate one EPC CSV handle into register records (see `aggregate_epc`).
+
+    Pure: takes any text handle, so the whole national shape can be exercised in
+    a test with a few lines of CSV and no download.
+    """
+    reader = csv.DictReader(handle)
+    header = reader.fieldnames or []
+    pc_col = _match_column(header, "postcode")
+    if not pc_col:
+        raise ValueError(
+            "an EPC file needs a postcode column; "
+            f"got {list(header)!r}"
+        )
+    uprn_col = _match_column(header, "uprn")
+    cert_col = _match_column(header, "certificate")
+    rows = (
+        {
+            "postcode": raw.get(pc_col),
+            "uprn": raw.get(uprn_col) if uprn_col else "",
+            "certificate": raw.get(cert_col) if cert_col else json.dumps(raw, sort_keys=True),
+        }
+        for raw in reader
+        if raw
+    )
+    return aggregate_epc(rows, areas=areas)
+
+
 def read_register_file(
-    path: str, source: Optional[Dict[str, Any]] = None
+    path: str, source: Optional[Dict[str, Any]] = None,
+    areas: Optional[Sequence[str]] = None,
 ) -> Iterator[Dict[str, Any]]:
     """Read a register from a plain CSV, or from every CSV inside a zip.
 
@@ -412,8 +548,16 @@ def read_register_file(
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(path)
+    # EPC is address-level and must be AGGREGATED to postcode totals, so it does
+    # not go through the row-per-record reader: its files are collected, counted
+    # by dwelling, and emitted as postcode/ UPRN records.
+    epc = src.get("aggregates_to_postcode")
     if not zipfile.is_zipfile(p):
         with p.open("r", encoding="utf-8-sig", errors="replace", newline="") as fh:
+            if epc:
+                records, _stats = read_epc_csv(fh, src, areas)
+                yield from records
+                return
             yield from read_register_csv(fh, src)
         return
     pattern = str(src.get("zip_member_glob") or "*.csv")
@@ -425,6 +569,10 @@ def read_register_file(
         for name in names:
             with zf.open(name) as raw:
                 text = io.TextIOWrapper(raw, encoding="utf-8-sig", errors="replace", newline="")
+                if epc:
+                    records, _stats = read_epc_csv(text, src, areas)
+                    yield from records
+                    continue
                 yield from read_register_csv(text, src)
 
 
@@ -573,7 +721,7 @@ def ingest_source(
     else:
         if not path:
             raise ValueError(f"--source {slug} needs --file <path to the register>")
-        records = read_register_file(path, source)
+        records = read_register_file(path, source, areas)
     # Validate before replacing anything. In particular, current ONSPD has no
     # dwellings column; asking for a first usable row raises on its header while
     # the old register is still intact. An empty/zero-only source is also a

@@ -6,18 +6,33 @@ An explicit operator step, not something a request triggers, for the same reason
 carries a licence, and which vintage to trust is not a decision this code should
 make on its own.
 
-Why it exists: OSM household counts are heuristic, while Census 2021 RM204
-publishes official dwellings counts for England and Wales at small-area level.
-The register can use an operator-supplied extract only when it contains an
-explicit dwellings/households column; the current ONSPD is a geography lookup,
-not that extract, and OS Open UPRN contains identifiers/coordinates but no
-household count. RM204 is area-level, so it must not be loaded into a postcode
-register until a transparent OA-to-postcode allocation is designed.
+Why it exists: OSM household counts are heuristic, and the register can only use
+a source that answers "how many dwellings are at this postcode". There is no free
+postcode-keyed count of that shape: the current ONSPD is a geography lookup, OS
+Open UPRN carries identifiers/coordinates but no count (a block of flats is one
+UPRN), AddressBase Premium is licensed, and VOA Council Tax stock is published at
+LA/LSOA/MSOA only. Census 2021 RM204 is area-level, so it must not be loaded
+until a transparent OA-to-postcode allocation is designed.
+
+The one free source that IS address-level is **EPC domestic certificates**: one
+certificate per dwelling, at postcode + UPRN, under the Open Government Licence
+(England & Wales; Scotland publishes separately). `--source epc` reads that
+archive and AGGREGATES it to postcode totals -- distinct UPRNs per postcode, with
+a per-UPRN row kept so a premise can also be matched by address. The EPC bulk
+download needs a GOV.UK One Login (and the developer API a registered key), so the
+file is operator-supplied:
 
     python ingest_household_register.py --list
     python ingest_household_register.py --count
+    python ingest_household_register.py --source epc --file <epc-certificates.zip or .csv> --areas B16,B17
     python ingest_household_register.py --source onspd --file <count-bearing-release.zip>
     python ingest_household_register.py --source uprn --file <licensed-count-bearing-uprn.csv>
+
+`--areas B16,B17` for EPC keeps only postcodes with those prefixes, so a national
+archive can be loaded for one project instead of the whole country (address-level
+files run into millions of rows). The EPC counts DWELLINGS, not occupied
+households, and only dwellings that have been assessed; the age of the archive is
+reported so the number is never mistaken for a survey.
 
 `--source onspd_area --areas B` is not an ingest path: it is only a published
 postcode/geography lookup, and the loader refuses it. Current May 2026 ONSPD has
@@ -50,6 +65,12 @@ import household_register  # noqa: E402
 import osm_source  # noqa: E402
 
 ENV_FILE = osm_source.load_env_file(BACKEND_DIR)
+
+# `REGISTER_ENABLED` is read at import time, which happens BEFORE the .env above
+# is loaded -- so without this the `--list` header said the register was OFF even
+# when `.env` switched it on. The design itself reads the env at run time and was
+# never affected; only this report was.
+household_register.REGISTER_ENABLED = household_register.register_enabled_from_env()
 
 
 def describe(slug: str, source: Dict[str, Any], status: Dict[str, Any]) -> str:
