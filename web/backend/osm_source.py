@@ -323,7 +323,7 @@ def narrowing_hint(
     return hint
 
 
-def narrowing_fallback(kinds: Sequence[str]) -> str:
+def narrowing_fallback(kinds: Sequence[str], boundary_kind: str = "") -> str:
     """What to say when no bucket can be offered honestly.
 
     "One street at a time" is right when the data simply has no postcode or
@@ -331,8 +331,18 @@ def narrowing_fallback(kinds: Sequence[str]) -> str:
     smaller is loaded for this country -- then the planner needs to know that a
     postcode will resolve back to this same area, or they will spend a round trip
     discovering it.
+
+    A postcode sector is the third case, and saying "no smaller boundary is
+    loaded" about it would be doubly wrong: a postcode DOES narrow to a sector,
+    and this area already IS one.  The reason the chip is withheld is that the
+    same postcode resolves back to this sector, not that the country has nothing.
     """
     if not tuple(kinds):
+        if str(boundary_kind or "") == "postcode_sector":
+            return (
+                " a postcode within it — this area is already the postcode "
+                "sector, and no finer boundary than a sector is published"
+            )
         return (
             " a smaller share of it — no smaller boundary is loaded for this "
             "country, so a postcode or district here resolves back to this same "
@@ -4073,6 +4083,10 @@ def preview_area(
     # and `resolvable_kinds`.  The breakdown itself is still reported: it is a
     # fact about the area.
     chip_kinds = resolvable_kinds(resolution, sub_areas)
+    # The kind of boundary we are standing on decides how a withheld chip is
+    # explained: "nothing smaller is loaded" is wrong when we are already on the
+    # smallest unit the country publishes.
+    boundary_kind = str(resolution.get("boundary_kind") or "")
     hint = narrowing_hint(
         sub_areas, kinds=chip_kinds,
         exclude=own_area_values(resolution, postcode),
@@ -4084,14 +4098,14 @@ def preview_area(
             f"{len(premises) // 285}x the largest design the pipeline has run "
             f"(285 premises), and above the {MAX_PREMISES}-premise per-run cap — "
             f"no run can start until it is narrowed. Design a narrower area "
-            f"instead —{hint or narrowing_fallback(chip_kinds)}."
+            f"instead —{hint or narrowing_fallback(chip_kinds, boundary_kind)}."
         )
     elif len(premises) >= SCALE_GUIDE_PREMISES:
         warnings.append(
             f"This area yields {len(premises)} premises, about "
             f"{len(premises) // 285}x the largest design the pipeline has run "
             f"(285 premises). Design a narrower area instead —"
-            f"{hint or narrowing_fallback(chip_kinds)}."
+            f"{hint or narrowing_fallback(chip_kinds, boundary_kind)}."
         )
 
     # Whether a RUN can start is a different question from whether the area can

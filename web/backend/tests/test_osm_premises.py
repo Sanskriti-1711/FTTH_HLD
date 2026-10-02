@@ -1326,6 +1326,27 @@ def test_a_postcode_inside_a_loaded_ward_boundary_is_not_offered():
     assert "same area" in osm_source.narrowing_fallback(kinds)
 
 
+def test_a_sector_boundary_does_not_claim_the_country_has_nothing_smaller():
+    """A withheld postcode chip on a SECTOR boundary has a different reason.
+
+    The chip is withheld because the same postcode resolves back to this sector,
+    not because nothing is loaded -- saying "no smaller boundary is loaded for
+    this country" under a boundary that IS a sector reads as though a postcode
+    would work when it would return the same 1.958 km².
+    """
+    kinds = osm_source.sub_area_kinds_that_narrow(
+        _ward_resolution(polygon_source="dataset", boundary_kind="postcode_sector")
+    )
+    assert kinds == [], kinds
+
+    note = osm_source.narrowing_fallback(kinds, "postcode_sector")
+    assert "already the postcode sector" in note
+    assert "no smaller boundary is loaded" not in note
+
+    # The ward wording is unchanged: a postcode really does resolve back to it.
+    assert "same area" in osm_source.narrowing_fallback([], "ward")
+
+
 def test_a_postcode_dataset_would_make_the_postcode_reachable_again():
     """A postcode dataset is a strictly smaller polygon than a ward, which is what
     breaks the loop -- so the offer returns as soon as one is loaded."""
