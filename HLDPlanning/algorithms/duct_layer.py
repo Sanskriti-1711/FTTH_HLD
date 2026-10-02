@@ -1859,7 +1859,8 @@ class DuctLayer(QgsProcessingAlgorithm):
             add_edge(adj, edge_geom, edge_len, kx, _kk, seg)
         return kx, QgsPointXY(fx, fy)
 
-    def _trench_route(self, corridor_lyr, a_xy, b_xy, tol_m=1.0):
+    def _trench_route(self, corridor_lyr, a_xy, b_xy, tol_m=1.0,
+                      detour_ref_m=None):
         """Shortest path ALONG the trench network between two points on it.
 
         A tap has to follow the trench (rule D10) and the coupler it reaches
@@ -1905,13 +1906,20 @@ class DuctLayer(QgsProcessingAlgorithm):
             cur = nxt
         coords.append(QgsPointXY(pb.x(), pb.y()))
         # A route that is an absurd detour is not the path between the points:
-        # it would invent far more duct than the chord it replaces. Cap it at
-        # ``x * chord + slack`` so a 5 m tap does not get a 1 km network route.
+        # it would invent far more duct than it replaces. Cap it at
+        # ``ref * ROUTE_DETOUR_MAX_X + ROUTE_DETOUR_SLACK_M``.
+        #
+        # ``ref`` is the straight chord by default (a tap must not invent far
+        # more duct than the gap it closes), but a FULL duct route passes the
+        # legacy route it replaces as ``detour_ref_m``: a winding distribution
+        # route is routinely 5-12x its chord, so the chord cap rejected 22 % of
+        # full duct routes outright and left them on the sidewalk (D10).
         try:
             straight = math.hypot(b_xy[0] - a_xy[0], b_xy[1] - a_xy[1])
         except Exception:
             straight = 0.0
-        if total > straight * self.ROUTE_DETOUR_MAX_X + self.ROUTE_DETOUR_SLACK_M:
+        ref = straight if detour_ref_m is None else max(detour_ref_m, 0.0)
+        if total > ref * self.ROUTE_DETOUR_MAX_X + self.ROUTE_DETOUR_SLACK_M:
             return None
         path = QgsGeometry.fromPolylineXY(coords)
         return None if path.isEmpty() else path
@@ -1987,9 +1995,21 @@ class DuctLayer(QgsProcessingAlgorithm):
                     if na is None or nb is None:
                         failure_reason = "endpoint has no trench candidate"
                         break
-                    route = self._trench_route(
+                    # Cap the trench route against the legacy route it
+                    # replaces (the sidewalk path), not the straight chord: a
+                    # winding distribution route is many times its chord, so
+                    # the tap cap rejected ~22 % of full duct routes and left
+                    # them on the sidewalk (rule D10). The connector also
+                    # falls back to a single trench carrying both ends.
+                    try:
+                        src_len = QgsGeometry.fromPolylineXY(
+                            [QgsPointXY(p.x(), p.y()) for p in part]).length()
+                    except Exception:
+                        src_len = None
+                    route = self._trench_connector(
                         trench_lyr, (na[1].x(), na[1].y()),
-                        (nb[1].x(), nb[1].y()), tol_m=50.0)
+                        (nb[1].x(), nb[1].y()), tol_m=50.0,
+                        detour_ref_m=src_len)
                     if route is None or route.isEmpty():
                         failure_reason = "no acceptable connected trench route"
                         break
@@ -2035,7 +2055,8 @@ class DuctLayer(QgsProcessingAlgorithm):
                 f"({reason_summary}).")
         return changed, unresolved
 
-    def _trench_connector(self, corridor_lyr, a_xy, b_xy, tol_m=1.0):
+    def _trench_connector(self, corridor_lyr, a_xy, b_xy, tol_m=1.0,
+                          detour_ref_m=None):
         """The trench path between two points: routed first, one feature second.
 
         ``_trench_route`` follows the whole network (the general case);
@@ -2043,16 +2064,23 @@ class DuctLayer(QgsProcessingAlgorithm):
         the network could not be noded). None means neither found a trench
         carrying both ends, and the caller falls back to a straight chord —
         counted and logged, never silent.
+
+        ``detour_ref_m`` is forwarded to both as the detour cap reference (see
+        ``_trench_route``): a full duct route passes the legacy route it
+        replaces, a tap leaves it ``None`` and keeps the chord cap.
         """
         try:
-            route = self._trench_route(corridor_lyr, a_xy, b_xy, tol_m)
+            route = self._trench_route(corridor_lyr, a_xy, b_xy, tol_m,
+                                       detour_ref_m=detour_ref_m)
         except Exception:
             route = None
         if route is not None:
             return route
-        return self._trench_link(corridor_lyr, a_xy, b_xy, tol_m)
+        return self._trench_link(corridor_lyr, a_xy, b_xy, tol_m,
+                                 detour_ref_m=detour_ref_m)
 
-    def _trench_link(self, corridor_lyr, a_xy, b_xy, tol_m=1.0):
+    def _trench_link(self, corridor_lyr, a_xy, b_xy, tol_m=1.0,
+                     detour_ref_m=None):
         """The TRENCH path between two points, or None when none carries both.
 
         A duct may only ever be drawn ON the trench network (rule D10), so a
@@ -2093,8 +2121,11 @@ class DuctLayer(QgsProcessingAlgorithm):
                 continue
             # Detour cap: a single-feature trench that carries both points the
             # long way round (loop) is not the path between them — it would
-            # invent far more duct than the chord it replaces.
-            if seg.length() > straight * self.ROUTE_DETOUR_MAX_X + self.ROUTE_DETOUR_SLACK_M:
+            # invent far more duct than it replaces. Same reference rule as
+            # ``_trench_route``: the chord for a tap, the legacy route for a
+            # full duct.
+            ref = straight if detour_ref_m is None else max(detour_ref_m, 0.0)
+            if seg.length() > ref * self.ROUTE_DETOUR_MAX_X + self.ROUTE_DETOUR_SLACK_M:
                 continue
             if best is None or seg.length() < best.length():
                 best = seg
