@@ -1655,6 +1655,191 @@ def boundary_dataset_ingest(
     return len(rows)
 
 
+# ---------------------------------------------------------------------------
+# Postcode sectors, derived rather than published
+#
+# A UK postcode is the unit a planner actually holds, and ONS publishes no
+# polygon for it -- nor for its sector.  Checked against the ONS ArcGIS org
+# itself: 3,954 services, 12 matching "Postcode", every one of them a directory,
+# a lookup or a centroid table, and ZERO named "Sector".  What ONS does publish
+# is the centroid of every live postcode.
+#
+# So a sector polygon is DERIVED here: the sector's own postcodes are fetched and
+# a concave hull is taken around their centroids, buffered so the buildings those
+# centroids sit in fall inside the area.  The result is cached in
+# `osm.boundary_areas` as an ordinary row under kind `postcode_sector`, which the
+# existing smallest-polygon-first rung already prefers over the ward -- the
+# ladder needs no special case for it.
+#
+# It is an approximation and says so in its note: a corridor around the sector's
+# postcode centroids, not an official boundary.  It is not the postcode either,
+# so `postcode_defines_the_area` still answers False and the warning that the
+# design area is not the postcode survives.
+# ---------------------------------------------------------------------------
+
+POSTCODE_SECTOR_SOURCES: Dict[str, Dict[str, Any]] = {
+    "GB": {
+        "name": "ONS Postcode Centroids (derived postcode sectors)",
+        "kind": "postcode_sector",
+        "country_code": "GB",
+        "vintage": "latest ONSPD",
+        "publisher": "Office for National Statistics",
+        "url": (
+            "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/"
+            "ONSPD_Online_latest_Postcode_Centroids/FeatureServer/0/query"
+        ),
+        "licence": (
+            "Open Government Licence v3.0 (ONS geography licences, "
+            "https://www.ons.gov.uk/methodology/geography/licences); centroids "
+            "contain OS data (c) Crown copyright and database right"
+        ),
+        "note": (
+            "Derived, not published: ONS issues no postcode-sector polygons, so "
+            "this area is built from the centroids of the postcodes in the "
+            "sector. It is narrower than the ward, but it is not an official "
+            "boundary and not the postcode itself."
+        ),
+        # PCD7 is the 7-character postcode.  ONSPD carries no sector column, so
+        # the sector is a string operation on the postcode itself.
+        "postcode_field": "PCD7",
+        "page_size": 2000,
+        "max_postcodes": 20_000,
+        # ~75 m at UK latitudes, so the buildings those centroids sit in are
+        # inside the hull rather than sliced by it.
+        "buffer_deg": 0.0007,
+        "concave_ratio": 0.9,
+    },
+}
+
+# Outward code + the first digit of the inward code: "B16 9BH" -> "B169".
+#
+# Named for the UK on purpose.  The generic `_POSTCODE_RE` above matches any
+# postal-code-shaped token ("12105", "10001", "201301") because it answers a
+# different question -- "is this a postcode rather than a place name" -- and
+# overwriting it here silently stopped a German or US postcode from being
+# recognised as one at all.
+_UK_POSTCODE_RE = re.compile(r"^([A-Z]{1,2}[0-9][0-9A-Z]?)([0-9])[A-Z]{2}$")
+
+
+def postcode_sector_of(postcode: str) -> str:
+    """'B16 9BH' -> 'B169'.  Empty when the text is not a UK postcode."""
+    text = re.sub(r"\s+", "", str(postcode or "")).upper()
+    match = _UK_POSTCODE_RE.match(text)
+    return (match.group(1) + match.group(2)) if match else ""
+
+
+def _sector_postcode_centroids(
+    spec: Dict[str, Any], sector: str
+) -> List[Tuple[float, float]]:
+    """Every postcode centroid in one sector, as (lon, lat) pairs.
+
+    Paged through the service rather than fetched in one call: a dense urban
+    sector is a few hundred postcodes and the layer's page ceiling is 2,000.
+    """
+    field = str(spec.get("postcode_field") or "PCD7")
+    # "B169" -> the search prefix "B16 9".
+    prefix = f"{sector[:-1]} {sector[-1]}"
+    page_size = int(spec.get("page_size") or 2000)
+    cap = int(spec.get("max_postcodes") or 20_000)
+    params = {
+        "where": f"{field} LIKE '{prefix}%'",
+        "outFields": field,
+        "returnGeometry": "true",
+        "outSR": "4326",
+        "f": "geojson",
+        "resultRecordCount": str(page_size),
+        "resultOffset": "0",
+    }
+    points: List[Tuple[float, float]] = []
+    while True:
+        payload = _http_json(
+            f"{spec['url']}?{urllib.parse.urlencode(params)}", timeout=60.0
+        )
+        features = (payload or {}).get("features") or []
+        for feature in features:
+            geometry = (feature or {}).get("geometry") or {}
+            coords = geometry.get("coordinates") or []
+            if geometry.get("type") == "Point" and len(coords) >= 2:
+                points.append((float(coords[0]), float(coords[1])))
+        if len(features) < page_size or len(points) >= cap:
+            break
+        params["resultOffset"] = str(len(points))
+    return points[:cap]
+
+
+def _sector_polygon(
+    points: Sequence[Tuple[float, float]], buffer_deg: float, concave_ratio: float
+) -> Optional[Dict[str, Any]]:
+    """A polygon around a sector's postcode centroids, computed in PostGIS.
+
+    In the database rather than in Python because GEOS is already there: a
+    concave hull is one call, and doing it by hand would be a second geometry
+    implementation to keep correct.
+    """
+    if len(points) < 3:
+        return None
+    lons = [float(p[0]) for p in points]
+    lats = [float(p[1]) for p in points]
+    rows = _query(
+        "WITH pts AS ("
+        "  SELECT ST_SetSRID(ST_MakePoint(lon, lat), 4326) AS g"
+        "  FROM unnest(%s::float8[], %s::float8[]) AS t(lon, lat)"
+        ") SELECT ST_AsGeoJSON("
+        "  ST_MakeValid(ST_Buffer(ST_ConcaveHull(ST_Collect(g), %s), %s))"
+        ") AS geom_json FROM pts",
+        (lons, lats, concave_ratio, buffer_deg),
+    )
+    if not rows:
+        return None
+    return _json_geometry(rows[0].get("geom_json"))
+
+
+def ensure_postcode_sector(country_code: str, sector: str) -> Optional[Dict[str, Any]]:
+    """Make sure a sector polygon exists, deriving and caching it on first use.
+
+    Returns the row, or None when this country has no sector source or the
+    sector cannot be built -- in which case the caller keeps the answer it would
+    have had anyway (the ward).  Never raises: a derived extra must not be able
+    to fail an area resolve.
+    """
+    spec = POSTCODE_SECTOR_SOURCES.get(normalize_country_code(country_code))
+    if not spec or not sector or not schema_ready():
+        return None
+    cached = boundary_dataset_lookup(country_code, sector)
+    if cached:
+        return cached
+    try:
+        points = _sector_postcode_centroids(spec, sector)
+        geometry = _sector_polygon(
+            points,
+            float(spec.get("buffer_deg") or 0.0007),
+            float(spec.get("concave_ratio") or 0.9),
+        )
+    except Exception:  # noqa: BLE001 - see the docstring
+        return None
+    if not geometry:
+        return None
+    boundary_dataset_ingest(
+        [
+            {
+                "country_code": country_code,
+                "code": sector,
+                "name": f"Postcode sector {sector[:-1]} {sector[-1]}",
+                "kind": spec["kind"],
+                "properties": {
+                    "licence": spec["licence"],
+                    "vintage": spec["vintage"],
+                    "note": spec["note"],
+                    "postcodes": len(points),
+                },
+                "geometry": geometry,
+            }
+        ],
+        str(spec["name"]),
+    )
+    return boundary_dataset_lookup(country_code, sector)
+
+
 def postcode_defines_the_area(
     postcode: str, source: str, category: str, kind: str, dataset_kind: str = ""
 ) -> Optional[bool]:
@@ -1841,6 +2026,15 @@ def resolve_area(area: str, refresh: bool = False, country_code: str = "",
             if osm_postcode_boundary is not True:
                 lat, lon = _best_point(best, geometry, bbox)
                 if lat is not None and lon is not None:
+                    # A postcode sector is the tightest unit a postcode can
+                    # narrow to, and it is derived here on first use so the
+                    # cached row exists before the rung below asks for the
+                    # smallest polygon containing the point.  When no sector can
+                    # be built, nothing is written and the ward is still the
+                    # answer -- the fallback is the previous behaviour exactly.
+                    sector = postcode_sector_of(postcode_in or area)
+                    if sector:
+                        ensure_postcode_sector(resolved_cc, sector)
                     refined = boundary_dataset_containing(resolved_cc, lon, lat)
         else:
             refined = boundary_dataset_by_name(

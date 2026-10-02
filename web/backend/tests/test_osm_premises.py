@@ -2387,3 +2387,109 @@ def test_a_progress_poll_never_touches_the_database(monkeypatch):
     assert state["state"] == "unknown"
     assert state["fetching"] is False
     assert state["groups_total"] == len(osm_source._OVERPASS_GROUPS)
+
+
+# -----------------------------------------------------------------------
+# Postcode sectors: derived from ONS centroids, preferred over the ward
+#
+# ONS publishes no postcode-sector polygons (checked: 3,954 services in their
+# ArcGIS org, 12 matching "Postcode", all directories/lookups/centroids, none
+# named "Sector"), so the sector is derived from the postcodes inside it.
+# -----------------------------------------------------------------------
+
+
+def test_postcode_sector_of_reads_the_sector_out_of_the_postcode():
+    """The sector is a string operation: ONSPD carries no sector column."""
+    assert osm_source.postcode_sector_of("B16 9BH") == "B169"
+    assert osm_source.postcode_sector_of("b16  9bh") == "B169"
+    assert osm_source.postcode_sector_of("EC1A 1BB") == "EC1A1"
+    assert osm_source.postcode_sector_of("SW1A 2AA") == "SW1A2"
+    # A sector on its own already IS the sector, and anything that is not a
+    # postcode has none -- neither may be mistaken for "B16 9" + digit.
+    assert osm_source.postcode_sector_of("B16 9") == ""
+    assert osm_source.postcode_sector_of("Mariendorf, Berlin") == ""
+    assert osm_source.postcode_sector_of("") == ""
+
+
+def test_only_a_country_with_a_sector_source_derives_one(monkeypatch):
+    """No source for the country means no work, and no database call."""
+    def boom(*a, **k):  # pragma: no cover - must never be called
+        raise AssertionError("a country without a sector source was queried")
+
+    monkeypatch.setattr(osm_source, "_query", boom)
+    monkeypatch.setattr(osm_source, "_http_json", boom)
+
+    assert osm_source.ensure_postcode_sector("US", "10001") is None
+    assert osm_source.ensure_postcode_sector("GB", "") is None
+
+
+def test_a_sector_already_loaded_is_not_derived_again(monkeypatch):
+    """The second postcode in a sector must not re-download its postcodes."""
+    cached = {"code": "B169", "kind": "postcode_sector"}
+    monkeypatch.setattr(osm_source, "schema_ready", lambda: True)
+    monkeypatch.setattr(osm_source, "boundary_dataset_lookup",
+                        lambda cc, code: cached)
+
+    def boom(*a, **k):  # pragma: no cover - must never be called
+        raise AssertionError("a cached sector was derived again")
+
+    monkeypatch.setattr(osm_source, "_sector_postcode_centroids", boom)
+    monkeypatch.setattr(osm_source, "boundary_dataset_ingest", boom)
+
+    assert osm_source.ensure_postcode_sector("GB", "B169") == cached
+
+
+def test_a_sector_that_cannot_be_built_leaves_the_ward_in_place(monkeypatch):
+    """The sector is an extra: failing to build it must not fail the resolve."""
+    monkeypatch.setattr(osm_source, "schema_ready", lambda: True)
+    monkeypatch.setattr(osm_source, "boundary_dataset_lookup", lambda cc, code: None)
+
+    def boom(*a, **k):
+        raise RuntimeError("ONS unreachable")
+
+    monkeypatch.setattr(osm_source, "_sector_postcode_centroids", boom)
+
+    assert osm_source.ensure_postcode_sector("GB", "B169") is None
+
+    # And a sector with too few postcodes is not a polygon either, and must not
+    # reach the database.
+    monkeypatch.setattr(osm_source, "_sector_postcode_centroids",
+                        lambda spec, sector: [(0.0, 0.0), (1.0, 1.0)])
+
+    def no_query(*a, **k):  # pragma: no cover - must never be called
+        raise AssertionError("fewer than three points reached the database")
+
+    monkeypatch.setattr(osm_source, "_query", no_query)
+    assert osm_source.ensure_postcode_sector("GB", "B169") is None
+
+
+def test_a_postcode_asks_for_its_sector_before_the_containing_lookup(monkeypatch):
+    """The smallest-polygon rung can only prefer the sector if the row exists."""
+    order = []
+    best = {
+        "properties": {"display_name": "B16 9BH, Birmingham", "osm_type": "node"},
+        "geometry": {"type": "Point", "coordinates": [-1.935644, 52.474540]},
+        "bbox": [-1.94, 52.47, -1.93, 52.48],
+    }
+    monkeypatch.setattr(osm_source, "schema_ready", lambda: True)
+    monkeypatch.setattr(osm_source.postgis, "is_available", lambda: True)
+    monkeypatch.setattr(osm_source, "init_schema", lambda: None)
+    monkeypatch.setattr(osm_source, "dataset_stamp", lambda cc: "")
+    monkeypatch.setattr(osm_source, "_query", lambda *a, **k: [])
+    monkeypatch.setattr(osm_source, "_execute", lambda *a, **k: None)
+    monkeypatch.setattr(osm_source, "nominatim_query", lambda area: area)
+    monkeypatch.setattr(osm_source, "nominatim_search", lambda area, cc: [best])
+    monkeypatch.setattr(osm_source, "pick_area_result", lambda results, area, cc: results[0])
+    monkeypatch.setattr(osm_source, "_result_address", lambda b: {})
+    monkeypatch.setattr(osm_source, "_country_code_of", lambda b: "GB")
+    monkeypatch.setattr(osm_source, "admin_boundary_for_point", lambda lat, lon: None)
+    monkeypatch.setattr(osm_source, "boundary_dataset_lookup", lambda cc, code: None)
+    monkeypatch.setattr(osm_source, "ensure_postcode_sector",
+                        lambda cc, sector: order.append(("sector", sector)))
+    monkeypatch.setattr(osm_source, "boundary_dataset_containing",
+                        lambda cc, lon, lat: order.append(("containing", None)) or None)
+
+    osm_source.resolve_area("B16 9BH, United Kingdom", refresh=True,
+                            country_code="GB", postcode="B16 9BH")
+
+    assert order == [("sector", "B169"), ("containing", None)], order
