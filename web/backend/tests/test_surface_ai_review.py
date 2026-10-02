@@ -491,6 +491,12 @@ def test_point_classify_transforms_a_projected_coordinate(monkeypatch):
     assert seen["candidate"]["span_id"] == item["span_id"]
 
 
+def _esri_record():
+    return {"image_bytes": b"esri", "mime_type": "image/jpeg",
+            "source": review.ESRI_SOURCE, "date": None,
+            "route_overlaid": False, "has_imagery": True}
+
+
 def _overlay_candidate():
     return {"span_id": "T-overlay", "claimed": None,
             "coordinates": [[1.5249, 49.0762], [1.52492, 49.07622]],
@@ -523,6 +529,216 @@ def test_imagery_falls_back_to_the_raw_patch_without_qt_bindings(monkeypatch):
     assert image["image_bytes"] == b"raw"
     assert image["route_overlaid"] is False
     assert image["source"] == review.IGN_SOURCE
+
+
+def test_a_blank_ign_patch_is_recognised_without_decoding_it():
+    # 1527 bytes is the measured size of IGN's constant-white no-coverage patch;
+    # 6761 bytes was the smallest real patch in the sample set.
+    assert review._ign_patch_has_content(b"x" * 1527) is False
+    assert review._ign_patch_has_content(b"x" * 6761) is True
+
+
+def test_ign_reports_a_blank_patch_as_having_no_imagery(monkeypatch):
+    monkeypatch.setattr(review, "_qt_overlay_available", lambda: False)
+    monkeypatch.setattr(review, "_wms_get_map", lambda bbox, width, height: b"x" * 1527)
+    monkeypatch.setattr(review, "_wms_capture_date", lambda bbox, width, height: None)
+    image = review.ign_bd_ortho_image(_overlay_candidate())
+    assert image["has_imagery"] is False
+    assert image["source"] == review.IGN_SOURCE
+
+
+def test_the_blank_patch_is_measured_before_the_route_is_drawn(monkeypatch):
+    # The container HAS the Qt bindings, so an overlay would paint a route over
+    # the blank patch and make it look like imagery. The flag must come from the
+    # raw bytes, not from what is finally sent to the model.
+    monkeypatch.setattr(review, "_qt_overlay_available", lambda: True)
+    monkeypatch.setattr(review, "_overlay_route", lambda raw, bbox, route: b"x" * 9000)
+    monkeypatch.setattr(review, "_wms_get_map", lambda bbox, width, height: b"x" * 1527)
+    monkeypatch.setattr(review, "_wms_capture_date", lambda bbox, width, height: None)
+    image = review.ign_bd_ortho_image(_overlay_candidate())
+    assert image["image_bytes"] == b"x" * 9000
+    assert image["route_overlaid"] is True
+    assert image["has_imagery"] is False
+
+
+def test_worldwide_imagery_keeps_ign_when_it_has_imagery(monkeypatch):
+    monkeypatch.setattr(review, "ign_bd_ortho_image",
+                        lambda _c: {"image_bytes": b"ign", "mime_type": "image/jpeg",
+                                    "source": review.IGN_SOURCE, "date": None,
+                                    "route_overlaid": False, "has_imagery": True})
+    monkeypatch.setattr(review, "esri_world_imagery",
+                        lambda _c: pytest.fail("Esri must not answer when IGN has imagery"))
+    image = review.worldwide_surface_imagery(_overlay_candidate())
+    assert image["source"] == review.IGN_SOURCE
+
+
+def test_worldwide_imagery_falls_back_to_esri_for_a_blank_patch(monkeypatch):
+    monkeypatch.setattr(review, "ign_bd_ortho_image",
+                        lambda _c: {"image_bytes": b"x" * 1527, "mime_type": "image/jpeg",
+                                    "source": review.IGN_SOURCE, "date": None,
+                                    "route_overlaid": False, "has_imagery": False})
+    monkeypatch.setattr(review, "esri_world_imagery", lambda _c: _esri_record())
+    image = review.worldwide_surface_imagery(_overlay_candidate())
+    assert image["source"] == review.ESRI_SOURCE
+
+
+def test_worldwide_imagery_falls_back_when_ign_refuses_the_request(monkeypatch):
+    def _ign_fails(_candidate):
+        raise RuntimeError(
+            "IGN BD ORTHO returned no image; location may be outside French coverage")
+
+    monkeypatch.setattr(review, "ign_bd_ortho_image", _ign_fails)
+    monkeypatch.setattr(review, "esri_world_imagery", lambda _c: _esri_record())
+    image = review.worldwide_surface_imagery(_overlay_candidate())
+    assert image["source"] == review.ESRI_SOURCE
+
+
+def test_a_provider_without_the_coverage_flag_is_still_trusted(monkeypatch):
+    # Providers written before the flag existed never report it; absence must not
+    # be read as "blank", or every custom deployment would silently switch source.
+    monkeypatch.setattr(review, "ign_bd_ortho_image",
+                        lambda _c: {"image_bytes": b"ign", "mime_type": "image/jpeg",
+                                    "source": "operator orthophoto", "date": None,
+                                    "route_overlaid": False})
+    monkeypatch.setattr(review, "esri_world_imagery",
+                        lambda _c: pytest.fail("absence of the flag is not a blank patch"))
+    image = review.worldwide_surface_imagery(_overlay_candidate())
+    assert image["source"] == "operator orthophoto"
+
+
+def test_the_artifact_names_the_source_that_actually_answered(monkeypatch):
+    monkeypatch.setenv("SURFACE_AI_REVIEW", "1")
+    monkeypatch.setenv("SURFACE_AI_PROVIDER", "ollama")
+    monkeypatch.setattr(review, "ign_bd_ortho_image",
+                        lambda _c: {"image_bytes": b"x" * 1527, "mime_type": "image/jpeg",
+                                    "source": review.IGN_SOURCE, "date": None,
+                                    "route_overlaid": False, "has_imagery": False})
+    monkeypatch.setattr(review, "esri_world_imagery", lambda _c: _esri_record())
+    item = review.classify_point(
+        [1.5249, 49.0762], image_provider=review.worldwide_surface_imagery,
+        classifier=lambda *_args: {"ai_surface": "road", "confidence": 0.8})
+    assert item["imagery_source"] == review.ESRI_SOURCE
+
+
+def test_esri_reports_a_declined_bbox_as_no_imagery(monkeypatch):
+    # Open water makes the export endpoint answer HTTP 500 "Error: bytes". That
+    # is the service saying it holds nothing here, not a broken request.
+    def fake_urlopen(request, timeout):
+        raise urllib.error.HTTPError(request.full_url, 500, "Internal Server Error", {}, None)
+
+    monkeypatch.setattr(review.urllib.request, "urlopen", fake_urlopen)
+    with pytest.raises(review.ImageryUnavailable, match="no imagery for this location"):
+        review._esri_get_map((1.0, 49.0, 1.001, 49.001), 256, 256)
+
+
+def test_a_transport_failure_is_not_mistaken_for_no_imagery(monkeypatch):
+    # A timeout or a refused connection is not an answer, so it must stay an
+    # error instead of being reported as "there is no photo of this span".
+    def fake_urlopen(request, timeout):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(review.urllib.request, "urlopen", fake_urlopen)
+    with pytest.raises(RuntimeError) as caught:
+        review._esri_get_map((1.0, 49.0, 1.001, 49.001), 256, 256)
+    assert not isinstance(caught.value, review.ImageryUnavailable)
+
+
+def test_imagery_missing_from_both_sources_is_not_a_failure(monkeypatch):
+    monkeypatch.setattr(review, "ign_bd_ortho_image",
+                        lambda _c: {"image_bytes": b"x" * 1527, "mime_type": "image/jpeg",
+                                    "source": review.IGN_SOURCE, "date": None,
+                                    "route_overlaid": False, "has_imagery": False})
+
+    def _esri_has_none(_candidate):
+        raise review.ImageryUnavailable("no imagery for this location")
+
+    monkeypatch.setattr(review, "esri_world_imagery", _esri_has_none)
+    assert review.worldwide_surface_imagery(_overlay_candidate()) is None
+
+
+def test_a_transport_failure_from_the_fallback_still_surfaces(monkeypatch):
+    monkeypatch.setattr(review, "ign_bd_ortho_image",
+                        lambda _c: {"image_bytes": b"x" * 1527, "mime_type": "image/jpeg",
+                                    "source": review.IGN_SOURCE, "date": None,
+                                    "route_overlaid": False, "has_imagery": False})
+
+    def _esri_is_down(_candidate):
+        raise RuntimeError("Esri World Imagery request failed")
+
+    monkeypatch.setattr(review, "esri_world_imagery", _esri_is_down)
+    with pytest.raises(RuntimeError, match="request failed"):
+        review.worldwide_surface_imagery(_overlay_candidate())
+
+
+def test_a_span_with_no_imagery_anywhere_is_recorded_as_no_imagery(monkeypatch):
+    monkeypatch.setenv("SURFACE_AI_REVIEW", "1")
+    monkeypatch.setenv("SURFACE_AI_PROVIDER", "ollama")
+    monkeypatch.setattr(review, "ign_bd_ortho_image",
+                        lambda _c: {"image_bytes": b"x" * 1527, "mime_type": "image/jpeg",
+                                    "source": review.IGN_SOURCE, "date": None,
+                                    "route_overlaid": False, "has_imagery": False})
+
+    def _esri_has_none(_candidate):
+        raise review.ImageryUnavailable("no imagery for this location")
+
+    monkeypatch.setattr(review, "esri_world_imagery", _esri_has_none)
+    item = review.classify_point(
+        [1.5249, 49.0762], image_provider=review.worldwide_surface_imagery,
+        classifier=lambda *_args: pytest.fail("there is no image to classify"))
+    assert item["review_status"] == "no_imagery"
+
+
+def test_esri_export_requests_one_patch_for_the_bbox(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        headers = {"Content-Type": "image/jpeg"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _limit=-1):
+            return b"fake-jpeg"
+
+    def fake_urlopen(request, timeout):
+        captured["url"] = request.full_url
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr(review.urllib.request, "urlopen", fake_urlopen)
+    image = review._esri_get_map((1.0, 49.0, 1.001, 49.001), 256, 200)
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(captured["url"]).query)
+    assert image == b"fake-jpeg"
+    assert query["f"] == ["image"]
+    assert query["format"] == ["jpg"]
+    assert query["size"] == ["256,200"]
+    assert query["bboxSR"] == ["4326"]
+    assert query["imageSR"] == ["4326"]
+    assert query["bbox"] == ["1.00000000,49.00000000,1.00100000,49.00100000"]
+
+
+def test_esri_export_rejects_a_non_image_answer(monkeypatch):
+    # An out-of-range export answers as JSON, so it must not be handed to the
+    # model as if it were imagery.
+    class FakeResponse:
+        headers = {"Content-Type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _limit=-1):
+            return b'{"error": {"code": 400, "message": "Invalid bbox"}}'
+
+    monkeypatch.setattr(review.urllib.request, "urlopen",
+                        lambda request, timeout: FakeResponse())
+    with pytest.raises(RuntimeError, match="returned no image"):
+        review._esri_get_map((1.0, 49.0, 1.001, 49.001), 256, 256)
 
 
 def test_point_classify_records_a_missing_route_marker(monkeypatch):

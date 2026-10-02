@@ -22,8 +22,11 @@ def main() -> None:
     # Provider, model and API key come from the environment (see .env): the
     # local Ollama service was removed when the review moved to Gemini.
     os.environ.setdefault("SURFACE_AI_PROVIDER", "gemini")
+    # Same default as the module and Compose: IGN where it has imagery, Esri
+    # World Imagery where it does not (IGN reports that case as a blank patch,
+    # which the model otherwise reads as "the image is completely blank").
     os.environ["SURFACE_AI_IMAGE_PROVIDER"] = (
-        "HLDPlanning.design.surface_ai_review:ign_bd_ortho_image"
+        "HLDPlanning.design.surface_ai_review:worldwide_surface_imagery"
     )
     # Default to a single candidate span; override with SURFACE_AI_MAX_SPANS
     # when running a wider review on a host with faster inference.

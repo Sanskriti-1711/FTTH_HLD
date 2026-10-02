@@ -5,14 +5,18 @@ This pass writes a separate JSON review artifact; it never edits
 ``Final_Trenches.gpkg`` or changes the deterministic geometry verdict. The
 built-in IGN provider fetches a small patch from France's public BD ORTHO WMS,
 transforms the candidate geometry to WGS84, and draws the planned route over
-the patch before inference. The provider is intended for France; outside IGN
-coverage the WMS may return no image.
+the patch before inference. IGN covers France only, and answers a point it holds
+no imagery for with a blank white patch rather than an error — which reached the
+model as an empty image and came back as an abstention. The default provider
+therefore falls back to Esri World Imagery (free, keyless, worldwide) when IGN
+has nothing for the point; which source answered is recorded per span as
+``imagery_source``.
 
 Provider settings:
   SURFACE_AI_PROVIDER=gemini|ollama (default: gemini)
   SURFACE_AI_MODEL=gemini-3.8-flash (Gemini default) or Ollama model override
   SURFACE_AI_OLLAMA_URL=http://127.0.0.1:11434
-  SURFACE_AI_IMAGE_PROVIDER=HLDPlanning.design.surface_ai_review:ign_bd_ortho_image
+  SURFACE_AI_IMAGE_PROVIDER=HLDPlanning.design.surface_ai_review:worldwide_surface_imagery
   SURFACE_AI_REVIEW=1 (the review remains off unless explicitly enabled)
   SURFACE_AI_MAX_SPANS=50 (new spans sent to AI per run; 200 maximum)
   SURFACE_AI_MIN_INTERVAL_SECONDS=6 (pause between calls on a free tier)
@@ -65,6 +69,20 @@ GEMINI_DEFAULT_MIN_INTERVAL_SECONDS = 6.0
 IGN_WMS_URL = "https://data.geopf.fr/wms-r/wms?"
 IGN_LAYER = "ORTHOIMAGERY.ORTHOPHOTOS"
 IGN_SOURCE = "IGN BD ORTHO (© IGN, Open Licence 2.0)"
+# IGN answers a point it holds no imagery for — anywhere outside France, and over
+# open water even inside it — with a constant-white JPEG rather than an error.
+# Across 13 sampled patches every blank one came back byte-identical at 1527
+# bytes while every real one measured 6761-9790 bytes, so a size guard with a
+# wide margin on both sides separates them without decoding the image (this
+# module deliberately carries no imaging dependency on the host).
+IGN_BLANK_PATCH_MAX_BYTES = 4096
+# Esri World Imagery covers the whole world from a single keyless endpoint, and is
+# already the results map's satellite basemap, so a fallback patch is the same
+# imagery a reader is looking at. One export request returns one patch, the same
+# shape as the WMS call IGN needs.
+ESRI_EXPORT_URL = ("https://services.arcgisonline.com/ArcGIS/rest/services/"
+                   "World_Imagery/MapServer/export?")
+ESRI_SOURCE = "Esri World Imagery (© Esri, Maxar, Earthstar Geographics)"
 
 
 def _max_image_dimension() -> int:
@@ -149,6 +167,17 @@ class SurfaceAIQuotaExceeded(RuntimeError):
     Distinct from a generic ``RuntimeError`` so a batch can stop spending quota
     and leave the remaining spans for a later, resuming run instead of walking
     the whole candidate list through a wall of 429s.
+    """
+
+
+class ImageryUnavailable(RuntimeError):
+    """An imagery source answered, but holds nothing for this location.
+
+    Kept apart from a transport failure on purpose. Open water and other places
+    Esri publishes no high-resolution tiles for come back as an HTTP 500 from the
+    export endpoint, and that is a real answer — "nothing here" — which the
+    review can report as ``no_imagery``. A timeout or a refused connection is
+    not an answer, so it stays an error instead of being silently swallowed.
     """
 
 
@@ -781,12 +810,17 @@ def ign_bd_ortho_image(candidate: dict) -> Optional[dict]:
     Returns JPEG image bytes plus source and best-effort capture date. IGN's
     WMS is open data (Open Licence 2.0); source attribution is retained in the
     review artifact. No request is sent to this provider unless the review pass
-    is opted into and at least one uncertain candidate is selected.
+    is opted into and at least one uncertain candidate is selected.  When IGN
+    holds no imagery for the point it returns a blank patch instead of failing,
+    so ``has_imagery`` reports that state for ``worldwide_surface_imagery`` to
+    act on — it is measured on the RAW patch, because drawing the route over a
+    blank one would hide the signal.
     """
     route = _candidate_lonlat(candidate)
     bbox = _route_bbox(route)
     width, height = _image_size_for_bbox(bbox)
     raw = _wms_get_map(bbox, width, height)
+    has_imagery = _ign_patch_has_content(raw)
     if _qt_overlay_available():
         highlighted = _overlay_route(raw, bbox, route)
         overlaid = True
@@ -799,11 +833,112 @@ def ign_bd_ortho_image(candidate: dict) -> Optional[dict]:
         "mime_type": "image/jpeg",
         "source": IGN_SOURCE,
         "date": capture_date,
+        "has_imagery": has_imagery,
         # Whether the planned route was drawn on the patch. When QGIS Qt is
         # unavailable the raw patch is sent, and the artifact records that the
         # classifier judged the centre of the image rather than a marked route.
         "route_overlaid": overlaid,
     }
+
+
+def _ign_patch_has_content(image_bytes: bytes) -> bool:
+    """False when IGN returned its constant-white no-coverage patch.
+
+    The reference case is a 236x236 request, which is where the 1527-byte blank
+    was measured; a larger request scales the blank with it, and the threshold
+    is a fraction of the smallest real patch seen, so it holds for both.
+    """
+    return len(image_bytes) > IGN_BLANK_PATCH_MAX_BYTES
+
+
+def _esri_get_map(bbox, width: int, height: int) -> bytes:
+    """Fetch one image patch for a WGS84 bbox from Esri World Imagery."""
+    params = {
+        "bbox": ",".join(format(value, ".8f") for value in bbox),
+        "bboxSR": "4326", "imageSR": "4326",
+        "size": "%d,%d" % (width, height), "format": "jpg", "f": "image",
+    }
+    request = urllib.request.Request(
+        ESRI_EXPORT_URL + urllib.parse.urlencode(params),
+        headers={"Accept": "image/jpeg", "User-Agent": "Fibre-FTTH-SurfaceReview/0.1"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=WMS_TIMEOUT_SECONDS) as response:
+            content_type = str(response.headers.get("Content-Type", "")).lower()
+            image_bytes = response.read(MAX_IMAGE_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        # "Error: bytes" — the service declined the bbox because it holds no
+        # imagery for it, which is the answer for open water and similar.
+        raise ImageryUnavailable(
+            "Esri World Imagery has no imagery for this location") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError("Esri World Imagery request failed") from exc
+    # A 200 carrying something other than an image is still a refusal, so it is
+    # the same "no imagery" state as the 500 above, not a transport error.
+    if "image/" not in content_type:
+        raise ImageryUnavailable("Esri World Imagery returned no image")
+    if len(image_bytes) > MAX_IMAGE_BYTES:
+        raise ValueError("Imagery patch exceeds 10 MiB")
+    return image_bytes
+
+
+def esri_world_imagery(candidate: dict) -> Optional[dict]:
+    """Fetch a patch from Esri World Imagery, which covers the whole world.
+
+    Same contract as :func:`ign_bd_ortho_image`: one image for a candidate span,
+    with the planned route drawn over it when the Qt bindings exist. Esri
+    publishes no capture date for an export patch, so ``date`` stays None and the
+    review records the imagery as undated rather than guessing one.
+    """
+    route = _candidate_lonlat(candidate)
+    bbox = _route_bbox(route)
+    width, height = _image_size_for_bbox(bbox)
+    raw = _esri_get_map(bbox, width, height)
+    if _qt_overlay_available():
+        highlighted = _overlay_route(raw, bbox, route)
+        overlaid = True
+    else:
+        highlighted = raw
+        overlaid = False
+    return {
+        "image_bytes": highlighted,
+        "mime_type": "image/jpeg",
+        "source": ESRI_SOURCE,
+        "date": None,
+        "route_overlaid": overlaid,
+        "has_imagery": True,
+    }
+
+
+def worldwide_surface_imagery(candidate: dict) -> Optional[dict]:
+    """IGN BD ORTHO where it has imagery, Esri World Imagery everywhere else.
+
+    IGN is still tried first because it is 20 cm and openly licensed, but it only
+    covers France and reports a point it has no imagery for as a blank patch
+    instead of an error. Sending that blank patch to the model produced
+    "completely blank image" abstentions for every span outside France (and over
+    open water, which BD ORTHO also does not cover), so an empty or failed IGN
+    answer is re-fetched from Esri. The artifact records ``imagery_source`` per
+    span, so which provider actually answered remains visible. When neither
+    source holds imagery — open water, or anywhere Esri publishes no
+    high-resolution tiles — it returns None, which the review reports as
+    ``no_imagery`` rather than as a provider failure.
+    """
+    try:
+        image = ign_bd_ortho_image(candidate)
+    except RuntimeError:
+        # Any IGN refusal is worth retrying from Esri, including its documented
+        # "outside French coverage" error.
+        image = None
+    if image is not None and image.get("has_imagery", True):
+        return image
+    try:
+        return esri_world_imagery(candidate)
+    except ImageryUnavailable:
+        # Neither source holds imagery here. Returning None makes the review
+        # report "no_imagery" — a state it already has — instead of an opaque
+        # provider error for a span that simply has no photo of it.
+        return None
 
 
 def review_uncertain_spans(

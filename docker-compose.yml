@@ -30,7 +30,11 @@ services:
       # passed through from the host environment rather than committed here.
       SURFACE_AI_REVIEW: 1
       SURFACE_AI_PROVIDER: gemini
-      SURFACE_AI_IMAGE_PROVIDER: HLDPlanning.design.surface_ai_review:ign_bd_ortho_image
+      # IGN BD ORTHO covers France only and reports a point it has no imagery
+      # for as a blank white patch, so the default provider falls back to Esri
+      # World Imagery (free, keyless, worldwide) instead of sending the model an
+      # empty image. Select ign_bd_ortho_image instead to force IGN only.
+      SURFACE_AI_IMAGE_PROVIDER: HLDPlanning.design.surface_ai_review:worldwide_surface_imagery
       SURFACE_AI_MAX_SPANS: 50
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
     depends_on:
