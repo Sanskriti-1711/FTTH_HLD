@@ -59,11 +59,13 @@ except ImportError:  # standalone script execution (python design/trench_design.
 # classify the same drop the same way. Geometry is measured here; the rules
 # live there (A11a).
 try:
-    from .aerial_feasibility import (MAX_UG_DROP_M_DEFAULT, crossed_road_class,
-                                     evaluate_drop_feasibility)
+    from .aerial_feasibility import (MAX_UG_DROP_M_DEFAULT, MIN_ZONE_AREA_M2,
+                                     crossed_road_class, evaluate_drop_feasibility,
+                                     is_restricted_landuse)
 except ImportError:  # standalone script execution
-    from aerial_feasibility import (MAX_UG_DROP_M_DEFAULT, crossed_road_class,
-                                    evaluate_drop_feasibility)
+    from aerial_feasibility import (MAX_UG_DROP_M_DEFAULT, MIN_ZONE_AREA_M2,
+                                    crossed_road_class, evaluate_drop_feasibility,
+                                    is_restricted_landuse)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Parameters
@@ -809,14 +811,36 @@ def _transform(src, target_epsg: int) -> Optional[osr.CoordinateTransformation]:
 
 
 def _read_polygons_geom(path: str, target_epsg: int) -> Optional[ogr.Geometry]:
-    """All polygons of a layer merged into one geometry (mask tests)."""
+    """Restricted-area polygons of a layer merged into one geometry (mask tests).
+
+    Filtered by ``fclass`` against the shared ``RESTRICTED_LANDUSE`` allow-list
+    in ``design/aerial_feasibility``. It was not filtered here, and that is the
+    whole reason 78 % of a residential ward's premises came back aerial: the
+    pipeline hands this function the RAW landuse layer, so ``residential``,
+    ``retail`` and ``commercial`` polygons -- the ground the network exists to
+    serve -- all became no-excavation zones. Measured on run ab8399fcc (North
+    Edgbaston, 2 620 premises): 188 polygons in, 2 040 of 2 057 drop legs
+    classified aerial for ``zone``.
+
+    A layer with no ``fclass`` field is taken AS IS. That is the one case the
+    filter cannot judge: an operator who supplies a hand-drawn "no dig" layer
+    has already made the decision, and second-guessing it would silently
+    discard a real constraint. The classes are logged either way so the two
+    cases are never confused.
+    """
     ds = ogr.Open(path)
     if ds is None:
         return None
     parts: List[ogr.Geometry] = []
+    kept_classes: Dict[str, int] = {}
+    dropped = 0
+    unfiltered = False
     for li in range(ds.GetLayerCount()):
         lyr = ds.GetLayer(li)
         tr = _transform(lyr.GetSpatialRef(), target_epsg)
+        fidx = lyr.GetLayerDefn().GetFieldIndex("fclass")
+        if fidx < 0:
+            unfiltered = True
         for f in lyr:
             g = f.GetGeometryRef()
             if g is None or g.IsEmpty():
@@ -824,6 +848,16 @@ def _read_polygons_geom(path: str, target_epsg: int) -> Optional[ogr.Geometry]:
             g = g.Clone()
             if tr is not None:
                 g.Transform(tr)
+            # Clipped later by the AOI, but a sliver is not grounds for aerial.
+            if g.GetArea() < MIN_ZONE_AREA_M2:
+                dropped += 1
+                continue
+            if fidx >= 0 and not unfiltered:
+                cls = (f.GetField(fidx) or "").strip().lower()
+                if not is_restricted_landuse(cls):
+                    dropped += 1
+                    continue
+                kept_classes[cls] = kept_classes.get(cls, 0) + 1
             parts.append(g)
     ds = None
     if not parts:
@@ -831,6 +865,9 @@ def _read_polygons_geom(path: str, target_epsg: int) -> Optional[ogr.Geometry]:
     col = ogr.Geometry(ogr.wkbGeometryCollection)
     for g in parts:
         col.AddGeometry(g)
+    col._aerial_class_counts = kept_classes      # type: ignore[attr-defined]
+    col._aerial_dropped = dropped                # type: ignore[attr-defined]
+    col._aerial_unfiltered = unfiltered          # type: ignore[attr-defined]
     return col
 
 
@@ -1474,22 +1511,41 @@ def _snap_anchor(sg: StreetGraph, x: float, y: float, tol: float,
 
 def design_backbone(sg: StreetGraph, mfg: dict, pdps: Sequence[dict],
                     params: Params, log) -> Set[Tuple[str, str]]:
+    """Route each PDP from its assigned MFG (legacy single-MFG inputs still work)."""
+    mfgs = list(mfg) if isinstance(mfg, (list, tuple)) else [mfg]
+    by_id = {
+        str(item.get("MFG_ID") or item.get("SRC_ID") or ""): item
+        for item in mfgs
+    }
+    snapped = {
+        key: _snap_anchor(sg, item["x"], item["y"], params.pdp_search_m)
+        for key, item in by_id.items()
+    }
+    fallback = min(mfgs, key=lambda item: str(item.get("MFG_ID") or item.get("SRC_ID") or ""))
     edges: Set[Tuple[str, str]] = set()
-    src = _snap_anchor(sg, mfg["x"], mfg["y"], params.pdp_search_m)
-    if src is None:
-        log("backbone: MFG could not be snapped to the street graph")
-        return edges
     reached = 0
-    for p in pdps:
-        dst = _snap_anchor(sg, p["x"], p["y"], params.pdp_search_m)
-        if dst is None:
+    unrouted = 0
+    for pdp in pdps:
+        mfg_id = str(pdp.get("MFG_ID") or "")
+        origin = by_id.get(mfg_id)
+        if origin is None:
+            if len(mfgs) > 1:
+                unrouted += 1
+                continue
+            origin = fallback
+            mfg_id = str(origin.get("MFG_ID") or origin.get("SRC_ID") or "")
+        src = snapped.get(mfg_id)
+        dst = _snap_anchor(sg, pdp["x"], pdp["y"], params.pdp_search_m)
+        if src is None or dst is None:
             continue
         path = _route(sg.G, src, dst)
         if not path:
             continue
         edges.update(_path_edges(sg.G, path))
         reached += 1
-    log(f"backbone: MFG → {reached}/{len(pdps)} PDP(s), {len(edges)} street edge(s)")
+    log(f"backbone: {len(mfgs)} MFG(s) → {reached}/{len(pdps)} PDP(s), "
+        f"{len(edges)} street edge(s)" +
+        (f"; {unrouted} PDP(s) lack a valid MFG_ID" if unrouted else ""))
     return edges
 
 
@@ -1773,8 +1829,46 @@ def place_nodes(network: List[Run], drills: Sequence[dict],
                 pdps: Sequence[dict], params: Params,
                 junction_points: Sequence[Tuple[float, float]] = (),
                 log=None) -> List[dict]:
-    """Structural nodes in priority order (TRENCH_DESIGN.md §4.7)."""
+    """Structural nodes in priority order (TRENCH_DESIGN.md §4.7).
+
+    Each node keeps a traceable MFG origin: runs publish their own MFG, PDP
+    spurs inherit the splitter's / catalog MFG at the false trench end, and
+    junction / bend / pull points adopt the nearest network run's MFG so every
+    downstream node field (Trench_Nodes → chamber stage → _NODE_FIELDS) can be
+    populated from the same MFG_ID contract as the trench spans.
+    """
     nodes: List[dict] = []
+
+    def _run_mfg(run) -> Optional[str]:
+        return getattr(run, "mfg", None)
+
+    def _nearest_run_index(x, y, max_d=5.0):
+        best = None, max_d, None
+        for i, r in enumerate(network):
+            if not r.coords:
+                continue
+            d, _a, _q = _project(r.coords, x, y)
+            if d <= max_d and d < best[1]:
+                best = i, d, r
+        return best[2]
+
+    def _resolve_node_mfg(x, y, run, ref):
+        if run is not None:
+            mfg = _run_mfg(run)
+            if mfg:
+                return mfg
+        if ref:
+            pid = str(ref)
+            for p in pdps:
+                if str(p.get("PDP_ID")) == pid:
+                    mfg = str(p.get("MFG_ID")) or _run_mfg(p)
+                    if mfg:
+                        return mfg
+        if run is None:
+            nearest = _nearest_run_index(x, y)
+            if nearest is not None:
+                return _run_mfg(nearest)
+        return None
 
     def add(x, y, ntype, priority, run=None, arc=None, ref=None):
         for n in nodes:
@@ -1785,7 +1879,8 @@ def place_nodes(network: List[Run], drills: Sequence[dict],
             if math.hypot(n["x"] - x, n["y"] - y) < sep:
                 return n
         n = {"x": x, "y": y, "NODE_TYPE": ntype, "PRIORITY": priority,
-             "run": id(run) if run is not None else None, "arc": arc, "ref": ref}
+             "run": id(run) if run is not None else None, "arc": arc, "ref": ref,
+             "mfg": _resolve_node_mfg(x, y, run, ref)}
         nodes.append(n)
         return n
 
@@ -1815,7 +1910,8 @@ def place_nodes(network: List[Run], drills: Sequence[dict],
             if n is None:
                 n = {"x": pt[0], "y": pt[1], "NODE_TYPE": "HDD_PIT",
                      "PRIORITY": 1, "run": d.get("run"), "arc": d.get("arc"),
-                     "ref": None, "drill": di}
+                     "ref": None, "drill": di,
+                     "mfg": _run_mfg(next((r for r in network if id(r) == d.get("run")), None))}
                 nodes.append(n)
 
 
@@ -1862,9 +1958,12 @@ def place_nodes(network: List[Run], drills: Sequence[dict],
             host["x"], host["y"] = px, py
             if pid:
                 host["ref"] = pid
+            host_mfg = str(p.get("MFG_ID")) or str(p.get("SRC_ID")) or _run_mfg(p)
+            if host_mfg:
+                host["mfg"] = host_mfg
             pdp_takeovers += 1
             continue
-        add(px, py, "PDP", 3, ref=pid)
+        add(px, py, "PDP", 3, ref=pid, run=None)
 
     # 4 — sharp bends
     for run in network:
@@ -2079,11 +2178,12 @@ FIELD_AERIAL = (
     # the LLD read instead of inferring "not dug" from the label.
     ("CONSTRUCTION_METHOD", ogr.OFTString), ("EXCAVATION", ogr.OFTInteger),
     ("length_m", ogr.OFTReal), ("AERIAL_REASON", ogr.OFTString),
-    ("INFRA_STATUS", ogr.OFTString),
+    ("INFRA_STATUS", ogr.OFTString), ("MFG_ID", ogr.OFTString),
 )
 FIELD_NODE = (
     ("NODE_ID", ogr.OFTString), ("NODE_TYPE", ogr.OFTString),
     ("PRIORITY", ogr.OFTInteger), ("PDP_ID", ogr.OFTString),
+    ("MFG_ID", ogr.OFTString),
     ("X", ogr.OFTReal), ("Y", ogr.OFTReal),
 )
 FIELD_DRILL = (
@@ -2569,8 +2669,8 @@ def connect_unreached_pdps(runs: List[Run], pdps: Sequence[dict],
             continue
         out.append(Run(coords=[q, (p["x"], p["y"])], tier="Feeder",
                        pdp=str(p.get("PDP_ID") or ""), polygon=None,
-                       src="pdp-spur",
-                       mfg=(runs[0].mfg if runs else None)))
+                       src="pdp-spur", mfg=p.get("MFG_ID") or
+                       (runs[0].mfg if runs else None)))
         segs.append(((q[0], q[1]), (p["x"], p["y"])))
         spurs += 1
         longest = max(longest, d)
@@ -3137,39 +3237,86 @@ def design(cfg: dict) -> dict:
         f"({sg.sidewalk_link_m:.0f} m of gap), so the route can stay on the "
         f"pavement instead of stepping onto the carriageway")
 
-    backbone_edges = design_backbone(sg, mfgs[0], pdps, params, log)
-    spine_edges, edge_houses = design_spine(sg, pdps, houses, params, log)
-
-    # ── assemble runs (Feeder wins over Distribution where they overlap) ──
-    feeder_keys = set(backbone_edges)
-    dist_keys = set().union(*spine_edges.values()) if spine_edges else set()
-    dist_only = dist_keys - feeder_keys
-
     runs: List[Run] = []
-    # The origin every span belongs to. ``cable_layer`` reads MFG_ID on the
-    # feeder and garden layers to plan the shared feeder from the MFG down, so
-    # it is stamped on the whole network rather than only on the backbone.
-    mfg_id = mfgs[0].get("MFG_ID") or mfgs[0].get("SRC_ID") or None
-    pdp_by_key = {}
-    for p in pdps:
-        k = _snap_anchor(sg, p["x"], p["y"], params.pdp_search_m)
-        if k:
-            pdp_by_key[k] = p
-    for keys, tier, pid in ((feeder_keys, "Feeder", None), (dist_only, "Distribution", None)):
-        if not keys:
+    mfg_runs: Dict[str, List[Run]] = {}
+    mfg_houses: Dict[str, List[dict]] = {}
+    connectivity_by_mfg = {}
+    spur_by_mfg = {}
+    mfg_connectivity = {}
+    all_feeder_edges: Set[Tuple[str, str]] = set()
+    all_distribution_edges: Set[Tuple[str, str]] = set()
+    for mfg_index, mfg in enumerate(mfgs):
+        mfg_id = str(mfg.get("MFG_ID") or mfg.get("SRC_ID") or f"MFG{mfg_index + 1:05d}")
+        mfg["MFG_ID"] = mfg_id
+        group_pdps = [p for p in pdps if str(p.get("MFG_ID") or "") == mfg_id]
+        group_houses = [h for h in houses if str(h.get("MFG_ID") or "") == mfg_id]
+        if len(mfgs) == 1:
+            group_pdps = list(pdps)
+            group_houses = list(houses)
+        mfg_houses[mfg_id] = group_houses
+        if not group_pdps:
+            log(f"{mfg_id}: no PDPs are assigned; skipping its trench network")
+            mfg_runs[mfg_id] = []
             continue
-        raw_runs, breaks, run_edge_keys = runs_from_edges(keys, sg)
-        for coords, ekeys in zip(raw_runs, run_edge_keys):
-            straight = _straighten(coords, params)
-            # Attach the premises this run was dug for. A shared street run
-            # often carries several houses' drops, so the value is the whole
-            # set — that is the truth about the span, and it is what lets the
-            # cabling stage fan the shared trunk back out per address.
-            addr, hh = houses_on_edges(ekeys, edge_houses, houses)
-            runs.append(Run(coords=straight, tier=tier, pdp=pid,
-                            polygon=None, src="street-graph", edge_keys=ekeys,
-                            addr=addr, hh=hh, mfg=mfg_id))
+        backbone_edges = design_backbone(sg, mfg, group_pdps, params, log)
+        spine_edges, edge_houses = design_spine(sg, group_pdps, group_houses, params, log)
+        feeder_keys = set(backbone_edges)
+        dist_keys = set().union(*spine_edges.values()) if spine_edges else set()
+        dist_only = dist_keys - feeder_keys
+        group_runs: List[Run] = []
+        for keys, tier in ((feeder_keys, "Feeder"), (dist_only, "Distribution")):
+            if not keys:
+                continue
+            raw_runs, _breaks, run_edge_keys = runs_from_edges(keys, sg)
+            for coords, ekeys in zip(raw_runs, run_edge_keys):
+                straight = _straighten(coords, params)
+                addr, hh = houses_on_edges(ekeys, edge_houses, group_houses)
+                group_runs.append(Run(
+                    coords=straight, tier=tier, polygon=None, src="street-graph",
+                    edge_keys=ekeys, addr=addr, hh=hh, mfg=mfg_id,
+                ))
+        all_feeder_edges.update(feeder_keys)
+        all_distribution_edges.update(dist_keys)
+        before = len(group_runs)
+        group_runs, connectivity_by_mfg[mfg_id] = keep_mfg_component(
+            group_runs, mfg, group_pdps, params, log
+        )
+        group_runs, spur_by_mfg[mfg_id] = connect_unreached_pdps(
+            group_runs, group_pdps, params, log, max_gap_m=params.anchor_touch_m
+        )
+        group_runs, mfg_connectivity[mfg_id] = connect_unreached_mfg(
+            group_runs, mfg, params, log
+        )
+        mfg_runs[mfg_id] = group_runs
+        runs.extend(group_runs)
+        if before != len(group_runs):
+            log(f"{mfg_id}: retained {len(group_runs)} connected mains run(s)")
+
+    feeder_keys = all_feeder_edges
+    dist_keys = all_distribution_edges
     carrier_mix = _edge_class_lengths(sg, feeder_keys | dist_keys)
+    conn_stats = {
+        "mfg_areas": len(mfgs),
+        "components": sum(value.get("components", 0) for value in connectivity_by_mfg.values()),
+        "dropped_runs": sum(value.get("dropped_runs", 0) for value in connectivity_by_mfg.values()),
+        "dropped_m": round(sum(value.get("dropped_m", 0.0) for value in connectivity_by_mfg.values()), 1),
+        "unreachable_pdps": sum(value.get("unreachable_pdps", 0) for value in connectivity_by_mfg.values()),
+    }
+    spur_stats = {
+        "pdp_spurs": sum(value.get("pdp_spurs", 0) for value in spur_by_mfg.values()),
+        "max_spur_m": max((value.get("max_spur_m", 0.0) for value in spur_by_mfg.values()), default=0.0),
+        "gap_m": params.anchor_touch_m,
+    }
+    mfg_conn = {
+        "mfg_connected": sum(value.get("mfg_connected", 0) for value in mfg_connectivity.values()),
+        "mfg_count": len(mfgs),
+        "mfg_gap_m": max((value.get("mfg_gap_m", 0.0) for value in mfg_connectivity.values()), default=0.0),
+    }
+    for mfg_id, group_pdps in ((str(m.get("MFG_ID")), [p for p in pdps if str(p.get("MFG_ID") or "") == str(m.get("MFG_ID"))]) for m in mfgs):
+        log(f"{mfg_id}: backbone/spine routing complete for {len(group_pdps)} PDP(s)")
+    if len(mfgs) == 1:
+        mfg_id = str(mfgs[0].get("MFG_ID") or mfgs[0].get("SRC_ID") or "MFG00001")
+        mfg_houses[mfg_id] = list(houses)
     log("carriers: " + ", ".join(
         "%s %.0f m" % (k, v)
         for k, v in sorted(carrier_mix.items(), key=lambda kv: -kv[1])[:6]))
@@ -3183,28 +3330,9 @@ def design(cfg: dict) -> dict:
         f"({sum(1 for r in runs if r.tier == 'Feeder')} feeder, "
         f"{sum(1 for r in runs if r.tier == 'Distribution')} distribution)")
 
-    # ── keep only the network that reaches the MFG / its PDPs ────────────
-    # Runs come from independent edge sets, so the assembly can leave fragments
-    # that no route reaches. They are dropped BEFORE the drops are designed, so
-    # a house that would have attached to a dead fragment attaches to the real
-    # network instead.
-    before = len(runs)
-    runs, conn_stats = keep_mfg_component(runs, mfgs[0], pdps, params, log)
-    if before != len(runs):
-        log("runs after connectivity filter: %d" % len(runs))
-    # Every PDP must end up ON a trench, or its splitter cannot be cabled.
-    # ANCHOR-EXACT: the tolerance is the physical "touching" distance, not the
-    # chamber-separation heuristic. With the default gap a splitter 1.9 m off
-    # the network was left alone (<= min_node_sep_m = 10 m), so the trench — and
-    # every duct and cable laid in it — stopped short of the splitter: measured
-    # on Berlin, MFG 1.91 m and 10 of 31 PDPs 1.2-1.9 m off the trench.
-    runs, spur_stats = connect_unreached_pdps(
-        runs, pdps, params, log, max_gap_m=params.anchor_touch_m)
-    # The MFG is the root of the whole design (feeder cables originate there),
-    # so it gets the same treatment as a splitter.
-    runs, mfg_conn = connect_unreached_mfg(runs, mfgs[0], params, log)
-
-    # attach the pre-straighten network for garden-leg snapping
+    # The per-MFG loop above already retained each origin's connected component
+    # and connected only its assigned PDPs. Do not run a project-wide filter
+    # here: selecting mfgs[0] would discard every other MFG's network.
     network_parts = [r.coords for r in runs]
 
     # ── garden legs + aerial classification ──────────────────────────────
@@ -3213,12 +3341,41 @@ def design(cfg: dict) -> dict:
         aerial_zone = _read_polygons_geom(cfg["aerial"], params.target_epsg)
         aerial_polys = _zone_polygons(aerial_zone)
         if aerial_polys:
-            log("aerial zones: %d polygon(s), %.1f ha - no excavation inside"
+            log("aerial zones: %d restricted polygon(s), %.1f ha - no excavation inside"
                 % (len(aerial_polys),
                    sum(g.GetArea() for g, _e in aerial_polys) / 10000.0))
-    legs = design_garden_legs(network_parts, houses, params, log)
-    legs, aerial_legs = _split_drop_legs(legs, aerial_polys, params, log,
-                                         road_parts=vehicular)
+        # The filter is the load-bearing step, so it says what it did. A layer
+        # that arrived UNFILTERED (no fclass field) is called out separately:
+        # that is an operator-supplied "no dig" mask and is honoured as-is.
+        if aerial_zone is not None:
+            kept = getattr(aerial_zone, "_aerial_class_counts", {}) or {}
+            dropped = getattr(aerial_zone, "_aerial_dropped", 0)
+            unfiltered = getattr(aerial_zone, "_aerial_unfiltered", False)
+            if unfiltered:
+                log("aerial zone mask has no 'fclass' field - taken AS IS "
+                    "(%d polygon(s)); a hand-supplied no-dig layer is honoured, "
+                    "but a raw landuse layer must carry fclass or it will "
+                    "blanket the AOI" % (len(aerial_polys),))
+            else:
+                log("aerial zone mask: kept %s; dropped %d non-restricted/sliver "
+                    "polygon(s)" % (", ".join("%s x%d" % kv for kv in sorted(kept.items())) or "none",
+                                    dropped))
+    legs: List[dict] = []
+    aerial_legs: List[dict] = []
+    for mfg in mfgs:
+        mfg_id = str(mfg.get("MFG_ID") or mfg.get("SRC_ID") or "")
+        group_houses = mfg_houses.get(mfg_id, [])
+        group_network = [r.coords for r in runs
+                         if r.mfg == mfg_id and r.src != "house-drop"]
+        group_legs = design_garden_legs(group_network, group_houses, params, log)
+        group_legs, group_aerial = _split_drop_legs(
+            group_legs, aerial_polys, params, log, road_parts=vehicular
+        )
+        for leg in group_legs + group_aerial:
+            leg["mfg_id"] = mfg_id
+            leg["house"].setdefault("MFG_ID", mfg_id)
+        legs.extend(group_legs)
+        aerial_legs.extend(group_aerial)
     if aerial_legs:
         by_reason: Dict[str, int] = defaultdict(int)
         for leg in aerial_legs:
@@ -3243,7 +3400,8 @@ def design(cfg: dict) -> dict:
                 polygon=(_house.get("POLYGON_ID") or None),
                 src="house-drop",
                 # A drop leg exists for exactly one premise.
-                addr=_addr_of(_house), hh=_hh_of(_house), mfg=mfg_id)
+                addr=_addr_of(_house), hh=_hh_of(_house),
+                mfg=leg.get("mfg_id") or _house.get("MFG_ID"))
         r.tier_type = leg["type"]          # type decided by leg length
         r.footway_pt = leg["coords"][0]    # the mains-side end (authoritative)
         runs.append(r)
@@ -3255,8 +3413,23 @@ def design(cfg: dict) -> dict:
     # service: only MFG/PDP ends, leg attachments and junctions keep a trench.
     mains_only = [r for r in runs if r.src != "house-drop"]
     drops_only = [r for r in runs if r.src == "house-drop"]
-    mains_only, tail_stats = trim_unserved_tails(
-        mains_only, drops_only, _anchor_points(pdps, [], mfgs), params, log)
+    tail_stats = {"trimmed_runs": 0, "dropped_runs": 0, "removed_m": 0.0,
+                  "restored_runs": 0, "detached_legs": 0}
+    trimmed_by_mfg = []
+    for mfg in mfgs:
+        mfg_id = str(mfg.get("MFG_ID") or mfg.get("SRC_ID") or "")
+        group_mains = [r for r in mains_only if r.mfg == mfg_id]
+        group_drops = [r for r in drops_only if r.mfg == mfg_id]
+        group_pdps = [p for p in pdps if str(p.get("MFG_ID") or "") == mfg_id]
+        group_mains, stats = trim_unserved_tails(
+            group_mains, group_drops, _anchor_points(group_pdps, [], [mfg]),
+            params, log)
+        trimmed_by_mfg.extend(group_mains)
+        for key in ("trimmed_runs", "dropped_runs", "restored_runs", "detached_legs"):
+            tail_stats[key] += stats.get(key, 0)
+        tail_stats["removed_m"] += stats.get("removed_m", 0.0)
+    tail_stats["removed_m"] = round(tail_stats["removed_m"], 1)
+    mains_only = trimmed_by_mfg
 
     # ── re-establish "every ANCHOR on a trench" on the FINAL run set ────────
     # The trim cuts a run back to its own supports, so a PDP that was 8 m from
@@ -3273,10 +3446,28 @@ def design(cfg: dict) -> dict:
     # physical touching distance the duct and cable stages club at (0.05 m),
     # so a splitter or cabinet that is 1.9 m off gets a 1.9 m connector and the
     # feeder/distribution trunk physically starts on it.
-    mains_only, pdp_spur_stats = connect_unreached_pdps(
-        mains_only, pdps, params, log, max_gap_m=params.anchor_touch_m)
-    # The MFG is the root of the feeder: same guarantee, same tolerance.
-    mains_only, mfg_conn = connect_unreached_mfg(mains_only, mfgs[0], params, log)
+    pdp_spur_stats = {"pdp_spurs": 0, "max_spur_m": 0.0, "gap_m": params.anchor_touch_m}
+    for mfg in mfgs:
+        mfg_id = str(mfg.get("MFG_ID") or mfg.get("SRC_ID") or "")
+        group_pdps = [p for p in pdps if str(p.get("MFG_ID") or "") == mfg_id]
+        group_mains = [r for r in mains_only if r.mfg == mfg_id]
+        group_mains, group_stats = connect_unreached_pdps(
+            group_mains, group_pdps, params, log, max_gap_m=params.anchor_touch_m
+        )
+        pdp_spur_stats["pdp_spurs"] += group_stats.get("pdp_spurs", 0)
+        pdp_spur_stats["max_spur_m"] = max(
+            pdp_spur_stats["max_spur_m"], group_stats.get("max_spur_m", 0.0)
+        )
+        group_mains, mfg_connectivity[mfg_id] = connect_unreached_mfg(
+            group_mains, mfg, params, log
+        )
+        retained = [r for r in mains_only if r.mfg != mfg_id]
+        mains_only = retained + group_mains
+    mfg_conn = {
+        "mfg_connected": sum(value.get("mfg_connected", 0) for value in mfg_connectivity.values()),
+        "mfg_count": len(mfgs),
+        "mfg_gap_m": max((value.get("mfg_gap_m", 0.0) for value in mfg_connectivity.values()), default=0.0),
+    }
     runs = mains_only + drops_only
     log("runs after trimming: %d (%d feeder, %d distribution, %d garden)"
         % (len(runs), sum(1 for r in runs if r.tier == "Feeder"),
@@ -3468,6 +3659,7 @@ def design(cfg: dict) -> dict:
         node_rows.append({
             "NODE_ID": n["NODE_ID"], "NODE_TYPE": n["NODE_TYPE"],
             "PRIORITY": n["PRIORITY"], "PDP_ID": n.get("ref") or None,
+            "MFG_ID": n.get("mfg"),
             "X": round(n["x"], 2), "Y": round(n["y"], 2),
             "geom": ogr.CreateGeometryFromWkt(f"POINT({n['x']} {n['y']})"),
         })
@@ -3502,7 +3694,7 @@ def design(cfg: dict) -> dict:
             "EXCAVATION": 0,
             "length_m": round(leg["length"], 2),
             "AERIAL_REASON": leg["aerial_reason"],
-            "INFRA_STATUS": "New",
+            "INFRA_STATUS": "New", "MFG_ID": leg.get("mfg_id"),
             "geom": _make_multiline([leg["coords"]]),
         })
     _write_lines(os.path.join(out_dir, "Aerial_Drops.gpkg"), "Aerial_Drops",
@@ -3559,6 +3751,16 @@ def design(cfg: dict) -> dict:
             "garden_spans_without_address": len(_garden_unattributed),
             "garden_legs": len(legs),
             "households_on_drop_legs": round(_hh_billed, 1),
+        },
+        "mfg_areas": {
+            mfg_id: {
+                "premises": len(mfg_houses.get(mfg_id, [])),
+                "households": round(sum(_hh_of(house) for house in mfg_houses.get(mfg_id, [])), 1),
+                "pdps": sum(1 for pdp in pdps if str(pdp.get("MFG_ID") or "") == mfg_id),
+                "mains_runs": sum(1 for run in runs if run.mfg == mfg_id and run.src != "house-drop"),
+                "drop_legs": sum(1 for run in runs if run.mfg == mfg_id and run.src == "house-drop"),
+            }
+            for mfg_id in sorted(mfg_houses)
         },
         "aerial_legs": len(aerial_rows),
         "aerial_length_m": round(sum(r["length_m"] for r in aerial_rows), 1),

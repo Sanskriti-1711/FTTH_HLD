@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
+import heapq
+import math
 import os
+from collections import defaultdict
 
 from qgis.PyQt.QtCore import QCoreApplication, QMetaType
 from qgis.core import (
@@ -19,6 +22,7 @@ from ..utils.layer_io import as_layer
 from ..utils.network_manager import NetworkManager
 from ..utils.fields import COMMON_FIELDS, THIN_PROFILES, build_fields, first_field_case_insensitive
 from ..utils.splitters import plan_splitters
+from ..utils.mfg_partition import partition_mfg_service_areas
 
 try:
     from osgeo import gdal
@@ -52,6 +56,7 @@ def _thin_feature(fields: QgsFields, geom: QgsGeometry, attrs: dict) -> QgsFeatu
     return f
 
 # prefer makevalid; fallback to fixgeometries
+
 def _valid_layer(input_layer, context, feedback):
     if _has("native:makevalid"):
         return as_layer(processing.run(
@@ -64,6 +69,160 @@ def _valid_layer(input_layer, context, feedback):
         {"INPUT": input_layer, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
         is_child_algorithm=True, context=context, feedback=feedback
     )["OUTPUT"], context)
+
+
+def _mfg_road_distance_matrix(polygon_geometries, roads_layer, feedback=None,
+                              max_road_m=3000.0):
+    """Shortest road-network distances between premise-polygon representatives.
+
+    Each representative is projected to its nearest eligible road segment.
+    Its projection is inserted as a real graph node by splitting that segment;
+    this matters because snapping only to a segment's endpoints would either
+    distort service distances or create a shortcut through an unsplit edge.
+    """
+    line_geometries = []
+    for feature in roads_layer.getFeatures():
+        geom = feature.geometry()
+        if geom is not None and not geom.isEmpty():
+            line_geometries.append(geom)
+    if not line_geometries:
+        return {}, {}
+
+    network = QgsGeometry.unaryUnion(line_geometries)
+    if network is None or network.isEmpty():
+        return {}, {}
+    parts = []
+
+    def collect_lines(geometry):
+        """Extract every line part, including lines nested in collections."""
+        if geometry is None or geometry.isEmpty():
+            return
+        geometry_type = QgsWkbTypes.geometryType(geometry.wkbType())
+        if geometry_type == QgsWkbTypes.LineGeometry:
+            if geometry.isMultipart():
+                multiline = geometry.asMultiPolyline()
+                if multiline:
+                    parts.extend(multiline)
+            else:
+                line = geometry.asPolyline()
+                if line:
+                    parts.append(line)
+            return
+        try:
+            for child in geometry.asGeometryCollection():
+                collect_lines(child)
+        except Exception:
+            return
+
+    collect_lines(network)
+
+    node_xy = {}
+    segments = []
+
+    def key_for(point):
+        key = (round(float(point.x()), 3), round(float(point.y()), 3))
+        node_xy.setdefault(key, QgsPointXY(point))
+        return key
+
+    for line in parts:
+        if len(line) < 2:
+            continue
+        previous = line[0]
+        previous_key = key_for(previous)
+        for point in line[1:]:
+            point_key = key_for(point)
+            if point_key != previous_key:
+                segments.append((QgsPointXY(previous), QgsPointXY(point),
+                                 previous_key, point_key))
+            previous, previous_key = point, point_key
+
+    if not segments:
+        return {}, {}
+
+    projections = {}
+    segment_cuts = defaultdict(list)
+    for polygon_id, geometry in polygon_geometries.items():
+        representative = geometry.pointOnSurface()
+        if representative is None or representative.isEmpty():
+            representative = geometry.centroid()
+        if representative is None or representative.isEmpty():
+            continue
+        point = representative.asPoint()
+        best = None
+        for segment_index, (a, b, ka, kb) in enumerate(segments):
+            dx, dy = b.x() - a.x(), b.y() - a.y()
+            length2 = dx * dx + dy * dy
+            t = 0.0 if length2 <= 1e-12 else (
+                (point.x() - a.x()) * dx + (point.y() - a.y()) * dy
+            ) / length2
+            t = min(1.0, max(0.0, t))
+            x, y = a.x() + t * dx, a.y() + t * dy
+            off_road = math.hypot(point.x() - x, point.y() - y)
+            if best is None or off_road < best[0]:
+                best = (off_road, segment_index, t, QgsPointXY(x, y))
+        if best is None:
+            continue
+        off_road, segment_index, t, snapped = best
+        road_key = key_for(snapped)
+        projections[polygon_id] = (road_key, off_road)
+        segment_cuts[segment_index].append((t, road_key))
+
+    adjacency = defaultdict(dict)
+
+    def add_edge(left, right):
+        if left == right:
+            return
+        a, b = node_xy[left], node_xy[right]
+        length = math.hypot(b.x() - a.x(), b.y() - a.y())
+        if length <= 1e-6:
+            return
+        previous = adjacency[left].get(right)
+        if previous is None or length < previous:
+            adjacency[left][right] = length
+            adjacency[right][left] = length
+
+    for segment_index, (a, b, ka, kb) in enumerate(segments):
+        cuts = [(0.0, ka), *segment_cuts.get(segment_index, ()), (1.0, kb)]
+        cuts.sort(key=lambda item: (item[0], item[1]))
+        ordered = []
+        for cut in cuts:
+            if ordered and cut[1] == ordered[-1][1]:
+                continue
+            ordered.append(cut)
+        for (_ta, left), (_tb, right) in zip(ordered, ordered[1:]):
+            add_edge(left, right)
+
+    distances = {}
+    locations = {polygon_id: node for polygon_id, (node, _off) in projections.items()}
+    offsets = {polygon_id: off for polygon_id, (_node, off) in projections.items()}
+    for source_index, (polygon_id, source) in enumerate(locations.items(), 1):
+        best = {source: 0.0}
+        queue = [(0.0, source)]
+        while queue:
+            cost, node = heapq.heappop(queue)
+            if cost > best.get(node, math.inf):
+                continue
+            for neighbour, edge_cost in adjacency.get(node, {}).items():
+                next_cost = cost + edge_cost
+                if next_cost <= max_road_m and next_cost < best.get(neighbour, math.inf):
+                    best[neighbour] = next_cost
+                    heapq.heappush(queue, (next_cost, neighbour))
+        for other_id, other_node in locations.items():
+            if other_node in best:
+                # MFG is placed at the seed's road projection, so its service
+                # distance includes only the served premise's off-road access
+                # leg (not the seed polygon's access leg).
+                route_distance = best[other_node] + offsets[other_id]
+                if route_distance <= max_road_m:
+                    distances[(polygon_id, other_id)] = route_distance
+        if feedback and source_index % 20 == 0:
+            feedback.pushInfo(
+                f"MFG road reach: routed {source_index}/{len(locations)} polygon representatives."
+            )
+    return locations, distances
+
+
+
 
 def _snap_points_to_lines(points_layer, lines_layer, tolerance_m, context, feedback):
     """
@@ -245,8 +404,9 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
     OUT_ASSIGNED = "OUT_ASSIGNED"
     OUT_CLIPPED_ROADS = "OUT_CLIPPED_ROADS"
 
-    # Outputs (derived MFG)
+    # Outputs (derived MFG service network)
     OUT_MFG = "OUT_MFG_POINT"
+    OUT_MFG_AREAS = "OUT_MFG_AREAS"
 
     # Final object layer: objects + POLYGON_ID/PDP_ID/MFG_ID from the registry
     OUT_FINAL_OBJECTS = "OUT_FINAL_OBJECTS"
@@ -290,6 +450,10 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
         )
         self.addParameter(clipped_param)
         self.addParameter(QgsProcessingParameterFeatureSink(self.OUT_MFG, "Final_MFG_Point"))
+        self.addParameter(QgsProcessingParameterFeatureSink(
+            self.OUT_MFG_AREAS, "MFG serving-area boundaries",
+            QgsProcessing.TypeVectorPolygon, optional=True,
+        ))
         self.addParameter(QgsProcessingParameterFeatureSink(
             self.OUT_FINAL_OBJECTS, "Final_Object_Layer", optional=True, createByDefault=True
         ))
@@ -1032,11 +1196,111 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
                 out_fields.append(QgsField(_n, _t))
         sinkA, idA = self.parameterAsSink(params, self.OUT_ASSIGNED, context, out_fields, QgsWkbTypes.Point, polys_valid.crs())
 
-        # Create NetworkManager to assign IDs and track relationships
+        # Partition service polygons into MFG service areas by premise load and
+        # shortest road-network reach. A polygon is a premise/PDP unit, not an
+        # MFG boundary: disconnected polygon geometry alone never creates a new
+        # cabinet catchment.
+        polygon_loads = {}
+        polygon_geometries = {}
+        hh_field = first_field_case_insensitive(
+            polys_valid, ["HH", "SUM_HOMES", "homes", "hh_count"]
+        )
+        polygon_id_field = first_field_case_insensitive(
+            polys_valid, ["POLYGON_ID", "polygon_id"]
+        ) or pid_field
+        polygon_rows = {}
+        canonical_polygon_field = first_field_case_insensitive(
+            polys_valid, ["POLYGON_ID", "polygon_id"]
+        )
+        polygon_key_by_fid = {}
+        for polygon_feature in polys_valid.getFeatures():
+            # Feature IDs are unique within this validated layer and avoid
+            # collapsing duplicate/null source polygon labels in the partition.
+            geometry = polygon_feature.geometry()
+            if not geometry or geometry.isEmpty():
+                continue
+            polygon_id = str(polygon_feature.id())
+            polygon_key_by_fid[polygon_feature.id()] = polygon_id
+            try:
+                household_load = int(float(polygon_feature[hh_field] or 0)) if hh_field else 0
+            except (TypeError, ValueError):
+                household_load = 0
+            polygon_loads[polygon_id] = household_load
+            polygon_geometries[polygon_id] = QgsGeometry(geometry)
+            polygon_rows[polygon_id] = QgsFeature(polygon_feature)
+
+        polygon_ids = sorted(polygon_geometries)
+        polygon_index = QgsSpatialIndex()
+        polygon_fids = {}
+        for polygon_id in polygon_ids:
+            polygon_feature = QgsFeature(polygon_rows[polygon_id])
+            polygon_index.addFeature(polygon_feature)
+            polygon_fids[polygon_feature.id()] = polygon_id
+        # Roads are expanded to the full service radius before graph building:
+        # the original 100 m polygon clip cannot answer a 3 km cabinet reach.
+        mfg_service_buffer = as_layer(processing.run(
+            "native:buffer",
+            {"INPUT": polys_valid, "DISTANCE": 3000.0, "SEGMENTS": 8,
+             "DISSOLVE": True, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
+            is_child_algorithm=True, context=context, feedback=feedback
+        )["OUTPUT"], context)
+        mfg_route_source = as_layer(processing.run(
+            "native:clip",
+            {"INPUT": roads_aligned, "OVERLAY": mfg_service_buffer,
+             "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
+            is_child_algorithm=True, context=context, feedback=feedback
+        )["OUTPUT"], context)
+        mfg_route_fields = {name.lower() for name in mfg_route_source.fields().names()}
+        mfg_class_field = "fclass" if "fclass" in mfg_route_fields else (
+            "highway" if "highway" in mfg_route_fields else None
+        )
+        if mfg_class_field:
+            road_classes = (
+                "residential", "living_street", "unclassified", "tertiary",
+                "secondary", "primary", "service", "footway", "pedestrian", "path",
+            )
+            class_expr = ",".join("'{}'".format(value) for value in road_classes)
+            mfg_route_roads = as_layer(processing.run(
+                "native:extractbyexpression",
+                {"INPUT": mfg_route_source,
+                 "EXPRESSION": f'"{mfg_class_field}" IN ({class_expr})',
+                 "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
+                is_child_algorithm=True, context=context, feedback=feedback
+            )["OUTPUT"], context)
+        else:
+            feedback.pushWarning(
+                "MFG road reach: no fclass/highway field; all lines in the 3 km service envelope are eligible."
+            )
+            mfg_route_roads = mfg_route_source
+
+        mfg_locations, mfg_road_distances = _mfg_road_distance_matrix(
+            polygon_geometries, mfg_route_roads, feedback, max_road_m=3000.0
+        )
+        mfg_areas = partition_mfg_service_areas(
+            polygon_loads, mfg_road_distances,
+            min_hh=2000, target_hh=3000, max_hh=4000, max_road_m=3000.0,
+        )
+        polygon_to_mfg = {
+            polygon_id: area["mfg_id"]
+            for area in mfg_areas
+            for polygon_id in area["polygon_keys"]
+        }
+        feedback.pushInfo(
+            "MFG service-area partition: {} catchment(s), {} total household equivalents "
+            "(capacity 2,000–4,000; 3,000 m road-network reach).".format(
+                len(mfg_areas), sum(polygon_loads.values())
+            )
+        )
+        for area in mfg_areas:
+            if area["review"]:
+                feedback.pushWarning(
+                    "{} requires review: {} HH. {}".format(
+                        area["mfg_id"], area["hh_count"], area["capacity_warning"]
+                    )
+                )
+
+        # Create NetworkManager to assign IDs and track relationships.
         manager = NetworkManager(polys_valid.crs(), feedback)
-        # Single-MFG network: the MFG id is deterministic, so it can be stamped
-        # onto PDPs/objects before the MFG point itself is placed (Stage 5).
-        planned_mfg_id = "MFG00001"
 
         clean_feats = list(clean.getFeatures())
         used = set()
@@ -1294,13 +1558,20 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
                     addresses_in_polygon=addresses_in_poly,
                     polygon_id_override=pid_val,
                 )
+                partition_key = polygon_key_by_fid.get(poly.id())
+                assigned_mfg_id = polygon_to_mfg.get(partition_key)
+                if assigned_mfg_id is None:
+                    raise QgsProcessingException(
+                        f"Polygon {polygon_id} has no MFG partition assignment."
+                    )
+                manager.get_registry().set_mfg_for_polygon(polygon_id, assigned_mfg_id)
 
                 # Write PDP feature using assigned IDs
                 nf = QgsFeature(out_fields)
                 nf.setGeometry(final_pdp_geom)
                 nf[COMMON_FIELDS.POLYGON_ID] = str(polygon_id)
                 nf[COMMON_FIELDS.PDP_ID] = str(pdp_id)
-                nf[COMMON_FIELDS.MFG_ID] = planned_mfg_id
+                nf[COMMON_FIELDS.MFG_ID] = assigned_mfg_id
                 nf[COMMON_FIELDS.NODE_TYPE] = "PDP"
                 nf[COMMON_FIELDS.SRC_ID] = _src_id
                 nf[COMMON_FIELDS.STAGE] = "assigned_pdp"
@@ -1347,8 +1618,16 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
         if objects is not None:
             feedback.pushInfo("Updating object layer with assigned polygon and PDP IDs")
             # Addresses were registered using QgsFeature.id(), so sync in feature-id mode.
+            _polygon_id_field = canonical_polygon_field or polygon_id_field
+            mfg_by_polygon_id = {
+                str(polygon_rows[key][_polygon_id_field]): area["mfg_id"]
+                for area in mfg_areas
+                for key in area["polygon_keys"]
+            }
+
             sync_stats = manager.update_object_layer(
-                objects, addr_id_field="id", use_feature_id=True, mfg_id=planned_mfg_id
+                objects, addr_id_field="id", use_feature_id=True, mfg_id=None,
+                mfg_by_polygon=mfg_by_polygon_id,
             )
             if sync_stats.get("updated", 0) == sync_stats.get("expected", 0) and sync_stats.get("commit_ok", False):
                 feedback.pushInfo(
@@ -1382,53 +1661,136 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
             feedback.pushWarning(f"Skipping registry export due to API/runtime limitation: {e}")
 
 
-        # --- OPTIONAL: place MFG as centroid of clipped roads, snapped to nearest sidewalk ---
-        feedback.pushInfo("Stage 5/6: placing MFG point on the road boundary")
+        # Place one MFG per road-reachable capacity catchment; polygon IDs stay
+        # as independent premise/PDP identities and map to the serving MFG.
+        feedback.pushInfo("Stage 5/6: placing MFG points for capacity/reach service areas")
         feedback.setProgress(80)
         out_mfg_id = None
-        mfg_final_geom = None
+        mfg_geometries = {}
+        mfg_service_geometries = {}
         if do_mfg:
-            # 1) Seed = centroid of the clipped roads extent
-            roads_extent_geom = QgsGeometry.fromRect(roads_valid.extent())
-            mfg_seed_geom = roads_extent_geom.centroid()
-            if mfg_seed_geom is None or mfg_seed_geom.isEmpty():
-                feedback.reportError("Could not compute centroid of clipped roads extent. Skipping MFG.")
-            else:
-                feedback.pushInfo(
-                    f"MFG seed: centroid of clipped roads extent at "
-                    f"{mfg_seed_geom.asPoint().x():.2f}, {mfg_seed_geom.asPoint().y():.2f}"
-                )
-                # 2) Snap the seed directly to the nearest sidewalk (road_boundary_lines)
-                mfg_seed_layer = _make_point_layer(polys_valid.crs().authid(), mfg_seed_geom)
-                snapped_layer = _snap_points_to_lines(
-                    points_layer=mfg_seed_layer,
-                    lines_layer=road_boundary_lines,
-                    tolerance_m=0.0,   # 0 = no distance cap, always snap to nearest
-                    context=context, feedback=feedback
-                )
-                mfg_final_geom = None
-                for sf in snapped_layer.getFeatures():
-                    mfg_final_geom = sf.geometry()
-                    break
-                if mfg_final_geom is None or mfg_final_geom.isEmpty():
-                    feedback.pushWarning("Snap to sidewalk returned no point; using raw seed.")
-                    mfg_final_geom = mfg_seed_geom
+            for area in mfg_areas:
+                parts = [polygon_geometries[key] for key in area["polygon_keys"]]
+                member_union = QgsGeometry.unaryUnion(parts)
+                if member_union is None or member_union.isEmpty():
+                    raise QgsProcessingException(
+                        f"{area['mfg_id']}: could not build its service-area geometry."
+                    )
+                # MFG serves an area, not the individual premise/polygon
+                # footprints. The convex envelope is one service-boundary
+                # feature per MFG; the original premise polygons remain
+                # unchanged in Polygons.gpkg.
+                area_geometry = member_union.convexHull()
+                if area_geometry is None or area_geometry.isEmpty() or (
+                    QgsWkbTypes.geometryType(area_geometry.wkbType())
+                    != QgsWkbTypes.PolygonGeometry
+                ):
+                    raise QgsProcessingException(
+                        f"{area['mfg_id']}: service-area boundary is not polygonal."
+                    )
+                area_geometry.convertToMultiType()
+                mfg_service_geometries[area["mfg_id"]] = area_geometry
 
-                # 3) Write MFG to its own optional sink
-                out_fields_m = build_fields(THIN_PROFILES["MFG"])
-                sinkM, out_mfg_id = self.parameterAsSink(
-                    params, self.OUT_MFG, context, out_fields_m, QgsWkbTypes.Point, polys_valid.crs()
+                seed_geometry = polygon_geometries[area["seed_polygon"]]
+                seed_road_node = mfg_locations.get(area["seed_polygon"])
+                if seed_road_node is not None:
+                    # This is the actual network projection used to measure the
+                    # 3 km reach, so keep the cabinet at that same road node.
+                    final_geom = QgsGeometry.fromPointXY(
+                        QgsPointXY(seed_road_node[0], seed_road_node[1])
+                    )
+                else:
+                    final_geom, road_offset = _nearest_street_point(
+                        seed_geometry.pointOnSurface(), mfg_route_roads
+                    )
+                    if final_geom is None:
+                        final_geom = seed_geometry.pointOnSurface()
+                        feedback.pushWarning(
+                            f"{area['mfg_id']}: no eligible road for its serving-area anchor."
+                        )
+                    elif road_offset is not None and road_offset > 100.0:
+                        feedback.pushWarning(
+                            f"{area['mfg_id']}: seed polygon is {road_offset:.1f} m from an eligible road."
+                        )
+                mfg_geometries[area["mfg_id"]] = final_geom
+
+            out_fields_m = build_fields(THIN_PROFILES["MFG"])
+            for _name, _type in (
+                ("HH_COUNT", QMetaType.Type.Int),
+                ("TARGET_HH", QMetaType.Type.Int),
+                ("MIN_HH", QMetaType.Type.Int),
+                ("MAX_HH", QMetaType.Type.Int),
+                ("RANGE_M", QMetaType.Type.Double),
+                ("CAPACITY_STATUS", QMetaType.Type.QString),
+                ("CAPACITY_WARNING", QMetaType.Type.QString),
+                ("REVIEW", QMetaType.Type.Int),
+            ):
+                if out_fields_m.indexOf(_name) < 0:
+                    out_fields_m.append(QgsField(_name, _type))
+            sinkM, out_mfg_id = self.parameterAsSink(
+                params, self.OUT_MFG, context, out_fields_m, QgsWkbTypes.Point, polys_valid.crs()
+            )
+            if sinkM is None:
+                raise QgsProcessingException(self.invalidSinkError(params, self.OUT_MFG))
+            sinkArea, out_mfg_areas_id = self.parameterAsSink(
+                params, self.OUT_MFG_AREAS, context, out_fields_m,
+                QgsWkbTypes.MultiPolygon, polys_valid.crs()
+            )
+            for index, area in enumerate(mfg_areas, 1):
+                mfg_id = manager.register_mfg(
+                    mfg_geometries[area["mfg_id"]],
+                    mfg_id_override=area["mfg_id"],
                 )
-                if sinkM is None:
-                    raise QgsProcessingException(self.invalidSinkError(params, self.OUT_MFG))
+
                 mfg_f = QgsFeature(out_fields_m)
-                mfg_f.setGeometry(mfg_final_geom)
-                mfg_f[COMMON_FIELDS.MFG_ID] = manager.register_mfg(mfg_final_geom, mfg_id_override=planned_mfg_id)
+                mfg_f.setGeometry(mfg_geometries[area["mfg_id"]])
+                mfg_f[COMMON_FIELDS.MFG_ID] = mfg_id
                 mfg_f[COMMON_FIELDS.NODE_TYPE] = "MFG"
-                mfg_f[COMMON_FIELDS.SRC_ID] = "1"
+                mfg_f[COMMON_FIELDS.SRC_ID] = str(index)
                 mfg_f[COMMON_FIELDS.STAGE] = "mfg"
+                mfg_f["HH_COUNT"] = int(area["hh_count"])
+                mfg_f["TARGET_HH"] = int(area["target_hh"])
+                mfg_f["MIN_HH"] = int(area["min_hh"])
+                mfg_f["MAX_HH"] = int(area["max_hh"])
+                mfg_f["RANGE_M"] = (
+                    float(area["range_m"]) if area["range_m"] is not None else None
+                )
+                mfg_f["CAPACITY_STATUS"] = area["capacity_status"]
+                mfg_f["CAPACITY_WARNING"] = area["capacity_warning"]
+                mfg_f["REVIEW"] = int(area["review"])
                 sinkM.addFeature(mfg_f, QgsFeatureSink.FastInsert)
-                feedback.pushInfo("MFG placed on nearest sidewalk of the clipped roads area.")
+                if sinkArea is not None:
+                    area_f = QgsFeature(out_fields_m)
+                    area_f.setGeometry(mfg_service_geometries[area["mfg_id"]])
+                    for field in out_fields_m.names():
+                        if field == "MFG_ID":
+                            area_f[field] = mfg_id
+                        elif field == "NODE_TYPE":
+                            area_f[field] = "MFG_SERVICE_AREA"
+                        elif field == "SRC_ID":
+                            area_f[field] = str(index)
+                        elif field == "STAGE":
+                            area_f[field] = "mfg_service_area"
+                        elif field == "HH_COUNT":
+                            area_f[field] = int(area["hh_count"])
+                        elif field == "TARGET_HH":
+                            area_f[field] = int(area["target_hh"])
+                        elif field == "MIN_HH":
+                            area_f[field] = int(area["min_hh"])
+                        elif field == "MAX_HH":
+                            area_f[field] = int(area["max_hh"])
+                        elif field == "RANGE_M":
+                            area_f[field] = (
+                                float(area["range_m"]) if area["range_m"] is not None else None
+                            )
+                        elif field == "CAPACITY_STATUS":
+                            area_f[field] = area["capacity_status"]
+                        elif field == "CAPACITY_WARNING":
+                            area_f[field] = area["capacity_warning"]
+                        elif field == "REVIEW":
+                            area_f[field] = int(area["review"])
+                    sinkArea.addFeature(area_f, QgsFeatureSink.FastInsert)
+            feedback.pushInfo("Placed {} MFG points and matching service-area boundaries.".format(len(mfg_areas)))
 
         # ------------------------------------------------------------------
         # Final Object Layer: a NEW layer (input objects are left untouched
@@ -1475,7 +1837,9 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
                     for _pid in _reg.polygon_ids():
                         _net = _reg.get_network(_pid)
                         for _aid in _net["addresses"]:
-                            _lookup[_aid] = (_pid, _net["pdp_id"])
+                            _lookup[_aid] = (
+                                _pid, _net["pdp_id"], _net.get("mfg_id")
+                            )
 
                     _poly_i = fo_fields.lookupField(COMMON_FIELDS.POLYGON_ID)
                     _pdp_i = fo_fields.lookupField(COMMON_FIELDS.PDP_ID)
@@ -1490,17 +1854,19 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
                         if _match:
                             _nf[_poly_i] = _match[0]
                             _nf[_pdp_i] = _match[1]
+                            _nf[_mfg_i] = _match[2]
                             _linked += 1
                         else:
                             # explicit NULL beats a stale source value
                             _nf[_poly_i] = None
                             _nf[_pdp_i] = None
                             _unlinked += 1
-                        _nf[_mfg_i] = planned_mfg_id
+                        if not _match:
+                            _nf[_mfg_i] = None
                         sinkFO.addFeature(_nf)
                     feedback.pushInfo(
-                        f"Final_Object_Layer written: {_linked} objects linked to PDPs, "
-                        f"{_unlinked} unlinked, MFG_ID={planned_mfg_id}."
+                        f"Final_Object_Layer written: {_linked} objects linked to PDPs/MFGs, "
+                        f"{_unlinked} unlinked."
                     )
                     if _unlinked:
                         feedback.pushWarning(
@@ -1539,6 +1905,8 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
             out[self.OUT_CLIPPED_ROADS] = idRoads
         if out_mfg_id is not None:
             out[self.OUT_MFG] = out_mfg_id
+        if locals().get("out_mfg_areas_id") is not None:
+            out[self.OUT_MFG_AREAS] = out_mfg_areas_id
         if id_final_obj is not None:
             out[self.OUT_FINAL_OBJECTS] = id_final_obj
         return out

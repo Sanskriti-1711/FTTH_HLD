@@ -46,6 +46,7 @@ class NetworkRegistry:
             "pdp_geom": pdp_geom,
             "addresses": addresses,
             "address_count": len(addresses),
+            "mfg_id": None,
         }
         
         self._pdp_lookup[pdp_id] = polygon_id
@@ -55,6 +56,17 @@ class NetworkRegistry:
     def get_network(self, polygon_id):
         """Retrieve a complete network by polygon ID."""
         return self._networks.get(polygon_id)
+
+    def set_mfg_for_polygon(self, polygon_id, mfg_id):
+        """Store the MFG serving a polygon's PDP and premises."""
+        if polygon_id not in self._networks:
+            raise KeyError(polygon_id)
+        self._networks[polygon_id]["mfg_id"] = str(mfg_id)
+
+    def get_mfg_for_polygon(self, polygon_id):
+        """Look up the MFG serving a polygon."""
+        network = self._networks.get(polygon_id)
+        return network.get("mfg_id") if network else None
 
     def get_polygon_for_pdp(self, pdp_id):
         """Look up the polygon ID for a given PDP ID."""
@@ -83,7 +95,9 @@ class NetworkRegistry:
     def summary(self):
         """Return a human-readable summary."""
         total_addresses = sum(n["address_count"] for n in self._networks.values())
+        mfg_count = len({n["mfg_id"] for n in self._networks.values() if n.get("mfg_id")})
         return (
             f"NetworkRegistry: {len(self._networks)} polygons, "
-            f"{len(self._pdp_lookup)} PDPs, {total_addresses} addresses"
+            f"{len(self._pdp_lookup)} PDPs, {mfg_count} MFGs, "
+            f"{total_addresses} addresses"
         )

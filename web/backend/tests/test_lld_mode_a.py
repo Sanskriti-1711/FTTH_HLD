@@ -12,10 +12,17 @@ contract:
   * output layers keep the public contract (LLD_LAYER_ORDER, excluded layers)
   * GeoJSON files + the downloadable zip land in the output directory
 
-Run from the engine backend dir (pytest 7.x available on the anaconda env):
+Run from the engine backend dir. The application and tests use the Anaconda
+Python; clear inherited QGIS Python 3.12 paths so compiled QGIS packages cannot
+shadow Anaconda's Python 3.11 packages:
 
     cd HLD_Planning_01/web/backend
-    python -m pytest tests/ -v
+    # Git Bash / bash
+    env -u PYTHONPATH -u PYTHONHOME python -m pytest tests/test_lld_mode_a.py -v
+    # Windows cmd.exe
+    set "PYTHONPATH=" && set "PYTHONHOME=" && python -m pytest tests\test_lld_mode_a.py -v
+
+The engine configures the QGIS environment only for its qgis_process child.
 """
 
 import json
@@ -290,10 +297,11 @@ def test_mode_a_drop_planning_connects_new_premises(mode_a_env):
     }
     assert by_addr["A-1"]["CABLE_TYPE"] == "Drop"
     assert by_addr["A-1"]["HH_COUNT"] == 18
-    assert by_addr["A-1"]["FIBER_COUNT"] == 20
+    assert by_addr["A-1"]["FIBER_COUNT"] == 24
     assert by_addr["A-2"]["CABLE_TYPE"] == "Drop"
     assert by_addr["A-2"]["HH_COUNT"] == 1
     assert by_addr["A-2"]["FIBER_COUNT"] == 12
+    assert by_addr["A-1"]["CAPACITY_STATUS"] == "OK"
     assert len(created_drops) == 2  # still one civil route per physical location
 
     trenches = _load_output(mode_a_env, "e2e-test-project", "LLD-TEST01", "final_trenches")
@@ -321,7 +329,11 @@ def test_mode_a_propagates_missing_support_layers(mode_a_env):
 
 def test_lld_enrichment_preserves_drop_cables_and_sizes_from_location_hh():
     """A building's HH load changes cable capacity, not its single drop record."""
-    from lld_cable_geometry import cable_fiber_capacity
+    from lld_cable_geometry import (
+        cable_fiber_capacity,
+        drop_capacity_warning,
+        drop_fiber_capacity,
+    )
 
     drop_geometry = _line([[13.4, 52.5], [13.4001, 52.5]])
     cables = [
@@ -332,16 +344,37 @@ def test_lld_enrichment_preserves_drop_cables_and_sizes_from_location_hh():
         _feature("distribution_cable", _line([[13.4, 52.5], [13.4002, 52.5]]), {
             "ADDR_ID": "BLDG-2", "addr_id": "BLDG-2", "HH_COUNT": 60,
         }),
+        _feature("distribution_cable", _line([[13.4, 52.5], [13.4003, 52.5]]), {
+            "ADDR_ID": "BLDG-3", "addr_id": "BLDG-3",
+            "CABLE_TYPE": "Drop", "HH_COUNT": 286,
+        }),
+        _feature("distribution_cable", _line([[13.4, 52.5], [13.4004, 52.5]]), {
+            "ADDR_ID": "BLDG-4", "addr_id": "BLDG-4",
+            "CABLE_TYPE": "Drop", "HH_COUNT": 300,
+        }),
     ]
-    assert engine._enrich_lld_distribution_cables({"distribution_cable": cables}) == 2
-    assert len(cables) == 2
+    assert engine._enrich_lld_distribution_cables({"distribution_cable": cables}) == 4
+    assert len(cables) == 4
     assert cables[0]["properties"]["CABLE_TYPE"] == "Drop"
     assert cables[0]["properties"]["HH_COUNT"] == 18
-    assert cables[0]["properties"]["FIBER_COUNT"] == 20
+    assert cables[0]["properties"]["FIBER_COUNT"] == 24
     assert cables[0]["properties"]["CONNECTION_TYPE"] == "Drop (garden leg)"
     assert cables[0]["geometry"] == drop_geometry
-    assert cables[1]["properties"]["FIBER_COUNT"] == 62
-    assert cables[1]["properties"]["CABLE_TYPE"] == "Distribution"
+    by_address = {
+        str((feature.get("properties") or {}).get("ADDR_ID") or
+            (feature.get("properties") or {}).get("addr_id")): feature["properties"]
+        for feature in cables
+    }
+    assert by_address["BLDG-2"]["FIBER_COUNT"] == 72
+    assert by_address["BLDG-2"]["CABLE_TYPE"] == "Distribution"
+    assert by_address["BLDG-3"]["FIBER_COUNT"] == 288
+    assert by_address["BLDG-3"]["CAPACITY_STATUS"] == "OK"
+    assert by_address["BLDG-3"]["REVIEW"] == 0
+    assert by_address["BLDG-4"]["FIBER_COUNT"] == 288
+    assert by_address["BLDG-4"]["CAPACITY_STATUS"] == "OVER_CAPACITY"
+    assert by_address["BLDG-4"]["REVIEW"] == 1
+    assert by_address["BLDG-4"]["UTIL_PCT"] == 100.0
+    assert "286 HH" in by_address["BLDG-4"]["CAPACITY_WARNING"]
 
     dropped = [
         _feature("distribution_cable", _line([[13.4, 52.5], [13.4002, 52.5]]), {
@@ -353,10 +386,20 @@ def test_lld_enrichment_preserves_drop_cables_and_sizes_from_location_hh():
     assert len(dropped) == 1
     assert dropped[0]["properties"]["CABLE_TYPE"] == "Drop"
     assert dropped[0]["properties"]["FIBER_COUNT"] == 12
-    assert cables[1]["properties"]["CABLE_TYPE"] == "Distribution"
-    assert cables[1]["properties"]["FIBER_COUNT"] == 62
+    assert by_address["BLDG-2"]["CABLE_TYPE"] == "Distribution"
+    assert by_address["BLDG-2"]["FIBER_COUNT"] == 72
     assert cable_fiber_capacity(1, 12) == 12
-    assert cable_fiber_capacity(18, 12) == 20
+    assert cable_fiber_capacity(10, 12) == 12
+    assert cable_fiber_capacity(11, 12) == 24
+    assert cable_fiber_capacity(18, 12) == 24
+    assert cable_fiber_capacity(22, 12) == 24
+    assert cable_fiber_capacity(23, 12) == 48
+    assert cable_fiber_capacity(46, 12) == 48
+    assert cable_fiber_capacity(47, 12) == 72
+    assert drop_fiber_capacity(286) == 288
+    assert drop_fiber_capacity(287) is None
+    assert by_address["BLDG-4"]["CAPACITY_STATUS"] == "OVER_CAPACITY"
+    assert "286 HH" in drop_capacity_warning(287)
 
 
 def test_mode_a_output_contract(mode_a_env):
@@ -373,12 +416,18 @@ def test_mode_a_output_contract(mode_a_env):
     assert not (layer_names & engine.LLD_EXCLUDED_LAYERS)
     # Every emitted layer is part of the public contract.
     assert layer_names <= set(engine.LLD_LAYER_ORDER), layer_names - set(engine.LLD_LAYER_ORDER)
-    # The grouped-cable normalisation ran: cables are enriched with capacity.
+    # Any shared trunks retain their 48F floor and enough capacity for
+    # aggregate HH plus the two reserved spare fibres; service drops remain Drop.
     cables = _load_output(mode_a_env, project_id, version, "distribution_cable")
-    assert any(
-        (f.get("properties") or {}).get("FIBER_COUNT") == engine.LLD_DISTRIBUTION_FIBERS
-        for f in cables["features"]
-        if (f.get("properties") or {}).get("ADDR_IDS")
+    cable_props = [f.get("properties") or {} for f in cables["features"]]
+    trunks = [p for p in cable_props if p.get("CABLE_TYPE") == "Distribution"]
+    assert all(p.get("CABLE_TYPE") in {"Distribution", "Drop"} for p in cable_props)
+    assert all(
+        p.get("FIBER_COUNT", 0) >= max(
+            engine.LLD_DISTRIBUTION_FIBERS,
+            p.get("HH_COUNT", 0) + engine.LLD_RESERVED_SPARE_FIBERS,
+        )
+        for p in trunks
     )
 
     zip_path = out_dir / f"{project_id}_{version}_lld.zip"

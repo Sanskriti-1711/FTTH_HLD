@@ -35,7 +35,7 @@ from qgis.core import (
     QgsFields, QgsField, QgsWkbTypes,
     QgsGeometry, QgsPointXY, QgsProject,
     QgsProcessingUtils, QgsSymbol,
-    QgsVectorLayer, QgsCoordinateTransform,
+    QgsVectorLayer, QgsCoordinateTransform, QgsRectangle,
 )
 from qgis import processing
 from ..utils.geom import round_key_xy, geom_substring, edges_to_geom, path_len, is_prefix, lcp_len
@@ -344,6 +344,15 @@ class AlgFeederDuctsNoSplit(QgsProcessingAlgorithm):
         feedback.pushInfo(f"  [timing] Duct graph indexing: {_time.time() - t0:.3f}s")
         t0 = _time.time()
         # Snap MFG/PDP and register mid-segment breaks
+        # The business ids ("PDP00007" / "MFG00003") are what the cable,
+        # LLD and PostGIS layers join on, so resolve them here too: writing
+        # the OGR feature ids into ``pdp_ids`` produced values like "4" that
+        # nothing downstream could match back to a PDP.
+        bid_pdp = f_pdp or first_field_case_insensitive(
+            pdp, ["PDP_ID", "pdp_id"]) or ""
+        bid_mfg = f_mfg or first_field_case_insensitive(
+            mfg, ["MFG_ID", "mfg_id"]) or ""
+
         mfg_nodes, mfg_label = {}, {}
         for fm in mfg.getFeatures():
             nk, fid = snap_point_create_virtual(
@@ -352,7 +361,7 @@ class AlgFeederDuctsNoSplit(QgsProcessingAlgorithm):
             )
             if nk is not None:
                 mfg_nodes[fm.id()] = (nk, fid)
-                lab = fm.attribute(f_mfg) if f_mfg else fm.id()
+                lab = fm.attribute(bid_mfg) if bid_mfg else fm.id()
                 mfg_label[fm.id()] = str(lab)
 
         pdp_nodes, pdp_label = {}, {}
@@ -363,7 +372,7 @@ class AlgFeederDuctsNoSplit(QgsProcessingAlgorithm):
             )
             if nk is not None:
                 pdp_nodes[fp.id()] = (nk, fid)
-                lab = fp.attribute(f_pdp) if f_pdp else fp.id()
+                lab = fp.attribute(bid_pdp) if bid_pdp else fp.id()
                 pdp_label[fp.id()] = str(lab)
 
         if not mfg_nodes or not pdp_nodes:
@@ -403,7 +412,9 @@ class AlgFeederDuctsNoSplit(QgsProcessingAlgorithm):
 
         feedback.pushInfo(f"  [timing] Duct graph construction: {_time.time() - t0:.3f}s")
         t0 = _time.time()
-        # Label nodes by nearest MFG (multi-source Dijkstra front)
+        # Label nodes by nearest MFG (multi-source Dijkstra front).  Every MFG
+        # seeds the front, so a design with one exchange area per MFG labels
+        # each node against the MFG that actually serves it.
         label_dist = {}
         heap = []
         for mfg_id, (node_k, _) in mfg_nodes.items():
@@ -478,7 +489,7 @@ class AlgFeederDuctsNoSplit(QgsProcessingAlgorithm):
                 if gtr and not gtr.isEmpty():
                     ft = QgsFeature(fields)
                     ft.setGeometry(gtr)
-                    ft["mfg_id"]    = str(mfg_fid)
+                    ft["mfg_id"]    = mfg_label.get(mfg_fid, str(mfg_fid))
                     ft["pdp_ids"]   = ""
                     ft["pdp_count"] = 0
                     ft["capacity_total"] = max_k
@@ -536,8 +547,9 @@ class AlgFeederDuctsNoSplit(QgsProcessingAlgorithm):
 
                     fb = QgsFeature(fields)
                     fb.setGeometry(geom)
-                    fb["mfg_id"]    = str(mfg_fid)
-                    fb["pdp_ids"]   = ",".join(sorted(str(pid) for pid in group))
+                    fb["mfg_id"]    = mfg_label.get(mfg_fid, str(mfg_fid))
+                    fb["pdp_ids"]   = ",".join(
+                        sorted(pdp_label.get(ppid, str(ppid)) for ppid in group))
                     fb["pdp_count"] = int(len(group))
                     fb["capacity_total"] = max_k
                     fb["capacity_used"] = int(len(group))
@@ -649,20 +661,69 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
                     G.add_edge((a.x(), a.y()), (b.x(), b.y()), weight=w)
 
     @staticmethod
-    def _segment_endpoints_near_point(geom, pt_xy, step_m):
+    def _pt_seg_dist(px, py, ax, ay, bx, by):
+        dx, dy = bx - ax, by - ay
+        L2 = dx * dx + dy * dy
+        if L2 <= 1e-12:
+            return _math.hypot(px - ax, py - ay)
+        t = ((px - ax) * dx + (py - ay) * dy) / L2
+        t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+        return _math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+    @staticmethod
+    def _dense_segment_index(geom, step_m):
+        """Densified segments of ``geom`` as (spatial index, fid → endpoints).
+
+        Densifying a whole sidewalk/tangent feature (one feature can be the
+        entire footway network, thousands of vertices at the 2 m step) is
+        expensive, and the bridge pass used to redo it — plus a full
+        ``closestSegmentWithContext`` scan — once per crossing point. That is
+        O(points × vertices) and held full-ward runs for many minutes. Build
+        the segment index ONCE per feature and query it per point instead.
+        """
+        idx = QgsSpatialIndex()
+        ends = {}
+        fid = 0
         g = AlgDistributionDucts._densify(geom, step_m)
-        best = (float("inf"), None)
         for line in AlgDistributionDucts._line_parts(g):
-            if len(line) < 2: continue
-            lg = QgsGeometry.fromPolylineXY(line)
-            try:
-                dist, _, after_idx, _ = lg.closestSegmentWithContext(pt_xy)
-            except Exception:
-                continue
-            if dist < best[0]:
-                i2 = max(1, min(after_idx, len(line)-1)); i1 = i2-1
-                a, b = line[i1], line[i2]
-                best = (dist, ((a.x(), a.y()), (b.x(), b.y())))
+            for i in range(len(line) - 1):
+                a, b = line[i], line[i + 1]
+                if a == b:
+                    continue
+                fid += 1
+                f = QgsFeature()
+                f.setId(fid)
+                f.setGeometry(QgsGeometry.fromPolylineXY([a, b]))
+                idx.addFeature(f)
+                ends[fid] = ((a.x(), a.y()), (b.x(), b.y()))
+        return idx, ends
+
+    @staticmethod
+    def _segment_endpoints_near_point(geom, pt_xy, step_m, index=None):
+        if index is None:
+            index = AlgDistributionDucts._dense_segment_index(geom, step_m)
+        idx, ends = index
+        if not ends:
+            return None
+        px, py = pt_xy.x(), pt_xy.y()
+        # The point lies on the geometry (it is an intersection), so the
+        # nearest densified segment is at most ~step_m/2 away; widen the box a
+        # few times in case of rounding, then give up.
+        grow = max(abs(step_m), 1.0) * 2.0 + 1.0
+        best = (float("inf"), None)
+        for _attempt in range(4):
+            for fid in idx.intersects(
+                    QgsRectangle(px - grow, py - grow, px + grow, py + grow)):
+                e = ends.get(fid)
+                if e is None:
+                    continue
+                d = AlgDistributionDucts._pt_seg_dist(
+                    px, py, e[0][0], e[0][1], e[1][0], e[1][1])
+                if d < best[0]:
+                    best = (d, e)
+            if best[1] is not None:
+                break
+            grow *= 5.0
         return best[1]
 
     @staticmethod
@@ -673,6 +734,7 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
         for af in A.getFeatures():
             ag = af.geometry()
             if not ag or ag.isEmpty(): continue
+            ag_index = None
             for bid in idxB.intersects(ag.boundingBox()):
                 bg = B.getFeature(bid).geometry()
                 if not bg or bg.isEmpty() or not ag.intersects(bg): continue
@@ -680,10 +742,14 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
                 if not inter or inter.isEmpty(): continue
                 if QgsWkbTypes.geometryType(inter.wkbType()) != QgsWkbTypes.PointGeometry: continue
                 pts = inter.asMultiPoint() if QgsWkbTypes.isMultiType(inter.wkbType()) else [inter.asPoint()]
+                if not pts: continue
+                if ag_index is None:
+                    ag_index = AlgDistributionDucts._dense_segment_index(ag, step_m)
+                bg_index = AlgDistributionDucts._dense_segment_index(bg, step_m)
                 for pt in pts:
                     pxy = QgsPointXY(pt)
-                    ends_a = AlgDistributionDucts._segment_endpoints_near_point(ag, pxy, step_m)
-                    ends_b = AlgDistributionDucts._segment_endpoints_near_point(bg, pxy, step_m)
+                    ends_a = AlgDistributionDucts._segment_endpoints_near_point(ag, pxy, step_m, ag_index)
+                    ends_b = AlgDistributionDucts._segment_endpoints_near_point(bg, pxy, step_m, bg_index)
                     if not ends_a or not ends_b: continue
                     px, py = pxy.x(), pxy.y()
                     for ex, ey in (ends_a + ends_b):
@@ -1866,6 +1932,7 @@ class DuctLayer(QgsProcessingAlgorithm):
         if layer is None or not layer.isValid():
             return 0, 0
         changed = unresolved = 0
+        unresolved_reasons = defaultdict(int)
         # Spatial index over the trench features: the rebase used to scan all
         # 3,58 trenches with two GEOS nearestPoint calls per endpoint per duct
         # (45 PDPs × dozens of ducts × 2 endpoints), which is where the duct
@@ -1902,41 +1969,70 @@ class DuctLayer(QgsProcessingAlgorithm):
             g = f.geometry()
             if g is None or g.isEmpty():
                 unresolved += 1
+                unresolved_reasons["empty geometry"] += 1
                 continue
             source_parts = g.asMultiPolyline() if g.isMultipart() else [g.asPolyline()]
             source_parts = [part for part in source_parts if len(part) >= 2]
             if not source_parts:
                 unresolved += 1
+                unresolved_reasons["no valid line parts"] += 1
                 continue
             rebased_parts = []
+            failure_reason = None
             try:
                 for part in source_parts:
                     a, b = part[0], part[-1]
                     na = _nearest_trench_point(a)
                     nb = _nearest_trench_point(b)
                     if na is None or nb is None:
-                        continue
+                        failure_reason = "endpoint has no trench candidate"
+                        break
                     route = self._trench_route(
                         trench_lyr, (na[1].x(), na[1].y()),
                         (nb[1].x(), nb[1].y()), tol_m=50.0)
-                    if route is not None and not route.isEmpty():
-                        rebased_parts.extend(
-                            route.asMultiPolyline() if route.isMultipart()
-                            else [route.asPolyline()])
-                if not rebased_parts:
+                    if route is None or route.isEmpty():
+                        failure_reason = "no acceptable connected trench route"
+                        break
+                    rebased_parts.extend(
+                        route.asMultiPolyline() if route.isMultipart()
+                        else [route.asPolyline()])
+                # A multipart legacy feature is one logical duct. Publishing
+                # only the parts that happened to route silently severs it;
+                # preserve the full source geometry and mark it for review.
+                if failure_reason or not rebased_parts:
                     unresolved += 1
+                    unresolved_reasons[failure_reason or "empty routed geometry"] += 1
+                    review_idx = layer.fields().indexFromName("REVIEW")
+                    if review_idx >= 0:
+                        f.setAttribute(review_idx, 1)
+                    status_idx = layer.fields().indexFromName("INFRA_STATUS")
+                    if status_idx >= 0:
+                        f.setAttribute(status_idx, "Review Required")
+                    layer.updateFeature(f)
                     continue
                 f.setGeometry(QgsGeometry.fromMultiPolylineXY(rebased_parts))
                 layer.updateFeature(f)
                 changed += 1
             except Exception:
                 unresolved += 1
+                unresolved_reasons["exception during rebase"] += 1
+                try:
+                    review_idx = layer.fields().indexFromName("REVIEW")
+                    if review_idx >= 0:
+                        f.setAttribute(review_idx, 1)
+                        layer.updateFeature(f)
+                except Exception:
+                    pass
         if changed:
             layer.commitChanges()
         if feedback:
+            reason_summary = ", ".join(
+                f"{reason}: {count}" for reason, count in sorted(unresolved_reasons.items())
+            ) or "none"
             feedback.pushInfo(
                 f"Distribution hybrid rebase: {changed} legacy route(s) moved onto "
-                f"Final_Trenches; {unresolved} unresolved route(s) left for review.")
+                f"Final_Trenches; {unresolved} unresolved route(s) left for review "
+                f"({reason_summary}).")
         return changed, unresolved
 
     def _trench_connector(self, corridor_lyr, a_xy, b_xy, tol_m=1.0):

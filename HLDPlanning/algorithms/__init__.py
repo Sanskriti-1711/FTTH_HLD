@@ -39,5 +39,6 @@ _register("cable_layer", "AlgCableBuilderAll")
 _register("chamber_layer", "ChamberLayerAlgorithm")
 _register("pole_layer", "PoleLayerAlgorithm")
 _register("aerial_drop_planner", "AerialDropLayerAlgorithm")
+_register("served_premises", "ServedPremisesAlgorithm")
 
 __all__ = ["ALL_ALGORITHMS", "IMPORT_ERRORS"]

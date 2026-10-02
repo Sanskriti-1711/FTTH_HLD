@@ -1,4 +1,4 @@
-"""Shared grouped distribution-cable helpers for LLD GeoJSON processing.
+"""Shared distribution-cable helpers for LLD GeoJSON processing.
 
 The HLD QGIS algorithm creates one MultiLineString per same-footway group.
 LLD uses this small GeoJSON-only implementation after approved survey changes
@@ -10,17 +10,39 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 
 
-RESERVED_SPARE_FIBERS = 2
+from HLDPlanning.utils.cable_capacity import (
+    RESERVED_SPARE_FIBERS,
+    distribution_fiber_capacity,
+    drop_capacity_warning,
+    drop_fiber_capacity,
+)
+
 DISTRIBUTION_FIBERS = 48
 
 
-def cable_fiber_capacity(hh_count: Any, minimum: int) -> int:
-    """Return a physical cable's fibre count for logical HH load plus spare."""
+def _households(hh_count: Any) -> int:
     try:
-        households = max(0, int(float(hh_count or 0)))
+        return max(0, int(float(hh_count or 0)))
     except (TypeError, ValueError):
-        households = 0
-    return max(int(minimum), households + RESERVED_SPARE_FIBERS)
+        return 0
+
+
+def _distribution_capacity(hh_count: Any) -> int:
+    return distribution_fiber_capacity(hh_count)
+
+
+def cable_fiber_capacity(hh_count: Any, minimum: int) -> int:
+    """Return the smallest standard cable size for HH plus spare.
+
+    Distribution trunks keep their 48F minimum and grow in exact counts when
+    demand exceeds it. Service-location drops use the standard ladder up to
+    288F; higher demand is reported as over-capacity by the caller and is never
+    silently clamped to an undersized cable.
+    """
+    households = _households(hh_count)
+    if minimum >= DISTRIBUTION_FIBERS:
+        return max(int(minimum), _distribution_capacity(households))
+    return drop_fiber_capacity(households) or (households + RESERVED_SPARE_FIBERS)
 
 
 def _lines(geometry: Optional[Dict[str, Any]]) -> List[List[List[float]]]:

@@ -45,6 +45,7 @@ class NetworkManager:
         self._pdp_prefix = "PDP"
         self._mfg_prefix = "MFG"
         self._mfg = None
+        self._mfgs = {}
 
     def set_id_prefixes(self, polygon_prefix="POLY", pdp_prefix="PDP"):
         """Set custom prefixes for generated IDs (e.g., 'BE' -> 'BE00001')."""
@@ -105,29 +106,36 @@ class NetworkManager:
         return polygon_id, pdp_id
 
     def register_mfg(self, mfg_geom, mfg_id_override=None):
-        """
-        Register the (single) MFG point and assign its canonical MFG_ID.
-
-        Args:
-            mfg_geom: QgsGeometry of the MFG point
-            mfg_id_override: Optional external MFG ID to preserve source IDs
-
-        Returns:
-            The assigned MFG_ID string (e.g. "MFG00001")
-        """
-        if mfg_id_override is not None and str(mfg_id_override).strip() != "":
-            mfg_id = str(mfg_id_override).strip()
-        else:
-            mfg_id = f"{self._mfg_prefix}00001"
-        self._mfg = {"mfg_id": mfg_id, "mfg_geom": mfg_geom}
+        """Register one MFG point, preserving a caller-supplied stable ID."""
+        mfg_id = (
+            str(mfg_id_override).strip()
+            if mfg_id_override is not None and str(mfg_id_override).strip()
+            else f"{self._mfg_prefix}{len(self._mfgs) + 1:05d}"
+        )
+        self._mfgs[mfg_id] = {"mfg_id": mfg_id, "mfg_geom": mfg_geom}
+        self._mfg = self._mfgs[mfg_id]
         self._report(f"Registered MFG {mfg_id}")
         return mfg_id
 
+    def register_mfgs(self, mfg_rows):
+        """Register MFG dictionaries and return a polygon-key to MFG-ID lookup."""
+        by_polygon = {}
+        for row in mfg_rows:
+            mfg_id = self.register_mfg(row["geom"], row["mfg_id"])
+            for polygon_id in row["polygon_keys"]:
+                by_polygon[str(polygon_id)] = mfg_id
+        return by_polygon
+
     def get_mfg(self):
-        """Return the registered MFG as {'mfg_id', 'mfg_geom'}, or None."""
+        """Return the most recently registered MFG for backwards compatibility."""
         return self._mfg
 
-    def update_object_layer(self, object_layer, addr_id_field="ADDR_ID", use_feature_id=False, mfg_id=None):
+    def get_mfgs(self):
+        """Return all registered MFGs in stable ID order."""
+        return [self._mfgs[key] for key in sorted(self._mfgs)]
+
+    def update_object_layer(self, object_layer, addr_id_field="ADDR_ID", use_feature_id=False,
+                            mfg_id=None, mfg_by_polygon=None):
         """
         Update the object layer with POLYGON_ID and PDP_ID for all addresses.
 
@@ -138,6 +146,7 @@ class NetworkManager:
             addr_id_field: Name of the address ID field
             use_feature_id: If True, match addresses using QgsFeature.id() instead of an attribute field
             mfg_id: Optional MFG_ID to stamp on every feature (single-MFG networks)
+            mfg_by_polygon: Optional polygon_id -> MFG_ID mapping for multi-MFG areas
 
         Returns:
             dict with sync statistics: expected, updated, unmatched, and matching mode details
@@ -149,7 +158,7 @@ class NetworkManager:
             provider.addAttributes([QgsField("POLYGON_ID", QMetaType.Type.QString)])
         if object_layer.fields().indexOf("PDP_ID") < 0:
             provider.addAttributes([QgsField("PDP_ID", QMetaType.Type.QString)])
-        if mfg_id is not None and object_layer.fields().indexOf("MFG_ID") < 0:
+        if (mfg_id is not None or mfg_by_polygon is not None) and object_layer.fields().indexOf("MFG_ID") < 0:
             provider.addAttributes([QgsField("MFG_ID", QMetaType.Type.QString)])
 
         object_layer.updateFields()
@@ -176,7 +185,10 @@ class NetworkManager:
         # Update features via a single batch provider call
         poly_idx = object_layer.fields().indexOf("POLYGON_ID")
         pdp_idx = object_layer.fields().indexOf("PDP_ID")
-        mfg_idx = object_layer.fields().indexOf("MFG_ID") if mfg_id is not None else -1
+        mfg_idx = (
+            object_layer.fields().indexOf("MFG_ID")
+            if mfg_id is not None or mfg_by_polygon is not None else -1
+        )
         attr_changes = {}
         updated_count = 0
         matched_by_field = 0
@@ -211,8 +223,10 @@ class NetworkManager:
                 changes[poly_idx] = poly_id
                 changes[pdp_idx] = pdp_id
                 updated_count += 1
-            # MFG_ID applies to every object in a single-MFG network
-            if mfg_idx >= 0:
+                if mfg_by_polygon is not None and poly_id in mfg_by_polygon:
+                    changes[mfg_idx] = mfg_by_polygon[poly_id]
+            # Single-MFG_ID mode applies one cabinet to every object.
+            if mfg_idx >= 0 and mfg_id is not None:
                 changes[mfg_idx] = mfg_id
             if changes:
                 attr_changes[feature.id()] = changes

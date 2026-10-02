@@ -29,6 +29,13 @@ from qgis.core import (
 )
 from qgis.PyQt.QtCore import QMetaType
 
+from ..utils.cable_capacity import (
+    DROP_FIBER_LADDER as STANDARD_DROP_FIBER_LADDER,
+    DROP_FIBER_MAX as STANDARD_DROP_FIBER_MAX,
+    RESERVED_SPARE_FIBERS as STANDARD_RESERVED_SPARE_FIBERS,
+    drop_capacity_warning,
+    drop_fiber_capacity,
+)
 from ..utils.fields import COMMON_FIELDS, build_fields, first_field_case_insensitive
 
 
@@ -58,8 +65,9 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
                                      # premise before it is a house-to-house span
     LEG_MATCH_M = 5.0                # how close a premise must sit to the
                                      # classified aerial leg it belongs to
-    RESERVED_SPARE_FIBERS = 2
-    DROP_FIBER_MIN = 12
+    RESERVED_SPARE_FIBERS = STANDARD_RESERVED_SPARE_FIBERS
+    DROP_FIBER_LADDER = STANDARD_DROP_FIBER_LADDER
+    DROP_FIBER_MAX = STANDARD_DROP_FIBER_MAX
 
     # ── QGIS Processing boilerplate ──────────────────────────────────────────
 
@@ -85,7 +93,7 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
         return self.tr(
             "Routes aerial drop trenches from poles to premises that were "
             "flagged as aerial_required=True by the trench evaluation stage. "
-            "Produces Aerial_Drop_Trenches and Aerial_Cable layers.\n\n"
+            "Produces Aerial_Spans and Aerial_Cable layers.\n\n"
             "Premises without aerial_required are ignored.  A premise is "
             "connected when the trench stage **classified its leg aerial** "
             "(supplied as INPUT_AERIAL_LEGS), or, failing that, when it sits "
@@ -186,6 +194,12 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
             COMMON_FIELDS.CABLE_TYPE,
             COMMON_FIELDS.FIBER_COUNT,
             "HH_COUNT",
+            "CAPACITY_STATUS",
+            "CAPACITY_WARNING",
+            "REVIEW",
+            "RESERVED_SPARE_FIBERS",
+            "AVAILABLE_FIBERS",
+            COMMON_FIELDS.UTIL_PCT,
             COMMON_FIELDS.LENGTH_M,
             COMMON_FIELDS.POLE_SPACING_M,
             COMMON_FIELDS.CROSSINGS,
@@ -202,6 +216,9 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
             "RESERVED_SPARE_FIBERS",
             "ACTIVE_FIBERS",
             "AVAILABLE_FIBERS",
+            "CAPACITY_STATUS",
+            "CAPACITY_WARNING",
+            "REVIEW",
             COMMON_FIELDS.LENGTH_M,
             COMMON_FIELDS.SOURCE_NODE,
             COMMON_FIELDS.UTIL_PCT,
@@ -620,17 +637,32 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
                 COMMON_FIELDS.TO_PREMISE: "POLE:%s" % b,
                 COMMON_FIELDS.TRENCH_TYPE: "Aerial_Drop",
                 COMMON_FIELDS.CONSTRUCTION_METHOD: "Overhead",
-                COMMON_FIELDS.CABLE_TYPE: "Aerial", COMMON_FIELDS.FIBER_COUNT: 12,
-                COMMON_FIELDS.LENGTH_M: round(length, 1), COMMON_FIELDS.POLE_SPACING_M: spacing,
+                COMMON_FIELDS.CABLE_TYPE: "Aerial",
+                COMMON_FIELDS.FIBER_COUNT: 12,
+                "HH_COUNT": 0,
+                "CAPACITY_STATUS": "OK",
+                "CAPACITY_WARNING": "",
+                "REVIEW": 0,
+                COMMON_FIELDS.LENGTH_M: round(length, 1),
+                COMMON_FIELDS.POLE_SPACING_M: spacing,
                 COMMON_FIELDS.CROSSINGS: 0, COMMON_FIELDS.PERMIT_REQUIRED: False,
                 COMMON_FIELDS.AERIAL_REASON: "pole_to_pole",
                 COMMON_FIELDS.INFRA_STATUS: "Proposed", COMMON_FIELDS.VERIFY_STATUS: "Assumed",
                 COMMON_FIELDS.STAGE: "HLD",
             }
             cprops = {
-                COMMON_FIELDS.CABLE_TYPE: "Aerial", COMMON_FIELDS.FIBER_COUNT: 12,
+                COMMON_FIELDS.CABLE_TYPE: "Aerial",
+                COMMON_FIELDS.FIBER_COUNT: 12,
+                "HH_COUNT": 0,
+                "RESERVED_SPARE_FIBERS": self.RESERVED_SPARE_FIBERS,
+                "ACTIVE_FIBERS": 0,
+                "AVAILABLE_FIBERS": 10,
+                "CAPACITY_STATUS": "OK",
+                "CAPACITY_WARNING": "",
+                "REVIEW": 0,
                 COMMON_FIELDS.LENGTH_M: round(length, 1),
-                COMMON_FIELDS.SOURCE_NODE: "%s->%s" % (a, b), COMMON_FIELDS.UTIL_PCT: 100.0,
+                COMMON_FIELDS.SOURCE_NODE: "%s->%s" % (a, b),
+                COMMON_FIELDS.UTIL_PCT: 0.0,
                 COMMON_FIELDS.INFRA_STATUS: "Proposed", COMMON_FIELDS.VERIFY_STATUS: "Assumed",
                 COMMON_FIELDS.STAGE: "HLD",
             }
@@ -647,7 +679,12 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
         for item in aerial_premises:
             f, pt = item["f"], item["pt"]
             hh_count = item["hh_count"]
-            fiber_count = max(self.DROP_FIBER_MIN, hh_count + self.RESERVED_SPARE_FIBERS)
+            capacity_warning = drop_capacity_warning(hh_count)
+            fiber_count = drop_fiber_capacity(hh_count) or DROP_FIBER_MAX
+            if capacity_warning:
+                feedback.pushWarning(
+                    f"Aerial drop over capacity for {item['addr']}: {capacity_warning}"
+                )
             anchor_id = item["anchor_id"]
 
             if item["path"]:
@@ -706,6 +743,12 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
                 COMMON_FIELDS.CABLE_TYPE: "Aerial",
                 COMMON_FIELDS.FIBER_COUNT: fiber_count,
                 "HH_COUNT": hh_count,
+                "RESERVED_SPARE_FIBERS": self.RESERVED_SPARE_FIBERS,
+                "AVAILABLE_FIBERS": max(0, fiber_count - hh_count - self.RESERVED_SPARE_FIBERS),
+                "CAPACITY_STATUS": "OVER_CAPACITY" if capacity_warning else "OK",
+                "CAPACITY_WARNING": capacity_warning or "",
+                "REVIEW": 1 if capacity_warning else 0,
+                COMMON_FIELDS.UTIL_PCT: min(100.0, round(((hh_count + self.RESERVED_SPARE_FIBERS) / float(fiber_count)) * 100.0, 1)),
                 COMMON_FIELDS.LENGTH_M: round(length_m, 1),
                 COMMON_FIELDS.POLE_SPACING_M: spacing,
                 COMMON_FIELDS.CROSSINGS: 0,
@@ -727,12 +770,15 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
                 COMMON_FIELDS.CABLE_TYPE: "Aerial",
                 COMMON_FIELDS.FIBER_COUNT: fiber_count,
                 "HH_COUNT": hh_count,
-                "RESERVED_SPARE_FIBERS": 2,
+                "RESERVED_SPARE_FIBERS": self.RESERVED_SPARE_FIBERS,
                 "ACTIVE_FIBERS": hh_count,
-                "AVAILABLE_FIBERS": max(0, fiber_count - hh_count - 2),
+                "AVAILABLE_FIBERS": max(0, fiber_count - hh_count - self.RESERVED_SPARE_FIBERS),
+                "CAPACITY_STATUS": "OVER_CAPACITY" if capacity_warning else "OK",
+                "CAPACITY_WARNING": capacity_warning or "",
+                "REVIEW": 1 if capacity_warning else 0,
                 COMMON_FIELDS.LENGTH_M: round(length_m, 1),
                 COMMON_FIELDS.SOURCE_NODE: str(anchor_id or ""),
-                COMMON_FIELDS.UTIL_PCT: round((hh_count / float(fiber_count)) * 100.0, 1),
+                COMMON_FIELDS.UTIL_PCT: min(100.0, round(((hh_count + self.RESERVED_SPARE_FIBERS) / float(fiber_count)) * 100.0, 1)),
                 COMMON_FIELDS.INFRA_STATUS: "Proposed",
                 COMMON_FIELDS.VERIFY_STATUS: "Assumed",
                 COMMON_FIELDS.STAGE: "HLD",

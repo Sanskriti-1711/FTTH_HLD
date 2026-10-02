@@ -17,6 +17,15 @@ output were removed.
 import math
 from collections import defaultdict
 
+from ..utils.cable_capacity import (
+    DISTRIBUTION_FIBER_LADDER as STANDARD_DISTRIBUTION_FIBER_LADDER,
+    DROP_FIBER_LADDER as STANDARD_DROP_FIBER_LADDER,
+    DROP_FIBER_MAX as STANDARD_DROP_FIBER_MAX,
+    RESERVED_SPARE_FIBERS as STANDARD_RESERVED_SPARE_FIBERS,
+    distribution_fiber_capacity,
+    drop_capacity_warning,
+    drop_fiber_capacity,
+)
 from qgis.PyQt.QtCore import QMetaType
 from qgis.PyQt.QtGui import QColor
 from qgis.core import (
@@ -176,9 +185,10 @@ def _heal_route_graph(adj, edge_geom, edge_len, anchor_nodes, must_reach_nodes,
     out of the feeder plan (observed: 6 of 31 PDPs, ~500 premises, with no
     error anywhere).
 
-    This bridges every island that holds an anchor back onto the component
-    holding the MFG, at the closest pair of nodes, so the feeder really does
-    run from the MFG to every PDP.  Only gaps up to ``max_bridge_m`` are
+    This bridges every island that holds a PDP back onto the nearest
+    component that holds an MFG, at the closest pair of nodes, so the feeder
+    really does run from an MFG to every PDP.  Only gaps up to
+    ``max_bridge_m`` are
     healed: a genuinely isolated island (a trench nobody connects to the MFG)
     is left alone and reported instead of being linked by an invented line.
 
@@ -210,24 +220,29 @@ def _heal_route_graph(adj, edge_geom, edge_len, anchor_nodes, must_reach_nodes,
             counts[comp[a]] += 1
     if not counts:
         return 0, 0.0, list(must_reach_nodes)
-    main = max(counts.items(), key=lambda kv: kv[1])[0]
+    # A planned network has ONE anchor per exchange area, so the MFG
+    # components are all equally valid roots.  Reach is therefore measured
+    # against "some MFG", not against a single global main component —
+    # judging every MFG against the biggest one made a healthy 35-MFG
+    # design look like 40 of 45 PDPs were stranded.
+    root_comps = {comp[a] for a in anchor_nodes if a in comp}
 
     n_bridges, bridged_m = 0, 0.0
     while True:
         islands = {}
         for n in must_reach_nodes:
-            if n in comp and comp[n] != main:
+            if n in comp and comp[n] not in root_comps:
                 islands.setdefault(comp[n], 0)
         if not islands:
             break
-        main_nodes = [n for n, c in comp.items() if c == main]
+        root_nodes = [n for n, c in comp.items() if c in root_comps]
         # Heal the island with the shortest possible gap first, so every
         # bridge is the smallest link that makes the network usable.
-        best = None          # (gap, island_cid, island_node, main_node)
+        best = None          # (gap, island_cid, island_node, root_node)
         for cid in islands:
             island_nodes = [n for n, c in comp.items() if c == cid]
             for a in island_nodes:
-                for b in main_nodes:
+                for b in root_nodes:
                     gap = math.hypot(a[0] - b[0], a[1] - b[1])
                     if best is None or gap < best[0]:
                         best = (gap, cid, a, b)
@@ -241,10 +256,10 @@ def _heal_route_graph(adj, edge_geom, edge_len, anchor_nodes, must_reach_nodes,
         n_bridges += 1
         for n, c in comp.items():
             if c == cid:
-                comp[n] = main
+                comp[n] = comp[b]
 
     unreachable = [n for n in must_reach_nodes
-                   if n in comp and comp[n] != main]
+                   if n in comp and comp[n] not in root_comps]
     unreachable += [n for n in must_reach_nodes if n not in comp]
     return n_bridges, bridged_m, unreachable
 
@@ -268,14 +283,20 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
     DEFAULT_DIST_COLOR = "#0000ff"
     DEFAULT_DIST_WIDTH = 0.8
     SAME_FOOTWAY_TOL_M = 0.5
-    RESERVED_SPARE_FIBERS = 2
+    RESERVED_SPARE_FIBERS = STANDARD_RESERVED_SPARE_FIBERS
     # Distribution sizing (docs/stages/HLD.md §Duct & cable rules): the shared
     # trunk is sized from logical households riding it (never below the 48F
-    # distribution floor); each physical-location drop cable has a 12F garden
-    # minimum plus HH demand and reserved spare, without duplicating geometry.
+    # distribution floor); physical-location drops use the standard cable
+    # ladder and retain logical HH demand without duplicating geometry.
     DIST_FIBER_MIN    = 12
-    DIST_FIBER_LADDER = (12, 24, 48)
+    DIST_FIBER_LADDER = STANDARD_DISTRIBUTION_FIBER_LADDER
+    # A location drop uses the shared common OSP ladder, up to a 288F maximum.
+    # Larger services need a building distribution point / unit-level locations.
+    DROP_FIBER_LADDER = STANDARD_DROP_FIBER_LADDER
+    DROP_FIBER_MAX = STANDARD_DROP_FIBER_MAX
+    DISTRIBUTION_FIBER_LADDER = STANDARD_DISTRIBUTION_FIBER_LADDER
     GARDEN_FIBER_COUNT = 12
+
     # Connection-type values written on the layer and read back by the duct
     # stage to keep the drop legs out of the distribution duct.
     CONN_TRUNK = "Trunk on spine span"
@@ -801,7 +822,7 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
                 mfg_nodes[fm.id()] = (nk, _fid)
                 mfg_label[fm.id()] = str(fm[f_mfg] or fm.id())
 
-        pdp_nodes, pdp_label, pdp_poly = {}, {}, {}
+        pdp_nodes, pdp_label, pdp_poly, pdp_mfg = {}, {}, {}, {}
         for fp in pdps.getFeatures():
             nk, _fid = snap_point_create_virtual(
                 fp.geometry(), seg_index, fid_to_geom, fid_to_len,
@@ -810,6 +831,7 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
                 pdp_nodes[fp.id()] = (nk, _fid)
                 pdp_label[fp.id()] = str(fp[f_pdp] or fp.id())
                 pdp_poly[fp.id()] = str(fp[f_poly]) if f_poly else ""
+                pdp_mfg[fp.id()] = str(fp[f_mfg]) if f_mfg and fp[f_mfg] else ""
 
         if not mfg_nodes or not pdp_nodes:
             raise QgsProcessingException(
@@ -878,9 +900,17 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
                    (abs(cand - label_dist[v][0]) <= 1e-9 and str(lab) < str(label_dist[v][1])):
                     _heapq.heappush(heap, (cand, str(seg_id), v, lab))
 
+        # Assignment from the network stage is authoritative: nearest-MFG
+        # graph labels are only a fallback for legacy PDP layers with no MFG_ID.
         pdp_to_mfg = {}
+        known_mfg_ids = set(mfg_label.values())
         for pid, (nk, _) in pdp_nodes.items():
-            if nk in label_dist:
+            assigned = pdp_mfg.get(pid)
+            if assigned in known_mfg_ids:
+                pdp_to_mfg[pid] = next(
+                    mid for mid, label in mfg_label.items() if label == assigned
+                )
+            elif nk in label_dist:
                 pdp_to_mfg[pid] = label_dist[nk][1]
 
         paths, demands, pid_mfg = {}, {}, {}
@@ -938,6 +968,10 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
             ("SPLIT_MODULES", QMetaType.Type.Int),
             ("UTIL_PCT", QMetaType.Type.Double),
             ("SPARE_PCT", QMetaType.Type.Double),
+            ("CAPACITY_STATUS", QMetaType.Type.QString),
+            ("CAPACITY_WARNING", QMetaType.Type.QString),
+            ("RESERVED_SPARE_FIBERS", QMetaType.Type.Int),
+            ("AVAILABLE_FIBERS", QMetaType.Type.Int),
             ("PDP_IDS", QMetaType.Type.QString),
             ("PDP_COUNT", QMetaType.Type.Int),
             ("SPLICE_OF", QMetaType.Type.QString),
@@ -983,6 +1017,10 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
             nf["CABLE_TYPE"] = "Feeder"
             nf["FIBER_COUNT"] = c["size"]
             nf["SPLIT_MODULES"] = c["demand"]
+            nf["RESERVED_SPARE_FIBERS"] = self.RESERVED_SPARE_FIBERS
+            nf["AVAILABLE_FIBERS"] = max(0, c["size"] - c["demand"] - self.RESERVED_SPARE_FIBERS)
+            nf["CAPACITY_STATUS"] = "OK"
+            nf["CAPACITY_WARNING"] = ""
             nf["UTIL_PCT"] = round((c["demand"] / c["size"]) * 100.0, 1) if c["size"] else 0.0
             nf["SPARE_PCT"] = round(max(0.0, 100.0 - nf["UTIL_PCT"]), 1)
             nf["PDP_IDS"] = ",".join(c["pdp_ids"])
@@ -1158,6 +1196,10 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
         out_fields.append(QgsField("FIBER_COUNT", QMetaType.Type.Int))
         out_fields.append(QgsField("RESERVED_SPARE_FIBERS", QMetaType.Type.Int))
         out_fields.append(QgsField("AVAILABLE_FIBERS", QMetaType.Type.Int))
+        out_fields.append(QgsField("ACTIVE_FIBERS", QMetaType.Type.Int))
+        out_fields.append(QgsField("CAPACITY_STATUS", QMetaType.Type.QString))
+        out_fields.append(QgsField("CAPACITY_WARNING", QMetaType.Type.QString))
+        out_fields.append(QgsField("REVIEW", QMetaType.Type.Int))
         out_fields.append(QgsField("UTIL_PCT", QMetaType.Type.Double))
         out_fields.append(QgsField("SPARE_PCT", QMetaType.Type.Double))
         out_fields.append(QgsField("CONNECTION_TYPE", QMetaType.Type.QString))
@@ -1173,24 +1215,11 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
         # it emitted one PDP-to-premise cable per object and defeated the
         # capacity-driven side trunks below.
         #
-        # Reference-compatible distribution cable mode. The stale approved
-        # output was produced by one PDP→premise cable per garden/pseudo route,
-        # not by the newer one-trunk-per-polygon clubber. Keep the physical
-        # geometry on the distribution and garden trench inputs; do not prepend
-        # PDP projection lines because those are logical links, not trench.
-        # Preserve the approved PDP-to-premise distribution topology. The
-        # cable-only side classifier is diagnostic/metadata only; it must not
-        # replace the reference route builder or cause the duct stage to see a
-        # different distribution network.
-        # Keep the reference topology's grouping, but publish physical trunk
-        # and drop cables separately.  The legacy early-return mode emitted
-        # one PDP-to-house row per premise and skipped the explicit Drop cable
-        # tier, so the duct stage could not form the required
-        # distribution-duct + drop-duct chain.
-        # 817928 is the approved HLD baseline (285 distribution cables,
-        # PDP->premise via trench route, no per-span trunk split). Keep the
-        # reference mode active so a re-run stays byte-identical to 817.
-        USE_REFERENCE_DISTRIBUTION_CABLES = True
+        # Publish shared distribution trunks and one explicit drop per
+        # physical service location. The reference-compatible PDP-to-premise
+        # early return suppressed drops entirely and could not expose the
+        # selected drop ladder or its 288F over-capacity review status.
+        USE_REFERENCE_DISTRIBUTION_CABLES = False
 
         # Index distribution segments by normalized addr_id
         distr_by_addr = {}
@@ -1278,15 +1307,17 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
                 of["hhs"] = str(hh_count)
                 of["HH_COUNT"] = hh_count
                 demand = hh_count + self.RESERVED_SPARE_FIBERS
-                # This reference-compatible route is still emitted as a
-                # Distribution cable. Keep its 48F floor, but never clip the
-                # physical capacity below the service location's aggregate
-                # logical HH load plus reserved spare. The catalogue ladder /
-                # maximum remains an operator design decision.
-                of["FIBER_COUNT"] = max(48, demand)
+                # Historical PDP-to-premise distribution geometry retains
+                # the shared-trunk 48F minimum and grows by HH load.
+                of["FIBER_COUNT"] = distribution_fiber_capacity(hh_count)
                 of["RESERVED_SPARE_FIBERS"] = self.RESERVED_SPARE_FIBERS
                 of["AVAILABLE_FIBERS"] = max(0, of["FIBER_COUNT"] - demand)
-                of["UTIL_PCT"] = round((demand / float(of["FIBER_COUNT"])) * 100.0, 1)
+                of["ACTIVE_FIBERS"] = hh_count
+                of["CAPACITY_STATUS"] = "OK"
+                of["CAPACITY_WARNING"] = ""
+                of["REVIEW"] = 0
+                of["UTIL_PCT"] = min(100.0, round((demand / float(of["FIBER_COUNT"])) * 100.0, 1))
+
                 of["SPARE_PCT"] = round(100.0 - of["UTIL_PCT"], 1)
                 of["CONNECTION_TYPE"] = "Reference PDP-to-premise"
                 of["CABLE_TYPE"] = self.CABLE_TYPE_TRUNK
@@ -1384,6 +1415,23 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
                 region_groups[base_key + "|" + side_name] = side_members
         span_groups = region_groups
 
+        # Index garden households by normalized address ONCE. The per-address
+        # block below used to re-scan the whole garden layer for every address
+        # (an O(addresses × garden features) loop that dominated the cable
+        # stage on full-ward runs). One pass here turns each lookup into O(1).
+        garden_homes = {}
+        if fld_g_addr:
+            for gf in garden_t.getFeatures():
+                key = normalize_key(gf[fld_g_addr])
+                if not key or key in garden_homes:
+                    continue
+                try:
+                    garden_homes[key] = (
+                        int(float(gf[fld_g_hhs]))
+                        if fld_g_hhs and gf[fld_g_hhs] not in (None, "") else 1)
+                except Exception:
+                    garden_homes[key] = 1
+
         for group_key, members in span_groups.items():
             df = members[0]
             side_name = str(group_key).rsplit("|", 1)[-1]
@@ -1404,18 +1452,10 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
             # One side/branch gets the fewest cables that fit its demand. A
             # bin may contain several source rows; its union is still one
             # continuous cable on the same chamber-segmented spine.
-            entries = []
-            for address in sorted(trunk_addr_keys):
-                homes = 1
-                for gf in garden_t.getFeatures():
-                    if normalize_key(gf[fld_g_addr]) != address:
-                        continue
-                    try:
-                        homes = int(float(gf[fld_g_hhs])) if fld_g_hhs and gf[fld_g_hhs] not in (None, "") else 1
-                    except Exception:
-                        homes = 1
-                    break
-                entries.append((members[0], address, homes))
+            entries = [
+                (members[0], address, garden_homes.get(address, 1))
+                for address in sorted(trunk_addr_keys)
+            ]
             bins = self._distribution_bins(entries or [(members[0], "", 1)])
             for bin_no, bucket in enumerate(bins, 1):
                 bin_addrs = [e[1] for e in bucket["entries"] if e[1]]
@@ -1430,9 +1470,14 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
                 of["ADDR_IDS"] = ",".join(bin_addrs)
                 of["hhs"] = str(hh_count)
                 of["HH_COUNT"] = hh_count
-                of["FIBER_COUNT"] = int(bucket["size"])
+                of["FIBER_COUNT"] = distribution_fiber_capacity(hh_count)
                 of["RESERVED_SPARE_FIBERS"] = self.RESERVED_SPARE_FIBERS
                 of["AVAILABLE_FIBERS"] = max(0, of["FIBER_COUNT"] - self.RESERVED_SPARE_FIBERS - hh_count)
+                of["ACTIVE_FIBERS"] = hh_count
+                of["CAPACITY_STATUS"] = "OK"
+                of["CAPACITY_WARNING"] = ""
+                of["REVIEW"] = 0
+                of["UTIL_PCT"] = min(100.0, round(((hh_count + self.RESERVED_SPARE_FIBERS) / float(of["FIBER_COUNT"])) * 100.0, 1))
                 of["CONNECTION_TYPE"] = self.CONN_TRUNK + " (side " + str(bin_no) + ")"
                 of["CABLE_TYPE"] = self.CABLE_TYPE_TRUNK
                 of["length_m"] = round(of.geometry().length(), 2)
@@ -1476,13 +1521,25 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
             of["hhs"]        = str(hh_count)
             of["HH_COUNT"]   = hh_count
             # One drop cable follows this physical service location. Its HH
-            # attribute records the logical load, but must not fabricate
-            # unit-level geometry or duplicate the civil drop path.
+            # attribute carries logical HH demand; it never fabricates unit geometry.
             demand = hh_count + self.RESERVED_SPARE_FIBERS
-            of["FIBER_COUNT"] = max(self.GARDEN_FIBER_COUNT, demand)
+            capacity_warning = drop_capacity_warning(hh_count)
+            cable_size = drop_fiber_capacity(hh_count)
+            if capacity_warning:
+                feedback.pushWarning(
+                    f"Drop cable over capacity for {addr or 'service location'}: "
+                    f"{capacity_warning}"
+                )
+            # Keep the 288F route visible for review, but explicitly mark it
+            # over-capacity rather than silently claiming it serves the load.
+            of["FIBER_COUNT"] = cable_size or STANDARD_DROP_FIBER_MAX
             of["RESERVED_SPARE_FIBERS"] = self.RESERVED_SPARE_FIBERS
             of["AVAILABLE_FIBERS"] = max(0, of["FIBER_COUNT"] - demand)
-            of["UTIL_PCT"] = round((demand / float(of["FIBER_COUNT"])) * 100.0, 1)
+            of["ACTIVE_FIBERS"] = hh_count
+            of["CAPACITY_STATUS"] = "OVER_CAPACITY" if capacity_warning else "OK"
+            of["CAPACITY_WARNING"] = capacity_warning or ""
+            of["REVIEW"] = 1 if capacity_warning else 0
+            of["UTIL_PCT"] = min(100.0, round((demand / float(of["FIBER_COUNT"])) * 100.0, 1))
             of["SPARE_PCT"] = round(100.0 - of["UTIL_PCT"], 1)
             of["CONNECTION_TYPE"] = self.CONN_DROP
             of["CABLE_TYPE"] = self.CABLE_TYPE_DROP
@@ -1504,7 +1561,7 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
             out_layer.renderer().setSymbol(sym)
 
         feedback.pushInfo(
-            f"Distribution: {made_trunks} spine trunk cable(s) (48F floor, "
+            f"Distribution: {made_trunks} spine trunk cable(s) (standard ladder, "
             f"households + {self.RESERVED_SPARE_FIBERS} spare) + "
             f"{made_drops} physical-location drop cable(s) (garden floor "
             f"leg) = {made} total")

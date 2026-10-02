@@ -44,6 +44,7 @@ LAYER_TABLES: Dict[str, str] = {
     "polygons": "polygon_layer",
     "pdps": "pdps",
     "mfg": "mfg",
+    "mfg_service_areas": "mfg_service_areas",
     # Feeder/Distribution sub-layers share the canonical merged table so the
     # frontend sees one "cables"/"ducts" layer (distinguishable by STAGE).
     "feeder_cable": "cable_layer",
@@ -60,12 +61,19 @@ LAYER_TABLES: Dict[str, str] = {
     # the evidence behind every planned chamber, in its own table so the
     # platform serves them next to the chambers they produced.
     "trench_nodes": "trench_nodes",
-    "aerial_drop_trenches": "aerial_drop_trench_layer",
-    "aerial_trenches": "aerial_drop_trench_layer",
+    # Overhead spans on poles — NOT an excavation. Renamed from
+    # `aerial_drop_trench_layer` / `aerial_drop_trenches` because "trench" in
+    # this project means "dug", and these carry EXCAVATION=0. The two old
+    # spellings remain aliases so a stored project, a saved URL or a Django
+    # FtthLayer row written before the rename still resolves to the same table.
+    "aerial_spans": "aerial_span_layer",
+    "aerial_drop_trenches": "aerial_span_layer",
+    "aerial_trenches": "aerial_span_layer",
+    "aerial_drop_trench_layer": "aerial_span_layer",
     "aerial_cable": "aerial_cable_layer",
     # Aerial legs CLASSIFIED by the trench stage (never excavated) — their own
     # table, because they are a design decision, not the aerial drop the
-    # pole/aerial stage BUILDS (which lands in aerial_drop_trench_layer).
+    # pole/aerial stage BUILDS (which lands in aerial_span_layer).
     "aerial_drops": "aerial_drops",
     # Occupancy registry (derived from the duct/cable layers each run).
     "duct_occupancy": "duct_occupancy",
@@ -102,6 +110,7 @@ TABLE_TO_PUBLIC_NAME = {
     "polygon_layer": "polygons",
     "pdps": "pdps",
     "mfg": "mfg",
+    "mfg_service_areas": "mfg_service_areas",
     "cable_layer": "cables",
     "duct_layer": "ducts",
     "trench_layer": "trenches",
@@ -111,7 +120,7 @@ TABLE_TO_PUBLIC_NAME = {
     "poles": "poles",
     "trench_nodes": "trench_nodes",
     "brownfield": "brownfield",
-    "aerial_drop_trench_layer": "aerial_drop_trenches",
+    "aerial_span_layer": "aerial_spans",
     "aerial_cable_layer": "aerial_cable",
     # NOTE: this map is also the list init_schema() creates tables from, so a
     # table named only in LAYER_TABLES is never created — publishing
@@ -269,6 +278,10 @@ def init_schema() -> None:
             ("output_dir", "TEXT"),
             ("downloads", "JSONB NOT NULL DEFAULT '[]'::jsonb"),
             ("pipeline_state", "JSONB"),
+            ("progress", "INTEGER"),
+            ("stage_name", "TEXT"),
+            ("stage_index", "INTEGER"),
+            ("stage_count", "INTEGER"),
         ]
         for col, ddl in _engine_extras:
             try:
@@ -352,6 +365,52 @@ def init_schema() -> None:
                     table=_gis_ident(table),
                 )
             )
+
+        # The aerial-span table was renamed `aerial_drop_trench_layer` ->
+        # `aerial_span_layer`. Carry the rows across rather than orphaning every
+        # already-published project on an empty new table.
+        #
+        # This runs AFTER the creation loop on purpose: the copy fallback below
+        # writes into `aerial_span_layer`, so that table has to exist first. Run
+        # before the loop it failed startup with `relation "gis.aerial_span_layer"
+        # does not exist` on the first boot against a database that still had the
+        # old name.
+        cur.execute("SELECT to_regclass(%s)", (f"{GIS_SCHEMA}.aerial_drop_trench_layer",))
+        if cur.fetchone()[0] is not None:
+            try:
+                cur.execute(
+                    sql.SQL("ALTER TABLE {old} RENAME TO {new}").format(
+                        old=sql.Identifier(GIS_SCHEMA, "aerial_drop_trench_layer"),
+                        new=sql.Identifier(GIS_SCHEMA, "aerial_span_layer"),
+                    )
+                )
+                for suffix in ("project", "geom"):
+                    cur.execute(
+                        sql.SQL("ALTER INDEX IF EXISTS {idx} RENAME TO {new_idx}").format(
+                            idx=sql.Identifier(f"idx_aerial_drop_trench_layer_{suffix}"),
+                            new_idx=sql.Identifier(f"idx_aerial_span_layer_{suffix}"),
+                        )
+                    )
+            except Exception:
+                # A view or a dependent object blocks RENAME. The rows still
+                # have to be readable, so copy them across and leave the old
+                # table for a human to drop. Best-effort: a failure here must
+                # not stop the engine booting.
+                try:
+                    cur.execute(
+                        sql.SQL(
+                            "INSERT INTO {new} (project_id, fid, geom, properties) "
+                            "SELECT o.project_id, o.fid, o.geom, o.properties "
+                            "FROM {old} o WHERE NOT EXISTS ("
+                            "  SELECT 1 FROM {new} n "
+                            "  WHERE n.project_id = o.project_id)"
+                        ).format(
+                            new=_gis_ident("aerial_span_layer"),
+                            old=_gis_ident("aerial_drop_trench_layer"),
+                        )
+                    )
+                except Exception:
+                    pass
 
 
 # ---------------------------------------------------------------------------

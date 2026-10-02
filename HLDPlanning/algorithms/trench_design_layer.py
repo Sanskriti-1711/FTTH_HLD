@@ -181,6 +181,7 @@ _AERIAL_FIELDS: Tuple[Tuple[str, object], ...] = (
     ("DROP_ID", QMetaType.Type.QString),
     ("POLYGON_ID", QMetaType.Type.QString),
     ("PDP_ID", QMetaType.Type.QString),
+    ("MFG_ID", QMetaType.Type.QString),
     ("addr_id", QMetaType.Type.QString),
     ("HH", QMetaType.Type.Double),
     ("TRENCH_TIER", QMetaType.Type.QString),
@@ -217,6 +218,7 @@ _NODE_FIELDS: Tuple[Tuple[str, object], ...] = (
     ("NODE_TYPE", QMetaType.Type.QString),
     ("PRIORITY", QMetaType.Type.Int),
     ("PDP_ID", QMetaType.Type.QString),
+    ("MFG_ID", QMetaType.Type.QString),
     ("X", QMetaType.Type.Double),
     ("Y", QMetaType.Type.Double),
     ("SRC", QMetaType.Type.QString),
@@ -426,7 +428,9 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
         # serves it, while the duct stage refuses to run its Distribution step
         # without a PDP on the endpoint points (pseudo objects / objects). The
         # lookup is a join on the address the objects layer already holds.
-        final_rows = self._attach_premise_lookup(final_rows, objects)
+        final_rows = self._attach_premise_lookup(
+            final_rows, objects, target_epsg, context, feedback
+        )
         if not final_rows:
             raise QgsProcessingException(_tr(
                 "The trench designer produced no usable spans."))
@@ -442,14 +446,16 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
         anchors = self._anchor_points(pdps, mfg, target_epsg, context, feedback)
         snapped: Dict[str, Tuple[float, float]] = {}
         pdp_axes = self._pdp_anchor_rows(pdps, target_epsg, context, feedback)
+
         if self._snap_pdps_to_backbone(pdp_axes, final_rows, polys,
                                        target_epsg, context, feedback):
             for a in pdp_axes:
                 if a["x"] != a["x0"] or a["y"] != a["y0"]:
                     snapped[str(a["id"])] = (a["x"], a["y"])
             anchors = [(lb, aid, snapped.get(str(aid), (ax, ay))[0],
-                        snapped.get(str(aid), (ax, ay))[1])
-                       for (lb, aid, ax, ay) in anchors]
+                        snapped.get(str(aid), (ax, ay))[1], mfg_id)
+                       for (lb, aid, ax, ay, mfg_id) in anchors]
+
         weld = self._weld_network(
             final_rows, anchors, feedback)
         if weld["welded"] or weld["connectors"] or weld["stitched"]:
@@ -695,7 +701,7 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
 
     def _anchor_points(self, pdps, mfg, epsg: int, context, feedback):
         """Every PDP + MFG in the project CRS, as (label, id, x, y)."""
-        out: List[Tuple[str, str, float, float]] = []
+        out: List[Tuple[str, str, float, float, str]] = []
         for lyr, label, idfield in ((pdps, "PDP", "PDP_ID"),
                                     (mfg, "MFG", "MFG_ID")):
             if lyr is None:
@@ -708,10 +714,30 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
                     continue
                 msg = g.asPoint() if not g.isMultipart() else g.asMultiPoint()[0]
                 aid = str(f[idfield]) if idfield in names and f[idfield] else "?"
-                out.append((label, aid, msg.x(), msg.y()))
+                mfg_id = str(f["MFG_ID"]) if "MFG_ID" in names and f["MFG_ID"] else ""
+                out.append((label, aid, msg.x(), msg.y(), mfg_id))
         return out
 
     def _weld_network(self, rows: List[dict], anchors, feedback=None) -> Dict[str, int]:
+        """Weld each MFG catchment independently, never to another origin."""
+        mfg_ids = sorted({str(row.get("MFG_ID") or "") for row in rows})
+        if len(mfg_ids) <= 1:
+            return self._weld_network_single(rows, anchors, feedback)
+        totals = {"welded": 0, "connectors": 0, "stitched": 0}
+        additions = []
+        for mfg_id in mfg_ids:
+            group_rows = [row for row in rows if str(row.get("MFG_ID") or "") == mfg_id]
+            group_anchors = [a for a in anchors
+                             if len(a) > 4 and str(a[4] or "") == mfg_id]
+            original_ids = {id(row) for row in group_rows}
+            stats = self._weld_network_single(group_rows, group_anchors, feedback)
+            for key in totals:
+                totals[key] += stats.get(key, 0)
+            additions.extend(row for row in group_rows if id(row) not in original_ids)
+        rows.extend(additions)
+        return totals
+
+    def _weld_network_single(self, rows: List[dict], anchors, feedback=None) -> Dict[str, int]:
         """Close the last metres between the published network and its anchors.
 
         Two repairs, both on the final span geometry:
@@ -753,10 +779,16 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
         def _dist(ax, ay, bx, by):
             return ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
 
-        for label, aid, ax, ay in (anchors or []):
+        for anchor in (anchors or []):
+            label, aid, ax, ay = anchor[:4]
+            mfg_id = str(anchor[4] if len(anchor) > 4 else "")
+            if label not in ("PDP", "MFG"):
+                continue
             best_end = (float("inf"), None, None)
             best_seg = (float("inf"), None)
             for i, pts in paths.items():
+                if mfg_id and str(rows[i].get("MFG_ID") or "") != mfg_id:
+                    continue
                 dd = _dist(pts[0][0], pts[0][1], ax, ay)
                 if dd < best_end[0]:
                     best_end = (dd, i, 0)
@@ -791,6 +823,7 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
             conn["length_m"] = round(span, 2)
             conn["SPAN_LEN_M"] = round(span, 2)
             conn["SRC"] = "anchor-connector"
+            conn["MFG_ID"] = mfg_id or conn.get("MFG_ID")
             conn["START_CHAMBER"] = None
             conn["END_CHAMBER"] = None
             conn["SPAN_KIND"] = "Unchambered"
@@ -828,7 +861,7 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
                         cands.update(grid.get((cx, cy), []))
                 best = (float("inf"), None)
                 for j in cands:
-                    if j == i:
+                    if j == i or str(rows[j].get("MFG_ID") or "") != str(rows[i].get("MFG_ID") or ""):
                         continue
                     bb = boxes.get(j)
                     if bb is None:
@@ -921,11 +954,6 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
         """
         if not anchors or not rows:
             return 0
-        feeder = [r["_geom"] for r in rows
-                  if str(r.get("TRENCH_TIER") or "") == "Feeder"
-                  and r.get("_geom") is not None]
-        if not feeder:
-            return 0
         own: Dict[str, object] = {}
         others: List[object] = []
         if polys is not None:
@@ -948,7 +976,14 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
                 continue
             pt = QgsGeometry.fromPointXY(QgsPointXY(a["x"], a["y"]))
             best, best_d = None, float("inf")
-            for g in feeder:
+            for row in rows:
+                if str(row.get("MFG_ID") or "") != str(a.get("mfg_id") or ""):
+                    continue
+                if str(row.get("TRENCH_TIER") or "") != "Feeder":
+                    continue
+                g = row.get("_geom")
+                if g is None:
+                    continue
                 d = g.distance(pt)
                 if d < best_d:
                     best_d, best = d, g
@@ -1034,32 +1069,36 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
 
     def _ensure_backbone_reach(self, rows: List[dict], anchors,
                                feedback=None) -> int:
-        """Guarantee the FEEDER trench physically runs MFG → every PDP.
+        """Repair backbone reach separately for every assigned MFG.
 
-        The old test asked the wrong question — *"is a Feeder span within
-        ``_BACKBONE_TOL_M`` of this PDP?"* — which a **detached** Feeder
-        fragment answers yes to. Measured on Berlin run ``ductfix2``: 11 of the
-        31 PDPs sat on a 0.6-8.0 m feeder fragment that no corridor reaches
-        (still 10 islands at a 2 m weld tolerance), and this pass reported
-        *nothing* because every one of them looked fed. Two more splitters were
-        13.01 m and 3.14 m off any feeder span at all.
-
-        This version asks the real question — is the PDP joined to the MFG? —
-        and repairs the two ways it can fail:
-
-        * **relabel** — the PDP touches the MFG's welded component but only
-          through Distribution spans: that path is promoted to Feeder (no new
-          geometry, as before). A Garden leg is a premise drop and stays
-          Garden.
-        * **spur** — the PDP only touches a detached island: ONE Feeder/Open Cut
-          span is emitted from the nearest backbone point to the cabinet. That
-          is how it is built in the field (a spur off the main trench to the
-          splitter) and it is what makes "MFG → every PDP" true by construction
-          instead of by a guard.
-
-        Anything further than ``_FEEDER_BRIDGE_MAX_M`` is reported, never
-        silently bridged.
+        Partitioning is only meaningful when the inputs actually carry area
+        information: spans stamped with an ``MFG_ID`` and anchors extended to
+        ``(label, id, x, y, mfg_id)``. Legacy callers pass 4-tuple anchors and
+        rows with no ``MFG_ID``; those carry nothing to partition on, and
+        filtering them into per-MFG groups emptied every group and silently
+        disabled the whole repair. They are therefore handled as ONE group,
+        exactly as before the multi-area split.
         """
+        row_mfgs = {str(row.get("MFG_ID") or "") for row in rows}
+        anchors_carry_mfg = any(len(a) > 4 for a in anchors)
+        if not (row_mfgs - {""}) or not anchors_carry_mfg:
+            return self._ensure_backbone_reach_single(rows, anchors, feedback)
+        total = 0
+        additions = []
+        for mfg_id in sorted(row_mfgs):
+            group_rows = [row for row in rows if str(row.get("MFG_ID") or "") == mfg_id]
+            group_anchors = [a for a in anchors
+                             if len(a) > 4 and str(a[4] or "") == mfg_id]
+            original_ids = {id(row) for row in group_rows}
+            total += self._ensure_backbone_reach_single(
+                group_rows, group_anchors, feedback
+            )
+            additions.extend(row for row in group_rows if id(row) not in original_ids)
+        rows.extend(additions)
+        return total
+
+    def _ensure_backbone_reach_single(self, rows: List[dict], anchors,
+                                      feedback=None) -> int:
         if not rows or not anchors:
             return 0
         feeder = {i for i, r in enumerate(rows)
@@ -1087,14 +1126,39 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
             return best, best_i
 
         # ── Ground truth: the component the MFG actually sits on ────────
-        mfg = next((a for a in anchors if str(a[0]).upper() == "MFG"), None)
-        if mfg is None:
+        mfgs = [a for a in anchors if str(a[0]).upper() == "MFG"]
+        if not mfgs:
             return 0
-        _, mfg_i = _near(mfg[2], mfg[3], only=feeder)
-        if mfg_i is None:
-            _, mfg_i = _near(mfg[2], mfg[3])
+        mfg_id = str(mfgs[0][4] if len(mfgs[0]) > 4 else mfgs[0][1])
+        mfg = mfgs[0]
+        # Ownership only restricts the search when the spans actually carry an
+        # MFG stamp. Legacy rows have none, so requiring them to match the
+        # anchor's id would leave nothing owned and disable the repair.
+        partitioned = bool({str(r.get("MFG_ID") or "") for r in rows} - {""})
+        if partitioned:
+            owned_rows = {i for i, row in enumerate(rows)
+                          if str(row.get("MFG_ID") or "") == mfg_id}
+        else:
+            owned_rows = set(range(len(rows)))
+        if not owned_rows:
+            return 0
+        mfg_i = None
+        mfg_pt = QgsGeometry.fromPointXY(QgsPointXY(mfg[2], mfg[3]))
+        origin_rows = {i for i in owned_rows
+                       if str(rows[i].get("TRENCH_TIER") or "") != "Garden"}
+        for i in origin_rows or owned_rows:
+            geom = rows[i].get("_geom")
+            if geom is not None and not geom.isEmpty():
+                if mfg_i is None or geom.distance(mfg_pt) < rows[mfg_i]["_geom"].distance(mfg_pt):
+                    mfg_i = i
         if mfg_i is None:
             return 0
+        for i in range(len(rows)):
+            if i not in owned_rows:
+                adj.pop(i, None)
+        for neighbours in adj.values():
+            neighbours.intersection_update(owned_rows)
+        feeder.intersection_update(owned_rows)
 
         # A Garden leg is a premise drop, NOT a route: the backbone must be
         # reachable without walking down one. This is the piece that hid the
@@ -1203,15 +1267,10 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
                     best, tx, ty, tgt = d, q.x(), q.y(), i
             if tgt is None or best > self._FEEDER_BRIDGE_MAX_M or best <= 0.05:
                 return False
-            # Leave the spur from the trench that is actually there (the
-            # detached island the PDP sits on), not from thin air.
+            # The connector must terminate at the actual cabinet coordinate.
+            # Starting it at the detached trench's nearest point instead can
+            # leave a second, unmeasured gap between that span and the PDP.
             sx, sy = x, y
-            sg = rows[src_i].get("_geom") if src_i is not None else None
-            if sg is not None:
-                snear = sg.nearestPoint(_pt(tx, ty))
-                if snear is not None and not snear.isEmpty():
-                    sq = snear.asPoint()
-                    sx, sy = sq.x(), sq.y()
             if ((tx - sx) ** 2 + (ty - sy) ** 2) ** 0.5 <= 0.05:
                 return False
             cls = str(rows[tgt].get("trench_type") or "Open Cut")
@@ -1224,6 +1283,9 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
             row.update({
                 "_geom": QgsGeometry.fromMultiPolylineXY(
                     [[QgsPointXY(sx, sy), QgsPointXY(tx, ty)]]),
+                # Only stamp an origin when the design is partitioned; on a
+                # legacy single-origin run every span is deliberately unstamped.
+                **({"MFG_ID": mfg_id} if partitioned else {}),
                 "TRENCH_ID": spur_id,
                 "RUN_ID": spur_id,
                 "TRENCH_TIER": "Feeder",
@@ -1259,10 +1321,13 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
             return True
 
         non_garden = None
-        for label, aid, x, y in anchors:
+        for anchor in anchors:
+            label, aid, x, y = anchor[:4]
+            if label != "PDP" or (len(anchor) > 4 and str(anchor[4] or "") != mfg_id):
+                continue
             if x is None or y is None:
                 continue
-            d_any, start = _near(x, y)
+            d_any, start = _near(x, y, only=owned_rows)
             if start is None:
                 continue
             if not _walkable(start):
@@ -1270,7 +1335,7 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
                 # sit next to — work from the nearest non-Garden span.
                 if non_garden is None:
                     non_garden = {i for i in range(len(rows)) if _walkable(i)}
-                _dg, alt = _near(x, y, only=non_garden)
+                _dg, alt = _near(x, y, only=non_garden & owned_rows)
                 if alt is not None:
                     start = alt
             if start in comp:
@@ -1434,7 +1499,7 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
             # drafting break as a separate trench even when the route, tier and
             # construction method were continuous. Chamber/PDP anchors are the
             # authoritative breaks downstream.
-            key = (value(row, "trench_type"), tier,
+            key = (value(row, "trench_type"), tier, value(row, "MFG_ID"),
                    "garden" if tier == "Garden" else "main")
             groups.setdefault(key, []).append(row)
 
@@ -1846,7 +1911,8 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
         return rows
 
     @staticmethod
-    def _attach_premise_lookup(rows: List[dict], objects: QgsVectorLayer) -> List[dict]:
+    def _attach_premise_lookup(rows: List[dict], objects: QgsVectorLayer,
+                               epsg: int, context, feedback) -> List[dict]:
         """Fill PDP_ID / POLYGON_ID on a span from the premise it serves.
 
         The designer's spine spans already carry the splitter; its drop legs do
@@ -1856,7 +1922,11 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
         """
         if objects is None:
             return rows
-        names = objects.fields().names()
+        # Work in the designer CRS: object coordinates originate in the
+        # plan CRS, while published trench geometry is projected.
+        objects = TrenchDesignLayerAlgorithm._reproject(
+            objects, epsg, context, feedback
+        ) or objects
         f_addr = _pick_field(objects, ["ADDR_ID", "addr_id", "id"])
         f_pdp = _pick_field(objects, ["PDP_ID", "pdp_id"])
         f_poly = _pick_field(objects, ["POLYGON_ID", "polygon_id"])
@@ -2018,11 +2088,11 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
                 # Aerial is a METHOD, not an inferred label: the published row
                 # carries Overhead + EXCAVATION = 0 so the BOQ, the map and the
                 # LLD never have to guess "not dug" from the type string.
-                "CONSTRUCTION_METHOD": "Overhead",
                 # The designer's aerial legs carry the address, not the splitter
                 # (they leave the network on the pole line); the platform joins
                 # the PDP from the polygon when it needs it.
                 "PDP_ID": g(f, "PDP_ID"),
+                "MFG_ID": g(f, "MFG_ID"),
                 "addr_id": g(f, "ADDR_ID"),
                 "HH": g(f, "HH"),
                 # Tier: the drop leg this aerial span replaces ("Drop"), never
@@ -2104,8 +2174,9 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
                 "NODE_ID": g(f, "NODE_ID"),
                 "NODE_TYPE": g(f, "NODE_TYPE"),
                 "PRIORITY": int(_as_float(g(f, "PRIORITY")) or 0),
-                "PDP_ID": g(f, "PDP_ID"),
-                "X": _as_float(g(f, "X")),
+            "PDP_ID": g(f, "PDP_ID"),
+            "MFG_ID": g(f, "MFG_ID"),
+            "X": _as_float(g(f, "X")),
                 "Y": _as_float(g(f, "Y")),
                 "SRC": "trench-designer:node",
                 "_geom": geom,

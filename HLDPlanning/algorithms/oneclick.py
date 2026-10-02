@@ -22,6 +22,8 @@ from qgis.core import (
     QgsProcessingParameterFeatureSink,
     QgsProcessingFeedback,
     QgsProcessingUtils,
+    QgsSpatialIndex,
+    QgsRectangle,
     QgsWkbTypes,
     QgsVectorLayer,
     QgsFeature,
@@ -33,6 +35,7 @@ from qgis.core import (
     QgsVectorFileWriter,
     QgsMapLayer,
     QgsProcessingOutputFile,
+    QgsProcessingParameterVectorDestination,
     Qgis,
 )
 from qgis import processing
@@ -170,6 +173,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
     OUT_POLYGONS = "OUT_POLYGONS"
     OUT_PDP = "OUT_PDP"
     OUT_MFG = "OUT_MFG"
+    OUT_MFG_AREAS = "OUT_MFG_AREAS"
     
     OUT_BROWNFIELD = "OUT_BROWNFIELD"
     OUT_BROWNFIELD_POINTS = "OUT_BROWNFIELD_POINTS"
@@ -190,6 +194,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
     OUT_POLES = "OUT_POLES"
     OUT_AERIAL_TRENCHES = "OUT_AERIAL_TRENCHES"
     OUT_AERIAL_CABLE = "OUT_AERIAL_CABLE"
+    OUT_SERVED_PREMISES = "OUT_SERVED_PREMISES"
 
     _DEFAULT_OUTPUT_FILES = {
         OUT_BROWNFIELD: "Existing_Infrastructure.gpkg",
@@ -197,6 +202,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         OUT_POLYGONS: "Polygons.gpkg",
         OUT_PDP: "PDPs.gpkg",
         OUT_MFG: "MFG.gpkg",
+        OUT_MFG_AREAS: "MFG_Service_Areas.gpkg",
         OUT_FEEDER_TRENCH: "Feeder_Trench.gpkg",
         OUT_DIST_TRENCH: "Distribution_Trench.gpkg",
         OUT_GARDEN_TRENCH: "Garden_Trench.gpkg",
@@ -209,8 +215,14 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         OUT_COUPLEURS: "Coupleurs.gpkg",
         OUT_CHAMBERS: "Chambers.gpkg",
         OUT_POLES: "Poles.gpkg",
-        OUT_AERIAL_TRENCHES: "Aerial_Drop_Trenches.gpkg",
+        # NOT "Aerial_Drop_Trenches". A trench is an excavation; these are
+        # overhead spans on poles (EXCAVATION=0, CONSTRUCTION_METHOD=Overhead),
+        # and the old name made the map's trench matcher pick them up as civil
+        # trench — it had to test for this layer BEFORE `trenches` to exclude
+        # it. "Aerial_Spans" cannot be mistaken for a dig.
+        OUT_AERIAL_TRENCHES: "Aerial_Spans.gpkg",
         OUT_AERIAL_CABLE: "Aerial_Cable.gpkg",
+        OUT_SERVED_PREMISES: "Served_Premises.gpkg",
     }
 
     _OBJ_EXCEL, _OBJ_SHEET, _OBJ_EMAIL = "EXCEL", "SHEET", "EMAIL"
@@ -234,8 +246,8 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
     _NET_EDGES, _NET_CAND, _NET_REMOVED, _NET_CLEAN = (
         "OUT_EDGES", "OUT_CAND", "OUT_REMOVED", "OUT_CLEAN",
     )
-    _NET_ASSIGNED, _NET_MFG, _NET_FINAL_OBJECTS = (
-        "OUT_ASSIGNED", "OUT_MFG_POINT", "OUT_FINAL_OBJECTS",
+    _NET_ASSIGNED, _NET_MFG, _NET_FINAL_OBJECTS, _NET_MFG_AREAS = (
+        "OUT_ASSIGNED", "OUT_MFG_POINT", "OUT_FINAL_OBJECTS", "OUT_MFG_AREAS",
     )
 
     _TR_POLY, _TR_ROADS_KEY, _TR_PDP = "INPUT_POLY", "INPUT_ROADS", "INPUT_PDP"
@@ -556,6 +568,10 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             QgsProcessing.TypeVectorPoint, optional=True, createByDefault=True
         ))
         self.addParameter(QgsProcessingParameterFeatureSink(
+            self.OUT_MFG_AREAS, self.tr("Network - MFG serving-area boundaries"),
+            QgsProcessing.TypeVectorPolygon, optional=True, createByDefault=True
+        ))
+        self.addParameter(QgsProcessingParameterFeatureSink(
             self.OUT_FEEDER_TRENCH,            self.tr("Trenches - Feeder"),
             QgsProcessing.TypeVectorLine, optional=True, createByDefault=True
         ))
@@ -610,6 +626,10 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(QgsProcessingParameterFeatureSink(
             self.OUT_AERIAL_CABLE,     self.tr("Cables - Aerial Drop"),
             QgsProcessing.TypeVectorLine, optional=True, createByDefault=True
+        ))
+        self.addParameter(QgsProcessingParameterFeatureSink(
+            self.OUT_SERVED_PREMISES, self.tr("QA - Served Premises Register"),
+            QgsProcessing.TypeVectorPoint, optional=True, createByDefault=True
         ))
 
         self.addOutput(QgsProcessingOutputFile(
@@ -700,16 +720,23 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         if source.featureCount() == 0:
             return lines
 
-        chamber_pts = []
+        # Index chamber points once. Testing every chamber against every line
+        # (and repeating this for four trench tiers plus ducts/cables) made the
+        # chamber normalization effectively O(lines × chambers × vertices),
+        # which held full-area runs for many minutes after chamber placement.
+        # A bounding-box query finds only candidates within the snap tolerance.
+        chamber_index = QgsSpatialIndex()
+        chamber_pts = {}
         for pf in points.getFeatures():
             pg = pf.geometry()
             if pg is None or pg.isEmpty():
                 continue
             try:
                 p = pg.asPoint()
-                chamber_pts.append(QgsPointXY(p))
             except Exception:
                 continue
+            chamber_pts[pf.id()] = QgsPointXY(p)
+            chamber_index.addFeature(pf)
         if not chamber_pts:
             return lines
 
@@ -733,11 +760,16 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
                     continue
                 line = QgsGeometry.fromPolylineXY([QgsPointXY(p) for p in coords])
                 cuts = []
-                for cp in chamber_pts:
+                search_rect = QgsRectangle(line.boundingBox())
+                search_rect.grow(0.75)
+                for fid in chamber_index.intersects(search_rect):
+                    cp = chamber_pts.get(fid)
+                    if cp is None:
+                        continue
                     try:
-                        if line.distance(QgsGeometry.fromPointXY(cp)) <= 0.75:
-                            m = float(line.lineLocatePoint(
-                                QgsGeometry.fromPointXY(cp)))
+                        point_geom = QgsGeometry.fromPointXY(cp)
+                        if line.distance(point_geom) <= 0.75:
+                            m = float(line.lineLocatePoint(point_geom))
                             if 0.01 < m < line.length() - 0.01:
                                 cuts.append(m)
                     except Exception:
@@ -953,6 +985,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             self._NET_ASSIGNED: self._dest(parameters, self.OUT_PDP, context),
             self._NET_MFG: (QgsProcessing.TEMPORARY_OUTPUT if mfg_override is not None
                             else self._dest(parameters, self.OUT_MFG, context)),
+            self._NET_MFG_AREAS: self._dest(parameters, self.OUT_MFG_AREAS, context),
             self._NET_FINAL_OBJECTS: self._dest(parameters, self.OUT_OBJECTS, context),
         }
         if roads is not None:
@@ -965,20 +998,10 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
     # ------------------------------------------------------------------
     # Trench engine selection
     #
-    # Two engines answer the same trench-stage contract (same parameters in,
-    # same layers out), so the stage can be swapped without touching any other
-    # stage:
-    #   legacy  — sidewalk/graph derived trenches (04_trench_layer)
-    #   design  — the civil trench designer (04_trench_design_layer), which
-    #             routes the plan over the street graph and emits node-to-node
-    #             spans typed Open Cut / HDD / Garden
-    #
-    # The default is "design": the designer was diffed against a legacy run of
-    # the same project first — every watched layer produced, every downstream
-    # stage built its features, no distribution cable shorter than 1 m.  legacy
-    # stays reachable so a run that goes wrong is switched back by changing one
-    # environment variable rather than reverting code.  See
-    # utils.params.TRENCH_ENGINE for the resolution rules.
+    # Production uses one trench implementation: the civil designer. The
+    # legacy sidewalk/graph algorithm remains callable directly for comparison,
+    # but the end-to-end pipeline cannot select that known-failing path. See
+    # utils.params.TRENCH_ENGINE for the fixed resolver.
     # ------------------------------------------------------------------
     TRENCH_ENGINE_ENV = TRENCH_ENGINE.ENV
     TRENCH_ENGINES = TRENCH_ENGINE.ENGINES
@@ -987,6 +1010,30 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
     @classmethod
     def _trench_engine(cls) -> str:
         return TRENCH_ENGINE.resolve()[0]
+
+    @staticmethod
+    def _restricted_zone_classes(zones):
+        """The distinct restricted ``fclass`` values in a zone layer.
+
+        Returns ``None`` when the layer has no ``fclass`` field at all — the
+        signal that it is a hand-supplied "do not dig here" mask, which is
+        honoured in full rather than second-guessed. Same rule as the designer's
+        (``design/aerial_feasibility.RESTRICTED_LANDUSE``), so the count reported
+        here is the count used there.
+        """
+        from ..design.aerial_feasibility import is_restricted_landuse
+        try:
+            idx = zones.fields().indexFromName("fclass")
+        except Exception:
+            return None
+        if idx < 0:
+            return None
+        found = set()
+        for feat in zones.getFeatures():
+            value = feat[idx]
+            if is_restricted_landuse(value):
+                found.add(str(value).strip().lower())
+        return found
 
     def run_trench_layer(self, parameters, results, context, feedback):
         roads = self.parameterAsVectorLayer(parameters, self.P_TR_ROADS, context)
@@ -1010,11 +1057,29 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         # Aerial_Drops, so the map, BOQ and LLD can see them as non-excavation.
         zones = self.parameterAsVectorLayer(parameters, self.P_AERIAL_ZONES, context)
         if zones is not None and zones.isValid() and zones.featureCount() > 0:
+            # An area run hands us the RAW OSM landuse layer, which is mostly the
+            # ground the network exists to serve (`residential`, `retail`,
+            # `commercial`). Counting all of it as "aerial zones" both lies in
+            # this line and — before the designer learned to filter — blanketed
+            # the AOI. Report the classes that are actually restricted so the
+            # number a reader trusts is the number the designer will use.
+            restricted = self._restricted_zone_classes(zones)
+            total = zones.featureCount()
+            if restricted is None:
+                # No fclass field: a hand-drawn "no dig" mask. Honoured as-is.
+                feedback.pushInfo(self.tr(
+                    "Trench stage: aerial zones supplied ({0} polygon(s), no "
+                    "'fclass' field — taken as given) — drop legs that cannot "
+                    "be dug are classified Aerial.").format(total))
+            else:
+                feedback.pushInfo(self.tr(
+                    "Trench stage: aerial zones supplied ({0} polygon(s)) — "
+                    "{1} restricted ({2}), {3} non-restricted discarded. Drop "
+                    "legs that cannot be dug are classified Aerial.").format(
+                        total, len(restricted),
+                        ", ".join(sorted(restricted)) or "none",
+                        total - len(restricted)))
             params[self._TR_AERIAL_IN] = zones
-            feedback.pushInfo(self.tr(
-                "Trench stage: aerial zones supplied ({0} polygon(s)) — drop "
-                "legs that cannot be dug are classified Aerial.").format(
-                    zones.featureCount()))
         engine, invalid = TRENCH_ENGINE.resolve()
         if invalid:
             feedback.pushWarning(self.tr(
@@ -1592,6 +1657,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         results["network"] = net.get(self._NET_EDGES)
         results["pdp"] = net.get(self._NET_ASSIGNED)
         results["mfg"] = net.get(self._NET_MFG)
+        results["mfg_service_areas"] = net.get(self._NET_MFG_AREAS)
         elapsed = time.time() - t0
         n_pdp = self._fast_count(results["pdp"], context)
         n_fobj = self._fast_count(net.get(self._NET_FINAL_OBJECTS), context)
@@ -1638,6 +1704,10 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         t_save = time.time()
         results["mfg"] = self._save_layer_to_gpkg(
             results["mfg"], "MFG.gpkg", out_dir, context, feedback)
+        if results.get("mfg_service_areas"):
+            results["mfg_service_areas"] = self._save_layer_to_gpkg(
+                results["mfg_service_areas"], "MFG_Service_Areas.gpkg",
+                out_dir, context, feedback)
         feedback.pushInfo(self.tr("  [timing] Network output saves: {:.3f}s".format(time.time() - t_save)))
 
         if feedback.isCanceled():
@@ -1898,10 +1968,28 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             feedback.pushInfo(self.tr("  [timing] Aerial Drop Layer: {}{:.3f}s".format(fc_str, elapsed)))
             if results.get("aerial_trench"):
                 results["aerial_trench"] = self._save_layer_to_gpkg(
-                    results["aerial_trench"], "Aerial_Drop_Trenches.gpkg", out_dir, context, feedback)
+                    results["aerial_trench"], "Aerial_Spans.gpkg", out_dir, context, feedback)
             if results.get("aerial_cable"):
                 results["aerial_cable"] = self._save_layer_to_gpkg(
                     results["aerial_cable"], "Aerial_Cable.gpkg", out_dir, context, feedback)
+
+        # Explicit premise coverage: a premise counts served only if a published
+        # UG drop trench or aerial drop names its stable ADDR_ID.
+        served_params = {
+            "OBJECTS": results.get("objects"),
+            "GARDEN_TRENCH": results.get("garden"),
+            "AERIAL_DROPS": results.get("aerial_drops"),
+            "OUTPUT": self._dest(parameters, self.OUT_SERVED_PREMISES, context),
+        }
+        try:
+            served_result = processing.run(
+                "hldplanning:served_premises", served_params,
+                context=context, feedback=feedback, is_child_algorithm=True)
+            results["served_premises"] = self._save_layer_to_gpkg(
+                served_result.get("OUTPUT"), "Served_Premises.gpkg",
+                out_dir, context, feedback)
+        except Exception as exc:
+            raise PipelineStageError(self._stage_error("Served Premises Register", exc))
 
         # --- HLD_attr catalogue enrichment (in place on the saved GPKGs) ---
         if out_dir:
@@ -1932,13 +2020,34 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
 
         return self._collect_outputs(results, parameters, context, feedback)
 
+    def _trace(self, message):
+        """Append a timestamped stage line when HLD_STAGE_TRACE names a file.
+
+        The Processing feedback log is block-buffered when the pipeline runs
+        headless, so a hanging stage can leave the log far behind reality.
+        This writes straight to a file (flush per line) for run diagnostics
+        only, and is a no-op unless the env var is set.
+        """
+        path = os.environ.get("HLD_STAGE_TRACE")
+        if not path:
+            return
+        try:
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write("%s %s\n" % (time.strftime("%H:%M:%S"), message))
+        except Exception:
+            pass
+
     def _run(self, stage_name, runner, parameters, context, feedback, base_feedback=None,
              results=None):
         base = base_feedback if base_feedback is not None else feedback
+        self._trace("START %s" % stage_name)
         try:
             if results is None:
-                return runner(parameters, context, feedback)
-            return runner(parameters, results, context, feedback)
+                out = runner(parameters, context, feedback)
+            else:
+                out = runner(parameters, results, context, feedback)
+            self._trace("END %s" % stage_name)
+            return out
         except PipelineStageError:
             raise
         except Exception as exc:
@@ -1964,6 +2073,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         put(self.OUT_POLYGONS, results.get("polygons"))
         put(self.OUT_PDP, results.get("pdp"))
         put(self.OUT_MFG, results.get("mfg"))
+        put(self.OUT_MFG_AREAS, results.get("mfg_service_areas"))
         put(self.OUT_FEEDER_TRENCH, results.get("feeder"))
         put(self.OUT_DIST_TRENCH, results.get("distribution"))
         put(self.OUT_GARDEN_TRENCH, results.get("garden"))
@@ -1977,6 +2087,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         put(self.OUT_POLES, results.get("poles"))
         put(self.OUT_AERIAL_TRENCHES, results.get("aerial_trench"))
         put(self.OUT_AERIAL_CABLE, results.get("aerial_cable"))
+        put(self.OUT_SERVED_PREMISES, results.get("served_premises"))
 
         return out
 
@@ -2140,6 +2251,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             self.OUT_POLYGONS:   (None, "Polygon Layer", 0),       # root
             self.OUT_PDP:        ("Network", "PDPs", 0),
             self.OUT_MFG:        ("Network", "MFG", 1),
+            self.OUT_MFG_AREAS:  ("Network", "MFG Service Areas", 2),
             self.OUT_FEEDER_TRENCH:  ("Trenches", "Feeder", 0),
             self.OUT_DIST_TRENCH:    ("Trenches", "Distribution", 1),
             self.OUT_GARDEN_TRENCH:  ("Trenches", "Drop (HH->Footway)", 2),
@@ -2153,6 +2265,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             self.OUT_POLES:        ("Civil", "Poles", 1),
             self.OUT_AERIAL_TRENCHES: ("Civil", "Aerial Drops", 2),
             self.OUT_AERIAL_CABLE:    ("Cables", "Aerial Drop", 2),
+            self.OUT_SERVED_PREMISES: ("Network", "Served Premises", 2),
         }
 
         # Ordered group list (top-to-bottom in the legend)
@@ -2164,6 +2277,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         LAYER_COLORS = {
             self.OUT_BROWNFIELD:        "#808080",  # grey
             self.OUT_BROWNFIELD_POINTS: "#9e9e9e",  # light grey
+            self.OUT_MFG_AREAS:         "#65a30d",  # olive green service boundary
             self.OUT_FEEDER_TRENCH:     "#1e88e5",  # blue
             self.OUT_DIST_TRENCH:    "#43a047",  # green
             self.OUT_GARDEN_TRENCH:  "#fb8c00",  # orange
@@ -2268,6 +2382,13 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
                             {"color": hexcol, "outline_color": "0,0,0,255",
                              "size": "2.2", "size_unit": "MM"})
                         lyr.setRenderer(QgsSingleSymbolRenderer(m))
+                    elif lyr.geometryType() == QgsWkbTypes.PolygonGeometry:
+                        from qgis.core import QgsFillSymbol, QgsSingleSymbolRenderer
+                        symbol = QgsFillSymbol.createSimple({
+                            "color": hexcol + ",45", "outline_color": hexcol,
+                            "outline_width": "0.8",
+                        })
+                        lyr.setRenderer(QgsSingleSymbolRenderer(symbol))
                     else:
                         apply_simple_line_style(lyr, hexcol, 1.0)
                 except Exception:
@@ -2306,9 +2427,26 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         except Exception:
             pass
 
+    def _arm_dump_traceback(self):
+        """When HLD_FAULTHANDLER names a file, dump the Python stack every
+        60 s there. A headless run block-buffers its log, so a hung stage can
+        otherwise leave no clue where it is stuck. Diagnostics only — a no-op
+        unless the env var is set."""
+        path = os.environ.get("HLD_FAULTHANDLER")
+        if not path:
+            return
+        try:
+            import faulthandler
+            self._fh_handle = open(path, "a", encoding="utf-8")
+            faulthandler.dump_traceback_later(
+                60, repeat=True, file=self._fh_handle)
+        except Exception:
+            pass
+
     def processAlgorithm(self, parameters, context, feedback):
         log_feedback, log_path = self._setup_logging(
             parameters, context, feedback)
+        self._arm_dump_traceback()
         try:
             self._validate_inputs(parameters, context, log_feedback)
             out = self.execute_pipeline(parameters, context, log_feedback)
