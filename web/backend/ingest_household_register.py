@@ -24,6 +24,7 @@ file is operator-supplied:
 
     python ingest_household_register.py --list
     python ingest_household_register.py --count
+    python ingest_household_register.py --source epc_api --postcodes "B16 9BH,B17 1AA"
     python ingest_household_register.py --source epc --file <epc-certificates.zip or .csv> --areas B16,B17
     python ingest_household_register.py --source onspd --file <count-bearing-release.zip>
     python ingest_household_register.py --source uprn --file <licensed-count-bearing-uprn.csv>
@@ -33,6 +34,13 @@ archive can be loaded for one project instead of the whole country (address-leve
 files run into millions of rows). The EPC counts DWELLINGS, not occupied
 households, and only dwellings that have been assessed; the age of the archive is
 reported so the number is never mistaken for a survey.
+
+**The API is the better route for one project**, and needs no multi-GB download:
+`--source epc_api` queries the certificates for the postcodes you name (`--postcodes
+"B16 9BH,B17 1AA"`, or `--areas B16,B17` as outward codes) and aggregates them
+through the exact same code as the bulk file. Register free at
+https://get-energy-performance-data.communities.gov.uk/ and set `EPC_API_TOKEN` to
+the Bearer token shown on your account page.
 
 `--source onspd_area --areas B` is not an ingest path: it is only a published
 postcode/geography lookup, and the loader refuses it. Current May 2026 ONSPD has
@@ -105,6 +113,9 @@ def main() -> int:
     ap.add_argument("--areas", default="",
                     help="postcode AREAS to pull from the ONSPD geography lookup "
                          "(e.g. B,EH); this source cannot be loaded as household counts")
+    ap.add_argument("--postcodes", default="",
+                    help="comma-separated full postcodes to query (the EPC API "
+                         "source); --areas is accepted for it as outward codes")
     ap.add_argument("--limit", type=int, default=0,
                     help="load at most N rows (a smoke test, not a full load)")
     ap.add_argument("--keep-existing", action="store_true",
@@ -137,16 +148,27 @@ def main() -> int:
         print(f"unknown source {args.source!r}; try --list", file=sys.stderr)
         return 2
     areas = [a for a in (args.areas or "").replace(" ", "").split(",") if a]
-    remote = bool(source.get("remote"))
+    postcodes = [p.strip() for p in (args.postcodes or "").split(",") if p.strip()]
+    is_api = source.get("kind") == "epc_api"
     if source.get("has_dwellings_count") is False:
         print(f"{args.source} is a postcode geography lookup with no dwelling "
               "count; it cannot be loaded into osm.household_register.", file=sys.stderr)
         return 2
-    if remote:
+    if source.get("remote") and not is_api:
         print(f"--source {args.source} is a geography lookup, not a household-count source.",
               file=sys.stderr)
         return 2
-    if not args.file:
+    if is_api:
+        if not (postcodes or areas):
+            print(f"--source {args.source} needs --postcodes <p1,p2> (or --areas "
+                  "<outward codes>)", file=sys.stderr)
+            return 2
+        try:
+            household_register.epc_api_token(source)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+    if not is_api and not args.file:
         print(f"--source {args.source} needs --file <count-bearing register>", file=sys.stderr)
         return 2
     if not osm_source.postgis.is_available():
@@ -156,7 +178,7 @@ def main() -> int:
 
     print(describe(args.source, source, status))
     print()
-    print(f"loading {args.file} ...", flush=True)
+    print(f"loading {args.postcodes or args.file} ...", flush=True)
 
     def _progress(n: int) -> None:
         print(f"  loaded {n}...", flush=True)
@@ -168,6 +190,7 @@ def main() -> int:
         replace=not args.keep_existing,
         on_batch=_progress,
         areas=areas or None,
+        postcodes=postcodes or None,
     )
     print()
     print(f"purged {result.get('purged')} previous row(s), loaded {result.get('loaded')}")

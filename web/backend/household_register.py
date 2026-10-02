@@ -334,12 +334,162 @@ def read_remote_register(
         )
 
 
+# The EPC service also offers a developer API, which is far better suited to a
+# single project than the multi-GB bulk archive: it takes a postcode filter and
+# returns the certificates for it, so the register can be filled for just the
+# postcodes an area actually has.  Access is free but needs an account; the token
+# is a Bearer token shown in the account page footer.  Endpoint and pagination
+# live in this dict (not in code) so a change on their side is one line, and the
+# reader tolerates both `rows` and `data` envelopes.
+EPC_API_SOURCE: Dict[str, Any] = {
+    "name": "EPC domestic certificates — developer API",
+    "kind": "epc_api",
+    "country_code": "GB",
+    "vintage": "live service",
+    "publisher": "Department for Energy Security and Net Zero / MHCLG",
+    "url": "https://api.get-energy-performance-data.communities.gov.uk/api/v1/domestic/search",
+    "licence": EPC_SOURCE["licence"],
+    "note": (
+        "The same EPC certificates as the bulk archive, fetched per postcode. "
+        "Free but registered: set EPC_API_TOKEN (the Bearer token in the "
+        "account page footer), then `--source epc_api --postcodes <p1,p2>` or "
+        "--areas <outward codes>`. Rows are aggregated to postcode totals the "
+        "same way the bulk file is (distinct dwellings), so it measures "
+        "DWELLINGS, not occupied households."
+    ),
+    "remote": True,
+    "token_env": ("EPC_API_TOKEN", "EPC_API_KEY", "EPC_API_TOKEN_HEADER"),
+    # Filter/response spellings, kept here so a change is one line.  `page_size`
+    # is what the old open-data service used; the new one paginates the same way.
+    "postcode_param": "postcode",
+    "page_param": "page",
+    "page_size_param": "page_size",
+    "page_size": 5000,
+    "rows_keys": ("rows", "data", "results"),
+    "next_keys": ("next", "next_page", "links"),
+    "aggregates_to_postcode": True,
+}
+
+def read_epc_api(
+    source: Dict[str, Any],
+    terms: Sequence[str],
+    *,
+    opener: Optional[Any] = None,
+    token: str = "",
+    limit_pages: int = 1000,
+) -> Iterator[Dict[str, Any]]:
+    """Postcode-aggregated register rows from the EPC developer API.
+
+    Queries the certificates for each postcode (or postcode prefix) and runs the
+    SAME `aggregate_epc` the bulk archive goes through, so the two routes cannot
+    disagree about what a postcode's number is: distinct dwellings, one `uprn`
+    row each, and the postcode total first.
+
+    Pagination follows the response's own next link when it offers one, else
+    pages until a short page comes back.  `opener` is injectable so the request
+    shape and the paging are testable with no network and no token.
+    """
+    import urllib.parse
+    import urllib.request
+
+    url = str(source.get("url") or "")
+    if not url:
+        raise ValueError("epc_api source needs a url")
+    wanted = [str(t).strip() for t in (terms or []) if str(t or "").strip()]
+    if not wanted:
+        raise ValueError(
+            "the EPC API needs --postcodes <p1,p2> (or --areas with outward codes)"
+        )
+    token = token or epc_api_token(source)
+    open_url = opener or urllib.request.urlopen
+    rows_keys = tuple(source.get("rows_keys") or ("rows", "data", "results"))
+    page_size = int(source.get("page_size") or 5000)
+
+    collected: List[Dict[str, Any]] = []
+    pages = 0
+    for term in wanted:
+        params = {
+            str(source.get("postcode_param") or "postcode"): term,
+            str(source.get("page_param") or "page"): 1,
+            str(source.get("page_size_param") or "page_size"): page_size,
+        }
+        next_url = ""
+        while pages < limit_pages:
+            pages += 1
+            target = next_url or f"{url}?{urllib.parse.urlencode(params)}"
+            request = urllib.request.Request(target, headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+                "User-Agent": "fibre-ftth-household-register/1.0",
+            })
+            with open_url(request) as response:
+                payload = json.loads(response.read().decode("utf-8", "replace") or "{}")
+            batch: List[Dict[str, Any]] = []
+            for key in rows_keys:
+                if isinstance(payload.get(key), list):
+                    batch = payload[key]
+                    break
+            for raw in batch:
+                if not isinstance(raw, dict):
+                    continue
+                # The API names its columns in its own case (`UPRN`, `LMK_KEY`),
+                # so match the row's keys the same way a CSV header is matched.
+                keys = list(raw.keys())
+                pc_key = _match_column(keys, "postcode")
+                uprn_key = _match_column(keys, "uprn")
+                cert_key = _match_column(keys, "certificate")
+                collected.append({
+                    "postcode": raw.get(pc_key) if pc_key else None,
+                    "uprn": raw.get(uprn_key) if uprn_key else "",
+                    "certificate": (raw.get(cert_key) if cert_key
+                                   else json.dumps(raw, sort_keys=True)),
+                })
+            next_url = ""
+            for key in source.get("next_keys") or ():
+                value = payload.get(key)
+                if isinstance(value, str) and value.startswith("http"):
+                    next_url = value
+                    break
+                if isinstance(value, dict) and isinstance(value.get("next"), str):
+                    next_url = value["next"]
+                    break
+            if next_url:
+                continue
+            # No next link: a short page ends the term, a full one asks for more.
+            if len(batch) < page_size:
+                break
+            params[str(source.get("page_param") or "page")] += 1
+
+    records, _stats = aggregate_epc(collected)
+    yield from records
+
+
 REGISTER_SOURCES: Dict[str, Dict[str, Any]] = {
     "onspd": ONSPD_SOURCE,
     "onspd_area": ONSPD_AREA_SOURCE,
     "uprn": UPRN_SOURCE,
     "epc": EPC_SOURCE,
+    "epc_api": EPC_API_SOURCE,
 }
+
+
+def epc_api_token(source: Dict[str, Any], env: Optional[Dict[str, str]] = None) -> str:
+    """The Bearer token for the EPC API, from the environment.
+
+    Raises rather than returning empty: an unauthenticated call would come back
+    403 and read like "this area has no certificates", which is the one answer a
+    register loader must never invent.
+    """
+    env = os.environ if env is None else env
+    for name in source.get("token_env") or ():
+        value = str(env.get(name) or "").strip()
+        if value:
+            return value
+    raise ValueError(
+        "the EPC API needs a token: set "
+        + " or ".join(source.get("token_env") or ()) 
+        + " (the Bearer token on your EPC account page)"
+    )
 
 REGISTER_COLUMN_ALIASES: Dict[str, Tuple[str, ...]] = {
     "postcode": ("pcd", "pcd7", "pcds", "postcode", "post_code", "outcode", "zip"),
@@ -702,6 +852,7 @@ def ingest_source(
     replace: bool = True,
     on_batch: Optional[Any] = None,
     areas: Optional[Sequence[str]] = None,
+    postcodes: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     """Fetch-and-load front end for one named register source (the CLI's entry).
 
@@ -716,7 +867,11 @@ def ingest_source(
             f"{slug} is a postcode geography lookup, not a dwelling-count source; "
             "it cannot be loaded into osm.household_register"
         )
-    if source.get("remote"):
+    if source.get("kind") == "epc_api":
+        # The API takes a postcode FILTER, so a project loads exactly the
+        # postcodes it has -- either listed outright or given as outward codes.
+        records = read_epc_api(source, list(postcodes or areas or []))
+    elif source.get("remote"):
         records = read_remote_register(source, list(areas or []))
     else:
         if not path:
