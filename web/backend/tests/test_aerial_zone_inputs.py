@@ -166,3 +166,100 @@ def test_a_layer_without_an_fclass_field_is_not_reported_as_restricted(tmp_path)
         "type": "Feature", "geometry": None, "properties": {"landuse": "park"},
     }]}), encoding="utf-8")
     assert design._restricted_landuse_classes(str(path)) == []
+
+
+# ---------------------------------------------------------------------------
+# The PIPELINE path filters the mask; the designer path always did
+# ---------------------------------------------------------------------------
+#
+# The rules above only ever guarded `design.derive_aerial_zones` — the
+# standalone designer. An AREA run does not go through it: `main.py` hands the
+# trench designer the RAW landuse layer as AERIAL_ZONES, and the designer took
+# every polygon in it. In a residential ward `residential`/`retail`/`commercial`
+# are the majority of the landuse layer, so the "no dig" mask covered the AOI
+# and nearly every drop leg came back aerial.
+#
+# Measured on run ab8399fcc (North Edgbaston, 2 620 premises): 188 polygons in,
+# 2 040 of 2 057 drop legs classified aerial for `zone`. These tests pin the
+# filter at the consumption point so the two paths cannot drift again.
+
+HLD_ROOT = BACKEND_DIR.parents[1]
+if str(HLD_ROOT) not in sys.path:
+    sys.path.insert(0, str(HLD_ROOT))
+
+
+def _write_landuse_wgs84(path: Path, classes):
+    """A landuse layer in REAL lon/lat.
+
+    `_write_landuse` above writes projected-looking coordinates, which is fine
+    for the class-reporting tests (they never reproject) but not for the mask:
+    `_read_polygons_geom` transforms to the design CRS, and a GeoJSON is WGS84 by
+    definition, so out-of-range values abort the transform. These are ~0.01 deg
+    squares near Berlin — far above MIN_ZONE_AREA_M2, so none is dropped as a
+    sliver for its size.
+    """
+    features = []
+    for i, cls in enumerate(classes):
+        lon, lat = 13.30 + i * 0.02, 52.40
+        features.append({
+            "type": "Feature",
+            "geometry": {"type": "Polygon", "coordinates": [[
+                [lon, lat], [lon + 0.01, lat], [lon + 0.01, lat + 0.01],
+                [lon, lat + 0.01], [lon, lat]]]},
+            "properties": {"fclass": cls},
+        })
+    path.write_text(json.dumps({"type": "FeatureCollection", "features": features}),
+                    encoding="utf-8")
+    return str(path)
+
+
+def _mask_classes(path):
+    """(kept classes, dropped count) as _read_polygons_geom reports them."""
+    from HLDPlanning.design.trench_design import _read_polygons_geom
+    geom = _read_polygons_geom(str(path), 27700)
+    if geom is None:
+        return {}, 0
+    return (getattr(geom, "_aerial_class_counts", {}) or {},
+            getattr(geom, "_aerial_dropped", 0))
+
+
+def test_residential_and_commercial_landuse_cannot_blanket_the_aoi(tmp_path):
+    layer = _write_landuse_wgs84(tmp_path / "lu.geojson",
+                                 ["residential", "retail", "commercial", "park"])
+    kept, dropped = _mask_classes(layer)
+    assert list(kept) == ["park"], kept
+    assert dropped == 3
+
+
+def test_the_pipeline_mask_and_the_derivation_agree_on_the_same_layer(tmp_path):
+    # The whole point of the shared list: one rule, so "the area has restricted
+    # land" and "the zones were derived from it" can never disagree.
+    classes = ["residential", "park", "grass", "allotments", "retail", "wood"]
+    layer = _write_landuse_wgs84(tmp_path / "lu.geojson", classes)
+    kept, _dropped = _mask_classes(layer)
+    assert sorted(kept) == design._restricted_landuse_classes(layer)
+
+
+def test_a_hand_supplied_no_dig_layer_without_fclass_is_honoured_as_is(tmp_path):
+    # An operator who draws "do not dig here" has already decided; the filter
+    # must not silently discard it. It is still reported, so the two cases are
+    # never confused.
+    path = tmp_path / "handmade.geojson"
+    path.write_text(json.dumps({"type": "FeatureCollection", "features": [
+        {"type": "Feature", "properties": {},
+         "geometry": {"type": "Polygon", "coordinates": [[[13.30, 52.40],
+                      [13.32, 52.40], [13.32, 52.42], [13.30, 52.42],
+                      [13.30, 52.40]]]}},
+    ]}), encoding="utf-8")
+    from HLDPlanning.design.trench_design import _read_polygons_geom
+    geom = _read_polygons_geom(str(path), 27700)
+    assert geom is not None
+    assert getattr(geom, "_aerial_unfiltered", False) is True
+
+
+def test_an_unknown_or_blank_class_is_never_restricted():
+    # The safe direction is to allow digging, not to invent a no-dig zone.
+    from HLDPlanning.design.aerial_feasibility import is_restricted_landuse
+    for value in ("", None, "residential", "retail", "unknown_class"):
+        assert is_restricted_landuse(value) is False
+    assert is_restricted_landuse("PARK") is True      # case-insensitive

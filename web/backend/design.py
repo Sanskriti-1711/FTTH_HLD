@@ -44,14 +44,15 @@ DESIGN_LAYERS: Dict[str, Tuple[str, str]] = {
     "aerial_zones": ("Aerial_Zones", "Aerial zones (no excavation)"),
 }
 
-# OSM landuse classes where underground construction is restricted. Roadside
-# classes (grass, scrub, garden, recreation_ground) are deliberately excluded —
-# in OSM they are mostly verges, and including them blankets the whole AOI.
-RESTRICTED_LANDUSE = {
-    "park", "forest", "nature_reserve", "meadow", "wetland", "wood",
-    "farmland", "farm", "orchard", "vineyard", "cemetery", "allotments",
-}
-MIN_ZONE_AREA_M2 = 2000.0
+# OSM landuse classes where underground construction is restricted, and the
+# area below which a polygon is a sliver rather than a zone. These live in
+# ``HLDPlanning/design/aerial_feasibility`` because the PIPELINE path needs the
+# same rule: it is the trench designer, not this module, that builds the aerial
+# mask on an area run, and it used to take every polygon of the raw landuse
+# layer. One list, two readers — see the note there.
+from HLDPlanning.design.aerial_feasibility import (  # noqa: E402
+    MIN_ZONE_AREA_M2, RESTRICTED_LANDUSE, is_restricted_landuse,
+)
 
 _tasks: Dict[str, Dict[str, Any]] = {}
 _lock = threading.Lock()
@@ -270,7 +271,7 @@ def derive_aerial_zones(landuse, anchor_paths, out_path: Path
     ol.StartTransaction()
     for feat in lyr:
         cls = (feat.GetField("fclass") or "").strip()
-        if cls not in RESTRICTED_LANDUSE:
+        if not is_restricted_landuse(cls):
             continue
         g = feat.GetGeometryRef()
         if g is None or g.IsEmpty():
@@ -328,7 +329,7 @@ def _restricted_landuse_classes(landuse: Optional[str]) -> List[str]:
         found = set()
         for feat in lyr:
             cls = (feat.GetField(idx) or "").strip()
-            if cls in RESTRICTED_LANDUSE:
+            if is_restricted_landuse(cls):
                 found.add(cls)
     except Exception:  # noqa: BLE001 - reporting must never fail a design
         return []

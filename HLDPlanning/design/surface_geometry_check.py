@@ -7,9 +7,12 @@ trench actually drawn?** Every span is classified against the road cross-section
 model (``surface_cross_section.classify_line``), and a span is flagged when its
 drawn position contradicts the ``SURFACE`` it claims.
 
-It is deterministic geometry — no AI — and it runs as a verification pass at the
-end of every run (``utils.attr_enrich.verify_surface_geometry``), the same place
-``verify_duct_continuity`` reports on the feeder chain.
+The base check is deterministic geometry and runs as a verification pass at
+the end of every run (``utils.attr_enrich.verify_surface_geometry``), the same
+place ``verify_duct_continuity`` reports on the feeder chain. When opted in,
+individual uncertain spans are retained as candidates for the separate
+``surface_ai_review`` evidence pass; its suggestions never modify this report's
+flags or the design's ``SURFACE`` values.
 
 Confidence
 ----------
@@ -29,6 +32,7 @@ road bands rather than proof of a wrong label.
 Coordinates are WGS84 lon/lat, as every published layer is; distances are
 converted to metres through a local equirectangular approximation so the
 cross-section's metre bands mean what they say.
+
 """
 
 from __future__ import annotations
@@ -242,13 +246,14 @@ RoadIndex = _SegmentRoadIndex
 def check_spans(spans: Iterable[Span], roads: Iterable[Road], *,
                 snap_m: float = SNAP_M, min_covered: float = MIN_COVERED,
                 step_m: float = STEP_M,
-                coordinates_are_projected: bool = False) -> dict:
+                coordinates_are_projected: bool = False,
+                coordinates_crs: Optional[str] = None) -> dict:
     """Compare every span's drawn position with the surface it claims.
 
     Returns::
 
         {"checked": n, "agreed": n, "uncertain": n, "no_road": n,
-         "no_claim": n, "flags": [ {...}, ... ]}
+         "no_claim": n, "flags": [ {...}, ... ], "uncertain_spans": [ ... ]}
 
     A flag carries ``span_id``, ``claimed`` / ``claimed_family``,
     ``geometric`` / ``geometric_family``, ``confidence``, ``known_share`` and a
@@ -258,8 +263,14 @@ def check_spans(spans: Iterable[Span], roads: Iterable[Road], *,
     report = {
         "checked": 0, "agreed": 0, "uncertain": 0,
         "no_road": 0, "no_claim": 0, "flags": [],
+        # Keep the individual spans that the geometry model could not judge so
+        # an optional review pass can inspect them without changing this result.
+        "uncertain_spans": [],
     }
     spans = list(spans)
+    candidate_crs = coordinates_crs or (
+        "EPSG:25833" if coordinates_are_projected else "EPSG:4326"
+    )
     roads = [r for r in roads if r.centerline and len(r.centerline) >= 2]
     if not spans or not roads:
         return report
@@ -302,6 +313,13 @@ def check_spans(spans: Iterable[Span], roads: Iterable[Road], *,
         total = sum((s1 - s0) for s0, s1, _c, _f in intervals) or 0.0
         if total <= 0.0:
             report["uncertain"] += 1
+            report["uncertain_spans"].append({
+                "span_id": span.span_id,
+                "claimed": span.surface,
+                "coordinates": [list(point) for point in span.line],
+                "coordinates_crs": candidate_crs,
+                "reason": "classifier_returned_no_intervals",
+            })
             continue
 
         by_family: Dict[str, float] = {}
@@ -318,8 +336,19 @@ def check_spans(spans: Iterable[Span], roads: Iterable[Road], *,
 
         if not by_family or known_share < min_covered:
             # Mostly off the modelled road — the classifier itself is saying
-            # "I cannot see the road here", so say nothing.
+            # "I cannot see the road here", so say nothing. Preserve the
+            # candidate separately for optional imagery review; the geometry
+            # verdict and the design's SURFACE remain unchanged.
             report["uncertain"] += 1
+            report["uncertain_spans"].append({
+                "span_id": span.span_id,
+                "claimed": span.surface,
+                "coordinates": [list(point) for point in span.line],
+                "coordinates_crs": candidate_crs,
+                "reason": "insufficient_modelled_coverage",
+                "known_share": round(known_share, 2),
+                "confidence": round(confidence, 2),
+            })
             continue
 
         geometric = max(by_family.items(), key=lambda kv: kv[1])[0]

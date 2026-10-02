@@ -539,7 +539,18 @@ def _coords_to_lonlat(coords, crs_name: str):
     """Transform coordinates from their recorded CRS to WGS84 lon/lat pairs."""
     crs_name = str(crs_name or "").strip().upper()
     if crs_name in ("EPSG:4326", "CRS84", "OGC:CRS84"):
-        return [(float(point[0]), float(point[1])) for point in coords]
+        # Validate the degrees path the same way the transform path is: a
+        # projected coordinate mislabelled as WGS84 (an easy caller mistake, and
+        # the default CRS) otherwise becomes a nonsense bbox and an image of
+        # nowhere, instead of the error that says what went wrong.
+        result = []
+        for point in coords:
+            lon, lat = float(point[0]), float(point[1])
+            if not (-180 <= lon <= 180 and -90 <= lat <= 90):
+                raise ValueError(
+                    "Coordinate is outside WGS84 bounds; check coordinates_crs")
+            result.append((lon, lat))
+        return result
     try:
         from osgeo import osr
         source = osr.SpatialReference()
@@ -1136,40 +1147,21 @@ def review_uncertain_spans(
 POINT_SPAN_PREFIX = "CLICK"
 
 
-def classify_point(coordinates, crs: str = "EPSG:4326", *,
-                   length_m: float = 8.0, bearing: Optional[float] = None,
-                   span_id: Optional[str] = None,
-                   image_provider: Optional[Callable[[dict], Optional[dict]]] = None,
-                   classifier: Optional[Callable[[bytes, str, str, str], dict]] = None,
-                   api_key: Optional[str] = None) -> dict:
-    """Suggest the surface under a single clicked coordinate (advisory only).
+def _review_item(span_id: str) -> dict:
+    """The item shape every surface answer uses, batched or on demand.
 
-    Same contract as ``review_uncertain_spans`` for one point: it never edits
-    design outputs and never changes the deterministic geometry verdict. A
-    short segment is synthesised through the point so the imagery provider can
-    highlight where the answer applies. Returns one review item shaped like the
-    artifact's ``suggestions`` entries, whose ``review_status`` is ``pending``,
-    ``no_imagery``, ``error``, ``disabled``, ``awaiting_imagery_source`` or
-    ``missing_credentials``. Invalid coordinates raise ``ValueError``.
+    Keeping the batch artifact's fields means the results page renders a span the
+    pipeline answered and a span a reader opted into identically. ``provider`` and
+    ``model`` name what an on-demand answer actually used; the batch artifact
+    records those only at report level.
     """
-    if not isinstance(coordinates, (list, tuple)) or len(coordinates) < 2:
-        raise ValueError("A point needs [x, y] coordinates")
-    try:
-        x = float(coordinates[0])
-        y = float(coordinates[1])
-    except (TypeError, ValueError, IndexError) as exc:
-        raise ValueError("Point coordinates must be numeric") from exc
-    if not math.isfinite(x) or not math.isfinite(y):
-        raise ValueError("Point coordinates must be finite")
-    crs_name = str(crs or "").strip() or "EPSG:4326"
-    lon, lat = _coords_to_lonlat([(x, y)], crs_name)[0]
-
-    item = {
-        "span_id": span_id or "%s-%.5f-%.5f" % (POINT_SPAN_PREFIX, lon, lat),
-        "point": [round(lon, 7), round(lat, 7)],
+    return {
+        "span_id": span_id,
+        "point": None,
         "claimed_surface": None,
+        "coordinates": None,
         "coordinates_crs": "EPSG:4326",
-        "geometry_reason": "manual_point_probe",
+        "geometry_reason": None,
         "geometry_confidence": None,
         "known_share": None,
         "AI_SURFACE": None,
@@ -1185,6 +1177,79 @@ def classify_point(coordinates, crs: str = "EPSG:4326", *,
         "error_detail": None,
     }
 
+
+def _point_pair(coordinates) -> tuple:
+    """Validate one ``[x, y]`` coordinate pair, rejecting anything unusable."""
+    if not isinstance(coordinates, (list, tuple)) or len(coordinates) < 2:
+        raise ValueError("A point needs [x, y] coordinates")
+    try:
+        x = float(coordinates[0])
+        y = float(coordinates[1])
+    except (TypeError, ValueError, IndexError) as exc:
+        raise ValueError("Point coordinates must be numeric") from exc
+    if not math.isfinite(x) or not math.isfinite(y):
+        raise ValueError("Point coordinates must be finite")
+    return x, y
+
+
+def _route_points(coordinates) -> list:
+    """Validate a span's own route line (two or more ``[x, y]`` pairs)."""
+    if not isinstance(coordinates, (list, tuple)) or len(coordinates) < 2:
+        raise ValueError("A span needs at least two coordinates")
+    points = []
+    for point in coordinates:
+        if not isinstance(point, (list, tuple)) or len(point) < 2:
+            raise ValueError("Span coordinates must be [x, y] pairs")
+        try:
+            x, y = float(point[0]), float(point[1])
+        except (TypeError, ValueError, IndexError) as exc:
+            raise ValueError("Span coordinates must be numeric") from exc
+        if not math.isfinite(x) or not math.isfinite(y):
+            raise ValueError("Span coordinates must be finite")
+        points.append((x, y))
+    return points
+
+
+def _apply_image(item: dict, image, include_imagery: bool,
+                 no_imagery_reason: str) -> bool:
+    """Record a provider's patch on the item; True when there is imagery.
+
+    ``include_imagery`` carries the patch itself as base64 so a caller can show
+    exactly what the model was given. The batch artifact deliberately stores no
+    image bytes, so this is off unless someone asked for it.
+    """
+    if not image:
+        item.update(review_status="no_imagery", reason=no_imagery_reason)
+        return False
+    if not isinstance(image, dict):
+        raise ValueError("Imagery provider must return an image record")
+    source = str(image.get("source") or "").strip()
+    date = image.get("date")
+    if not source:
+        raise ValueError("Imagery provider must identify its source")
+    if date is not None and not str(date).strip():
+        date = None
+    item["imagery_source"] = source
+    item["imagery_date"] = str(date) if date else None
+    overlaid = image.get("route_overlaid")
+    item["imagery_route_overlaid"] = None if overlaid is None else bool(overlaid)
+    if include_imagery and isinstance(image.get("image_bytes"), bytes):
+        item["image_base64"] = base64.b64encode(image["image_bytes"]).decode("ascii")
+        item["image_mime_type"] = image.get("mime_type") or "image/jpeg"
+    return True
+
+
+def _surface_review(item: dict, candidate: dict, *,
+                    image_provider=None, classifier=None, api_key=None,
+                    include_imagery: bool = False,
+                    no_imagery_reason: str = "No imagery available.") -> dict:
+    """Answer one candidate: its imagery, then the vision model. Advisory only.
+
+    Shared by the batch pass, the clicked-point probe and the per-span opt-in so
+    all three agree on enablement, credentials, the no-imagery/error states and
+    the item shape. A provider or model failure never raises — it is recorded as
+    the item's ``review_status``.
+    """
     enabled = (os.environ.get("SURFACE_AI_REVIEW", "").strip().lower()
                in ("1", "true", "yes", "on"))
     if not enabled:
@@ -1209,32 +1274,10 @@ def classify_point(coordinates, crs: str = "EPSG:4326", *,
         item.update(review_status="missing_credentials",
                     reason="GEMINI_API_KEY is not configured.")
         return item
-
-    candidate = {
-        "span_id": item["span_id"],
-        "claimed": None,
-        "coordinates": _segment_lonlat(lon, lat, length_m, bearing),
-        "coordinates_crs": "EPSG:4326",
-    }
-    item["coordinates"] = candidate["coordinates"]
     try:
         image = provider_callable(candidate)
-        if not image:
-            item.update(review_status="no_imagery",
-                        reason="No imagery available for this point.")
+        if not _apply_image(item, image, include_imagery, no_imagery_reason):
             return item
-        if not isinstance(image, dict):
-            raise ValueError("Imagery provider must return an image record")
-        source = str(image.get("source") or "").strip()
-        date = image.get("date")
-        if not source:
-            raise ValueError("Imagery provider must identify its source")
-        if date is not None and not str(date).strip():
-            date = None
-        item["imagery_source"] = source
-        item["imagery_date"] = str(date) if date else None
-        overlaid = image.get("route_overlaid")
-        item["imagery_route_overlaid"] = None if overlaid is None else bool(overlaid)
         result = classify(
             image["image_bytes"], image.get("mime_type", "image/jpeg"),
             api_key or "", model,
@@ -1249,6 +1292,141 @@ def classify_point(coordinates, crs: str = "EPSG:4326", *,
         item["reason"] = str(result.get("reason") or "")[:500]
         item["review_status"] = "pending"
         item["review_required"] = True
+    except Exception as exc:
+        item.update(review_status="error", review_required=True,
+                    reason=type(exc).__name__,
+                    error_detail=getattr(exc, "raw_reply", None))
+    return item
+
+
+def classify_point(coordinates, crs: str = "EPSG:4326", *,
+                   length_m: float = 8.0, bearing: Optional[float] = None,
+                   span_id: Optional[str] = None,
+                   image_provider: Optional[Callable[[dict], Optional[dict]]] = None,
+                   classifier: Optional[Callable[[bytes, str, str, str], dict]] = None,
+                   api_key: Optional[str] = None,
+                   include_imagery: bool = False) -> dict:
+    """Suggest the surface under a single clicked coordinate (advisory only).
+
+    Same contract as ``review_uncertain_spans`` for one point: it never edits
+    design outputs and never changes the deterministic geometry verdict. A
+    short segment is synthesised through the point so the imagery provider can
+    highlight where the answer applies. Returns one review item shaped like the
+    artifact's ``suggestions`` entries, whose ``review_status`` is ``pending``,
+    ``no_imagery``, ``error``, ``disabled``, ``awaiting_imagery_source`` or
+    ``missing_credentials``. Invalid coordinates raise ``ValueError``.
+    ``include_imagery`` also returns the patch the model saw, as base64.
+    """
+    x, y = _point_pair(coordinates)
+    crs_name = str(crs or "").strip() or "EPSG:4326"
+    lon, lat = _coords_to_lonlat([(x, y)], crs_name)[0]
+
+    item = _review_item(span_id or "%s-%.5f-%.5f" % (POINT_SPAN_PREFIX, lon, lat))
+    item["point"] = [round(lon, 7), round(lat, 7)]
+    item["geometry_reason"] = "manual_point_probe"
+    candidate = {
+        "span_id": item["span_id"],
+        "claimed": None,
+        "coordinates": _segment_lonlat(lon, lat, length_m, bearing),
+        "coordinates_crs": "EPSG:4326",
+    }
+    item["coordinates"] = candidate["coordinates"]
+    return _surface_review(
+        item, candidate, image_provider=image_provider, classifier=classifier,
+        api_key=api_key, include_imagery=include_imagery,
+        no_imagery_reason="No imagery available for this point.")
+
+
+def classify_span(span_id, coordinates, coordinates_crs: str = "EPSG:4326", *,
+                  claimed_surface=None, geometry_reason=None,
+                  geometry_confidence=None, known_share=None,
+                  image_provider: Optional[Callable[[dict], Optional[dict]]] = None,
+                  classifier: Optional[Callable[[bytes, str, str, str], dict]] = None,
+                  api_key: Optional[str] = None,
+                  include_imagery: bool = False) -> dict:
+    """Suggest the surface along ONE span a reader opted into (one call).
+
+    The on-demand counterpart of ``review_uncertain_spans``: it takes the span's
+    own route geometry — the vertices the geometry check left uncertain — rather
+    than synthesising a probe segment, and sends exactly that one span to the
+    imagery provider and the vision model. Nothing is written to the review
+    artifact, so a reader chooses span by span and spends one call per choice.
+    """
+    span_id = str(span_id or "").strip()
+    if not span_id:
+        raise ValueError("A span needs an id")
+    points = _route_points(coordinates)
+    crs_name = str(coordinates_crs or "").strip() or "EPSG:4326"
+    item = _review_item(span_id)
+    item["claimed_surface"] = claimed_surface
+    item["geometry_reason"] = geometry_reason
+    item["geometry_confidence"] = geometry_confidence
+    item["known_share"] = known_share
+    item["coordinates"] = points
+    item["coordinates_crs"] = crs_name
+    candidate = {
+        "span_id": span_id,
+        "claimed": claimed_surface,
+        "coordinates": points,
+        "coordinates_crs": crs_name,
+    }
+    return _surface_review(
+        item, candidate, image_provider=image_provider, classifier=classifier,
+        api_key=api_key, include_imagery=include_imagery,
+        no_imagery_reason="No imagery available for this span.")
+
+
+def preview_imagery(coordinates, crs: str = "EPSG:4326", *,
+                    length_m: float = 8.0, bearing: Optional[float] = None,
+                    span_id: Optional[str] = None,
+                    image_provider: Optional[Callable[[dict], Optional[dict]]] = None) -> dict:
+    """Fetch the patch a detect would send, without contacting the model.
+
+    Lets a reader see exactly which imagery the model would be given before
+    spending a call on it. Accepts the same two input shapes as ``classify``: one
+    ``[x, y]`` point (a short probe segment is synthesised through it, matching
+    ``classify_point``) or a span's route line ``[[x, y], ...]``. The patch comes
+    back as base64 in ``image_base64`` with its ``imagery_source``, ``imagery_date``
+    and whether the planned route was drawn over it.
+    """
+    item = _review_item(str(span_id or "PREVIEW").strip() or "PREVIEW")
+    if (isinstance(coordinates, (list, tuple)) and coordinates
+            and isinstance(coordinates[0], (list, tuple))):
+        points = _route_points(coordinates)
+        crs_name = str(crs or "").strip() or "EPSG:4326"
+        item["coordinates"] = points
+        item["coordinates_crs"] = crs_name
+        candidate = {"span_id": item["span_id"], "claimed": None,
+                     "coordinates": points, "coordinates_crs": crs_name}
+    else:
+        x, y = _point_pair(coordinates)
+        crs_name = str(crs or "").strip() or "EPSG:4326"
+        lon, lat = _coords_to_lonlat([(x, y)], crs_name)[0]
+        item["point"] = [round(lon, 7), round(lat, 7)]
+        item["coordinates"] = _segment_lonlat(lon, lat, length_m, bearing)
+        item["coordinates_crs"] = "EPSG:4326"
+        candidate = {"span_id": item["span_id"], "claimed": None,
+                     "coordinates": item["coordinates"], "coordinates_crs": "EPSG:4326"}
+
+    enabled = (os.environ.get("SURFACE_AI_REVIEW", "").strip().lower()
+               in ("1", "true", "yes", "on"))
+    if not enabled:
+        item.update(review_status="disabled",
+                    reason="Set SURFACE_AI_REVIEW=1 to enable imagery review.")
+        return item
+    provider_callable = (image_provider if image_provider is not None
+                         else configured_image_provider())
+    if provider_callable is None:
+        item.update(review_status="awaiting_imagery_source",
+                    reason="No imagery source configured.")
+        return item
+    try:
+        image = provider_callable(candidate)
+        if not _apply_image(item, image, True,
+                           "No imagery available for this location."):
+            return item
+        item["review_status"] = "pending"
+        item["reason"] = "Patch preview only; the vision model was not called."
     except Exception as exc:
         item.update(review_status="error", review_required=True,
                     reason=type(exc).__name__,

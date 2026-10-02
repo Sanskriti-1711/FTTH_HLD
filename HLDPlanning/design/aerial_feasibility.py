@@ -46,6 +46,46 @@ AERIAL_TERRAIN_TYPES = frozenset({
 # it; the designer exposes the same knob as ``Params.max_ug_drop_m``.
 MAX_UG_DROP_M_DEFAULT = 300.0
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Which OSM landuse classes are grounds for "do not dig here"
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# This is the ONE list that decides it, and both entry points read it:
+# ``trench_design._read_polygons_geom`` (the pipeline path) and
+# ``web/backend/design.derive_aerial_zones`` (the standalone designer). It
+# used to live only in the second, so the pipeline handed the designer the
+# whole landuse layer and the designer took every polygon in it as a
+# no-excavation zone.
+#
+# That is not a subtle over-count. In a residential ward the landuse layer is
+# mostly `residential`, `retail` and `commercial` — the ground the network
+# exists to serve — so on run ab8399fcc (North Edgbaston, 2 620 premises) the
+# mask blanketed the AOI and 2 040 of 2 057 drop legs were classified aerial
+# for `zone`. Restricted land is a small minority of a ward, so the filter has
+# to be an allow-list; a deny-list would eventually include the suburbs.
+#
+# Roadside classes (grass, scrub, garden, recreation_ground) are deliberately
+# absent: in OSM they are mostly verges, and including them blankets the whole
+# AOI for the same reason residential did.
+RESTRICTED_LANDUSE = frozenset({
+    "park", "forest", "nature_reserve", "meadow", "wetland", "wood",
+    "farmland", "farm", "orchard", "vineyard", "cemetery", "allotments",
+})
+
+# Zones below this are dropped as slivers/mapping noise rather than treated as
+# grounds for aerial construction.
+MIN_ZONE_AREA_M2 = 2000.0
+
+
+def is_restricted_landuse(fclass: object) -> bool:
+    """Is this OSM ``fclass`` grounds for a no-excavation zone?
+
+    Accepts the raw field value so a caller can pass what OGR handed back
+    without pre-cleaning it. An absent/blank/unknown class is never
+    restricted — the safe direction is to allow digging, not to invent a zone.
+    """
+    return str(fclass or "").strip().lower() in RESTRICTED_LANDUSE
+
 
 def evaluate_drop_feasibility(*,
                               distance_m: Optional[float] = None,

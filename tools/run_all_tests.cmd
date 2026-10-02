@@ -29,7 +29,9 @@ if not defined PYEXE (
 
 REM The launchers warn about this: a QGIS site-packages on PYTHONPATH shadows
 REM the Anaconda interpreter and makes Django report "Pillow is not installed".
+REM PYTHONHOME can redirect Anaconda to QGIS's Python 3.12 standard library too.
 set "PYTHONPATH="
+set "PYTHONHOME="
 set "FAIL="
 
 echo.

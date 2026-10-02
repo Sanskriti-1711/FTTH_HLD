@@ -22,7 +22,16 @@ invocation covers it.
     HLD_Planning_01/tools/run_qgis_tests.py
 
 # Backend / FastAPI — must run from web/backend (the tests import `main`)
-cd HLD_Planning_01/web/backend && python -m pytest tests -q
+# Git Bash: remove any QGIS Python 3.12 environment inherited by Anaconda 3.11
+cd HLD_Planning_01/web/backend && env -u PYTHONPATH -u PYTHONHOME python -m pytest tests -q
+# Windows cmd.exe: clear those variables before invoking Python
+cd HLD_Planning_01\web\backend
+set "PYTHONPATH=" && set "PYTHONHOME=" && python -m pytest tests -q
+
+# Focused LLD Mode A suite (same environment isolation)
+cd HLD_Planning_01/web/backend && env -u PYTHONPATH -u PYTHONHOME python -m pytest tests/test_lld_mode_a.py -q
+cd HLD_Planning_01\web\backend
+set "PYTHONPATH=" && set "PYTHONHOME=" && python -m pytest tests\test_lld_mode_a.py -q
 
 # One file / one test
 ./HLD_Planning_01/tools/qgis_python.cmd \
@@ -49,6 +58,7 @@ cd HLD_Planning_01/web/backend && python -m pytest tests -q
 
 - Tests in `tests/` use the `qgis_app` fixture from `conftest.py`, which starts
   a headless `QgsApplication` once per session.
-- `unset PYTHONPATH` before running the backend suite by hand: a QGIS
-  `site-packages` on `PYTHONPATH` shadows the Anaconda interpreter and makes
-  Django report "Pillow is not installed". `run_all_tests.cmd` clears it.
+- Clear both `PYTHONPATH` and `PYTHONHOME` before running the backend suite by
+  hand: QGIS's Python 3.12 packages/stdlib are incompatible with the backend's
+  Anaconda Python 3.11. The test harness and server launchers clear both; the
+  engine injects QGIS paths only into the `qgis_process` subprocess.

@@ -76,14 +76,20 @@ def test_normalize_fills_missing_class_aliases_on_canonical_features():
     assert props["USAGE_TYPE"] == "HDD"
 
 
-def test_normalize_leaves_aerial_drop_trenches_alone():
+def test_normalize_leaves_aerial_spans_alone():
+    """The civil-trench normaliser must not touch overhead spans.
+
+    `aerial_spans` (formerly `aerial_drop_trenches`) keeps its own class: it is
+    a span on a pole, never dug, so forcing it into the closed 3-value trench
+    set would relabel overhead fibre as an excavation.
+    """
     layer = {
         "final_trenches": [_trench({"trench_type": "Feeder"})],
-        "aerial_drop_trenches": [_trench({"trench_type": "Aerial_Drop"})],
+        "aerial_spans": [_trench({"trench_type": "Aerial_Drop"})],
     }
     _normalize_trench_construction_class(layer)
     assert layer["final_trenches"][0]["properties"]["trench_type"] == "Open Cut"
-    assert layer["aerial_drop_trenches"][0]["properties"]["trench_type"] == "Aerial_Drop"
+    assert layer["aerial_spans"][0]["properties"]["trench_type"] == "Aerial_Drop"
 
 
 def test_normalize_handles_missing_layers_and_empty_props():

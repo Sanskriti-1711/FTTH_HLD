@@ -28,7 +28,12 @@ set "QGIS_PLUGINPATH=%REPO_ROOT%"
 ::    in-process path on Windows).
 set "QGIS_PREFIX_PATH=%QGIS_BIN%\.."
 
-:: 5. No GUI: offscreen Qt suppresses any modal dialog a provider might pop up.
+:: 5. Keep Anaconda isolated from QGIS's Python 3.12 packages. The engine
+::    injects the QGIS paths only into its qgis_process child environment.
+set "PYTHONPATH="
+set "PYTHONHOME="
+
+:: 6. No GUI: offscreen Qt suppresses any modal dialog a provider might pop up.
 set "QT_QPA_PLATFORM=offscreen"
 
 echo Using QGIS_BIN=%QGIS_BIN%

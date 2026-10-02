@@ -1,9 +1,9 @@
-"""Unit tests for the pipeline's trench-engine selection.
+"""Unit tests for the single production trench-engine selection.
 
-The pipeline can run either trench stage — the legacy sidewalk/graph layer or
-the civil trench designer — behind one environment variable.  These tests pin
-the resolution rules (which the graders of a wrong run depend on) and the
-wiring that makes the designer reachable as a processing algorithm.
+The end-to-end pipeline always uses the civil trench designer. The legacy
+sidewalk/graph stage remains directly available for comparison, but no
+configuration value should route production runs into that known-failing path.
+Tests pin the fixed resolver and the wiring to the registered designer.
 
 No QGIS required: the resolver lives in ``utils/params.py``, which is pure, and
 the registration is asserted from source.
@@ -46,16 +46,21 @@ def test_empty_env_selects_the_default():
     assert TRENCH_ENGINE.resolve("   ") == (TRENCH_ENGINE.DESIGN, None)
 
 
-def test_env_is_read_from_the_environment(monkeypatch):
+def test_environment_cannot_reenable_the_legacy_pipeline(monkeypatch):
     monkeypatch.setenv(TRENCH_ENGINE.ENV, "legacy")
-    assert TRENCH_ENGINE.resolve() == (TRENCH_ENGINE.LEGACY, None)
+    assert TRENCH_ENGINE.resolve() == (TRENCH_ENGINE.DESIGN, "legacy")
     monkeypatch.setenv(TRENCH_ENGINE.ENV, "design")
     assert TRENCH_ENGINE.resolve() == (TRENCH_ENGINE.DESIGN, None)
 
 
 @pytest.mark.parametrize("raw", ["legacy", "LEGACY", "  Legacy "])
-def test_legacy_escape_hatch_is_honoured(raw):
-    assert TRENCH_ENGINE.resolve(raw) == (TRENCH_ENGINE.LEGACY, None)
+def test_legacy_selection_is_rejected_for_pipeline_runs(raw):
+    assert TRENCH_ENGINE.resolve(raw) == (TRENCH_ENGINE.DESIGN, raw.strip())
+
+
+@pytest.mark.parametrize("raw", ["trench_design", "bad", "unknown"])
+def test_unrecognised_engine_is_reported_and_uses_designer(raw):
+    assert TRENCH_ENGINE.resolve(raw) == (TRENCH_ENGINE.DESIGN, raw)
 
 
 @pytest.mark.parametrize("raw", ["design", "DESIGN", " Design\t"])
@@ -63,38 +68,27 @@ def test_design_is_honoured(raw):
     assert TRENCH_ENGINE.resolve(raw) == (TRENCH_ENGINE.DESIGN, None)
 
 
-def test_unrecognised_value_falls_back_but_is_reported():
-    """A typo must not silently change the design without saying so."""
-    assert TRENCH_ENGINE.resolve("trench_design") == (
-        TRENCH_ENGINE.DESIGN, "trench_design")
-    assert TRENCH_ENGINE.resolve(" legacy ") == (TRENCH_ENGINE.LEGACY, None)
-
 
 # ── algorithm id ─────────────────────────────────────────────────────────
 
 
-def test_algorithm_ids_are_distinct_and_stable():
-    assert TRENCH_ENGINE.algorithm_id(TRENCH_ENGINE.LEGACY) == ALG.TRENCH
+def test_algorithm_id_always_selects_the_designer(monkeypatch):
     assert TRENCH_ENGINE.algorithm_id(TRENCH_ENGINE.DESIGN) == ALG.TRENCH_DESIGN
+    monkeypatch.setenv(TRENCH_ENGINE.ENV, "legacy")
+    assert TRENCH_ENGINE.algorithm_id() == ALG.TRENCH_DESIGN
     assert ALG.TRENCH == "hldplanning:04_trench_layer"
     assert ALG.TRENCH_DESIGN == "hldplanning:04_trench_design_layer"
-
-
-def test_algorithm_id_defaults_to_the_resolved_engine(monkeypatch):
-    assert TRENCH_ENGINE.algorithm_id() == ALG.TRENCH_DESIGN
-    monkeypatch.setenv(TRENCH_ENGINE.ENV, "legacy")
-    assert TRENCH_ENGINE.algorithm_id() == ALG.TRENCH
 
 
 # ── registration / wiring ────────────────────────────────────────────────
 
 
 def test_adapter_is_registered_and_named_like_its_id():
-    """The designer must stay addressable by the id the pipeline selects.
+    """The designer must stay addressable by the fixed production algorithm id.
 
     ``04_trench_design_layer`` is derived from the module name by QGIS's
-    provider, so a rename in one place without the other silently makes
-    TRENCH_ENGINE=design unrunnable.
+    provider, so a rename in one place without the other silently makes the
+    production trench stage unrunnable.
     """
     init_src = (_HLD_ROOT / "HLDPlanning" / "algorithms" / "__init__.py").read_text(
         encoding="utf-8")
@@ -106,8 +100,8 @@ def test_adapter_is_registered_and_named_like_its_id():
     assert "04_trench_design_layer" in adapter
 
 
-def test_pipeline_runs_the_selected_engine():
-    """The trench stage must dispatch through the resolver, not hardcode one."""
+def test_pipeline_dispatches_to_the_designer_algorithm():
+    """The trench stage must use the single supported pipeline engine."""
     src = (_HLD_ROOT / "HLDPlanning" / "algorithms" / "oneclick.py").read_text(
         encoding="utf-8")
     assert "alg_id = TRENCH_ENGINE.algorithm_id(engine)" in src

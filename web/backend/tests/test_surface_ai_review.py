@@ -1,6 +1,7 @@
 """Pure-Python tests for the opt-in surface imagery review prototype."""
 from __future__ import annotations
 
+import base64
 import json
 import math
 import pathlib
@@ -1132,3 +1133,233 @@ def test_point_classify_keeps_the_rejected_reply(monkeypatch):
 
 def test_queued_items_carry_a_null_error_detail():
     assert review._not_processed({"span_id": "T-1"})["error_detail"] is None
+
+
+# ----------------------------------------------------------------------
+# Per-span opt-in detect (one call per choice) and imagery preview (no call)
+# ----------------------------------------------------------------------
+
+_SPAN = [[1.5249, 49.0762], [1.52492, 49.07618]]
+
+
+def test_span_classify_sends_the_spans_own_route(monkeypatch):
+    monkeypatch.setenv("SURFACE_AI_REVIEW", "1")
+    monkeypatch.setenv("SURFACE_AI_PROVIDER", "ollama")
+    monkeypatch.setenv("SURFACE_AI_MODEL", "qwen2.5vl:3b")
+    seen = {}
+
+    def image_provider(candidate):
+        seen["candidate"] = candidate
+        return {"image_bytes": b"patch", "mime_type": "image/jpeg",
+                "source": "IGN BD ORTHO", "date": None, "route_overlaid": False}
+
+    item = review.classify_span(
+        "TR-001033", _SPAN, "EPSG:4326",
+        claimed_surface="Footpath", geometry_reason="insufficient_modelled_coverage",
+        geometry_confidence=0.0, known_share=0.0,
+        image_provider=image_provider,
+        classifier=lambda *_a: {"ai_surface": "garden", "confidence": 0.6,
+                                "reason": "Trees over the modelled corridor."})
+    assert item["review_status"] == "pending"
+    assert item["AI_SURFACE"] == "garden"
+    assert item["confidence"] == 0.6
+    assert item["span_id"] == "TR-001033"
+    assert item["claimed_surface"] == "Footpath"
+    assert item["geometry_reason"] == "insufficient_modelled_coverage"
+    assert item["known_share"] == 0.0
+    assert item["provider"] == "ollama"
+    # The provider is handed the span's real route, not a synthesised probe,
+    # which is what makes one opt-in cost exactly one call for that span.
+    assert seen["candidate"]["coordinates"] == [(1.5249, 49.0762), (1.52492, 49.07618)]
+    assert seen["candidate"]["coordinates_crs"] == "EPSG:4326"
+    assert seen["candidate"]["claimed"] == "Footpath"
+    # No patch is carried unless the caller asked to show it.
+    assert "image_base64" not in item
+
+
+def test_span_classify_can_return_the_patch_the_model_saw(monkeypatch):
+    monkeypatch.setenv("SURFACE_AI_REVIEW", "1")
+    monkeypatch.setenv("SURFACE_AI_PROVIDER", "ollama")
+    item = review.classify_span(
+        "TR-1", _SPAN,
+        image_provider=lambda _c: {"image_bytes": b"\xff\xd8patch",
+                                   "mime_type": "image/jpeg",
+                                   "source": "IGN BD ORTHO", "date": None},
+        classifier=lambda *_a: {"ai_surface": "road", "confidence": 0.5},
+        include_imagery=True)
+    assert item["review_status"] == "pending"
+    assert item["image_base64"] == base64.b64encode(b"\xff\xd8patch").decode("ascii")
+    assert item["image_mime_type"] == "image/jpeg"
+
+
+def test_point_classify_can_return_the_patch_the_model_saw(monkeypatch):
+    monkeypatch.setenv("SURFACE_AI_REVIEW", "1")
+    monkeypatch.setenv("SURFACE_AI_PROVIDER", "ollama")
+    item = review.classify_point(
+        [1.5249, 49.0762],
+        image_provider=lambda _c: {"image_bytes": b"jpegbytes",
+                                   "mime_type": "image/jpeg",
+                                   "source": "Esri", "date": None},
+        classifier=lambda *_a: {"ai_surface": "garden", "confidence": 0.7},
+        include_imagery=True)
+    assert item["image_base64"] == base64.b64encode(b"jpegbytes").decode("ascii")
+    assert item["image_mime_type"] == "image/jpeg"
+
+
+def test_span_classify_is_disabled_without_opt_in(monkeypatch):
+    monkeypatch.delenv("SURFACE_AI_REVIEW", raising=False)
+    called = []
+    item = review.classify_span(
+        "TR-1", _SPAN, image_provider=lambda _c: called.append(True))
+    assert item["review_status"] == "disabled"
+    assert item["AI_SURFACE"] is None
+    # Nothing is spent while the review is off.
+    assert called == []
+
+
+def test_span_classify_rejects_unusable_input():
+    cases = [
+        ("", _SPAN),
+        (None, _SPAN),
+        ("TR-1", [[1.0, 2.0]]),
+        ("TR-1", [[1.0, 2.0], "nope"]),
+        ("TR-1", [[1.0, 2.0], [float("nan"), 2.0]]),
+    ]
+    for span_id, coordinates in cases:
+        try:
+            review.classify_span(span_id, coordinates)
+        except ValueError:
+            continue
+        raise AssertionError("bad span input must raise ValueError: %r"
+                             % ((span_id, coordinates),))
+
+
+def test_span_classify_records_missing_imagery(monkeypatch):
+    monkeypatch.setenv("SURFACE_AI_REVIEW", "1")
+    monkeypatch.setenv("SURFACE_AI_PROVIDER", "ollama")
+    item = review.classify_span(
+        "TR-1", _SPAN, image_provider=lambda _c: None,
+        classifier=lambda *_a: {"ai_surface": "road", "confidence": 0.5})
+    assert item["review_status"] == "no_imagery"
+    assert item["reason"] == "No imagery available for this span."
+
+
+def test_preview_imagery_returns_the_patch_without_calling_the_model(monkeypatch):
+    monkeypatch.setenv("SURFACE_AI_REVIEW", "1")
+    monkeypatch.setenv("SURFACE_AI_PROVIDER", "gemini")
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    seen = {}
+
+    def image_provider(candidate):
+        seen["candidate"] = candidate
+        return {"image_bytes": b"aerial", "mime_type": "image/jpeg",
+                "source": "Esri World Imagery", "date": None,
+                "route_overlaid": True}
+
+    item = review.preview_imagery(
+        _SPAN, "EPSG:4326", span_id="TR-7", image_provider=image_provider)
+    # A preview works even with no model credentials: it never calls the model.
+    assert item["review_status"] == "pending"
+    assert item["span_id"] == "TR-7"
+    assert item["image_base64"] == base64.b64encode(b"aerial").decode("ascii")
+    assert item["imagery_source"] == "Esri World Imagery"
+    assert item["imagery_route_overlaid"] is True
+    assert item["AI_SURFACE"] is None
+    assert "model was not called" in item["reason"]
+    assert seen["candidate"]["coordinates"] == [(1.5249, 49.0762), (1.52492, 49.07618)]
+
+
+def test_preview_imagery_synthesises_a_probe_for_a_point(monkeypatch):
+    monkeypatch.setenv("SURFACE_AI_REVIEW", "1")
+    seen = {}
+
+    def image_provider(candidate):
+        seen["candidate"] = candidate
+        return {"image_bytes": b"p", "mime_type": "image/jpeg",
+                "source": "IGN BD ORTHO", "date": None}
+
+    item = review.preview_imagery([1.5249, 49.0762], image_provider=image_provider)
+    assert item["review_status"] == "pending"
+    assert item["point"] == [1.5249, 49.0762]
+    assert seen["candidate"]["coordinates_crs"] == "EPSG:4326"
+    assert len(seen["candidate"]["coordinates"]) == 2
+
+
+def test_preview_imagery_reports_missing_imagery(monkeypatch):
+    monkeypatch.setenv("SURFACE_AI_REVIEW", "1")
+    item = review.preview_imagery([1.5249, 49.0762], image_provider=lambda _c: None)
+    assert item["review_status"] == "no_imagery"
+    assert item.get("image_base64") is None
+
+
+def test_preview_imagery_reports_a_provider_failure(monkeypatch):
+    monkeypatch.setenv("SURFACE_AI_REVIEW", "1")
+
+    def image_provider(_candidate):
+        raise OSError("imagery unavailable")
+
+    item = review.preview_imagery([1.5249, 49.0762], image_provider=image_provider)
+    assert item["review_status"] == "error"
+    assert item["reason"] == "OSError"
+
+
+def test_preview_imagery_is_disabled_without_opt_in(monkeypatch):
+    monkeypatch.delenv("SURFACE_AI_REVIEW", raising=False)
+    called = []
+    item = review.preview_imagery([1.5249, 49.0762],
+                                  image_provider=lambda _c: called.append(True))
+    assert item["review_status"] == "disabled"
+    assert called == []
+
+
+def test_preview_imagery_reports_no_configured_source(monkeypatch):
+    monkeypatch.setenv("SURFACE_AI_REVIEW", "1")
+    monkeypatch.delenv("SURFACE_AI_IMAGE_PROVIDER", raising=False)
+    monkeypatch.setattr(review, "_CONFIGURED_IMAGE_PROVIDER", None)
+    item = review.preview_imagery([1.5249, 49.0762])
+    assert item["review_status"] == "awaiting_imagery_source"
+
+
+def test_a_projected_coordinate_mislabelled_as_wgs84_is_rejected(monkeypatch):
+    # The project CRS is EPSG:25833 while EPSG:4326 is the default, so a caller
+    # that forgets coordinates_crs is a realistic mistake. Without the bounds
+    # check it produced a nonsense bbox and an image of nowhere.
+    monkeypatch.setenv("SURFACE_AI_REVIEW", "1")
+    called = []
+    provider = lambda _c: called.append(True)
+    projected = [[-482744.5175, 5524003.8769], [-482744.2913, 5523997.8769]]
+    for fn in (
+        lambda: review.classify_span("TR-1", projected, image_provider=provider),
+        lambda: review.preview_imagery(projected, image_provider=provider),
+        lambda: review.classify_point([-482744.5175, 5524003.8769],
+                                      image_provider=provider),
+        lambda: review.preview_imagery([-482744.5175, 5524003.8769],
+                                       image_provider=provider),
+    ):
+        try:
+            fn()
+        except ValueError as exc:
+            assert "WGS84" in str(exc)
+        else:
+            raise AssertionError("a projected coordinate mislabelled as WGS84 must be rejected")
+    # The refusal happens before any imagery is fetched.
+    assert called == []
+
+
+def test_review_item_shape_is_shared_by_point_span_and_preview(monkeypatch):
+    monkeypatch.setenv("SURFACE_AI_REVIEW", "1")
+    monkeypatch.setenv("SURFACE_AI_PROVIDER", "ollama")
+    patch = {"image_bytes": b"p", "mime_type": "image/jpeg",
+             "source": "IGN BD ORTHO", "date": None}
+    classify = lambda *_a: {"ai_surface": "road", "confidence": 0.5}
+    point = review.classify_point([1.5249, 49.0762], image_provider=lambda _c: patch,
+                                  classifier=classify)
+    span = review.classify_span("TR-1", _SPAN, image_provider=lambda _c: patch,
+                                classifier=classify)
+    preview = review.preview_imagery(_SPAN, image_provider=lambda _c: patch)
+    for item in (point, span, preview):
+        for key in ("span_id", "AI_SURFACE", "confidence", "imagery_source",
+                    "imagery_date", "imagery_route_overlaid", "review_status",
+                    "review_required", "reason", "error_detail"):
+            assert key in item

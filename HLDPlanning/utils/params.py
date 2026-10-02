@@ -38,57 +38,39 @@ class ALG:
     AERIAL  = "hldplanning:09_aerial_drop_layer"
 
 class TRENCH_ENGINE:
-    """Which algorithm answers the pipeline's trench stage.
+    """The single trench implementation used by the production pipeline.
 
-    Two engines produce the same trench-stage contract — the same parameters in
-    and the same layers out — so the stage can be switched without touching any
-    other stage:
-
-        legacy  hldplanning:04_trench_layer         sidewalk/graph trenches
-        design  hldplanning:04_trench_design_layer  civil trench designer
-
-    ``design`` is the default: the designer routes the plan over the street
-    graph, types every span Open Cut / HDD / Garden and cuts node-to-node spans
-    (HDD ends landing on open cut), which is the network the platform's trench
-    design page shows.  ``legacy`` stays reachable so a run that goes wrong is
-    switched back with one environment variable instead of a revert.
-
-    Selection is per process, from ``TRENCH_ENGINE``:  a QGIS run started by the
-    engine backend inherits the server's environment, so setting it there
-    switches every project; setting it for a single ``qgis_process`` call
-    switches that run.
+    The civil designer routes the plan over the street graph, types every span
+    Open Cut / HDD / Garden and cuts node-to-node spans (HDD ends landing on
+    open cut). The legacy sidewalk/graph stage remains available as a direct
+    QGIS algorithm for comparison, but the end-to-end pipeline always selects
+    this designer so a stale environment setting cannot send runs down the
+    known-failing legacy path.
     """
 
     ENV = "TRENCH_ENGINE"
-    LEGACY = "legacy"
     DESIGN = "design"
-    ENGINES = (LEGACY, DESIGN)
+    ENGINES = (DESIGN,)
     DEFAULT = DESIGN
 
     @classmethod
     def resolve(cls, raw=None):
-        """Resolve the engine to run.
+        """Resolve the one supported pipeline engine.
 
-        Returns ``(engine, invalid_raw)`` where ``invalid_raw`` is the
-        unrecognised value that was requested, or ``None``.  An unrecognised
-        value falls back to the default rather than failing the run, but it is
-        reported so a typo cannot silently change the design.
+        Returns ``(design, invalid_raw)``. Any explicitly set legacy/unknown
+        value is reported as invalid but cannot select another implementation.
         """
         if raw is None:
             raw = os.environ.get(cls.ENV) or ""
         value = raw.strip().lower()
-        if not value:
-            return cls.DEFAULT, None
-        if value in cls.ENGINES:
-            return value, None
-        return cls.DEFAULT, raw.strip()
+        if not value or value == cls.DESIGN:
+            return cls.DESIGN, None
+        return cls.DESIGN, raw.strip()
 
     @classmethod
     def algorithm_id(cls, engine=None):
-        """Processing algorithm id for ``engine`` (defaults to the current one)."""
-        if engine is None:
-            engine = cls.resolve()[0]
-        return ALG.TRENCH_DESIGN if engine == cls.DESIGN else ALG.TRENCH
+        """Return the production trench algorithm (always the civil designer)."""
+        return ALG.TRENCH_DESIGN
 
 
 # Vendor/customer profile keys that can be overridden per deployment
