@@ -141,6 +141,63 @@ def test_a_csv_with_no_count_column_is_refused_rather_than_loading_nothing():
         list(hr.read_register_csv(io.StringIO(text)))
 
 
+def test_current_onspd_area_lookup_is_not_advertised_as_a_count_source():
+    source = hr.REGISTER_SOURCES["onspd_area"]
+    assert source["has_dwellings_count"] is False
+    assert "no dwellings count" in source["note"]
+    with pytest.raises(ValueError, match="not a dwelling-count source"):
+        hr.ingest_source("onspd_area", areas=["B"])
+
+
+def test_countless_file_is_rejected_before_existing_register_is_purged(
+        tmp_path, monkeypatch):
+    source_file = tmp_path / "onspd_geography_only.csv"
+    source_file.write_text(chr(10).join([
+        "pcd,oa21cd", "B11 3SA,E000001", "",
+    ]), encoding="utf-8")
+    monkeypatch.setattr(hr.postgis, "is_available", lambda: True)
+
+    def unexpected_purge(*_args, **_kwargs):
+        raise AssertionError("invalid source must not purge existing register rows")
+
+    monkeypatch.setattr(hr, "register_purge", unexpected_purge)
+    with pytest.raises(ValueError, match="dwellings/households"):
+        hr.ingest_source("onspd", str(source_file))
+
+
+def test_empty_or_zero_only_register_is_a_noop_before_purge(tmp_path, monkeypatch):
+    source_file = tmp_path / "empty_register.csv"
+    source_file.write_text(chr(10).join([
+        "postcode,households", "B11 3SA,0", "",
+    ]), encoding="utf-8")
+    monkeypatch.setattr(hr.postgis, "is_available", lambda: True)
+
+    def unexpected_purge(*_args, **_kwargs):
+        raise AssertionError("empty source must not purge existing register rows")
+
+    monkeypatch.setattr(hr, "register_purge", unexpected_purge)
+    result = hr.ingest_source("onspd", str(source_file), limit=1)
+    assert result["loaded"] == 0
+    assert result["purged"] == 0
+
+
+def test_keep_existing_never_calls_country_wide_purge(tmp_path, monkeypatch):
+    source_file = tmp_path / "register.csv"
+    source_file.write_text(chr(10).join([
+        "postcode,households", "B11 3SA,120", "",
+    ]), encoding="utf-8")
+    monkeypatch.setattr(hr.postgis, "is_available", lambda: True)
+    monkeypatch.setattr(hr, "register_ingest", lambda *args, **kwargs: len(args[0]))
+
+    def unexpected_purge(*_args, **_kwargs):
+        raise AssertionError("--keep-existing must not purge other sources")
+
+    monkeypatch.setattr(hr, "register_purge", unexpected_purge)
+    result = hr.ingest_source("onspd", str(source_file), replace=False)
+    assert result["purged"] == 0
+    assert result["loaded"] == 1
+
+
 def test_pcd_is_preferred_over_pcds_when_both_are_present():
     # The ONSPD carries both: `pcd` is the 7-character form and `pcds` the
     # 8-character one. Both normalise to the same key, so either works, but the
@@ -456,3 +513,36 @@ def test_both_named_sources_state_what_their_number_is():
         assert source.get("licence")
         assert source.get("publisher")
         assert len(source.get("note") or "") > 40
+
+
+# ---------------------------------------------------------------------------
+# Turning it on
+# ---------------------------------------------------------------------------
+
+def test_the_register_reads_either_documented_env_name(monkeypatch):
+    """`OSM_HH_REGISTER` really turns the register on.
+
+    The ingest CLI told operators to set `OSM_HH_REGISTER=1` while this module
+    read `OSM_HOUSEHOLD_REGISTER`, so following the documented instruction left
+    the register off with no error at all.  Both spellings are honoured now.
+    """
+    monkeypatch.delenv("OSM_HOUSEHOLD_REGISTER", raising=False)
+    monkeypatch.setenv("OSM_HH_REGISTER", "1")
+    assert hr.register_enabled_from_env() is True
+
+    monkeypatch.delenv("OSM_HH_REGISTER", raising=False)
+    monkeypatch.setenv("OSM_HOUSEHOLD_REGISTER", "1")
+    assert hr.register_enabled_from_env() is True
+
+
+def test_an_explicit_off_on_the_canonical_name_wins(monkeypatch):
+    """Named "off" beats an ambient legacy variable saying "on"."""
+    monkeypatch.setenv("OSM_HOUSEHOLD_REGISTER", "0")
+    monkeypatch.setenv("OSM_HH_REGISTER", "1")
+    assert hr.register_enabled_from_env() is False
+
+
+def test_the_register_is_off_when_no_knob_is_set(monkeypatch):
+    for name in hr.REGISTER_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    assert hr.register_enabled_from_env() is False

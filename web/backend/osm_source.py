@@ -3632,17 +3632,39 @@ def _reference_features(table: str, polygon: Dict[str, Any]) -> List[Dict[str, A
     return features
 
 
+def household_method_label(methods: Iterable[str]) -> str:
+    """One label for the household methods behind a building's total.
+
+    A building's premises can be counted by more than one method (one address
+    node with `addr:flats`, the rest `fallback_one`), and the label says so
+    rather than picking one: `fallback_one` on a building whose total is really a
+    mix would present a measured number as a guess and a guess as measured.
+    """
+    unique = sorted({str(m) for m in methods if str(m or "").strip()})
+    if not unique:
+        return ""
+    return unique[0] if len(unique) == 1 else "mixed(" + ",".join(unique) + ")"
+
+
 def input_layer_geojson(
     polygon: Dict[str, Any],
     layer: str,
     country: str = "",
     city: str = "",
+    country_code: str = "",
 ) -> Dict[str, Any]:
     """Return one complete pre-run input layer as GeoJSON.
 
     This endpoint is intentionally based on the generated OSM snapshot and
     project OSM reference layers only. It does not read a manual workbook or
     any existing HLD design output.
+
+    The `objects` and `premises` layers carry the HOUSEHOLD count the design will
+    actually load, through the same `assemble_premises` path (and the same
+    external household register, when one is loaded) the run itself uses. A
+    building point is therefore not a bare building: a block of flats reads as
+    the households it holds, not as one row, and the review cannot disagree with
+    the run about the number the cable sizing is computed from.
     """
     key = str(layer or "").strip().lower().replace("-", "_")
     allowed = {
@@ -3657,6 +3679,14 @@ def input_layer_geojson(
         features = _reference_features(_INPUT_LAYER_TABLES[key], polygon)
     else:
         buildings, addresses, addr_to_building, roads = read_area_rows(polygon)
+        # Only the two layers that show household counts consult the register,
+        # and `household_register_for` returns None (so the OSM heuristic is
+        # used) whenever the knob is off, no register is loaded, or the country
+        # is not covered.
+        register = (
+            household_register_for(country_code, area_postcodes(buildings, addresses))
+            if key in ("objects", "premises") else None
+        )
         if key == "buildings":
             for row in buildings:
                 props = {k: v for k, v in row.items() if k not in ("geom_json", "lon", "lat")}
@@ -3679,8 +3709,42 @@ def input_layer_geojson(
             # not just the handful this module names.  This is the layer the HLD
             # object layer is built from, so what a planner reviews here is what
             # the design will actually see.
+            #
+            # It is not purely a building layer: each point also carries the
+            # household count the building contributes, summed from the premises
+            # this same area produces (`households`), how many service locations
+            # that is (`premises`), and the method(s) behind the number
+            # (`household_method`).  A block of flats therefore reads as several
+            # households on one point instead of as one unremarkable building.
+            premises, _stats = assemble_premises(
+                buildings, addresses, addr_to_building,
+                country=country, city=city, register=register,
+            )
+            by_building: Dict[int, Dict[str, Any]] = {}
+            for p in premises:
+                # Premises carry the building's OSM id in OSM_ID (an address-node
+                # premise with no building carries the node id, which matches no
+                # building and is simply not attributed).
+                try:
+                    bid = int(p.get("OSM_ID"))
+                except (TypeError, ValueError):
+                    continue
+                slot = by_building.setdefault(bid, {"households": 0, "premises": 0, "methods": []})
+                slot["households"] += int(p.get("HH") or 0)
+                slot["premises"] += 1
+                slot["methods"].append(str(p.get("HH_METHOD") or ""))
             for row in buildings:
                 props = object_properties(row)
+                try:
+                    row_id = int(row.get("osm_id"))
+                except (TypeError, ValueError):
+                    row_id = None
+                agg = by_building.get(row_id)
+                props.update({
+                    "households": int(agg["households"]) if agg else 0,
+                    "premises": int(agg["premises"]) if agg else 0,
+                    "household_method": household_method_label(agg["methods"]) if agg else "",
+                })
                 lon, lat = row.get("lon"), row.get("lat")
                 if lon is None or lat is None:
                     continue
@@ -3689,7 +3753,8 @@ def input_layer_geojson(
                     features.append(item)
         elif key == "premises":
             premises, _stats = assemble_premises(
-                buildings, addresses, addr_to_building, country=country, city=city
+                buildings, addresses, addr_to_building,
+                country=country, city=city, register=register,
             )
             for row in premises:
                 props = dict(row)

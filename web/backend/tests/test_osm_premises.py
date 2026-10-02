@@ -2514,3 +2514,134 @@ def test_a_postcode_asks_for_its_sector_before_the_containing_lookup(monkeypatch
                             country_code="GB", postcode="B16 9BH")
 
     assert order == [("sector", "B169"), ("containing", None)], order
+
+
+# ---------------------------------------------------------------------------
+# The review Objects layer carries HOUSEHOLDS, not just buildings
+# ---------------------------------------------------------------------------
+#
+# The design is sized on households: one building can hold many of them, and a
+# point that shows only "a building" hides exactly the number the cable sizing
+# and the BOQ are computed from.  Measured on Carlyle Road (B16 9BH): two ~2000
+# m2 OSM apartment blocks with no flats/levels tags became 1 household each, and
+# the whole road read as 7 households.  These tests pin the count onto the point.
+
+def _review_polygon():
+    return {"type": "Polygon", "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 0]]]}
+
+
+def _stub_review_rows(monkeypatch, buildings, addresses=(), join=None):
+    """Make the review layers run off fixed rows, with no database."""
+    monkeypatch.setattr(
+        osm_source, "read_area_rows",
+        lambda poly: (list(buildings), list(addresses), dict(join or {}), []),
+    )
+
+
+def test_objects_layer_carries_the_household_count_of_each_building(monkeypatch):
+    """A building point is not a bare building: it carries the households.
+
+    The count has to agree with what the run loads, so it is asserted against
+    `assemble_premises` itself rather than against a hard-coded expectation.
+    """
+    buildings = [_building(1), _building(2, building_flats="3")]
+    _stub_review_rows(monkeypatch, buildings)
+    monkeypatch.setattr(osm_source, "household_register_for", lambda cc, pcs: None)
+
+    out = osm_source.input_layer_geojson(_review_polygon(), "objects")
+
+    assert out["layer"] == "objects"
+    assert len(out["features"]) == 2
+    expected = {}
+    for p in osm_source.assemble_premises(buildings, [], {})[0]:
+        expected[p["OSM_ID"]] = expected.get(p["OSM_ID"], 0) + int(p["HH"])
+    got = {f["properties"]["osm_object_id"]: f["properties"]["households"]
+           for f in out["features"]}
+    assert got == expected
+    for f in out["features"]:
+        assert f["properties"]["premises"] == 1
+        assert f["properties"]["household_method"]
+
+
+def test_objects_layer_reads_a_block_of_flats_as_many_households(monkeypatch):
+    """One building, many households: the number must be on the point.
+
+    This is the Carlyle Road case -- the building does not become the household
+    count, and it does not become one household either.
+    """
+    buildings = [_building(1, building_flats="12")]
+    _stub_review_rows(monkeypatch, buildings)
+    monkeypatch.setattr(osm_source, "household_register_for", lambda cc, pcs: None)
+
+    out = osm_source.input_layer_geojson(_review_polygon(), "objects")
+
+    props = out["features"][0]["properties"]
+    assert props["households"] == 12
+    assert props["household_method"] == "building_flats"
+    assert props["premises"] == 1
+
+
+def test_objects_layer_sums_a_buildings_many_service_locations(monkeypatch):
+    """Several address nodes inside one building become one point with the sum."""
+    buildings = [_building(1)]
+    addresses = [_address(11, "2"), _address(12, "4"), _address(13, "6")]
+    _stub_review_rows(monkeypatch, buildings, addresses, {11: 1, 12: 1, 13: 1})
+    monkeypatch.setattr(osm_source, "household_register_for", lambda cc, pcs: None)
+
+    out = osm_source.input_layer_geojson(_review_polygon(), "objects")
+
+    props = out["features"][0]["properties"]
+    assert props["osm_object_id"] == 1
+    assert props["premises"] == 3
+    assert props["households"] == 23   # 9 + 7 + 7, as the run allocates them
+
+
+def test_objects_and_premises_reviews_use_the_loaded_household_register(monkeypatch):
+    """Preview must not disagree with the run about the number that sizes it.
+
+    The register replaces the heuristic, so a review that skipped it would show
+    2 households for a premise the design loads 9 for.
+    """
+    buildings = [_building(1, building_flats="2", addr_postcode="B11 3SA")]
+    _stub_review_rows(monkeypatch, buildings)
+    monkeypatch.setattr(
+        osm_source, "household_register_for",
+        lambda cc, pcs: {"by_postcode": {"B11 3SA": 9}, "by_uprn": {},
+                         "source": "Test register", "licence": "OGL", "vintage": "2024"},
+    )
+
+    objects = osm_source.input_layer_geojson(
+        _review_polygon(), "objects", country_code="GB")
+    props = objects["features"][0]["properties"]
+    assert props["households"] == 9
+    assert props["household_method"] == "register_postcode"
+
+    premises = osm_source.input_layer_geojson(
+        _review_polygon(), "premises", country_code="GB")
+    assert sum(f["properties"]["HH"] for f in premises["features"]) == 9
+    assert {f["properties"]["HH_METHOD"] for f in premises["features"]} == {"register_postcode"}
+
+
+def test_a_building_with_no_premises_carries_no_households(monkeypatch):
+    """An excluded building must not be credited with households it holds none of.
+
+    `_building("garage")` is filtered out of the premise set, so its point must
+    report zero rather than a made-up one.
+    """
+    buildings = [_building(1, building="garage", building_levels=None)]
+    _stub_review_rows(monkeypatch, buildings)
+    monkeypatch.setattr(osm_source, "household_register_for", lambda cc, pcs: None)
+
+    out = osm_source.input_layer_geojson(_review_polygon(), "objects")
+
+    props = out["features"][0]["properties"]
+    assert props["households"] == 0
+    assert props["premises"] == 0
+    assert props["household_method"] == ""
+
+
+def test_household_method_label_names_a_mix_instead_of_picking_one():
+    assert osm_source.household_method_label(["fallback_one"]) == "fallback_one"
+    assert osm_source.household_method_label([]) == ""
+    assert osm_source.household_method_label(["building_flats", "fallback_one"]) == \
+        "mixed(building_flats,fallback_one)"

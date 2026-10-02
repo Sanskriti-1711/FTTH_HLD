@@ -7,15 +7,36 @@ on none.  Trunk sizing, HH-based physical-location drop capacity, and the BOQ re
 that heuristic, and
 `HH_METHOD` travels with each row so nobody mistakes it for a survey.
 
-The UK is the case where this is *fixable with real data*, because the UK
-publishes an address-level register of dwellings:
+The UK is the case where this is *partly fixable with authoritative data*:
 
-* **ONSPD** (ONS Postcode Directory) carries a `Dwellings` count for every one
-  of the ~2.7 M UK postcodes.  Free, quarterly, OGL v3.
 * **UPRN** (OS Open UPRN / OS Open Names) gives a unique identifier and a
-  coordinate for every addressable location -- ~40 M of them -- and AddressBase
-  carries per-UPRN dwelling counts.  UPRNs are the join key that makes a
-  register address-accurate rather than postcode-accurate.
+  coordinate for every addressable location, but does NOT include a dwelling
+  count. AddressBase can carry per-UPRN property/dwelling information under its
+  own licence. UPRNs are the join key for an address-level register only when
+  paired with an explicit, licensed count source.
+* **ONSPD** (ONS Postcode Directory) is free, quarterly, OGL v3, and is the
+  canonical postcode lookup. **It is not a household-count source.** The May
+  2026 release's full CSV, per-area CSV splits, and ArcGIS hosted table are
+  the same 53-column geography lookup, with no `Dwellings` or `Pop01`. The
+  postcode-area B CSV is available in place for geography lookup, but loading
+  it as household counts is deliberately refused. Its useful role here is the
+  official postcode -> census Output Area / LSOA / MSOA mapping.
+* **ONS Census 2021 RM204 — Number of Dwellings** is the most relevant
+  published count source found for England and Wales. It reports dwellings by
+  census geography (down to Output Area), not by postcode. It is a defensible
+  small-area dwelling total, but joining it to this postcode-keyed register
+  requires an explicit geographic crosswalk and allocation rule; do not repeat
+  an OA total on each postcode or label it an exact postcode count. Scotland
+  and Northern Ireland require their own census sources/geographies. Official
+  links: [ONS RM204](https://www.ons.gov.uk/datasets/RM204/editions/2021/versions/1)
+  and [Nomis bulk Census downloads](https://www.nomisweb.co.uk/sources/census_2021_bulk)
+  (one geography-specific CSV per zip; ONS says OA is its lowest census geography).
+
+An operator-supplied ONSPD file from an older release is accepted only if it
+actually contains a dwellings/households column; the CSV reader rejects a
+geography-only file. The loader validates the first usable record before it
+replaces any already-loaded source rows, so a rejected file cannot empty the
+register.
 
 So the register is keyed on the **postcode**, with an optional **UPRN** column
 for operators who have an address-level extract.  Both are ingest-time operator
@@ -24,7 +45,7 @@ same rule as the boundary datasets: which dataset, and under which licence, is
 not a decision this code should make on its own.
 
     python ingest_household_register.py --list
-    python ingest_household_register.py --source onspd --file ONSPD_*.zip
+    python ingest_household_register.py --source onspd --file <count-bearing-release.zip>
     python ingest_household_register.py --source uprn --file uprns.csv
 
 What "wins" means is stated precisely in `apply_register`, and it is the whole
@@ -54,8 +75,38 @@ import postgis
 # sizing and the BOQ are computed from, so it is a decision an operator makes
 # and can be measured both ways.  Same convention as the other `OSM_*` knobs
 # (see OSM_PAVEMENT_CARRIERS / OSM_PAVEMENT_ARTERIALS in osm_source).
-REGISTER_ENABLED = os.environ.get("OSM_HOUSEHOLD_REGISTER", "0").strip().lower() \
-    not in ("0", "false", "no", "off")
+#
+# `OSM_HOUSEHOLD_REGISTER` is the canonical name. `OSM_HH_REGISTER` is accepted
+# as an alias because the ingest CLI and its help text told operators to set
+# that name while this module read the other one -- so following the documented
+# instruction turned nothing on, and the register stayed off with no error.
+REGISTER_ENV_NAMES = ("OSM_HOUSEHOLD_REGISTER", "OSM_HH_REGISTER")
+
+
+def register_env_name() -> str:
+    """The enabled variable the operator actually set (canonical name otherwise)."""
+    for name in REGISTER_ENV_NAMES:
+        if os.environ.get(name) is not None:
+            return name
+    return REGISTER_ENV_NAMES[0]
+
+
+def register_enabled_from_env() -> bool:
+    """True when any known OSM household-register knob says "on".
+
+    Explicit "off" on the canonical name wins, so an operator can disable a
+    register that an ambient `OSM_HH_REGISTER=1` would otherwise switch on.
+    """
+    if os.environ.get(REGISTER_ENV_NAMES[0]) is not None:
+        return os.environ[REGISTER_ENV_NAMES[0]].strip().lower() \
+            not in ("0", "false", "no", "off")
+    for name in REGISTER_ENV_NAMES[1:]:
+        if os.environ.get(name) is not None:
+            return os.environ[name].strip().lower() not in ("0", "false", "no", "off")
+    return False
+
+
+REGISTER_ENABLED = register_enabled_from_env()
 
 # A register count below this is treated as absent rather than as a real answer.
 # ONSPD uses 0 (and a blank) for postcodes with no counted dwellings, and a
@@ -138,11 +189,12 @@ ONSPD_SOURCE: Dict[str, Any] = {
         "https://www.ons.gov.uk/methodology/geography/licences)"
     ),
     "note": (
-        "The ONSPD Dwellings field is a count of DWELLINGS in a postcode, not a "
-        "survey of how many are occupied and not a count of people. A vacant or "
-        "second-home dwelling is counted, so this is an upper bound on connected "
-        "homes in a fully-built-up postcode and the closest published measure "
-        "rather than a measured one."
+        "The May 2026 ONSPD publication is a postcode geography lookup, not a "
+        "household-count source. This loader accepts an operator-supplied CSV/ZIP "
+        "only when it has an explicit dwellings/households column; geography-only "
+        "files are rejected. If a supplied count is present, it is a postcode "
+        "dwelling total (not an occupancy survey or people count; vacant and "
+        "second homes are included)."
     ),
     # ONSPD's own column names, so a downloaded file needs no renaming. The
     # reader accepts the usual spellings too (see REGISTER_COLUMN_ALIASES).
@@ -174,17 +226,88 @@ UPRN_SOURCE: Dict[str, Any] = {
     "fields": {"uprn": "uprn", "postcode": "postcode", "dwellings": "dwellings"},
 }
 
-REGISTER_SOURCES: Dict[str, Dict[str, Any]] = {
-    "onspd": ONSPD_SOURCE,
-    "uprn": UPRN_SOURCE,
+
+
+# Column spellings accepted for each field, lower-cased and stripped. Legacy
+# ONSPD/count files may spell them `pcd` / `Dwellings` / `Pop01`; an operator's
+# own extract may use `postcode` / `households` / `hh`. Current ONSPD geography
+# files have no count column and are rejected by read_register_csv.
+#
+# ONSPD can also be read by postcode area over HTTP range requests. That area
+# endpoint is retained as metadata for a future postcode/geography crosswalk,
+# not as an ingestible household-register source: it has no dwelling counts.
+#
+# The URL is the ArcGIS item that serves the ONSPD release's CSV archive.  ONS
+# re-publishes quarterly, so the item id changes each release -- hence a
+# versioned constant rather than a scraped link, and `--source onspd --file`
+# stays the route for a release this entry has not been pointed at yet.
+ONSPD_AREA_SOURCE: Dict[str, Any] = {
+    "name": "ONS Postcode Directory (May 2026) — area lookup only",
+    "kind": "postcode_lookup",
+    "country_code": "GB",
+    "vintage": "May 2026",
+    "publisher": "Office for National Statistics",
+    "url": ("https://www.arcgis.com/sharing/rest/content/items/"
+            "6fff67d204fd4f339591ed667a6e3642/data"),
+    "licence": ONSPD_SOURCE["licence"],
+    "note": (
+        "The B-area member can be fetched without downloading the full release, "
+        "but this 53-column geography lookup contains no dwellings count. It "
+        "cannot be loaded into the household register; use it only as a postcode "
+        "to census-geography crosswalk."
+    ),
+    "has_dwellings_count": False,
+    "fields": ONSPD_SOURCE["fields"],
+    "member_glob": "data/multi_csv/*_uk_{areas}.csv",
+    "remote": True,
 }
 
 
-# Column spellings accepted for each field, lower-cased and stripped. A
-# downloaded ONSPD spells them `pcd` / `Dwellings` / `Pop01`; an operator's own
-# extract spells them `postcode` / `households` / `hh`. Being strict about the
-# ONSPD spelling only would mean a hand-made CSV silently loads zero rows,
-# which reads exactly like "the register has no data for this area".
+def read_remote_register(
+    source: Dict[str, Any], areas: Sequence[str]
+) -> Iterator[Dict[str, Any]]:
+    """Read selected members of the remote ONSPD area lookup archive.
+
+    This remains for geography-crosswalk tooling only. The current ONSPD has no
+    household counts and ``ingest_source`` explicitly refuses this source.
+    `areas` are postcode AREAS ("B", "EH", ...), not outward codes. The whole
+    matching member is fetched (a few MB rather than the full archive).
+    """
+    import remote_zip
+
+    url = str(source.get("url") or "")
+    if not url:
+        raise ValueError("remote register source needs a url")
+    wanted = [a.strip().upper() for a in areas if str(a or "").strip()]
+    if not wanted:
+        raise ValueError("no postcode areas given")
+    entries = remote_zip.zip_entries(url)
+    # "_AB_," as one alternative would only match the AB area; a trailing "_"
+    # is what makes a list of areas a list, because the member is ..._UK_<AREA>.csv
+    pattern = str(source.get("member_glob") or "data/multi_csv/*_uk_{areas}.csv")
+    pattern = pattern.format(areas="_".join(wanted) + "_")
+    hits = remote_zip.select(entries, [pattern])
+    if not hits:
+        have = sorted({e.name.rsplit("/", 1)[-1] for e in entries
+                       if not e.name.endswith("/")})[:12]
+        raise ValueError(
+            f"no member matching {pattern!r} in the archive; first members: {have}")
+    for entry in sorted(hits, key=lambda e: e.name):
+        yield from read_register_csv(
+            io.TextIOWrapper(
+                io.BytesIO(remote_zip.read_member(url, entry)),
+                encoding="utf-8-sig", errors="replace", newline="",
+            ),
+            source,
+        )
+
+
+REGISTER_SOURCES: Dict[str, Dict[str, Any]] = {
+    "onspd": ONSPD_SOURCE,
+    "onspd_area": ONSPD_AREA_SOURCE,
+    "uprn": UPRN_SOURCE,
+}
+
 REGISTER_COLUMN_ALIASES: Dict[str, Tuple[str, ...]] = {
     "postcode": ("pcd", "pcd7", "pcds", "postcode", "post_code", "outcode", "zip"),
     "uprn": ("uprn", "uprn_id", "uprnno", "uprn_no", "unique_property_reference_number", "id"),
@@ -281,9 +404,9 @@ def read_register_file(
 ) -> Iterator[Dict[str, Any]]:
     """Read a register from a plain CSV, or from every CSV inside a zip.
 
-    The ONSPD ships as one zip of per-area CSVs, so a zip is the normal input
-    for it and requiring the operator to unpack a ~700 MB download by hand would
-    make the documented command wrong.
+    Some ONSPD/count releases ship as a zip of per-area CSVs; archive sizes vary,
+    so the reader opens matching CSV members without requiring manual extraction.
+    Current May 2026 ONSPD is geography-only and has no count field.
     """
     src = dict(source or ONSPD_SOURCE)
     p = Path(path)
@@ -336,9 +459,8 @@ def init_register_schema() -> None:
 def register_purge(country_code: str, source: Optional[str] = None) -> int:
     """Delete a loaded register for a country (optionally one source).
 
-    A replace rather than a merge, for the same reason `boundary_dataset_purge`
-    is: a newer vintage must not leave a withdrawn postcode behind still serving
-    a household count.
+    A source-scoped replace prevents a newer vintage from leaving withdrawn
+    postcodes behind without deleting independent registers for the same country.
     """
     from countries import normalize_country_code
     if not postgis.is_available():
@@ -369,10 +491,9 @@ def register_ingest(
     """Load register rows into `osm.household_register`.
 
     Deliberately a function over an iterable, not a downloader -- the same
-    contract as `boundary_dataset_ingest`, for the same reason: ONSPD is a
-    ~700 MB quarterly download under a licence, and which vintage to trust is an
-    operator decision.  Batched, because the full ONSPD is ~2.7 M rows and the
-    database is remote.
+    contract as `boundary_dataset_ingest`, for the same reason: a register is a
+    data/licence decision for the operator. Batched because a national register
+    may contain millions of rows and the database is remote.
     """
     from countries import normalize_country_code
     if not postgis.is_available():
@@ -428,23 +549,57 @@ def _register_insert(rows: Sequence[Tuple[Any, ...]]) -> int:
 
 def ingest_source(
     slug: str,
-    path: str,
+    path: str = "",
     limit: Optional[int] = None,
     replace: bool = True,
     on_batch: Optional[Any] = None,
+    areas: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
-    """Fetch-and-load front end for one named register source (the CLI's entry)."""
+    """Fetch-and-load front end for one named register source (the CLI's entry).
+
+    `path` is the operator's own count-bearing file. Area lookup sources are
+    metadata/crosswalk-only and are rejected before any database write.
+    """
     source = REGISTER_SOURCES.get(slug)
     if source is None:
         raise KeyError(slug)
+    if source.get("has_dwellings_count") is False:
+        raise ValueError(
+            f"{slug} is a postcode geography lookup, not a dwelling-count source; "
+            "it cannot be loaded into osm.household_register"
+        )
+    if source.get("remote"):
+        records = read_remote_register(source, list(areas or []))
+    else:
+        if not path:
+            raise ValueError(f"--source {slug} needs --file <path to the register>")
+        records = read_register_file(path, source)
+    # Validate before replacing anything. In particular, current ONSPD has no
+    # dwellings column; asking for a first usable row raises on its header while
+    # the old register is still intact. An empty/zero-only source is also a
+    # no-op rather than an accidental purge.
+    records = iter(records)
+    try:
+        first_record = next(records)
+    except StopIteration:
+        first_record = None
+    if first_record is None:
+        return {
+            "source": source["name"], "licence": source.get("licence"),
+            "vintage": source.get("vintage"), "purged": 0, "loaded": 0,
+            "kind": source.get("kind"), "country_code": source.get("country_code"),
+            "areas": sorted(a.upper() for a in (areas or [])) or None,
+        }
     if not postgis.is_available():
         raise RuntimeError("postgis_unavailable")
-    purged = register_purge(
-        source["country_code"], source=str(source["name"]) if replace else None
+    # Replace is source-scoped. A merge must not pass ``source=None`` here:
+    # register_purge interprets that as "delete every register row for GB".
+    purged = (
+        register_purge(source["country_code"], source=str(source["name"]))
+        if replace else 0
     )
-    records = read_register_file(path, source)
     loaded = 0
-    batch: List[Dict[str, Any]] = []
+    batch: List[Dict[str, Any]] = [first_record]
     for rec in records:
         batch.append(rec)
         if len(batch) >= 5000:
@@ -474,6 +629,7 @@ def ingest_source(
         "loaded": loaded,
         "kind": source.get("kind"),
         "country_code": source.get("country_code"),
+        "areas": sorted(a.upper() for a in (areas or [])) or None,
     }
 
 
@@ -504,7 +660,7 @@ def load_register(country_code: str, postcodes: Sequence[str]
     """`({postcode: households}, {uprn: households}, meta)` for the given postcodes.
 
     The lookup is by the area's own postcodes, so it costs one indexed query for
-    the area rather than a scan of ~2.7 M register rows.
+    the area rather than a scan of the full register.
     """
     from countries import normalize_country_code
     wanted = sorted({p for p in (normalize_postcode(pc) for pc in postcodes) if p})

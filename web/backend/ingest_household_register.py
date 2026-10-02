@@ -6,27 +6,29 @@ An explicit operator step, not something a request triggers, for the same reason
 carries a licence, and which vintage to trust is not a decision this code should
 make on its own.
 
-Why it exists: the household rule in `osm_source` is a heuristic, and on real
-UK data it is almost entirely `fallback_one` -- OpenStreetMap carries
-`building:flats` on 1 building in 15,583 and `addr:flats` on none, so trunk
-sizing and the BOQ for a generated UK area rest on `UNIT_AREA_M2` rather than
-on a count. The UK publishes the count: ONSPD carries
-a `Dwellings` figure for every postcode, and a UPRN extract carries one per
-addressable location. This loads either, and `OSM_HH_REGISTER=1` then makes the
-loaded number win over the heuristic for the postcodes it covers.
+Why it exists: OSM household counts are heuristic, while Census 2021 RM204
+publishes official dwellings counts for England and Wales at small-area level.
+The register can use an operator-supplied extract only when it contains an
+explicit dwellings/households column; the current ONSPD is a geography lookup,
+not that extract, and OS Open UPRN contains identifiers/coordinates but no
+household count. RM204 is area-level, so it must not be loaded into a postcode
+register until a transparent OA-to-postcode allocation is designed.
 
     python ingest_household_register.py --list
     python ingest_household_register.py --count
-    python ingest_household_register.py --source onspd --file "D:/ONSPD_2026_05.zip"
-    python ingest_household_register.py --source onspd --file ONSPD.zip --limit 50000
-    python ingest_household_register.py --source uprn --file uprns.csv
+    python ingest_household_register.py --source onspd --file <count-bearing-release.zip>
+    python ingest_household_register.py --source uprn --file <licensed-count-bearing-uprn.csv>
 
-A re-ingest REPLACES the source's rows for its country rather than merging, so a
-newer vintage cannot leave a withdrawn postcode still serving a household count.
-`--keep-existing` opts out.
+`--source onspd_area --areas B` is not an ingest path: it is only a published
+postcode/geography lookup, and the loader refuses it. Current May 2026 ONSPD has
+no dwellings column, so passing that archive to `--source onspd` is also rejected
+before any existing rows are deleted.
 
-The load does nothing on its own: `OSM_HH_REGISTER=1` is what turns it on, so an
-area can be built with and without the register and the two compared.
+A re-ingest replaces only that named source's rows. `--keep-existing` merges
+without purging existing rows from any source.
+
+The load does nothing on its own: `OSM_HOUSEHOLD_REGISTER=1` is what turns it on,
+so an area can be built with and without the register and the two compared.
 
 Run it with PYTHONPATH unset (the engine's own convention): a global PYTHONPATH
 drags QGIS's Python312 site-packages in and breaks numpy/pandas. The repo .env is
@@ -61,7 +63,7 @@ def describe(slug: str, source: Dict[str, Any], status: Dict[str, Any]) -> str:
         f"({rows})\n"
         f"{'':<8} publisher: {source.get('publisher')}\n"
         f"{'':<8} licence:   {source.get('licence')}\n"
-        f"{'':<8} ON by default? no — set OSM_HH_REGISTER=1 to use a loaded register\n"
+        f"{'':<8} ON by default? no — set OSM_HOUSEHOLD_REGISTER=1 to use a loaded register\n"
         f"{'':<8} what it is: {source.get('note')}"
     )
 
@@ -79,6 +81,9 @@ def main() -> int:
     ap.add_argument("--source", default="onspd",
                     help=f"one of: {', '.join(household_register.REGISTER_SOURCES)}")
     ap.add_argument("--file", default="", help="the register file: a CSV, or a zip of CSVs (ONSPD)")
+    ap.add_argument("--areas", default="",
+                    help="postcode AREAS to pull from the ONSPD geography lookup "
+                         "(e.g. B,EH); this source cannot be loaded as household counts")
     ap.add_argument("--limit", type=int, default=0,
                     help="load at most N rows (a smoke test, not a full load)")
     ap.add_argument("--keep-existing", action="store_true",
@@ -91,7 +96,8 @@ def main() -> int:
           f"{osm_source.os.environ.get('PGDATABASE', 'ftth')} "
           f"-> available={osm_source.postgis.is_available()}")
     print(f"on:     {household_register.REGISTER_ENABLED} "
-          f"(OSM_HH_REGISTER={'1' if household_register.REGISTER_ENABLED else '0'})\n")
+          f"({household_register.REGISTER_ENV_NAMES[0]}="
+          f"{'1' if household_register.REGISTER_ENABLED else '0'})\n")
 
     status = household_register.register_status("GB")
 
@@ -109,8 +115,18 @@ def main() -> int:
     if source is None:
         print(f"unknown source {args.source!r}; try --list", file=sys.stderr)
         return 2
+    areas = [a for a in (args.areas or "").replace(" ", "").split(",") if a]
+    remote = bool(source.get("remote"))
+    if source.get("has_dwellings_count") is False:
+        print(f"{args.source} is a postcode geography lookup with no dwelling "
+              "count; it cannot be loaded into osm.household_register.", file=sys.stderr)
+        return 2
+    if remote:
+        print(f"--source {args.source} is a geography lookup, not a household-count source.",
+              file=sys.stderr)
+        return 2
     if not args.file:
-        print(f"--source {args.source} needs --file <path to the register>", file=sys.stderr)
+        print(f"--source {args.source} needs --file <count-bearing register>", file=sys.stderr)
         return 2
     if not osm_source.postgis.is_available():
         print("PostGIS is not reachable, so there is nothing to load into. Check the "
@@ -130,13 +146,17 @@ def main() -> int:
         limit=args.limit or None,
         replace=not args.keep_existing,
         on_batch=_progress,
+        areas=areas or None,
     )
     print()
     print(f"purged {result.get('purged')} previous row(s), loaded {result.get('loaded')}")
+    if result.get("areas"):
+        print(f"areas:  {', '.join(result['areas'])} (the rest of the release was not read)")
     print(f"source:  {result.get('source')}")
     print(f"licence: {result.get('licence')}")
     if not household_register.REGISTER_ENABLED:
-        print("\nThe register is loaded but NOT in use. Set OSM_HH_REGISTER=1 and "
+        print("\nThe register is loaded but NOT in use. Set "
+              f"{household_register.REGISTER_ENV_NAMES[0]}=1 and "
               "restart the engine to make it win over the OSM heuristic.")
     return 0
 
@@ -144,7 +164,8 @@ def main() -> int:
 def json_status(status: Dict[str, Any]) -> str:
     if not status.get("available"):
         return ("no register is loaded. That is the default state, not an error: "
-                "load one with --source onspd --file <ONSPD zip>.")
+                "load an operator-supplied CSV/ZIP with a verified dwelling-count "
+                "column; current ONSPD and OS Open UPRN do not provide the required counts.")
     lines = [f"{status.get('rows')} register row(s) loaded, in use: {status.get('enabled')}"]
     for entry in status.get("sources") or []:
         lines.append(

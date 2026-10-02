@@ -1785,6 +1785,7 @@ def get_input_layer(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
             layer,
             country=resolution.get("country") or "",
             city=resolution.get("city") or "",
+            country_code=resolution.get("country_code") or "",
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -1959,13 +1960,17 @@ def get_surface_ai_review(project_id: str) -> Dict[str, Any]:
 @app.post("/ftth/hld/results/{project_id}/surface-ai-review/classify")
 def classify_surface_at_point(project_id: str,
                               payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-    """Suggest the surface at one clicked map coordinate (advisory only).
+    """Suggest the surface at one clicked point or along one span (advisory only).
 
     Suggestion-only, exactly like the batch review artifact: it fetches fresh
-    imagery for the clicked point and asks the configured vision model. It
-    never edits ``Final_Trenches.gpkg`` or any other design output. The call is
-    synchronous, so a slow local model is bounded by SURFACE_AI_OLLAMA_TIMEOUT
-    rather than by the HTTP layer.
+    imagery for the geometry and asks the configured vision model. Two shapes are
+    accepted — a clicked point as ``[x, y]`` with ``crs``, or a span the reader
+    opted into as its own route ``[[x, y], ...]`` with ``coordinates_crs`` and a
+    ``span_id``. It never edits ``Final_Trenches.gpkg`` or any other design output
+    and never writes the review artifact, so one reader choice costs one model
+    call. The call is synchronous, so a slow local model is bounded by
+    SURFACE_AI_OLLAMA_TIMEOUT rather than by the HTTP layer. ``include_imagery``
+    returns the patch the model saw, as base64, for display.
     """
     output_dir = _project_output_dir(project_id)
     if not output_dir.is_dir():
@@ -1978,11 +1983,39 @@ def classify_surface_at_point(project_id: str,
         ) from exc
 
     coordinates = payload.get("coordinates")
+    if not isinstance(coordinates, (list, tuple)) or len(coordinates) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="coordinates must be [x, y] or a span route [[x, y], ...]",
+        )
+    include_imagery = bool(payload.get("include_imagery"))
+
+    # A span detect carries the span's own route, so its first element is a
+    # point rather than a number. That single shape test picks the path without
+    # needing the caller to declare a mode.
+    if isinstance(coordinates[0], (list, tuple)):
+        try:
+            return surface_review.classify_span(
+                payload.get("span_id"), coordinates,
+                payload.get("coordinates_crs") or payload.get("crs") or "EPSG:4326",
+                claimed_surface=payload.get("claimed_surface"),
+                geometry_reason=payload.get("geometry_reason"),
+                geometry_confidence=payload.get("geometry_confidence"),
+                known_share=payload.get("known_share"),
+                include_imagery=include_imagery,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
     try:
-        coordinates = [float(coordinates[0]), float(coordinates[1])]
+        point = [float(coordinates[0]), float(coordinates[1])]
     except (TypeError, ValueError, IndexError):
-        raise HTTPException(status_code=400, detail="coordinates must be [x, y]") from None
-    options: Dict[str, Any] = {}
+        raise HTTPException(
+            status_code=400, detail="Point coordinates must be numeric"
+        ) from None
+    options: Dict[str, Any] = {"include_imagery": include_imagery}
     if payload.get("length_m") is not None:
         options["length_m"] = payload["length_m"]
     if payload.get("bearing") is not None:
@@ -1990,7 +2023,50 @@ def classify_surface_at_point(project_id: str,
 
     try:
         return surface_review.classify_point(
-            coordinates, payload.get("crs") or "EPSG:4326", **options)
+            point, payload.get("crs") or "EPSG:4326", **options)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/ftth/hld/results/{project_id}/surface-ai-review/imagery")
+def preview_surface_imagery(project_id: str,
+                            payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    """Return the imagery patch a detect would send, without calling the model.
+
+    Imagery-only and free: it resolves the same provider and patch the review
+    uses and hands back the JPEG as base64 plus its source, date and whether the
+    planned route was drawn over it. No vision-model call is made, so a reader can
+    look at exactly what the model would be given before spending a call on it.
+    Accepts the same dual input shape as the classify route: a point as ``[x, y]``
+    with ``crs``, or a span's route ``[[x, y], ...]`` with ``coordinates_crs``.
+    """
+    output_dir = _project_output_dir(project_id)
+    if not output_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Unknown project")
+    try:
+        from HLDPlanning.design import surface_ai_review as surface_review
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=503, detail="Surface review module is unavailable"
+        ) from exc
+
+    coordinates = payload.get("coordinates")
+    if not isinstance(coordinates, (list, tuple)) or len(coordinates) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="coordinates must be [x, y] or a span route [[x, y], ...]",
+        )
+    options: Dict[str, Any] = {"span_id": payload.get("span_id")}
+    if payload.get("length_m") is not None:
+        options["length_m"] = payload["length_m"]
+    if payload.get("bearing") is not None:
+        options["bearing"] = payload["bearing"]
+    crs = payload.get("coordinates_crs") or payload.get("crs") or "EPSG:4326"
+
+    try:
+        return surface_review.preview_imagery(coordinates, crs, **options)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
