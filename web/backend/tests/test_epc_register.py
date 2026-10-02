@@ -117,6 +117,45 @@ def test_the_epc_reader_goes_through_read_register_file(tmp_path):
     ]
 
 
+def test_the_cli_path_loads_the_aggregated_totals(tmp_path, monkeypatch):
+    # The link between the reader and the database, without touching a database:
+    # what `--source epc --file ... --areas ...` would write.
+    path = tmp_path / "certificates.csv"
+    path.write_text(EPC_HEADER + "".join([
+        "c1,1,B16 9BH,C\n",
+        "c2,2,B16 9BH,C\n",
+        "c3,3,B17 1AA,C\n",
+    ]), encoding="utf-8")
+    written = []
+    monkeypatch.setattr(hr.postgis, "is_available", lambda: True)
+    monkeypatch.setattr(hr, "register_purge", lambda *a, **k: 0)
+    monkeypatch.setattr(hr, "register_ingest",
+                        lambda rows, *a, **k: (written.extend(rows), len(rows))[1])
+
+    result = hr.ingest_source("epc", str(path), areas=["B16"])
+
+    assert result["loaded"] == 3  # one postcode total + its two dwellings
+    assert result["source"] == hr.EPC_SOURCE["name"]
+    totals = [r for r in written if "uprn" not in r]
+    assert totals == [{"postcode": "B16 9BH", "households": 2}]
+    # B17 was filtered out before any row was built.
+    assert all(r["postcode"] == "B16 9BH" for r in written)
+
+
+def test_a_countless_epc_file_is_refused_before_the_register_is_purged(
+        tmp_path, monkeypatch):
+    path = tmp_path / "not_epc.csv"
+    path.write_text("UPRN,CURRENT_ENERGY_RATING\n1,C\n", encoding="utf-8")
+    monkeypatch.setattr(hr.postgis, "is_available", lambda: True)
+
+    def unexpected_purge(*_a, **_k):
+        raise AssertionError("a file with no postcode must not purge existing rows")
+
+    monkeypatch.setattr(hr, "register_purge", unexpected_purge)
+    with pytest.raises(ValueError, match="postcode column"):
+        hr.ingest_source("epc", str(path))
+
+
 def test_the_epc_note_states_what_the_number_is():
     note = hr.EPC_SOURCE["note"]
     assert "DWELLINGS" in note and "England" in note
