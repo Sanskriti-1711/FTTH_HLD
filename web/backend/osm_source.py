@@ -2223,6 +2223,82 @@ _FETCH_PHASE_LABELS = {
 }
 
 
+# The registry above is in-memory, but the PAGE polls it across process
+# lifetimes.  Before this, an engine restart mid-download turned a running
+# fetch into `unknown`, and the page then polled a state that could never
+# change: the area never became ready, no input layer was ever requested, and
+# nothing told the planner why the object points had not appeared.  The phases
+# are persisted so a restart can answer honestly -- an interrupted download is
+# reported as `failed`, which is startable, rather than as a wait with no end.
+_FETCH_STATE_ENV = "HLD_AREA_FETCH_STATE"
+_FETCH_STATE_IN_MEMORY = {"memory", "off", "none"}
+
+
+def _fetch_state_path() -> Optional[Path]:
+    """Where the fetch registry is mirrored, or None when it must not be.
+
+    ``HLD_AREA_FETCH_STATE`` overrides the location; ``memory``/``off`` keep the
+    registry strictly in-process, which is what the test suite asks for so one
+    run's downloads are never read back by the next.
+    """
+    raw = str(os.environ.get(_FETCH_STATE_ENV, "")).strip()
+    if raw.lower() in _FETCH_STATE_IN_MEMORY:
+        return None
+    if raw:
+        return Path(raw)
+    return Path(__file__).resolve().parent / "outputs" / "area_fetch_state.json"
+
+
+def _persist_fetches(snapshot: Dict[str, Dict[str, Any]]) -> None:
+    """Write the fetch registry for the next process.  Best-effort."""
+    path = _fetch_state_path()
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        staging = path.with_name(path.name + ".tmp")
+        staging.write_text(json.dumps(snapshot, default=str), encoding="utf-8")
+        os.replace(staging, path)
+    except OSError:
+        # Losing the progress file costs a clearer message, never a run.
+        pass
+
+
+def _load_fetches() -> None:
+    """Restore the registry, demoting anything that was in flight at exit."""
+    path = _fetch_state_path()
+    if path is None:
+        return
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    try:
+        loaded = json.loads(raw)
+    except ValueError:
+        return
+    if not isinstance(loaded, dict):
+        return
+    now = _now().isoformat(timespec="seconds")
+    with _FETCH_LOCK:
+        for key, entry in loaded.items():
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("state") not in ("ready", "failed"):
+                # Nothing is downloading it any more.  Say so, so the page can
+                # stop waiting and the retry path is reachable.
+                entry["state"] = "failed"
+                entry["error"] = entry.get("error") or "engine_restarted_mid_download"
+                entry["finished_at"] = entry.get("finished_at") or now
+                entry["updated_at"] = entry["finished_at"]
+            _FETCHES[key] = entry
+
+
+# Restore what the last process knew, so a page polling across a restart gets
+# an answer it can act on instead of `unknown` forever.
+_load_fetches()
+
+
 def _bbox_key(bbox: Sequence[float]) -> str:
     """A stable key for a fetch: the bbox, rounded so neighbours share it."""
     try:
@@ -2295,6 +2371,7 @@ def _set_fetch_state(
     source: Optional[str] = None,
     counts: Optional[Dict[str, int]] = None,
     error: Optional[str] = None,
+    reset: bool = False,
 ) -> None:
     with _FETCH_LOCK:
         entry = _FETCHES.setdefault(
@@ -2311,6 +2388,18 @@ def _set_fetch_state(
                 "error": None,
             },
         )
+        if reset:
+            # A new attempt must not inherit the previous one's counts: a
+            # retry that failed after storing buildings used to report
+            # "buildings: 83245" beside "0 of 4 groups", which is unreadable
+            # and hides the fact that the earlier download had failed.
+            entry["groups_done"] = 0
+            entry["detail"] = None
+            entry["source"] = None
+            entry["counts"] = {}
+            entry["error"] = None
+            entry["finished_at"] = None
+            entry["started_at"] = _now().isoformat(timespec="seconds")
         entry["state"] = state
         if groups_done is not None:
             entry["groups_done"] = int(groups_done)
@@ -2325,6 +2414,8 @@ def _set_fetch_state(
         entry["updated_at"] = _now().isoformat(timespec="seconds")
         if state in ("ready", "failed"):
             entry["finished_at"] = entry["updated_at"]
+        snapshot = {k: dict(v) for k, v in _FETCHES.items()}
+    _persist_fetches(snapshot)
 
 
 def _run_area_fetch(key: str, area: str, bbox: Sequence[float]) -> None:
@@ -2338,6 +2429,9 @@ def _run_area_fetch(key: str, area: str, bbox: Sequence[float]) -> None:
     # the provenance line read.
     counts: Dict[str, int] = {}
     try:
+        # Every attempt starts from zero, whether it was started here or
+        # entered directly through ensure_area_data().
+        _set_fetch_state(key, "queued", groups_done=0, reset=True)
         for group, body in groups:
             _set_fetch_state(key, f"fetching_{group}", groups_done=done)
             group_elements, mirror_used = overpass_query(body, bbox)
@@ -2387,7 +2481,7 @@ def start_area_fetch(area: str, bbox: Sequence[float]) -> Dict[str, Any]:
             return area_fetch_state(area, bbox)
     if not postgis.is_available():
         return {"state": "failed", "error": "postgis_unavailable", "fetching": False}
-    _set_fetch_state(key, "queued", groups_done=0)
+    _set_fetch_state(key, "queued", groups_done=0, reset=True)
     thread = threading.Thread(
         target=_run_area_fetch, args=(key, area, list(bbox)),
         name=f"osm-fetch-{key[:12]}", daemon=True,
