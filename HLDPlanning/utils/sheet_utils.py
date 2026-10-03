@@ -135,13 +135,6 @@ def add_household_aggregates(
     premise came from).  A row with no identity is its own object: pooling it
     with unrelated rows would invent a count for a building we cannot name.
     """
-    # Drop only what this call recomputes.  `households` is the SOURCE here (the
-    # object layer hands it over already renamed), so it is never dropped.
-    df.drop(
-        columns=[c for c in HOUSEHOLD_AGGREGATE_COLUMNS
-                 if c != "households" and c in df.columns],
-        inplace=True,
-    )
     if df.empty:
         df["households"] = pd.Series([], dtype="int64", index=df.index)
         df["premises"] = pd.Series([], dtype="int64", index=df.index)
@@ -159,6 +152,15 @@ def add_household_aggregates(
     method = (
         df[method_src].fillna("").astype(str)
         if method_src in df.columns else pd.Series("", index=df.index)
+    )
+    # Drop only what this call recomputes -- AFTER reading it.  `households` and
+    # the method are the SOURCE here (the object layer hands them over already
+    # renamed), so dropping `household_method` before `method_src` is resolved
+    # would silently fall back to the absent `HH_METHOD` and blank the label.
+    df.drop(
+        columns=[c for c in HOUSEHOLD_AGGREGATE_COLUMNS
+                 if c != "households" and c in df.columns],
+        inplace=True,
     )
 
     own_row = pd.Series([f"__row_{i}" for i in df.index], index=df.index)

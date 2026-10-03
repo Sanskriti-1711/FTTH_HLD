@@ -205,8 +205,44 @@ def test_the_api_request_is_authenticated_and_filtered():
     request = seen[0]
     assert request.get_header("Authorization") == "Bearer secret"
     assert request.full_url.startswith(hr.EPC_API_SOURCE["url"])
+    # The live service serves the search at /api/domestic/search (no /v1).
+    assert hr.EPC_API_SOURCE["url"].endswith("/api/domestic/search")
     assert "postcode=B16+9BH" in request.full_url
     assert "page_size=" in request.full_url
+    assert "page=1" in request.full_url
+
+
+def test_the_pagination_envelope_drives_the_next_page():
+    """The live service pages with {data, pagination:{nextPage,...}}."""
+    seen = []
+    pages = [
+        {"data": [{"uprn": 1, "postcode": "B16 9BH", "certificateNumber": "c1"}],
+         "pagination": {"totalRecords": 2, "currentPage": 1, "totalPages": 2,
+                        "nextPage": 2, "prevPage": None, "pageSize": 1}},
+        {"data": [{"uprn": 2, "postcode": "B16 9BH", "certificateNumber": "c2"}],
+         "pagination": {"totalRecords": 2, "currentPage": 2, "totalPages": 2,
+                        "nextPage": None, "prevPage": 1, "pageSize": 1}},
+    ]
+    records = list(hr.read_epc_api(hr.EPC_API_SOURCE, ["B16 9BH"],
+                                   opener=_api_pages(pages, seen), token="t"))
+    # Two pages, the second asked for explicitly via nextPage.
+    assert len(seen) == 2
+    assert "page=2" in seen[1].full_url
+    assert [r for r in records if "uprn" not in r] == [
+        {"postcode": "B16 9BH", "households": 2}
+    ]
+
+
+def test_a_null_next_page_ends_the_term():
+    """A full page whose envelope says nextPage=null must not over-fetch."""
+    seen = []
+    page = {"data": [{"uprn": i, "postcode": "B16 9BH", "certificateNumber": f"c{i}"}
+                     for i in range(3)],
+            "pagination": {"totalRecords": 3, "currentPage": 1, "totalPages": 1,
+                           "nextPage": None, "prevPage": None, "pageSize": 3}}
+    list(hr.read_epc_api(hr.EPC_API_SOURCE, ["B16 9BH"],
+                         opener=_api_pages([page], seen), token="t"))
+    assert len(seen) == 1
 
 
 def test_a_next_link_is_followed_instead_of_counting_pages():
@@ -222,6 +258,36 @@ def test_a_next_link_is_followed_instead_of_counting_pages():
     assert [r for r in records if "uprn" not in r] == [
         {"postcode": "B16 9BH", "households": 2}
     ]
+
+
+def test_a_valid_postcode_with_no_certificates_is_not_fatal():
+    """A 404 'No certificates could be found' means no dwellings here."""
+    import io
+    import urllib.error
+
+    def opener(request):
+        raise urllib.error.HTTPError(
+            request.full_url, 404, "Not Found", {},
+            io.BytesIO(b'{"data":{"error":"No certificates could be found for that query"}}')
+        )
+
+    records = list(hr.read_epc_api(hr.EPC_API_SOURCE, ["B16 9BZ"],
+                                   opener=opener, token="t"))
+    assert records == []
+
+
+def test_a_genuine_404_still_raises():
+    """A wrong path also 404s, so only the service's marker is swallowed."""
+    import io
+    import urllib.error
+
+    def opener(request):
+        raise urllib.error.HTTPError(
+            request.full_url, 404, "Not Found", {}, io.BytesIO(b"<h1>Not Found</h1>"))
+
+    with pytest.raises(urllib.error.HTTPError):
+        list(hr.read_epc_api(hr.EPC_API_SOURCE, ["B16 9BZ"],
+                             opener=opener, token="t"))
 
 
 def test_the_api_token_comes_from_the_environment_and_is_required():

@@ -347,7 +347,7 @@ EPC_API_SOURCE: Dict[str, Any] = {
     "country_code": "GB",
     "vintage": "live service",
     "publisher": "Department for Energy Security and Net Zero / MHCLG",
-    "url": "https://api.get-energy-performance-data.communities.gov.uk/api/v1/domestic/search",
+    "url": "https://api.get-energy-performance-data.communities.gov.uk/api/domestic/search",
     "licence": EPC_SOURCE["licence"],
     "note": (
         "The same EPC certificates as the bulk archive, fetched per postcode. "
@@ -365,8 +365,25 @@ EPC_API_SOURCE: Dict[str, Any] = {
     "page_param": "page",
     "page_size_param": "page_size",
     "page_size": 5000,
-    "rows_keys": ("rows", "data", "results"),
+    "rows_keys": ("data", "rows", "results"),
     "next_keys": ("next", "next_page", "links"),
+    # A syntactically valid postcode with no certificates answers HTTP 404 with
+    #   {"data": {"error": "No certificates could be found for that query"}}
+    # which is "no dwellings here", not a broken request, so it ends that term
+    # with an empty result instead of taking the whole load down.
+    "empty_result_status": 404,
+    "empty_result_marker": "No certificates could be found",
+    # The new service paginates with an envelope rather than a next link:
+    #   {"data": [...], "pagination": {"totalRecords": n, "currentPage": 1,
+    #    "totalPages": t, "nextPage": 2|null, "prevPage": null, "pageSize": 5000}}
+    # so the page number to fetch next lives at pagination.nextPage (null on the
+    # last page), and pageSize is the server's effective page length.  The
+    # postcode filter takes one VALID FULL postcode (an outward code like "B16"
+    # is a 400), which is exactly the granularity the register is keyed at.
+    "pagination_key": "pagination",
+    "next_page_key": "nextPage",
+    "total_pages_key": "totalPages",
+    "page_size_key": "pageSize",
     "aggregates_to_postcode": True,
 }
 
@@ -389,6 +406,7 @@ def read_epc_api(
     pages until a short page comes back.  `opener` is injectable so the request
     shape and the paging are testable with no network and no token.
     """
+    import urllib.error
     import urllib.parse
     import urllib.request
 
@@ -422,8 +440,22 @@ def read_epc_api(
                 "Accept": "application/json",
                 "User-Agent": "fibre-ftth-household-register/1.0",
             })
-            with open_url(request) as response:
-                payload = json.loads(response.read().decode("utf-8", "replace") or "{}")
+            try:
+                with open_url(request) as response:
+                    payload = json.loads(response.read().decode("utf-8", "replace") or "{}")
+            except urllib.error.HTTPError as exc:
+                marker = str(source.get("empty_result_marker") or "").lower()
+                status = int(source.get("empty_result_status") or 0)
+                body = ""
+                if exc.code == status and marker:
+                    try:
+                        body = exc.read().decode("utf-8", "replace")
+                    except Exception:  # noqa: BLE001 - body is best-effort
+                        body = ""
+                if marker and marker in body.lower():
+                    # Valid postcode, no certificates: no dwellings here.
+                    break
+                raise
             batch: List[Dict[str, Any]] = []
             for key in rows_keys:
                 if isinstance(payload.get(key), list):
@@ -455,10 +487,29 @@ def read_epc_api(
                     break
             if next_url:
                 continue
-            # No next link: a short page ends the term, a full one asks for more.
+            page_param = str(source.get("page_param") or "page")
+            # The service's own pagination envelope beats guessing from page
+            # length: `nextPage` is the page to ask for, null on the last page.
+            env_key = source.get("pagination_key")
+            envelope = payload.get(env_key) if env_key else None
+            if isinstance(envelope, dict):
+                next_key = str(source.get("next_page_key") or "nextPage")
+                size_key = str(source.get("page_size_key") or "")
+                reported = envelope.get(size_key) if size_key else None
+                if isinstance(reported, int) and reported > 0:
+                    page_size = reported
+                next_page = envelope.get(next_key)
+                if isinstance(next_page, int) and next_page > 1:
+                    params[page_param] = next_page
+                    continue
+                if next_key in envelope:
+                    # Explicit end of the sequence (nextPage is null).
+                    break
+            # No envelope and no next link: a short page ends the term, a full
+            # one asks for more.
             if len(batch) < page_size:
                 break
-            params[str(source.get("page_param") or "page")] += 1
+            params[page_param] += 1
 
     records, _stats = aggregate_epc(collected)
     yield from records
@@ -958,6 +1009,38 @@ def register_ready(country_code: str = "GB") -> bool:
         return False
 
 
+def _postcode_totals(rows: Sequence[Sequence[Any]]) -> Dict[str, int]:
+    """Collapse register rows into `{postcode: households}`.
+
+    A register row is EITHER a postcode total (no UPRN) or one dwelling keyed
+    on its UPRN.  The two must not be added together: a postcode whose total
+    row says 14 and whose 13 UPRN rows say 1 each has 14 dwellings, not 27.
+    So a postcode's count is its total row when one exists, and the sum of its
+    per-UPRN rows when it does not -- a plain ONSPD extract has no UPRN rows at
+    all, while a UPRN-keyed file has only per-dwelling rows.
+
+    Rows must already be ordered newest-first: the first total row for a
+    postcode wins, so a newer vintage supersedes an older one instead of the
+    two being summed into a number that describes neither.
+    """
+    totals: Dict[str, int] = {}
+    per_uprn: Dict[str, int] = {}
+    for row in rows:
+        postcode = str(row[0] or "").strip()
+        if not postcode:
+            continue
+        uprn = str(row[1] or "").strip()
+        count = int(row[2] or 0)
+        if uprn:
+            per_uprn[postcode] = per_uprn.get(postcode, 0) + count
+        else:
+            totals.setdefault(postcode, count)
+    by_postcode: Dict[str, int] = {}
+    for postcode in set(totals) | set(per_uprn):
+        by_postcode[postcode] = totals.get(postcode, per_uprn.get(postcode, 0))
+    return by_postcode
+
+
 def load_register(country_code: str, postcodes: Sequence[str]
                   ) -> Tuple[Dict[str, int], Dict[str, int], Dict[str, Any]]:
     """`({postcode: households}, {uprn: households}, meta)` for the given postcodes.
@@ -976,21 +1059,24 @@ def load_register(country_code: str, postcodes: Sequence[str]
             # status call: a design's household count and the licence of the
             # dataset behind it have to be able to disagree about as little as
             # possible, and one query cannot.
+            # The postcode TOTAL comes from a dedicated row (no UPRN), not from
+            # whichever row a tie happened to return: every row in a batch
+            # shares one `loaded_at`, so "the first row" was an arbitrary
+            # dwelling's `1` rather than the postcode's count.  Aggregate the
+            # rows instead of trusting their order (see `_postcode_totals`).
             cur.execute(
-                f"SELECT postcode, households, source, licence, vintage "
+                f"SELECT postcode, uprn, households, source, licence, vintage "
                 f"FROM {OSM_SCHEMA}.household_register "
                 "WHERE country_code = %s AND postcode = ANY(%s) "
                 "ORDER BY loaded_at DESC",
                 (normalize_country_code(country_code), wanted),
             )
-            by_postcode: Dict[str, int] = {}
-            for row in cur.fetchall():
-                if row[0] in by_postcode:
-                    continue
-                by_postcode[row[0]] = int(row[1])
-                meta["source"] = row[2]
-                meta["licence"] = row[3]
-                meta["vintage"] = row[4]
+            fetched = cur.fetchall()
+            by_postcode = _postcode_totals(fetched)
+            if fetched:
+                meta["source"] = fetched[0][3]
+                meta["licence"] = fetched[0][4]
+                meta["vintage"] = fetched[0][5]
             cur.execute(
                 f"SELECT uprn, households FROM {OSM_SCHEMA}.household_register "
                 "WHERE country_code = %s AND uprn <> ''",

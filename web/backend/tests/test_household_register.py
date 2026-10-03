@@ -208,6 +208,46 @@ def test_pcd_is_preferred_over_pcds_when_both_are_present():
 
 
 # ---------------------------------------------------------------------------
+# Collapsing register rows into a postcode total
+# ---------------------------------------------------------------------------
+
+def test_a_postcode_total_row_is_not_added_to_its_own_dwelling_rows():
+    # This is the shape `aggregate_epc` writes: one no-UPRN row holding the
+    # postcode's dwellings count, plus one `households=1` row per UPRN.  The
+    # total is 14, not 14 + 13 -- summing them would double-count the postcode.
+    rows = [("B16 0AG", "", 14), ("B16 0AG", "1001", 1), ("B16 0AG", "1002", 1)]
+    assert hr._postcode_totals(rows) == {"B16 0AG": 14}
+
+
+def test_a_uprn_only_register_sums_its_dwellings():
+    # A plain UPRN-keyed file has no total row, so the postcode count is the
+    # number of dwellings it lists.
+    rows = [("B11 3SA", "1001", 1), ("B11 3SA", "1002", 1), ("B11 3SA", "1003", 1)]
+    assert hr._postcode_totals(rows) == {"B11 3SA": 3}
+
+
+def test_a_postcode_only_register_reads_its_total():
+    # An ONSPD extract: one row per postcode, no UPRN at all.
+    rows = [("B11 3SA", "", 120), ("SW1A 1AA", "", 50)]
+    assert hr._postcode_totals(rows) == {"B11 3SA": 120, "SW1A 1AA": 50}
+
+
+def test_the_newest_total_row_wins_when_a_postcode_is_loaded_twice():
+    # Rows arrive newest-first, so the first total row is the current vintage;
+    # adding the two would report a number that describes neither.
+    rows = [("B11 3SA", "", 120), ("B11 3SA", "", 90)]
+    assert hr._postcode_totals(rows) == {"B11 3SA": 120}
+
+
+def test_a_total_row_that_is_not_first_still_beats_the_dwelling_rows():
+    # The whole bug this guards: row ORDER within one load is not meaningful
+    # (every row shares a `loaded_at`), so the total row has to win by being a
+    # total, not by arriving first.
+    rows = [("B16 0AG", "1001", 1), ("B16 0AG", "", 14), ("B16 0AG", "1002", 1)]
+    assert hr._postcode_totals(rows) == {"B16 0AG": 14}
+
+
+# ---------------------------------------------------------------------------
 # Apportionment: the register total is reproduced exactly
 # ---------------------------------------------------------------------------
 
