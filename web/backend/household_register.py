@@ -72,10 +72,13 @@ import postgis
 # Turning on/off
 # ---------------------------------------------------------------------------
 #
-# Default OFF, and deliberately so: a register changes the number the cable
-# sizing and the BOQ are computed from, so it is a decision an operator makes
-# and can be measured both ways.  Same convention as the other `OSM_*` knobs
-# (see OSM_PAVEMENT_CARRIERS / OSM_PAVEMENT_ARTERIALS in osm_source).
+# Default ON for the countries the register covers (GB/UK), and only those:
+# `household_register_for` refuses any other country before it reads anything,
+# so a non-UK area never consults the register however this is set. It is also
+# a no-op when nothing is loaded. The knob still forces it off explicitly
+# (`OSM_HOUSEHOLD_REGISTER=0`) -- a register changes the number the cable sizing
+# and the BOQ are computed from, so an operator must be able to measure a run
+# both ways.
 #
 # `OSM_HOUSEHOLD_REGISTER` is the canonical name. `OSM_HH_REGISTER` is accepted
 # as an alias because the ingest CLI and its help text told operators to set
@@ -93,10 +96,13 @@ def register_env_name() -> str:
 
 
 def register_enabled_from_env() -> bool:
-    """True when any known OSM household-register knob says "on".
+    """True unless a known OSM household-register knob says "off".
 
-    Explicit "off" on the canonical name wins, so an operator can disable a
-    register that an ambient `OSM_HH_REGISTER=1` would otherwise switch on.
+    On by default for the countries the register covers (GB/UK) -- the country
+    gate in `household_register_for` is what keeps it off everywhere else, and
+    it is never read for an area with no register loaded. Explicit "off" on the
+    canonical name wins, so an operator can disable a register that an ambient
+    `OSM_HH_REGISTER=1` would otherwise switch on.
     """
     if os.environ.get(REGISTER_ENV_NAMES[0]) is not None:
         return os.environ[REGISTER_ENV_NAMES[0]].strip().lower() \
@@ -104,7 +110,7 @@ def register_enabled_from_env() -> bool:
     for name in REGISTER_ENV_NAMES[1:]:
         if os.environ.get(name) is not None:
             return os.environ[name].strip().lower() not in ("0", "false", "no", "off")
-    return False
+    return True
 
 
 REGISTER_ENABLED = register_enabled_from_env()

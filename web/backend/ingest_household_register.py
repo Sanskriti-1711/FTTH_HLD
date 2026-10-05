@@ -50,8 +50,9 @@ before any existing rows are deleted.
 A re-ingest replaces only that named source's rows. `--keep-existing` merges
 without purging existing rows from any source.
 
-The load does nothing on its own: `OSM_HOUSEHOLD_REGISTER=1` is what turns it on,
-so an area can be built with and without the register and the two compared.
+The load is what supplies the counts: the design reads it by default for a
+GB/UK area. Set `OSM_HOUSEHOLD_REGISTER=0` to build an area without it and
+compare the two.
 
 Run it with PYTHONPATH unset (the engine's own convention): a global PYTHONPATH
 drags QGIS's Python312 site-packages in and breaks numpy/pandas. The repo .env is
@@ -92,7 +93,7 @@ def describe(slug: str, source: Dict[str, Any], status: Dict[str, Any]) -> str:
         f"({rows})\n"
         f"{'':<8} publisher: {source.get('publisher')}\n"
         f"{'':<8} licence:   {source.get('licence')}\n"
-        f"{'':<8} ON by default? no — set OSM_HOUSEHOLD_REGISTER=1 to use a loaded register\n"
+        f"{'':<8} ON by default? yes for GB/UK — set OSM_HOUSEHOLD_REGISTER=0 to ignore a loaded register\n"
         f"{'':<8} what it is: {source.get('note')}"
     )
 

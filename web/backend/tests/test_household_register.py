@@ -412,8 +412,8 @@ def test_the_register_reaches_the_premises_the_pipeline_actually_writes():
 
 
 def test_no_register_means_deterministic_physical_locations_with_estimated_load():
-    # The feature is off by default; records still preserve the estimated HH on
-    # each unchanged physical location.
+    # With no register passed, records still preserve the estimated HH on each
+    # unchanged physical location.
     buildings = [_building(1), _building(2)]
     addresses = [_address(11, "1"), _address(12, "2")]
     join = {11: 1, 12: 2}
@@ -582,7 +582,11 @@ def test_an_explicit_off_on_the_canonical_name_wins(monkeypatch):
     assert hr.register_enabled_from_env() is False
 
 
-def test_the_register_is_off_when_no_knob_is_set(monkeypatch):
+def test_the_register_is_on_by_default_and_the_country_gate_still_binds(monkeypatch):
+    # The register is on by default now; the country gate in
+    # `household_register_for` is what keeps it off outside GB/UK, so a region
+    # the register does not cover never consults it even with no knob set.
     for name in hr.REGISTER_ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
-    assert hr.register_enabled_from_env() is False
+    assert hr.register_enabled_from_env() is True
+    assert osm_source.household_register_for("Germany", ["B11 3SA"]) is None
