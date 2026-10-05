@@ -137,9 +137,11 @@ def test_a_run_whose_files_are_still_changing_stays_running(project):
 
     assert task["status"] == "running"
     # Reported at the stage its files prove, not the one the lost thread claimed.
-    # Index 4 is the Duct Layer since the cascade reorder (trench → chambers →
-    # ducts → cables): the duct files land before the cable files on disk.
-    assert task["stage"] == "Duct Layer"
+    # Four stages are written (object, polygon, network, trench), so the run is
+    # on the NEXT one. Index 4 is the Chamber Layer: the cascade is trench →
+    # chambers → ducts → cables, because the duct and cable stages both run on
+    # chamber-to-chamber spans.
+    assert task["stage"] == "Chamber Layer"
     assert task["stage_index"] == 4
 
 

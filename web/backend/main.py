@@ -47,13 +47,22 @@ MAX_MESSAGES = 5000
 _ADR_WARN_MARKERS = ("ADDR_ID", "exceeds maximum field length", "Value of field")
 tasks: Dict[str, Dict[str, Any]] = {}
 
+# The cascade as it actually runs, in order, and the list the status page is
+# driven from (stage_count, stage_index, progress). It carried only six names,
+# so the chamber, pole and aerial stages had no entry: the UI could never show
+# "Chamber Layer" and its progress was measured against a shorter ladder than
+# the pipeline walks. Keep this in step with _STAGE_OUTPUT_MARKERS below — the
+# tests build a completed run from one and read the stage from the other.
 PIPELINE_STAGES = [
     "Object Layer",
     "Polygon Layer",
     "Network Layer",
     "Trench Layer",
+    "Chamber Layer",
     "Duct Layer",
     "Cable Layer",
+    "Pole Layer",
+    "Aerial Drop Layer",
 ]
 
 ONECLICK_OUTPUTS: List[Tuple[str, str, str]] = [
@@ -126,11 +135,19 @@ _STAGE_OUTPUT_MARKERS: List[Tuple[str, List[str]]] = [
     ("Polygon Layer", ["Polygons.gpkg"]),
     ("Network Layer", ["PDPs.gpkg", "MFG.gpkg"]),
     ("Trench Layer", ["Final_Trenches.gpkg"]),
-    # Phase C cascade order (TRENCH_DESIGN.md §6.1): trench → chambers →
-    # ducts → cables, so the duct files land before the cable files on disk
-    # and the recovery walk below reads the run's real position.
+    # Chamber sits BETWEEN trench and duct — the duct and cable stages run on
+    # chamber-to-chamber spans — so the cascade order is trench → chambers →
+    # ducts → cables (TRENCH_DESIGN.md §6.1). This list mirrored only six of the
+    # pipeline's nine stages, so a run that died at the chamber stage (the one
+    # stage with no marker) reported the TRENCH stage as in progress and the
+    # recovery walk read the wrong position. The pole + aerial stages run
+    # unconditionally in the cascade and always write their layers, so they are
+    # markers too and `all_stages_written` stays meaningful.
+    ("Chamber Layer", ["Chambers.gpkg"]),
     ("Duct Layer", ["Feeder_Ducts.gpkg", "Distribution_Ducts.gpkg", "Drop_Ducts.gpkg"]),
     ("Cable Layer", ["Feeder_Cable.gpkg", "Distribution_Cable.gpkg"]),
+    ("Pole Layer", ["Poles.gpkg"]),
+    ("Aerial Drop Layer", ["Aerial_Drops.gpkg"]),
 ]
 
 # How long an orphaned run's files must be quiet before it is declared dead.
@@ -327,8 +344,14 @@ def _run_command(project_id: str, cmd: Union[List[str], str], output_dir: Path) 
         if not text:
             continue
         _append(project_id, "info", text)
+        # Only the pipeline's own "Running <Stage>" progress line moves the
+        # stage. A loose substring match over every line also fired on prose —
+        # "Trench layers normalized at chambers" is emitted right AFTER the
+        # chamber stage and dragged the reported stage back to Trench — and the
+        # six-name list could not match the chamber/pole/aerial lines at all.
+        lowered = text.lower()
         for idx, stage in enumerate(PIPELINE_STAGES):
-            if stage.lower() in text.lower():
+            if f"running {stage.lower()}" in lowered:
                 task = _task(project_id)
                 if task.get("stage") == stage and task.get("stage_index") == idx:
                     continue
