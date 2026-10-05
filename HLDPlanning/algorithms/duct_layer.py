@@ -1607,6 +1607,26 @@ class DuctLayer(QgsProcessingAlgorithm):
     ROUTE_DETOUR_MAX_X = 3.0
     ROUTE_DETOUR_SLACK_M = 30.0
 
+    # The distribution rebase (rule D10) prefers a CONNECTED trench route
+    # between a legacy line's two ends. When the network offers none (a coupler
+    # behind a break, or two ends on severed pieces), the line used to keep its
+    # sidewalk geometry and was flagged for review — measured on the CV1 2DE
+    # run: 144 of 2336 distribution routes stayed on the pavement, every one
+    # about 3 m off (the sidewalk offset), 1.8 % of the layer's length. A duct
+    # may only ever lie ON the trench, so those are now PROJECTED: the line is
+    # densified to this spacing and every point snapped to its nearest trench
+    # point, which follows the trench instead of the pavement. It is not a
+    # route (no connectivity is claimed) and is reported separately.
+    #
+    # The projection only works where the trench is CONTINUOUS under the sample
+    # step: a point of the source line whose nearest trench point is a whole gap
+    # away would snap across that gap and redraw the very chord that is off the
+    # network. A jump larger than this many sample steps therefore refuses the
+    # projection and the row stays unresolved, exactly as before. Set against a
+    # 90 m gap (refused) and a 4 m drafting break (accepted).
+    REBASE_PROJECT_DENSIFY_M = 5.0
+    REBASE_PROJECT_MAX_JUMP_M = 15.0
+
     def _route_network(self, corridor_lyr):
         """The trench network as a routed graph — built once, then cached.
 
@@ -1939,7 +1959,7 @@ class DuctLayer(QgsProcessingAlgorithm):
             layer = QgsVectorLayer(str(output_uri), "distribution_rebase", "ogr")
         if layer is None or not layer.isValid():
             return 0, 0
-        changed = unresolved = 0
+        changed = unresolved = projected = 0
         unresolved_reasons = defaultdict(int)
         # Spatial index over the trench features: the rebase used to scan all
         # 3,58 trenches with two GEOS nearestPoint calls per endpoint per duct
@@ -1970,6 +1990,44 @@ class DuctLayer(QgsProcessingAlgorithm):
                 if best is None or d < best[0]:
                     best = (d, np)
             return best
+
+        def _project_onto_trench(part):
+            """Snap a legacy part onto the trench when no route connects it.
+
+            Densifies the part to ``REBASE_PROJECT_DENSIFY_M`` and projects
+            every point to its nearest trench point, so the published duct
+            follows the trench network. Returns the snapped polyline, or None
+            when a point has no trench within ``SEARCH_R``.
+            """
+            pts = [QgsPointXY(p.x(), p.y()) for p in part]
+            dense = []
+            for i in range(len(pts) - 1):
+                a, b = pts[i], pts[i + 1]
+                dense.append(a)
+                seg = math.hypot(b.x() - a.x(), b.y() - a.y())
+                n = max(1, int(seg // self.REBASE_PROJECT_DENSIFY_M))
+                for k in range(1, n):
+                    t = k / n
+                    dense.append(QgsPointXY(a.x() + (b.x() - a.x()) * t,
+                                            a.y() + (b.y() - a.y()) * t))
+            dense.append(pts[-1])
+            snapped = []
+            for p in dense:
+                near = _nearest_trench_point(p)
+                if near is None:
+                    return None
+                sp = near[1]
+                if snapped:
+                    jump = math.hypot(sp.x() - snapped[-1].x(),
+                                      sp.y() - snapped[-1].y())
+                    if jump < 1e-6:
+                        continue
+                    if jump > self.REBASE_PROJECT_MAX_JUMP_M:
+                        # The nearest trench point jumped a gap: projecting here
+                        # would draw the chord back across it.
+                        return None
+                snapped.append(sp)
+            return snapped if len(snapped) >= 2 else None
 
         if not layer.isEditable():
             layer.startEditing()
@@ -2020,8 +2078,30 @@ class DuctLayer(QgsProcessingAlgorithm):
                 # only the parts that happened to route silently severs it;
                 # preserve the full source geometry and mark it for review.
                 if failure_reason or not rebased_parts:
+                    # No connected route between the ends. The duct may still
+                    # not be drawn off the trench (D10), so project the line
+                    # onto the trench network rather than keeping the sidewalk
+                    # geometry. Only when a point has no trench within range
+                    # does the row stay unresolved and flagged.
+                    proj_parts = []
+                    proj_failed = False
+                    for part in source_parts:
+                        pp = _project_onto_trench(part)
+                        if pp is None:
+                            proj_failed = True
+                            break
+                        proj_parts.append(pp)
+                    if not proj_failed and proj_parts:
+                        f.setGeometry(QgsGeometry.fromMultiPolylineXY(proj_parts))
+                        layer.updateFeature(f)
+                        changed += 1
+                        projected += 1
+                        continue
                     unresolved += 1
-                    unresolved_reasons[failure_reason or "empty routed geometry"] += 1
+                    unresolved_reasons[
+                        (failure_reason or "empty routed geometry")
+                        + (" (no trench to project onto)" if proj_failed else "")
+                    ] += 1
                     review_idx = layer.fields().indexFromName("REVIEW")
                     if review_idx >= 0:
                         f.setAttribute(review_idx, 1)
@@ -2043,16 +2123,23 @@ class DuctLayer(QgsProcessingAlgorithm):
                         layer.updateFeature(f)
                 except Exception:
                     pass
-        if changed:
+        # Commit whenever anything was written — including the REVIEW flag set on
+        # a row that stayed unresolved. Committing only on `changed` dropped
+        # those flags on a run where no route could be rebased at all.
+        if changed or unresolved:
             layer.commitChanges()
         if feedback:
             reason_summary = ", ".join(
                 f"{reason}: {count}" for reason, count in sorted(unresolved_reasons.items())
             ) or "none"
+            proj_note = (
+                f", {projected} projected onto the trench (a broken network "
+                f"offered no connected route)" if projected else ""
+            )
             feedback.pushInfo(
-                f"Distribution hybrid rebase: {changed} legacy route(s) moved onto "
-                f"Final_Trenches; {unresolved} unresolved route(s) left for review "
-                f"({reason_summary}).")
+                f"Distribution hybrid rebase: {changed - projected} legacy route(s) "
+                f"routed onto Final_Trenches{proj_note}; {unresolved} unresolved "
+                f"route(s) left for review ({reason_summary}).")
         return changed, unresolved
 
     def _trench_connector(self, corridor_lyr, a_xy, b_xy, tol_m=1.0,
