@@ -1,0 +1,1285 @@
+[
+  {
+    "country": "DE",
+    "label": "Mariendorf, Berlin, Germany",
+    "rung": "nominatim",
+    "area_km2": 9.343,
+    "matched": "Mariendorf, Tempelhof-Sch\u00f6neberg, Berlin, Deutschland",
+    "country_from_resolution": "Germany",
+    "city_from_resolution": "Berlin",
+    "premises": 8697,
+    "households": 31261,
+    "can_run": true,
+    "roads_km": 402.6,
+    "workbook": "outputs\\countrycheck-de\\inputs\\Main_DataSet.xlsx",
+    "workbook_check": {
+      "rows": 8697,
+      "keys_satisfied": 10,
+      "keys_expected": 10,
+      "missing_keys": [],
+      "country_values": [
+        "Germany"
+      ],
+      "city_values": [
+        "Berlin"
+      ],
+      "country_filled": 8697,
+      "city_filled": 8697,
+      "address_filled": 6242,
+      "housenumber_filled": 6268,
+      "postcode_filled": 6210,
+      "district_filled": 6146,
+      "invalid_coords": 0,
+      "blank_rows": 0
+    },
+    "objects": {
+      "features": 9119,
+      "distinct_attributes": 198,
+      "features_with_no_attributes": 0,
+      "top_attributes": [
+        [
+          "osm_object_id",
+          9119
+        ],
+        [
+          "osm_object_type",
+          9119
+        ],
+        [
+          "latitude",
+          9119
+        ],
+        [
+          "longitude",
+          9119
+        ],
+        [
+          "building_type",
+          9119
+        ],
+        [
+          "footprint_m2",
+          9119
+        ],
+        [
+          "tag_count",
+          9119
+        ],
+        [
+          "building",
+          9079
+        ]
+      ]
+    },
+    "ok": true,
+    "seconds": 15.1
+  },
+  {
+    "country": "MX",
+    "label": "Real de Catorce, San Luis Potos\u00ed, Mexico",
+    "rung": "administrative",
+    "area_km2": 1949.471,
+    "matched": "Real de Catorce, Catorce, San Luis Potos\u00ed, M\u00e9xico",
+    "country_from_resolution": "Mexico",
+    "city_from_resolution": "Real de Catorce",
+    "premises": 93,
+    "households": 93,
+    "can_run": true,
+    "roads_km": 733.1,
+    "workbook": "outputs\\countrycheck-mx\\inputs\\Main_DataSet.xlsx",
+    "workbook_check": {
+      "rows": 93,
+      "keys_satisfied": 10,
+      "keys_expected": 10,
+      "missing_keys": [],
+      "country_values": [
+        "Mexico"
+      ],
+      "city_values": [
+        "Real de Catorce"
+      ],
+      "country_filled": 93,
+      "city_filled": 93,
+      "address_filled": 1,
+      "housenumber_filled": 7,
+      "postcode_filled": 0,
+      "district_filled": 0,
+      "invalid_coords": 0,
+      "blank_rows": 0
+    },
+    "objects": {
+      "features": 92,
+      "distinct_attributes": 21,
+      "features_with_no_attributes": 0,
+      "top_attributes": [
+        [
+          "building",
+          92
+        ],
+        [
+          "osm_object_id",
+          92
+        ],
+        [
+          "osm_object_type",
+          92
+        ],
+        [
+          "latitude",
+          92
+        ],
+        [
+          "longitude",
+          92
+        ],
+        [
+          "building_type",
+          92
+        ],
+        [
+          "footprint_m2",
+          92
+        ],
+        [
+          "tag_count",
+          92
+        ]
+      ]
+    },
+    "ok": true,
+    "seconds": 174.0
+  },
+  {
+    "country": "JP",
+    "label": "Naoshima, Japan",
+    "rung": "nominatim",
+    "area_km2": 81.096,
+    "matched": "\u76f4\u5cf6\u753a, \u9999\u5ddd\u90e1, \u9999\u5ddd\u770c, \u65e5\u672c",
+    "country_from_resolution": "Japan",
+    "city_from_resolution": "\u76f4\u5cf6\u753a",
+    "premises": 1386,
+    "households": 1490,
+    "can_run": true,
+    "roads_km": 84.1,
+    "workbook": "outputs\\countrycheck-jp\\inputs\\Main_DataSet.xlsx",
+    "workbook_check": {
+      "rows": 1386,
+      "keys_satisfied": 10,
+      "keys_expected": 10,
+      "missing_keys": [],
+      "country_values": [
+        "Japan"
+      ],
+      "city_values": [
+        "\u76f4\u5cf6\u753a"
+      ],
+      "country_filled": 1386,
+      "city_filled": 1386,
+      "address_filled": 3,
+      "housenumber_filled": 16,
+      "postcode_filled": 3,
+      "district_filled": 0,
+      "invalid_coords": 0,
+      "blank_rows": 0
+    },
+    "objects": {
+      "features": 1386,
+      "distinct_attributes": 68,
+      "features_with_no_attributes": 0,
+      "top_attributes": [
+        [
+          "osm_object_id",
+          1386
+        ],
+        [
+          "osm_object_type",
+          1386
+        ],
+        [
+          "latitude",
+          1386
+        ],
+        [
+          "longitude",
+          1386
+        ],
+        [
+          "building_type",
+          1386
+        ],
+        [
+          "footprint_m2",
+          1386
+        ],
+        [
+          "tag_count",
+          1386
+        ],
+        [
+          "building",
+          1385
+        ]
+      ]
+    },
+    "ok": true,
+    "seconds": 140.8
+  },
+  {
+    "country": "IN",
+    "label": "Mahabalipuram, India",
+    "rung": "administrative",
+    "area_km2": 367.152,
+    "matched": "Mahabalipuram, Tirukalukundram, Chengalpattu, Tamil Nadu, 603104, India",
+    "country_from_resolution": "India",
+    "city_from_resolution": "Mahabalipuram",
+    "premises": 1812,
+    "households": 1813,
+    "can_run": true,
+    "roads_km": 1535.7,
+    "workbook": "outputs\\countrycheck-in\\inputs\\Main_DataSet.xlsx",
+    "workbook_check": {
+      "rows": 1812,
+      "keys_satisfied": 10,
+      "keys_expected": 10,
+      "missing_keys": [],
+      "country_values": [
+        "India"
+      ],
+      "city_values": [
+        "Chennai",
+        "Mahabalipuram",
+        "Mamallapuram"
+      ],
+      "country_filled": 1812,
+      "city_filled": 1812,
+      "address_filled": 9,
+      "housenumber_filled": 33,
+      "postcode_filled": 5,
+      "district_filled": 0,
+      "invalid_coords": 0,
+      "blank_rows": 0
+    },
+    "objects": {
+      "features": 1808,
+      "distinct_attributes": 55,
+      "features_with_no_attributes": 0,
+      "top_attributes": [
+        [
+          "osm_object_id",
+          1808
+        ],
+        [
+          "osm_object_type",
+          1808
+        ],
+        [
+          "latitude",
+          1808
+        ],
+        [
+          "longitude",
+          1808
+        ],
+        [
+          "building_type",
+          1808
+        ],
+        [
+          "footprint_m2",
+          1808
+        ],
+        [
+          "tag_count",
+          1808
+        ],
+        [
+          "building",
+          1806
+        ]
+      ]
+    },
+    "ok": true,
+    "seconds": 112.5
+  },
+  {
+    "country": "AU",
+    "label": "Hahndorf, South Australia, Australia",
+    "rung": "nominatim",
+    "area_km2": 21.456,
+    "matched": "Hahndorf, South Australia, Australia",
+    "country_from_resolution": "Australia",
+    "city_from_resolution": "Hahndorf",
+    "premises": 215,
+    "households": 216,
+    "can_run": true,
+    "roads_km": 102.2,
+    "workbook": "outputs\\countrycheck-au\\inputs\\Main_DataSet.xlsx",
+    "workbook_check": {
+      "rows": 215,
+      "keys_satisfied": 10,
+      "keys_expected": 10,
+      "missing_keys": [],
+      "country_values": [
+        "Australia"
+      ],
+      "city_values": [
+        "Hahndorf"
+      ],
+      "country_filled": 215,
+      "city_filled": 215,
+      "address_filled": 18,
+      "housenumber_filled": 24,
+      "postcode_filled": 8,
+      "district_filled": 10,
+      "invalid_coords": 0,
+      "blank_rows": 0
+    },
+    "objects": {
+      "features": 215,
+      "distinct_attributes": 53,
+      "features_with_no_attributes": 0,
+      "top_attributes": [
+        [
+          "osm_object_id",
+          215
+        ],
+        [
+          "osm_object_type",
+          215
+        ],
+        [
+          "latitude",
+          215
+        ],
+        [
+          "longitude",
+          215
+        ],
+        [
+          "building_type",
+          215
+        ],
+        [
+          "footprint_m2",
+          215
+        ],
+        [
+          "tag_count",
+          215
+        ],
+        [
+          "building",
+          214
+        ]
+      ]
+    },
+    "ok": true,
+    "seconds": 92.7
+  },
+  {
+    "country": "FR",
+    "label": "Giverny, France",
+    "rung": "nominatim",
+    "area_km2": 6.443,
+    "matched": "Giverny, Les Andelys, Eure, Normandie, France m\u00e9tropolitaine, 27620, France",
+    "country_from_resolution": "France",
+    "city_from_resolution": "Giverny",
+    "premises": 672,
+    "households": 697,
+    "can_run": true,
+    "roads_km": 65.4,
+    "workbook": "outputs\\countrycheck-fr\\inputs\\Main_DataSet.xlsx",
+    "workbook_check": {
+      "rows": 672,
+      "keys_satisfied": 10,
+      "keys_expected": 10,
+      "missing_keys": [],
+      "country_values": [
+        "France"
+      ],
+      "city_values": [
+        "Giverny"
+      ],
+      "country_filled": 672,
+      "city_filled": 672,
+      "address_filled": 95,
+      "housenumber_filled": 98,
+      "postcode_filled": 36,
+      "district_filled": 0,
+      "invalid_coords": 0,
+      "blank_rows": 0
+    },
+    "objects": {
+      "features": 649,
+      "distinct_attributes": 63,
+      "features_with_no_attributes": 0,
+      "top_attributes": [
+        [
+          "osm_object_id",
+          649
+        ],
+        [
+          "osm_object_type",
+          649
+        ],
+        [
+          "latitude",
+          649
+        ],
+        [
+          "longitude",
+          649
+        ],
+        [
+          "building_type",
+          649
+        ],
+        [
+          "footprint_m2",
+          649
+        ],
+        [
+          "tag_count",
+          649
+        ],
+        [
+          "building",
+          648
+        ]
+      ]
+    },
+    "ok": true,
+    "seconds": 4.6
+  },
+  {
+    "country": "GB",
+    "label": "New Frankley in Birmingham, United Kingdom",
+    "rung": "nominatim",
+    "area_km2": 1.432,
+    "matched": "New Frankley in Birmingham, Birmingham, West Midlands, England, United Kingdom",
+    "country_from_resolution": "United Kingdom",
+    "city_from_resolution": "Birmingham",
+    "premises": 1347,
+    "households": 1347,
+    "can_run": true,
+    "roads_km": 52.5,
+    "workbook": "outputs\\countrycheck-gb\\inputs\\Main_DataSet.xlsx",
+    "workbook_check": {
+      "rows": 1347,
+      "keys_satisfied": 10,
+      "keys_expected": 10,
+      "missing_keys": [],
+      "country_values": [
+        "United Kingdom"
+      ],
+      "city_values": [
+        "Birmingham"
+      ],
+      "country_filled": 1347,
+      "city_filled": 1347,
+      "address_filled": 938,
+      "housenumber_filled": 8,
+      "postcode_filled": 938,
+      "district_filled": 0,
+      "invalid_coords": 0,
+      "blank_rows": 0
+    },
+    "objects": {
+      "features": 1400,
+      "distinct_attributes": 22,
+      "features_with_no_attributes": 0,
+      "top_attributes": [
+        [
+          "building",
+          1400
+        ],
+        [
+          "osm_object_id",
+          1400
+        ],
+        [
+          "osm_object_type",
+          1400
+        ],
+        [
+          "latitude",
+          1400
+        ],
+        [
+          "longitude",
+          1400
+        ],
+        [
+          "building_type",
+          1400
+        ],
+        [
+          "footprint_m2",
+          1400
+        ],
+        [
+          "tag_count",
+          1400
+        ]
+      ]
+    },
+    "ok": true,
+    "seconds": 3.8
+  },
+  {
+    "country": "US",
+    "label": "Telluride, Colorado, United States",
+    "rung": "nominatim",
+    "area_km2": 4.342,
+    "matched": "Telluride, San Miguel County, Colorado, 81435, United States",
+    "country_from_resolution": "United States",
+    "city_from_resolution": "Telluride",
+    "premises": 1219,
+    "households": 1224,
+    "can_run": true,
+    "roads_km": 76.9,
+    "workbook": "outputs\\countrycheck-us\\inputs\\Main_DataSet.xlsx",
+    "workbook_check": {
+      "rows": 1219,
+      "keys_satisfied": 10,
+      "keys_expected": 10,
+      "missing_keys": [],
+      "country_values": [
+        "United States"
+      ],
+      "city_values": [
+        "Telluride"
+      ],
+      "country_filled": 1219,
+      "city_filled": 1219,
+      "address_filled": 302,
+      "housenumber_filled": 324,
+      "postcode_filled": 303,
+      "district_filled": 0,
+      "invalid_coords": 0,
+      "blank_rows": 0
+    },
+    "objects": {
+      "features": 1212,
+      "distinct_attributes": 56,
+      "features_with_no_attributes": 0,
+      "top_attributes": [
+        [
+          "osm_object_id",
+          1212
+        ],
+        [
+          "osm_object_type",
+          1212
+        ],
+        [
+          "latitude",
+          1212
+        ],
+        [
+          "longitude",
+          1212
+        ],
+        [
+          "building_type",
+          1212
+        ],
+        [
+          "footprint_m2",
+          1212
+        ],
+        [
+          "tag_count",
+          1212
+        ],
+        [
+          "building",
+          1211
+        ]
+      ]
+    },
+    "ok": true,
+    "seconds": 33.6
+  },
+  {
+    "country": "CA",
+    "label": "Banff, Alberta, Canada",
+    "rung": "nominatim",
+    "area_km2": 4.861,
+    "matched": "Banff, Alberta, Canada",
+    "country_from_resolution": "Canada",
+    "city_from_resolution": "Banff",
+    "premises": 1952,
+    "households": 4226,
+    "can_run": true,
+    "roads_km": 146.4,
+    "workbook": "outputs\\countrycheck-ca\\inputs\\Main_DataSet.xlsx",
+    "workbook_check": {
+      "rows": 1952,
+      "keys_satisfied": 10,
+      "keys_expected": 10,
+      "missing_keys": [],
+      "country_values": [
+        "Canada"
+      ],
+      "city_values": [
+        "Banff"
+      ],
+      "country_filled": 1952,
+      "city_filled": 1952,
+      "address_filled": 1434,
+      "housenumber_filled": 1480,
+      "postcode_filled": 154,
+      "district_filled": 0,
+      "invalid_coords": 0,
+      "blank_rows": 0
+    },
+    "objects": {
+      "features": 2023,
+      "distinct_attributes": 127,
+      "features_with_no_attributes": 0,
+      "top_attributes": [
+        [
+          "osm_object_id",
+          2023
+        ],
+        [
+          "osm_object_type",
+          2023
+        ],
+        [
+          "latitude",
+          2023
+        ],
+        [
+          "longitude",
+          2023
+        ],
+        [
+          "building_type",
+          2023
+        ],
+        [
+          "footprint_m2",
+          2023
+        ],
+        [
+          "tag_count",
+          2023
+        ],
+        [
+          "building",
+          2016
+        ]
+      ]
+    },
+    "ok": true,
+    "seconds": 150.1
+  },
+  {
+    "country": "ES",
+    "label": "Mogarraz, Spain",
+    "rung": "nominatim",
+    "area_km2": 9.04,
+    "matched": "Mogarraz, Salamanca, Castilla y Le\u00f3n, Espa\u00f1a",
+    "country_from_resolution": "Spain",
+    "city_from_resolution": "Mogarraz",
+    "premises": 754,
+    "households": 1110,
+    "can_run": true,
+    "roads_km": 53.8,
+    "workbook": "outputs\\countrycheck-es\\inputs\\Main_DataSet.xlsx",
+    "workbook_check": {
+      "rows": 754,
+      "keys_satisfied": 10,
+      "keys_expected": 10,
+      "missing_keys": [],
+      "country_values": [
+        "Spain"
+      ],
+      "city_values": [
+        "Mogarraz"
+      ],
+      "country_filled": 754,
+      "city_filled": 754,
+      "address_filled": 342,
+      "housenumber_filled": 349,
+      "postcode_filled": 339,
+      "district_filled": 0,
+      "invalid_coords": 0,
+      "blank_rows": 0
+    },
+    "objects": {
+      "features": 428,
+      "distinct_attributes": 32,
+      "features_with_no_attributes": 0,
+      "top_attributes": [
+        [
+          "building",
+          428
+        ],
+        [
+          "osm_object_id",
+          428
+        ],
+        [
+          "osm_object_type",
+          428
+        ],
+        [
+          "latitude",
+          428
+        ],
+        [
+          "longitude",
+          428
+        ],
+        [
+          "building_type",
+          428
+        ],
+        [
+          "footprint_m2",
+          428
+        ],
+        [
+          "tag_count",
+          428
+        ]
+      ]
+    },
+    "ok": true,
+    "seconds": 41.1
+  },
+  {
+    "country": "TR",
+    "label": "Sogutlu, Mugla, Turkey",
+    "rung": "nominatim",
+    "area_km2": 0.512,
+    "matched": "S\u00f6\u011f\u00fctl\u00fc, Mu\u011fla, Ege B\u00f6lgesi, T\u00fcrkiye",
+    "country_from_resolution": "Turkey",
+    "city_from_resolution": "S\u00f6\u011f\u00fctl\u00fc",
+    "premises": 1,
+    "households": 1,
+    "can_run": true,
+    "roads_km": 14.2,
+    "workbook": "outputs\\countrycheck-tr\\inputs\\Main_DataSet.xlsx",
+    "workbook_check": {
+      "rows": 1,
+      "keys_satisfied": 10,
+      "keys_expected": 10,
+      "missing_keys": [],
+      "country_values": [
+        "Turkey"
+      ],
+      "city_values": [
+        "S\u00f6\u011f\u00fctl\u00fc"
+      ],
+      "country_filled": 1,
+      "city_filled": 1,
+      "address_filled": 0,
+      "housenumber_filled": 0,
+      "postcode_filled": 0,
+      "district_filled": 0,
+      "invalid_coords": 0,
+      "blank_rows": 0
+    },
+    "objects": {
+      "features": 1,
+      "distinct_attributes": 8,
+      "features_with_no_attributes": 0,
+      "top_attributes": [
+        [
+          "building",
+          1
+        ],
+        [
+          "osm_object_id",
+          1
+        ],
+        [
+          "osm_object_type",
+          1
+        ],
+        [
+          "latitude",
+          1
+        ],
+        [
+          "longitude",
+          1
+        ],
+        [
+          "building_type",
+          1
+        ],
+        [
+          "footprint_m2",
+          1
+        ],
+        [
+          "tag_count",
+          1
+        ]
+      ]
+    },
+    "ok": true,
+    "seconds": 374.4
+  },
+  {
+    "country": "ZA",
+    "label": "Greyton, Western Cape, South Africa",
+    "rung": "administrative",
+    "area_km2": 560.537,
+    "matched": "Greyton, Theewaterskloof Local Municipality, Overberg District Municipality, Western Cape, 7233, South Africa",
+    "country_from_resolution": "South Africa",
+    "city_from_resolution": "Theewaterskloof Local Municipality",
+    "premises": 96,
+    "households": 100,
+    "can_run": true,
+    "roads_km": 1008.6,
+    "workbook": "outputs\\countrycheck-za\\inputs\\Main_DataSet.xlsx",
+    "workbook_check": {
+      "rows": 96,
+      "keys_satisfied": 10,
+      "keys_expected": 10,
+      "missing_keys": [],
+      "country_values": [
+        "South Africa"
+      ],
+      "city_values": [
+        "Greyton",
+        "Theewaterskloof Local Municipality"
+      ],
+      "country_filled": 96,
+      "city_filled": 96,
+      "address_filled": 30,
+      "housenumber_filled": 32,
+      "postcode_filled": 6,
+      "district_filled": 0,
+      "invalid_coords": 0,
+      "blank_rows": 0
+    },
+    "objects": {
+      "features": 91,
+      "distinct_attributes": 41,
+      "features_with_no_attributes": 0,
+      "top_attributes": [
+        [
+          "osm_object_id",
+          91
+        ],
+        [
+          "osm_object_type",
+          91
+        ],
+        [
+          "latitude",
+          91
+        ],
+        [
+          "longitude",
+          91
+        ],
+        [
+          "building_type",
+          91
+        ],
+        [
+          "footprint_m2",
+          91
+        ],
+        [
+          "tag_count",
+          91
+        ],
+        [
+          "building",
+          90
+        ]
+      ]
+    },
+    "ok": true,
+    "seconds": 24.4
+  },
+  {
+    "country": "IE",
+    "label": "Adare, Limerick, Ireland",
+    "rung": "nominatim",
+    "area_km2": 0.873,
+    "matched": "Adare, The Municipal District of Adare \u2014 Rathkeale, County Limerick, Munster, \u00c9ire / Ireland",
+    "country_from_resolution": "Ireland",
+    "city_from_resolution": "The Municipal District of Adare \u2014 Rathkeale",
+    "premises": 609,
+    "households": 705,
+    "can_run": true,
+    "roads_km": 19.5,
+    "workbook": "outputs\\countrycheck-ie\\inputs\\Main_DataSet.xlsx",
+    "workbook_check": {
+      "rows": 609,
+      "keys_satisfied": 10,
+      "keys_expected": 10,
+      "missing_keys": [],
+      "country_values": [
+        "Ireland"
+      ],
+      "city_values": [
+        "Adare",
+        "The Municipal District of Adare \u2014 Rathkeale"
+      ],
+      "country_filled": 609,
+      "city_filled": 609,
+      "address_filled": 46,
+      "housenumber_filled": 14,
+      "postcode_filled": 1,
+      "district_filled": 0,
+      "invalid_coords": 0,
+      "blank_rows": 0
+    },
+    "objects": {
+      "features": 677,
+      "distinct_attributes": 60,
+      "features_with_no_attributes": 0,
+      "top_attributes": [
+        [
+          "building",
+          677
+        ],
+        [
+          "osm_object_id",
+          677
+        ],
+        [
+          "osm_object_type",
+          677
+        ],
+        [
+          "latitude",
+          677
+        ],
+        [
+          "longitude",
+          677
+        ],
+        [
+          "building_type",
+          677
+        ],
+        [
+          "footprint_m2",
+          677
+        ],
+        [
+          "tag_count",
+          677
+        ]
+      ]
+    },
+    "ok": true,
+    "seconds": 32.6
+  },
+  {
+    "country": "NL",
+    "label": "Marken, Netherlands",
+    "rung": "nominatim",
+    "area_km2": 54.514,
+    "matched": "Marken, Waterland, Noord-Holland, Nederland",
+    "country_from_resolution": "Netherlands",
+    "city_from_resolution": "Marken",
+    "premises": 1549,
+    "households": 1549,
+    "can_run": true,
+    "roads_km": 40.4,
+    "workbook": "outputs\\countrycheck-nl\\inputs\\Main_DataSet.xlsx",
+    "workbook_check": {
+      "rows": 1549,
+      "keys_satisfied": 10,
+      "keys_expected": 10,
+      "missing_keys": [],
+      "country_values": [
+        "Netherlands"
+      ],
+      "city_values": [
+        "Marken"
+      ],
+      "country_filled": 1549,
+      "city_filled": 1549,
+      "address_filled": 1044,
+      "housenumber_filled": 1044,
+      "postcode_filled": 1036,
+      "district_filled": 0,
+      "invalid_coords": 0,
+      "blank_rows": 0
+    },
+    "objects": {
+      "features": 1586,
+      "distinct_attributes": 41,
+      "features_with_no_attributes": 0,
+      "top_attributes": [
+        [
+          "osm_object_id",
+          1586
+        ],
+        [
+          "osm_object_type",
+          1586
+        ],
+        [
+          "latitude",
+          1586
+        ],
+        [
+          "longitude",
+          1586
+        ],
+        [
+          "building_type",
+          1586
+        ],
+        [
+          "footprint_m2",
+          1586
+        ],
+        [
+          "tag_count",
+          1586
+        ],
+        [
+          "building",
+          1585
+        ]
+      ]
+    },
+    "ok": true,
+    "seconds": 89.2
+  },
+  {
+    "country": "IT",
+    "label": "Civita di Bagnoregio, Italy",
+    "rung": "administrative",
+    "area_km2": 72.508,
+    "matched": "Civita, Bagnoregio, Viterbo, Lazio, 01022, Italia",
+    "country_from_resolution": "Italy",
+    "city_from_resolution": "Bagnoregio",
+    "premises": 1580,
+    "households": 1816,
+    "can_run": true,
+    "roads_km": 249.6,
+    "workbook": "outputs\\countrycheck-it\\inputs\\Main_DataSet.xlsx",
+    "workbook_check": {
+      "rows": 1580,
+      "keys_satisfied": 10,
+      "keys_expected": 10,
+      "missing_keys": [],
+      "country_values": [
+        "Italy"
+      ],
+      "city_values": [
+        "Bagnoregio",
+        "Castel Cellesi",
+        "Vetriolo"
+      ],
+      "country_filled": 1580,
+      "city_filled": 1580,
+      "address_filled": 217,
+      "housenumber_filled": 228,
+      "postcode_filled": 214,
+      "district_filled": 0,
+      "invalid_coords": 0,
+      "blank_rows": 0
+    },
+    "objects": {
+      "features": 1426,
+      "distinct_attributes": 72,
+      "features_with_no_attributes": 0,
+      "top_attributes": [
+        [
+          "building",
+          1426
+        ],
+        [
+          "osm_object_id",
+          1426
+        ],
+        [
+          "osm_object_type",
+          1426
+        ],
+        [
+          "latitude",
+          1426
+        ],
+        [
+          "longitude",
+          1426
+        ],
+        [
+          "building_type",
+          1426
+        ],
+        [
+          "footprint_m2",
+          1426
+        ],
+        [
+          "tag_count",
+          1426
+        ]
+      ]
+    },
+    "ok": true,
+    "seconds": 68.7
+  },
+  {
+    "country": "PL",
+    "label": "Kazimierz Dolny, Poland",
+    "rung": "nominatim",
+    "area_km2": 30.329,
+    "matched": "Kazimierz Dolny, gmina Kazimierz Dolny, powiat pu\u0142awski, wojew\u00f3dztwo lubelskie, 24-120, Polska",
+    "country_from_resolution": "Poland",
+    "city_from_resolution": "Kazimierz Dolny",
+    "premises": 3611,
+    "households": 3835,
+    "can_run": true,
+    "roads_km": 232.1,
+    "workbook": "outputs\\countrycheck-pl\\inputs\\Main_DataSet.xlsx",
+    "workbook_check": {
+      "rows": 3611,
+      "keys_satisfied": 10,
+      "keys_expected": 10,
+      "missing_keys": [],
+      "country_values": [
+        "Poland"
+      ],
+      "city_values": [
+        "Kazimierz Dolny",
+        "Mi\u0119\u0107mierz",
+        "Wyl\u0105gi"
+      ],
+      "country_filled": 3611,
+      "city_filled": 3611,
+      "address_filled": 1579,
+      "housenumber_filled": 1962,
+      "postcode_filled": 1957,
+      "district_filled": 0,
+      "invalid_coords": 0,
+      "blank_rows": 0
+    },
+    "objects": {
+      "features": 3255,
+      "distinct_attributes": 97,
+      "features_with_no_attributes": 0,
+      "top_attributes": [
+        [
+          "building",
+          3255
+        ],
+        [
+          "osm_object_id",
+          3255
+        ],
+        [
+          "osm_object_type",
+          3255
+        ],
+        [
+          "latitude",
+          3255
+        ],
+        [
+          "longitude",
+          3255
+        ],
+        [
+          "building_type",
+          3255
+        ],
+        [
+          "footprint_m2",
+          3255
+        ],
+        [
+          "tag_count",
+          3255
+        ]
+      ]
+    },
+    "ok": true,
+    "seconds": 296.3
+  },
+  {
+    "country": "BR",
+    "label": "Tiradentes, Minas Gerais, Brazil",
+    "rung": "nominatim",
+    "area_km2": 83.318,
+    "matched": "Tiradentes, Minas Gerais, Regi\u00e3o Sudeste, 36325-000, Brasil",
+    "country_from_resolution": "Brazil",
+    "city_from_resolution": "Tiradentes",
+    "premises": 4987,
+    "households": 5073,
+    "can_run": true,
+    "roads_km": 308.8,
+    "workbook": "outputs\\countrycheck-br\\inputs\\Main_DataSet.xlsx",
+    "workbook_check": {
+      "rows": 4987,
+      "keys_satisfied": 10,
+      "keys_expected": 10,
+      "missing_keys": [],
+      "country_values": [
+        "Brazil"
+      ],
+      "city_values": [
+        "Tiradentes"
+      ],
+      "country_filled": 4987,
+      "city_filled": 4987,
+      "address_filled": 139,
+      "housenumber_filled": 156,
+      "postcode_filled": 9,
+      "district_filled": 10,
+      "invalid_coords": 0,
+      "blank_rows": 0
+    },
+    "objects": {
+      "features": 4970,
+      "distinct_attributes": 55,
+      "features_with_no_attributes": 0,
+      "top_attributes": [
+        [
+          "osm_object_id",
+          4970
+        ],
+        [
+          "osm_object_type",
+          4970
+        ],
+        [
+          "latitude",
+          4970
+        ],
+        [
+          "longitude",
+          4970
+        ],
+        [
+          "building_type",
+          4970
+        ],
+        [
+          "footprint_m2",
+          4970
+        ],
+        [
+          "tag_count",
+          4970
+        ],
+        [
+          "building",
+          4968
+        ]
+      ]
+    },
+    "ok": true,
+    "seconds": 208.9
+  }
+]
