@@ -1589,6 +1589,18 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             feedback.pushInfo(self.tr(
                 f"  [timing] Brownfield: disabled (toggle off) in {time.time() - t0:.3f}s"))
 
+        # Apply the reuse gate to the shared registry state, exactly like the
+        # brownfield subclass does. The registry lives at module scope for the
+        # whole QGIS process, so a standalone "Load Brownfield" run earlier in
+        # the same session leaves a registry the downstream stages would
+        # otherwise reuse even with USE_BROWNFIELD off. This pipeline is
+        # authoritative for its own run: with the toggle off, reuse is off.
+        try:
+            from ..utils.brownfield import BrownfieldRegistry
+            BrownfieldRegistry.set_reuse_enabled(use_bf)
+        except Exception as exc:
+            feedback.pushWarning(f"Could not apply brownfield reuse gate: {exc}")
+
         # Save brownfield layers to output directory (if requested)
         if results.get("brownfield_output"):
             results["brownfield_output"] = self._save_layer_to_gpkg(

@@ -973,26 +973,46 @@ def _match_brownfield_param(filename: str) -> Optional[str]:
     return None
 
 
-def _brownfield_args(brownfield_path: Optional[Path], output_dir: Path) -> List[str]:
+def _brownfield_args(brownfield_path: Optional[Path], output_dir: Path,
+                     project_id: Optional[str] = None) -> List[str]:
     """Unzip an uploaded brownfield archive and build the plugin BF_* params.
 
     Returns qgis_process ``--`` style args (e.g. ``USE_BROWNFIELD=true``,
-    ``BF_DUCTS=<path>``) or an empty list when no archive was supplied.
+    ``BF_DUCTS=<path>``) or an empty list when nothing was supplied.
+
+    ``project_id`` enables the occupancy read-back: the last run's duct
+    occupancy is the spare capacity this run must consume before laying new
+    duct, so it is exported as ``bf_ducts.geojson`` (merged with any uploaded
+    duct file) and fed as BF_DUCTS. A fresh project id has no stored
+    occupancy, so this is a no-op there.
     """
-    if not brownfield_path or not brownfield_path.exists():
-        return []
     bf_dir = output_dir / "brownfield"
-    bf_dir.mkdir(parents=True, exist_ok=True)
-    if zipfile.is_zipfile(brownfield_path):
-        with zipfile.ZipFile(brownfield_path) as zf:
-            base = str(bf_dir.resolve())
-            for member in zf.namelist():
-                dest = (bf_dir / member).resolve()
-                if not str(dest).startswith(base):
-                    continue  # skip path-traversal entries
-                zf.extract(member, bf_dir)
-    else:
-        shutil.copy2(brownfield_path, bf_dir / brownfield_path.name)
+    have_inputs = False
+    if brownfield_path and brownfield_path.exists():
+        bf_dir.mkdir(parents=True, exist_ok=True)
+        if zipfile.is_zipfile(brownfield_path):
+            with zipfile.ZipFile(brownfield_path) as zf:
+                base = str(bf_dir.resolve())
+                for member in zf.namelist():
+                    dest = (bf_dir / member).resolve()
+                    if not str(dest).startswith(base):
+                        continue  # skip path-traversal entries
+                    zf.extract(member, bf_dir)
+        else:
+            shutil.copy2(brownfield_path, bf_dir / brownfield_path.name)
+        have_inputs = True
+
+    # ── Occupancy read-back: previous run's spare duct ways → BF_DUCTS ────
+    # Derived, never fatal (and merged with the uploaded file when one exists).
+    if project_id:
+        try:
+            if occupancy.write_duct_brownfield(project_id, bf_dir) is not None:
+                have_inputs = True
+        except Exception:
+            pass
+
+    if not have_inputs:
+        return []
 
     matches: Dict[str, str] = {}
     # Prefer GeoJSON > GPKG > JSON > SHP when a zip ships the same asset
@@ -1229,7 +1249,7 @@ def _run_pipeline(
             f"OUTPUT_DIR={output_dir}",
             f"POLY_METHOD={int(poly_method or 3)}",
         ]
-        bf_args = _brownfield_args(brownfield_path, output_dir)
+        bf_args = _brownfield_args(brownfield_path, output_dir, project_id)
         if bf_args:
             cmd.extend(bf_args)
             _append(project_id, "info", "Brownfield upload detected; enabling reuse.")
@@ -4309,6 +4329,26 @@ def _run_lld_replan(
         task.update({"stage": "Writing approved survey as brownfield", "updated_at": _now()})
         replan_root = OUTPUT_DIR / project_id / "replan" / lld_version
         bf_args = _write_replan_brownfield(replan_root / "brownfield", dataset)
+        # ── Occupancy read-back: the HLD run's spare duct ways are fed back
+        # as reusable brownfield ducts (occupancy.write_duct_brownfield), so
+        # the re-plan consumes existing spare capacity before laying new duct
+        # and never routes through a full one. Merged into the survey file
+        # when approved survey ducts exist, added as its own BF_DUCTS when not.
+        try:
+            occ_path = occupancy.write_duct_brownfield(
+                project_id, replan_root / "brownfield")
+            if occ_path is not None:
+                arg = "BF_DUCTS=%s" % occ_path
+                if arg not in bf_args:
+                    bf_args.append(arg)
+                if "USE_BROWNFIELD=true" not in bf_args:
+                    bf_args.insert(0, "USE_BROWNFIELD=true")
+                _lld_append(project_id, lld_version, "info",
+                            "Mode B re-plan: fed the HLD run's spare duct ways "
+                            "back as reusable brownfield ducts (%s)." % occ_path)
+        except Exception as exc:  # noqa: BLE001 - derived artefact, never fatal
+            _lld_append(project_id, lld_version, "warn",
+                        "Mode B re-plan: occupancy read-back skipped (%r)." % (exc,))
         if bf_args:
             _lld_append(project_id, lld_version, "info",
                         "Mode B re-plan: brownfield = approved survey segments only (%s); no HLD design layers fed."

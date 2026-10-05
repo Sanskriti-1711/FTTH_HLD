@@ -808,6 +808,60 @@ def store_occupancy(project_id: str, table: str, features: List[Dict[str, Any]])
     return len(rows)
 
 
+def load_occupancy(project_id: str, table: str) -> List[Dict[str, Any]]:
+    """Read a project's stored occupancy registry back as GeoJSON features.
+
+    The counterpart of ``store_occupancy``: the duct/cable occupancy the last
+    run wrote is the capacity the NEXT run (or the LLD) must honour as
+    brownfield, so the read-back side needs the rows back as features rather
+    than counts. Returns ``[]`` whenever the table is missing, empty or the
+    database is unreachable — an unavailable registry must never fail a run.
+    """
+    if table not in ("duct_occupancy", "cable_occupancy"):
+        raise ValueError(f"unknown occupancy table: {table}")
+    try:
+        if not is_available():
+            return []
+        conn = get_conn()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql.SQL("SELECT to_regclass(%s)"),
+                        (f"{GIS_SCHEMA}.{table}",))
+            if cur.fetchone()["to_regclass"] is None:
+                return []
+            cur.execute(
+                sql.SQL(
+                    """
+                    SELECT fid, properties,
+                           CASE WHEN geom IS NULL THEN NULL
+                                ELSE ST_AsGeoJSON(geom)::json END AS geom
+                    FROM {table}
+                    WHERE project_id = %s
+                    ORDER BY fid
+                    """
+                ).format(table=_gis_ident(table)),
+                (project_id,),
+            )
+            rows = cur.fetchall() or []
+    except Exception:
+        return []
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        geom = row.get("geom")
+        if isinstance(geom, str):
+            try:
+                geom = json.loads(geom)
+            except ValueError:
+                geom = None
+        out.append(
+            {
+                "type": "Feature",
+                "geometry": geom,
+                "properties": dict(row.get("properties") or {}),
+            }
+        )
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Layer querying
 # ---------------------------------------------------------------------------

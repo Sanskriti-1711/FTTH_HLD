@@ -1084,6 +1084,26 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
             out_fields, QgsWkbTypes.Point, crs,
         )
 
+        # ── Reuse existing (brownfield) chambers instead of inventing new ones ──
+        # The registry is populated only when the run supplied existing assets
+        # (or a standalone Load Brownfield ran first, with reuse enabled). A
+        # planned chamber that lands on an existing chamber/PDP is the SAME
+        # structure in the ground, so it is labelled Reused and carries the
+        # asset id — the design and the BOQ then agree with what already
+        # exists instead of billing a new chamber. Placement is unchanged.
+        bf_reg = None
+        bf_asset = None
+        try:
+            from ..utils.brownfield import BrownfieldRegistry, AssetType
+            bf_asset = AssetType
+            bf_reg = BrownfieldRegistry.load_from_project()
+            if bf_reg is not None and not bf_reg.has_assets():
+                bf_reg = None
+        except Exception:
+            bf_reg = None
+        chamber_reuse_tol_m = 2.0
+        reused = 0
+
         counters = {"HH": 0, "DHH": 0, "MH": 0}
         reason_counts = {}
         written = 0
@@ -1120,6 +1140,26 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
             feat[COMMON_FIELDS.INFRA_STATUS] = InfraStatus.PROPOSED
             feat[COMMON_FIELDS.VERIFY_STATUS] = VerifyStatus.VERIFIED
             feat[COMMON_FIELDS.STAGE] = "Civil"
+            if bf_reg is not None:
+                try:
+                    hit = bf_reg.find_nearest_point_asset(
+                        QgsPointXY(x, y), chamber_reuse_tol_m,
+                        asset_types={bf_asset.CHAMBER, bf_asset.PDP},
+                    )
+                except Exception:
+                    hit = None
+                if hit is not None:
+                    aid = hit[0]
+                    feat[COMMON_FIELDS.INFRA_STATUS] = InfraStatus.REUSED
+                    feat[COMMON_FIELDS.REUSE_SOURCE] = aid
+                    try:
+                        asset = bf_reg.get_asset(aid)
+                        if asset is not None:
+                            feat[COMMON_FIELDS.VERIFY_STATUS] = asset["verify_status"]
+                        bf_reg.consume_capacity(aid)
+                    except Exception:
+                        pass
+                    reused += 1
             if sink is not None:
                 sink.addFeature(feat, QgsFeatureSink.FastInsert)
                 written += 1
@@ -1140,7 +1180,14 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
             f"they sit on.\n"
             f"  Boundary: {dropped_boundary} candidate(s) outside design boundary removed; "
             f"{snapped_building} chamber(s) snapped out of buildings; "
-            f"{snapped_trench} chamber(s) snapped onto trench paths (tol {self.TRENCH_SNAP_M} m)."))
+            f"{snapped_trench} chamber(s) snapped onto trench paths (tol {self.TRENCH_SNAP_M} m)."
+            + (f"\n  Brownfield: {reused} chamber(s) reused an existing "
+               f"chamber/PDP within {chamber_reuse_tol_m:g} m "
+               f"(INFRA_STATUS={InfraStatus.REUSED}, REUSE_SOURCE set)."
+               if reused else
+               "\n  Brownfield: no planned chamber sat on an existing "
+               "chamber/PDP (within the reuse tolerance)."
+               if bf_reg is not None else "")))
 
         result = {}
         if out_id:

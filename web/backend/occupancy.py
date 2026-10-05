@@ -326,3 +326,87 @@ def store(output_dir: Path, project_id: str) -> Dict[str, int]:
 def publish_for_project(output_dir: Path) -> Dict[str, int]:
     """Alias kept explicit for callers that read as ``occupancy.publish_for_project``."""
     return publish(output_dir)
+
+
+def duct_brownfield_features(project_id: str) -> List[Dict[str, Any]]:
+    """The stored duct occupancy as brownfield DUCT features (capacity read-back).
+
+    A re-run must consume the spare ways the last run left BEFORE it lays a new
+    duct, and never route new duct through a full one. The registry is stored
+    by ``store`` under ``gis.duct_occupancy``; this turns it back into the
+    brownfield feature list the run consumes.
+
+    The capacity fields are named the way the brownfield loader AUTO-DETECTS
+    them (``capacity_total`` / ``capacity_used``): the one-click pipeline
+    exposes no duct-capacity-field parameter, so ``WAYS_TOTAL`` / ``WAYS_USED``
+    alone would be ignored. Only rows with spare ways are exported — a full
+    duct is unusable and the loader skips it anyway.
+    """
+    try:
+        from . import postgis  # package context
+    except ImportError:
+        import postgis  # type: ignore  # top-level engine context
+
+    features: List[Dict[str, Any]] = []
+    try:
+        rows = postgis.load_occupancy(project_id, "duct_occupancy")
+    except Exception:  # noqa: BLE001 - registry is optional, never fatal
+        return features
+    for row in rows:
+        props = dict(row.get("properties") or {})
+        geom = row.get("geometry")
+        if not geom:
+            continue
+        total = _int(props.get("WAYS_TOTAL"))
+        used = _int(props.get("WAYS_USED"))
+        if total <= 0:
+            continue
+        if max(0, total - used) <= 0:
+            continue  # full duct: never reusable
+        out = dict(props)
+        out["capacity_total"] = total
+        out["capacity_used"] = used
+        out["capacity_source"] = "duct_occupancy"
+        # Prefer the previous run's own verified status; otherwise the survey
+        # still has to confirm the spare capacity in the field.
+        out.setdefault("verify_status", props.get("VERIFY_STATUS") or "Assumed")
+        # Preferred (weight 0.1x), never mandatory: the router may still find a
+        # better path, but existing spare ways are consumed before new duct.
+        out["USE_MODE"] = "brownfield"
+        features.append({"type": "Feature", "geometry": geom, "properties": out})
+    return features
+
+
+def write_duct_brownfield(project_id: str, bf_dir: Path) -> Optional[Path]:
+    """Export a project's stored duct occupancy as ``bf_ducts.geojson`` for a re-run.
+
+    Merges into an existing ``bf_ducts.geojson`` (an uploaded / approved-survey
+    duct file) so BOTH the field survey and the previous run's spare capacity
+    are honoured, and returns the file path — or ``None`` there is nothing to
+    feed. Never raises: a read-back failure must not fail the run it feeds.
+    """
+    try:
+        features = duct_brownfield_features(project_id)
+    except Exception:  # noqa: BLE001
+        return None
+    if not features:
+        return None
+    try:
+        bf_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    path = bf_dir / "bf_ducts.geojson"
+    existing: List[Dict[str, Any]] = []
+    if path.is_file():
+        try:
+            existing = (json.loads(path.read_text(encoding="utf-8")) or {}).get(
+                "features") or []
+        except (OSError, ValueError):
+            existing = []
+    # Occupancy rows go LAST: a duplicate id already in the survey file keeps
+    # its field reading (the loader mints BF_<id>, so the survey id wins).
+    try:
+        _write(path, list(existing) + features, "EPSG:4326")
+    except OSError:
+        return None
+    return path

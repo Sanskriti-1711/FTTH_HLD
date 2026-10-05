@@ -257,11 +257,30 @@ class PoleLayerAlgorithm(QgsProcessingAlgorithm):
                     return True
             return False
 
+        # ── Reuse existing (brownfield) poles instead of inventing new ones ──
+        # Same rule as the chamber layer: a planned pole that lands on an
+        # existing surveyed pole is the SAME asset. Label it Reused and carry
+        # the registry id, so a brownfield area is not billed for poles it
+        # already owns. Placement is unchanged.
+        bf_reg = None
+        bf_asset = None
+        try:
+            from ..utils.brownfield import BrownfieldRegistry, AssetType
+            bf_asset = AssetType
+            bf_reg = BrownfieldRegistry.load_from_project()
+            if bf_reg is not None and not bf_reg.has_assets():
+                bf_reg = None
+        except Exception:
+            bf_reg = None
+        pole_reuse_tol_m = 2.0
+        reused_poles = 0
+
         counters = {"Pole": 0, "h7m": 0, "h9m": 0}
         placed_xy = []
 
         def _emit(x, y, cable_cnt, near_feed):
             """One pole at (x, y); refused when a pole is already within 1 m."""
+            nonlocal reused_poles
             for px, py in placed_xy:
                 if ((px - x) ** 2 + (py - y) ** 2) ** 0.5 < 1.0:
                     return False
@@ -286,6 +305,26 @@ class PoleLayerAlgorithm(QgsProcessingAlgorithm):
             feat[COMMON_FIELDS.INFRA_STATUS] = InfraStatus.PROPOSED
             feat[COMMON_FIELDS.VERIFY_STATUS] = VerifyStatus.VERIFIED
             feat[COMMON_FIELDS.STAGE] = "Civil"
+            if bf_reg is not None:
+                try:
+                    hit = bf_reg.find_nearest_point_asset(
+                        QgsPointXY(x, y), pole_reuse_tol_m,
+                        asset_types={bf_asset.POLE},
+                    )
+                except Exception:
+                    hit = None
+                if hit is not None:
+                    aid = hit[0]
+                    feat[COMMON_FIELDS.INFRA_STATUS] = InfraStatus.REUSED
+                    feat[COMMON_FIELDS.REUSE_SOURCE] = aid
+                    try:
+                        asset = bf_reg.get_asset(aid)
+                        if asset is not None:
+                            feat[COMMON_FIELDS.VERIFY_STATUS] = asset["verify_status"]
+                        bf_reg.consume_capacity(aid)
+                    except Exception:
+                        pass
+                    reused_poles += 1
             if sink is not None and sink.addFeature(
                     feat, QgsFeatureSink.FastInsert):
                 return True
@@ -398,7 +437,14 @@ class PoleLayerAlgorithm(QgsProcessingAlgorithm):
 
         feedback.pushInfo(self.tr(
             f"Pole layer: {counters['Pole']} poles planned in aerial zones "
-            f"(7 m: {counters['h7m']}, 9 m: {counters['h9m']})."))
+            f"(7 m: {counters['h7m']}, 9 m: {counters['h9m']})."
+            + (f"\n  Brownfield: {reused_poles} pole(s) reused an existing "
+               f"pole within {pole_reuse_tol_m:g} m "
+               f"(INFRA_STATUS={InfraStatus.REUSED}, REUSE_SOURCE set)."
+               if reused_poles else
+               "\n  Brownfield: no planned pole sat on an existing pole "
+               "(within the reuse tolerance)."
+               if bf_reg is not None else "")))
 
         result = {}
         if out_id:
