@@ -29,6 +29,12 @@ try:
 except Exception:
     gdal = None
 
+# How far an MFG's service-area boundary is grown beyond its member premise
+# polygons so a group of separate footprints reads as one region. The boundary
+# is made disjoint across areas at write time (see the MFG service-area pass);
+# it used to be a convex hull, which bridged across neighbours and overlapped.
+MFG_SERVICE_BOUNDARY_BUFFER_M = 10.0
+
 def _has(alg_id: str) -> bool:
     try:
         return QgsApplication.processingRegistry().algorithmById(alg_id) is not None
@@ -54,6 +60,37 @@ def _thin_feature(fields: QgsFields, geom: QgsGeometry, attrs: dict) -> QgsFeatu
         if fields.indexOf(name) >= 0:
             f[name] = value
     return f
+
+
+def _disjoin_service_areas(geometries):
+    """Make MFG service-area geometries pairwise disjoint, deterministically.
+
+    ``geometries`` is an iterable of ``(mfg_id, QgsGeometry)``. The member
+    premise polygons are disjoint (a polygon belongs to exactly one MFG), but the
+    service boundary is a buffered union of them, so two areas can still overlap
+    where neighbouring groups sit close together. Process in MFG-id order and let
+    each area keep only the ground no earlier area claimed, so the lower id wins
+    an overlap and the result never depends on iteration order.
+
+    Raises ``QgsProcessingException`` for a non-polygonal or empty result, which
+    is a data error rather than something to publish as a boundary.
+    """
+    out = {}
+    taken = None
+    for mfg_id, geometry in sorted(geometries, key=lambda item: item[0]):
+        if taken is not None and not taken.isEmpty():
+            geometry = geometry.difference(taken)
+        if geometry is None or geometry.isEmpty() or (
+            QgsWkbTypes.geometryType(geometry.wkbType())
+            != QgsWkbTypes.PolygonGeometry
+        ):
+            raise QgsProcessingException(
+                f"{mfg_id}: service-area boundary is not polygonal."
+            )
+        geometry.convertToMultiType()
+        out[mfg_id] = geometry
+        taken = geometry if taken is None else taken.combine(geometry)
+    return out
 
 # prefer makevalid; fallback to fixgeometries
 
@@ -1677,19 +1714,17 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
                         f"{area['mfg_id']}: could not build its service-area geometry."
                     )
                 # MFG serves an area, not the individual premise/polygon
-                # footprints. The convex envelope is one service-boundary
-                # feature per MFG; the original premise polygons remain
-                # unchanged in Polygons.gpkg.
-                area_geometry = member_union.convexHull()
-                if area_geometry is None or area_geometry.isEmpty() or (
-                    QgsWkbTypes.geometryType(area_geometry.wkbType())
-                    != QgsWkbTypes.PolygonGeometry
-                ):
-                    raise QgsProcessingException(
-                        f"{area['mfg_id']}: service-area boundary is not polygonal."
-                    )
-                area_geometry.convertToMultiType()
-                mfg_service_geometries[area["mfg_id"]] = area_geometry
+                # footprints, so the boundary is the members grown slightly to
+                # read as one region. A convex hull must NOT be used here: a hull
+                # of an interleaved group bridges across its neighbours, so the
+                # areas overlapped - on a North Edgbaston run MFG00006's hull was
+                # 430% of its members' area and covered all of MFG00001. The
+                # disjoint pass after this loop removes any overlap the buffer
+                # introduces. Original premise polygons stay unchanged in
+                # Polygons.gpkg.
+                mfg_service_geometries[area["mfg_id"]] = member_union.buffer(
+                    MFG_SERVICE_BOUNDARY_BUFFER_M, 8
+                )
 
                 seed_geometry = polygon_geometries[area["seed_polygon"]]
                 seed_road_node = mfg_locations.get(area["seed_polygon"])
@@ -1713,6 +1748,12 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
                             f"{area['mfg_id']}: seed polygon is {road_offset:.1f} m from an eligible road."
                         )
                 mfg_geometries[area["mfg_id"]] = final_geom
+
+            # Two service areas must never cover the same ground; see
+            # `_disjoin_service_areas` for the rule.
+            mfg_service_geometries = _disjoin_service_areas(
+                mfg_service_geometries.items()
+            )
 
             out_fields_m = build_fields(THIN_PROFILES["MFG"])
             for _name, _type in (
