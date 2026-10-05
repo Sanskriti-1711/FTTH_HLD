@@ -20,12 +20,13 @@ from typing import Any, Dict, Iterable, List, Optional
 
 try:
     import psycopg2
-    from psycopg2.extras import Json, RealDictCursor
+    from psycopg2.extras import Json, RealDictCursor, execute_values
     from psycopg2 import sql
 except ImportError:  # pragma: no cover - handled by API diagnostics
     psycopg2 = None  # type: ignore
     Json = None  # type: ignore
     RealDictCursor = None  # type: ignore
+    execute_values = None  # type: ignore
     sql = None  # type: ignore
 
 
@@ -664,28 +665,39 @@ def load_geojson(
             )
         if not rows:
             return 0
-        cur.executemany(
-            sql.SQL(
-                """
-                INSERT INTO {table} (
-                    project_id, fid, geom, "POLYGON_ID", "PDP_ID", "MFG_ID",
-                    "SRC_ID", "STAGE", properties
-                )
-                VALUES (
-                    %s, %s,
-                    CASE
-                        WHEN %s IS NULL THEN NULL
-                        WHEN %s = 4326 THEN ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326)
-                        ELSE ST_Transform(ST_SetSRID(ST_GeomFromGeoJSON(%s), %s), 4326)
-                    END,
-                    %s, %s, %s, %s, %s, %s
-                )
-                """
-            ).format(table=_gis_ident(table)),
+        # ``executemany`` sends one statement per row: against a remote PostGIS
+        # that is one network round-trip per feature (measured 36 ms/row — the
+        # objects layer alone cost 49-58 s, and the whole ingest ~6.5 min).
+        # ``execute_values`` folds a page of rows into a single multi-row INSERT
+        # so the round-trips collapse: the same 1,359 rows went 58 s -> 1.0 s.
+        query = sql.SQL(
+            """
+            INSERT INTO {table} (
+                project_id, fid, geom, "POLYGON_ID", "PDP_ID", "MFG_ID",
+                "SRC_ID", "STAGE", properties
+            )
+            VALUES %s
+            """
+        ).format(table=_gis_ident(table)).as_string(conn)
+        template = (
+            "(%s, %s,"
+            " CASE"
+            "  WHEN %s IS NULL THEN NULL"
+            "  WHEN %s = 4326 THEN ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326)"
+            "  ELSE ST_Transform(ST_SetSRID(ST_GeomFromGeoJSON(%s), %s), 4326)"
+            " END,"
+            " %s, %s, %s, %s, %s, %s)"
+        )
+        execute_values(
+            cur,
+            query,
             [
                 (
                     project_id,
                     fid,
+                    # geom appears twice per branch: the CASE tests it for NULL
+                    # and then parses it, so the placeholder count is one more
+                    # than the number of distinct values.
                     geom,
                     source_srid,
                     geom,
@@ -710,6 +722,8 @@ def load_geojson(
                     props,
                 ) in rows
             ],
+            template=template,
+            page_size=500,
         )
     return len(rows)
 
@@ -771,21 +785,25 @@ def store_occupancy(project_id: str, table: str, features: List[Dict[str, Any]])
             ),
             (project_id,),
         )
-        cur.executemany(
-            sql.SQL(
-                """
-                INSERT INTO {table} (
-                    project_id, fid, geom, "PDP_ID", "SRC_ID", properties
-                )
-                VALUES (
-                    %s, %s,
-                    CASE WHEN %s IS NULL THEN NULL
-                         ELSE ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326) END,
-                    %s, %s, %s
-                )
-                """
-            ).format(table=_gis_ident(table)),
+        # Batched for the same reason as load_geojson: one round-trip per
+        # occupancy row against a remote PostGIS dominated the derivation.
+        query = sql.SQL(
+            """
+            INSERT INTO {table} (
+                project_id, fid, geom, "PDP_ID", "SRC_ID", properties
+            )
+            VALUES %s
+            """
+        ).format(table=_gis_ident(table)).as_string(conn)
+        execute_values(
+            cur,
+            query,
             rows,
+            template=("(%s, %s,"
+                      " CASE WHEN %s IS NULL THEN NULL"
+                      "  ELSE ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326) END,"
+                      " %s, %s, %s)"),
+            page_size=500,
         )
     return len(rows)
 

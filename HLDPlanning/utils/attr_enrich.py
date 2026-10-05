@@ -20,9 +20,11 @@ segfaults.  Every function here therefore:
   2. creates them in one pass,
   3. then iterates features and sets values.
 """
+import functools
 import json
 import math
 import os
+import time
 from collections import deque
 
 try:
@@ -53,6 +55,38 @@ except ImportError:  # QGIS may load the module under the plugin package name.
         drop_capacity_warning,
         drop_fiber_capacity,
     )
+
+def _profiled(label=None):
+    """Log the wall-clock cost of one enrichment sub-step.
+
+    ``enrich_all`` reports a single total, which only sizes the whole post-pass;
+    on a 1,359-premise area the sub-steps range from milliseconds to minutes, so
+    the expensive one is invisible.  This makes it visible (and lets it be
+    optimised deliberately).  Set ``HLD_ATTR_PROFILE=0`` to silence it.
+    """
+    def _deco(fn):
+        step = label or fn.__name__
+
+        @functools.wraps(fn)
+        def _wrap(*args, **kwargs):
+            if os.environ.get("HLD_ATTR_PROFILE", "1") == "0":
+                return fn(*args, **kwargs)
+            feedback = None
+            for candidate in list(args) + list(kwargs.values()):
+                if hasattr(candidate, "pushInfo"):
+                    feedback = candidate
+                    break
+            t0 = time.time()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                if feedback is not None:
+                    feedback.pushInfo(
+                        "  [timing] enrich/%s: %.3fs" % (step, time.time() - t0)
+                    )
+        return _wrap
+    return _deco
+
 
 CAPACITY_FIELDS = [
     ("RESERVED_SPARE_FIBERS", ogr.OFTInteger if _HAS_OGR else None),
@@ -263,6 +297,65 @@ def _line_points(feat):
 # Lookup layers are static while the enrichment runs, and ``_nearest_id`` is
 # called twice per duct row, so the parsed features are kept per process.
 _NEAREST_CACHE = {}
+# Geometries are also bucketed into a coarse grid so a nearest query scans only
+# the features whose box reaches the query point — the cached list alone still
+# made every query a full distance scan over the layer (2018 trench spans per
+# duct, ~12M GEOS Distance calls / ~114s on a 1,359-premise area).  The cell is
+# in projected metres (the layers the callers look up are in the design CRS).
+_NEAREST_CELL_M = 25.0
+# A feature whose box covers more cells than this (a very long line) is kept in
+# a fallback list that every query scans, rather than filling the grid.
+_NEAREST_MAX_CELLS = 4096
+
+
+def _nearest_index(path, id_fields):
+    """``(items, grid, large, cell)`` for ``path``, cached for the process.
+
+    ``items`` is ``[(cloned geometry, id value)]`` (only features carrying one
+    of ``id_fields``); ``grid`` maps ``(cx, cy)`` -> item indices whose envelope
+    overlaps that cell; ``large`` holds indices not worth gridding.  A query
+    scans the cells its tolerance reaches plus ``large``, so it stays exact —
+    geometry nearer than the tolerance always shares a cell with the query
+    (its own envelope's nearest point is inside the tolerance box).
+    """
+    key = (str(path), tuple(id_fields))
+    hit = _NEAREST_CACHE.get(key)
+    if hit is not None:
+        return hit
+    items = []
+    ds, lyr = _open_lyr(path)
+    if lyr is not None:
+        for f in lyr:
+            g = f.GetGeometryRef()
+            if g is None or g.IsEmpty():
+                continue
+            v = ""
+            for fld in id_fields:
+                val = _get(lyr, f, fld)
+                if val not in (None, ""):
+                    v = str(val)
+                    break
+            if v:
+                items.append((g.Clone(), v))
+        ds = None
+    grid = {}
+    large = []
+    cell = _NEAREST_CELL_M
+    for i, (g, _v) in enumerate(items):
+        env = g.GetEnvelope()          # (minx, maxx, miny, maxy)
+        cx0 = int(math.floor(env[0] / cell))
+        cx1 = int(math.floor(env[1] / cell))
+        cy0 = int(math.floor(env[2] / cell))
+        cy1 = int(math.floor(env[3] / cell))
+        if (cx1 - cx0 + 1) * (cy1 - cy0 + 1) > _NEAREST_MAX_CELLS:
+            large.append(i)
+            continue
+        for cx in range(cx0, cx1 + 1):
+            for cy in range(cy0, cy1 + 1):
+                grid.setdefault((cx, cy), []).append(i)
+    hit = (items, grid, large, cell)
+    _NEAREST_CACHE[key] = hit
+    return hit
 
 
 def _nearest_geoms(path, id_fields):
@@ -277,28 +370,8 @@ def _nearest_geoms(path, id_fields):
     rather than borrowed because a borrowed geometry is invalidated when its
     datasource closes.
     """
-    key = (str(path), tuple(id_fields))
-    hit = _NEAREST_CACHE.get(key)
-    if hit is not None:
-        return hit
-    out = []
-    ds, lyr = _open_lyr(path)
-    if lyr is not None:
-        for f in lyr:
-            g = f.GetGeometryRef()
-            if g is None or g.IsEmpty():
-                continue
-            v = ""
-            for fld in id_fields:
-                val = _get(lyr, f, fld)
-                if val not in (None, ""):
-                    v = str(val)
-                    break
-            if v:
-                out.append((g.Clone(), v))
-        ds = None
-    _NEAREST_CACHE[key] = out
-    return out
+    items, _grid, _large, _cell = _nearest_index(path, id_fields)
+    return items
 
 
 def _nearest_id(path, x, y, tol_m, id_fields):
@@ -310,11 +383,25 @@ def _nearest_id(path, x, y, tol_m, id_fields):
     """
     if isinstance(id_fields, str):
         id_fields = [id_fields]
+    items, grid, large, cell = _nearest_index(path, id_fields)
+    if not items:
+        return ""
+    candidates = set(large)
+    lo_x = int(math.floor((x - tol_m) / cell))
+    hi_x = int(math.floor((x + tol_m) / cell))
+    lo_y = int(math.floor((y - tol_m) / cell))
+    hi_y = int(math.floor((y + tol_m) / cell))
+    for cx in range(lo_x, hi_x + 1):
+        for cy in range(lo_y, hi_y + 1):
+            candidates.update(grid.get((cx, cy), ()))
     best = ""
     best_d = tol_m
     dg = ogr.Geometry(ogr.wkbPoint)
     dg.AddPoint(x, y)
-    for g, v in _nearest_geoms(path, id_fields):
+    # Ascending item order preserves the original tie-breaking (the last of
+    # several equally-near features wins, exactly as the old linear scan did).
+    for i in sorted(candidates):
+        g, v = items[i]
         try:
             dist = g.Distance(dg)
         except Exception:
@@ -339,6 +426,7 @@ def _first_field_value(path, field):
 
 # ── Trench enrichment ────────────────────────────────────────────────────────
 
+@_profiled("enrich_trench_sublayers")
 def enrich_trench_sublayers(out_dir, feedback=None):
     """Write USAGE_TYPE / CONSTRUCT (+ trench_type when missing) onto the
     Feeder/Distribution/Garden sub-layer GPKGs so the per-tier layers carry
@@ -679,6 +767,7 @@ def attribute_section_streets(trench_path, roads_source, feedback=None):
     return total
 
 
+@_profiled("enrich_trenches")
 def enrich_trenches(trench_path, feedback=None, roads_lyr=None):
     ds, lyr = _open_lyr(trench_path)
     if lyr is None:
@@ -1723,6 +1812,7 @@ def _segment_layer_at_chambers(path, chambers, feedback=None, label="layer",
     return published
 
 
+@_profiled("segment_trenches_at_chambers")
 def segment_trenches_at_chambers(trench_path, chamber_path, feedback=None,
                                  snap_tol_m=5.0):
     """Publish Final_Trenches as chamber-to-chamber spans (see the segmenter)."""
@@ -1735,6 +1825,7 @@ def segment_trenches_at_chambers(trench_path, chamber_path, feedback=None,
         trench_path, chambers, feedback, "Final_Trenches", snap_tol_m)
 
 
+@_profiled("segment_ducts_at_chambers")
 def segment_ducts_at_chambers(feeder_path, dist_path, chamber_path,
                               feedback=None, snap_tol_m=10.0,
                               trench_path=None):
@@ -1853,6 +1944,7 @@ def _region_tap_points(path):
     return out
 
 
+@_profiled("confine_distribution_to_region")
 def confine_distribution_to_region(dist_path, poly_path, tap_path,
                                    trench_path=None, feedback=None,
                                    tol_m=DIST_REGION_TOL_M,
@@ -2169,6 +2261,7 @@ def _confine_one_layer(path, polys, taps, trench, links, feedback,
 
 # ── Duct enrichment ──────────────────────────────────────────────────────────
 
+@_profiled("enrich_ducts")
 def enrich_ducts(feeder_path, dist_path, drop_path, trench_path, chamber_path, feedback=None):
     total = 0
     for path, profile_key in (
@@ -2390,6 +2483,7 @@ def _covered_share(geom_a, geom_b, tol_m=_DBL_COVER_M):
     return covered / total if total > 0 else 1.0
 
 
+@_profiled("merge_ducts_per_chamber_span")
 def merge_ducts_per_chamber_span(path, feedback=None, label="Feeder ducts"):
     """Fold the ducts that ride the SAME corridor of a chamber pair into ONE.
 
@@ -2563,6 +2657,7 @@ def _min_line_dist(geom_a, geom_b):
 _STUB_COINCIDENT_M = 1.0
 
 
+@_profiled("absorb_chamber_stubs")
 def absorb_chamber_stubs(path, feedback=None,
                          label="Feeder ducts", mode="absorb", floor=4):
     """Remove ducts that begin and end at the SAME chamber.
@@ -2755,6 +2850,7 @@ def absorb_chamber_stubs(path, feedback=None,
     return absorbed
 
 
+@_profiled("propagate_duct_pdp_id")
 def propagate_duct_pdp_id(path, feedback=None, label="Distribution ducts"):
     """Give every duct its owning splitter, so POLYGON_ID *and* PDP_ID resolve.
 
@@ -2828,6 +2924,7 @@ def _dist_point_seg(px, py, ax, ay, bx, by):
     return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
 
 
+@_profiled("link_couplers_to_ducts")
 def link_couplers_to_ducts(coupler_path, dist_path, drop_path,
                            feedback=None, tol_m=5.0):
     """Name BOTH ducts on every coupler: the distribution and the drop side.
@@ -2846,11 +2943,53 @@ def link_couplers_to_ducts(coupler_path, dist_path, drop_path,
     # One entry PER PART (a duct is published as a MultiLineString): measuring
     # across parts would invent segments that are not in the data.
     ducts = []
+    # The published distribution duct carries its id as ``duct_uid`` (the duct
+    # stage renames the QGIS DUCT_UID on the OGR side); DUCT_ID is kept first so
+    # a run whose duct layer still exposes that name is unaffected. Reading only
+    # ``DUCT_ID`` found no field at all, so every coupler was written a blank
+    # DIST_DUCT_ID — the pass spent its full runtime and linked nothing.
     for f in dlyr:
-        did = str(_get(dlyr, f, "DUCT_ID") or "").strip()
+        did = ""
+        for _fld in ("DUCT_ID", "DUCT_UID"):
+            _v = _get(dlyr, f, _fld)
+            if _v not in (None, ""):
+                did = str(_v).strip()
+                break
         dpoly = str(_get(dlyr, f, "POLYGON_ID") or "").strip()
         for part in _geom_parts(f.geometry()):
             ducts.append({"id": did, "poly": dpoly, "pts": part})
+    # Bucket the duct parts into the same coarse metre grid stamp_region_identity
+    # and _nearest_id use, so a coupler only measures the parts whose envelope
+    # reaches within ``tol_m`` of it.  Without it every coupler scanned every
+    # part (~1400 couplers x ~2500 parts = 3.5M segment-distance calls / ~43s on
+    # a 1,359-premise area).  The grid is exact: a part nearer than the tolerance
+    # necessarily has a point inside the tolerance box, so it is indexed in a
+    # cell the query scans; parts too long to grid go to ``large`` and are always
+    # scanned.  Geographic CRSs are left to the original linear scan (a degree
+    # grid would be meaningless).
+    cell_m = _NEAREST_CELL_M
+    grid = None
+    large = []
+    try:
+        srs = dlyr.GetSpatialRef()
+        if (srs is None or srs.IsProjected()) and ducts:
+            grid = {}
+            for i, d in enumerate(ducts):
+                pts = d["pts"]
+                minx = min(p[0] for p in pts)
+                maxx = max(p[0] for p in pts)
+                miny = min(p[1] for p in pts)
+                maxy = max(p[1] for p in pts)
+                cx0, cx1 = int(math.floor(minx / cell_m)), int(math.floor(maxx / cell_m))
+                cy0, cy1 = int(math.floor(miny / cell_m)), int(math.floor(maxy / cell_m))
+                if (cx1 - cx0 + 1) * (cy1 - cy0 + 1) > _NEAREST_MAX_CELLS:
+                    large.append(i)
+                    continue
+                for cx in range(cx0, cx1 + 1):
+                    for cy in range(cy0, cy1 + 1):
+                        grid.setdefault((cx, cy), []).append(i)
+    except Exception:
+        grid = None
     dl = None
     if not ducts:
         return 0
@@ -2882,7 +3021,22 @@ def link_couplers_to_ducts(coupler_path, dist_path, drop_path,
         poly = str(_get(lyr, f, "POLYGON_ID") or "").strip().upper()
         best_id, best_d, best_same = "", float("inf"), 0
         best_score = float("inf")
-        for d in ducts:
+        if grid is None:
+            candidates = range(len(ducts))
+        else:
+            # Every part whose envelope reaches the tolerance box is a candidate;
+            # the box may be smaller than a cell, so query every cell it touches.
+            found = set(large)
+            lo_x = int(math.floor((px - tol_m) / cell_m))
+            hi_x = int(math.floor((px + tol_m) / cell_m))
+            lo_y = int(math.floor((py - tol_m) / cell_m))
+            hi_y = int(math.floor((py + tol_m) / cell_m))
+            for cx in range(lo_x, hi_x + 1):
+                for cy in range(lo_y, hi_y + 1):
+                    found.update(grid.get((cx, cy), ()))
+            candidates = sorted(found)
+        for di in candidates:
+            d = ducts[di]
             pts = d["pts"]
             dist = min(_dist_point_seg(px, py, pts[i][0], pts[i][1],
                                        pts[i + 1][0], pts[i + 1][1])
@@ -2956,6 +3110,7 @@ def _hh_per_pdp(objects_path):
     return out
 
 
+@_profiled("enrich_cables")
 def enrich_cables(feeder_path, dist_path, objects_path, mfg_path, feedback=None):
     total = 0
     hh_by_pdp = _hh_per_pdp(objects_path)
@@ -3052,6 +3207,7 @@ def enrich_cables(feeder_path, dist_path, objects_path, mfg_path, feedback=None)
 
 # ── Equipment enrichment ─────────────────────────────────────────────────────
 
+@_profiled("enrich_equipment")
 def enrich_equipment(pdp_path, mfg_path, feedback=None):
     total = 0
 
@@ -3285,6 +3441,7 @@ def _components(segments, snap_m=_DUCT_SNAP_M):
     return nodes, groups, segment_nodes
 
 
+@_profiled("verify_duct_continuity")
 def verify_duct_continuity(out_dir, feedback=None, include_distribution=True):
     """Log feeder reach and, optionally, distribution/coupler reach.
 
@@ -3540,6 +3697,7 @@ def _polygon_index(out_dir):
     return out
 
 
+@_profiled("stamp_region_identity")
 def stamp_region_identity(out_dir, feedback=None):
     """Put POLYGON_ID (and the PDP link where one exists) on EVERY layer.
 
@@ -3567,6 +3725,14 @@ def stamp_region_identity(out_dir, feedback=None):
                 "(the layer is written by the polygon stage).")
         return 0
 
+    # An axis-aligned box per polygon, checked before the expensive GEOS call.
+    # Without it this pass ran one ``Intersection``/``Contains`` per
+    # (feature, polygon) pair — ~500k GEOS calls and ~330s on a 1,359-premise
+    # area, the single largest cost in the whole run.  A box test is exact-safe:
+    # geometry that overlaps inside a polygon overlaps that polygon's box too,
+    # so it can only skip pairs that cannot match (no false negatives).
+    poly_envs = [(pid, poly, poly.GetEnvelope()) for pid, poly in polys]
+
     written = 0
     report = []
 
@@ -3590,6 +3756,11 @@ def stamp_region_identity(out_dir, feedback=None):
             continue
         is_point = label in ("chamber", "trench node")
         filled = blank = 0
+        # Batch the writes: a GPKG SetFeature outside a transaction commits (and
+        # fsyncs) per row, which made this pass ~340s on a 1,359-premise area
+        # even after the geometry work itself became cheap. Every other writer
+        # in this module already batches this way.
+        lyr.StartTransaction()
         for ft in lyr:
             if str(ft.GetField(i_f) or "").strip():
                 continue                     # never overwrite what is known
@@ -3602,7 +3773,10 @@ def stamp_region_identity(out_dir, feedback=None):
                     cx, cy = g.GetX(), g.GetY()
                     pg = _pt_geom(cx, cy)
                     best, best_d = "", None
-                    for pid, poly in polys:
+                    for pid, poly, env in poly_envs:
+                        if not (env[0] - _REGION_POINT_TOL_M <= cx <= env[1] + _REGION_POINT_TOL_M
+                                and env[2] - _REGION_POINT_TOL_M <= cy <= env[3] + _REGION_POINT_TOL_M):
+                            continue
                         if poly.Contains(pg):
                             best, best_d = pid, -1.0
                             break
@@ -3611,8 +3785,14 @@ def stamp_region_identity(out_dir, feedback=None):
                             best, best_d = pid, d
                     val = best
                 else:
+                    # The feature's own box, so a polygon that cannot touch it
+                    # is rejected before Intersection ever runs.
+                    genv = g.GetEnvelope()
                     overlaps = []
-                    for pid, poly in polys:
+                    for pid, poly, env in poly_envs:
+                        if (env[1] < genv[0] or env[0] > genv[1]
+                                or env[3] < genv[2] or env[2] > genv[3]):
+                            continue
                         try:
                             inter = poly.Intersection(g)
                         except Exception:
@@ -3632,6 +3812,7 @@ def stamp_region_identity(out_dir, feedback=None):
                     blank += 1
             except Exception:
                 blank += 1
+        lyr.CommitTransaction()
         written += filled
         report.append((label, filled, blank))
         ds = None
@@ -3657,6 +3838,7 @@ def stamp_region_identity(out_dir, feedback=None):
         if lyr is not None:
             _create_fields(lyr, [("PDP_ID", ogr.OFTString, 24)])
             i_pdp = lyr.GetLayerDefn().GetFieldIndex("PDP_ID")
+            lyr.StartTransaction()
             for ft in lyr:
                 if i_pdp < 0 or str(ft.GetField(i_pdp) or "").strip():
                     continue
@@ -3670,6 +3852,7 @@ def stamp_region_identity(out_dir, feedback=None):
                     ft.SetField(i_pdp, hit)
                     lyr.SetFeature(ft)
                     pdp_written += 1
+            lyr.CommitTransaction()
             ds = None
     written += pdp_written
 
@@ -3985,6 +4168,7 @@ def _mfg_from_geometry(geom, kind, by_poly, polys):
     return by_poly.get(overlaps[0][1], "")
 
 
+@_profiled("stamp_mfg_identity")
 def stamp_mfg_identity(out_dir, feedback=None):
     """Put the owning MFG on every published component.
 
@@ -4147,6 +4331,7 @@ def _previous_surface_review(path):
     return data if isinstance(data, dict) else None
 
 
+@_profiled("verify_surface_geometry")
 def verify_surface_geometry(out_dir, feedback=None, roads_source=None):
     """Flag trenches whose drawn position contradicts the SURFACE they claim.
 

@@ -38,10 +38,12 @@ import json
 import math
 import os
 import re
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Optional
@@ -252,6 +254,119 @@ def _throttle_interval(provider: Optional[str] = None) -> float:
             return value
     provider = provider or _provider_name()
     return GEMINI_DEFAULT_MIN_INTERVAL_SECONDS if provider == "gemini" else 0.0
+
+
+def _review_concurrency() -> int:
+    """How many vision calls may overlap; ``SURFACE_AI_CONCURRENCY`` (default 4).
+
+    Call STARTS stay ``_throttle_interval`` apart (the gate serialises the
+    pacing), so the request rate against the provider is unchanged; the setting
+    only lets the per-call network latency — imagery download plus inference,
+    measured ~35 s per span against ~6 s of pacing — overlap instead of running
+    strictly end to end.  Set to 1 for the original serial behaviour.
+    """
+    raw = os.environ.get("SURFACE_AI_CONCURRENCY", "").strip()
+    try:
+        value = int(raw) if raw else 4
+    except (TypeError, ValueError):
+        value = 4
+    return max(1, min(value, 8))
+
+
+class _CallGate:
+    """Pace call STARTS across threads so concurrency keeps the request rate."""
+
+    def __init__(self, throttle: float) -> None:
+        self.throttle = max(0.0, float(throttle))
+        self._lock = threading.Lock()
+        self._last: Optional[float] = None
+
+    def __call__(self) -> None:
+        if self.throttle <= 0:
+            return
+        # Held across the sleep: a second caller waits for the lock and then
+        # re-checks, so starts are spaced by ``throttle`` no matter how many
+        # threads are in flight.
+        with self._lock:
+            now = time.monotonic()
+            if self._last is not None:
+                gap = self.throttle - (now - self._last)
+                if gap > 0:
+                    time.sleep(gap)
+            self._last = time.monotonic()
+
+
+def _review_one(candidate: dict, image_provider, classify, api_key: str,
+                model: str, pace) -> tuple:
+    """Review one span: fetch imagery, classify it, return ``(item, outcome)``.
+
+    ``outcome`` is ``"ok"``, ``"quota"`` or ``"error"``.  ``pace()`` runs
+    before the network work so the caller controls how calls are spaced (a
+    serial closure for the default path, a :class:`_CallGate` when concurrent).
+    The item shape is unchanged from the serial implementation, so serial and
+    concurrent batches write identical artifacts.
+    """
+    item = {
+        "span_id": _candidate_key(candidate),
+        "claimed_surface": candidate.get("claimed"),
+        "coordinates": candidate.get("coordinates"),
+        "coordinates_crs": candidate.get("coordinates_crs"),
+        "geometry_reason": candidate.get("reason"),
+        "geometry_confidence": candidate.get("confidence"),
+        "known_share": candidate.get("known_share"),
+        "review_status": "pending",
+        "review_required": True,
+        "AI_SURFACE": None,
+        "confidence": None,
+        "imagery_source": None,
+        "imagery_date": None,
+        "imagery_route_overlaid": None,
+        "reason": None,
+        "error_detail": None,
+    }
+    try:
+        pace()
+        image = image_provider(candidate)
+        if not image:
+            item.update(review_status="no_imagery", review_required=True,
+                        reason="No imagery available for this span.")
+        else:
+            if not isinstance(image, dict):
+                raise ValueError("Imagery provider must return an image record")
+            source = str(image.get("source") or "").strip()
+            date = image.get("date")
+            if not source:
+                raise ValueError("Imagery provider must identify its source")
+            if date is not None and not str(date).strip():
+                date = None
+            item["imagery_source"] = source
+            item["imagery_date"] = str(date) if date else None
+            overlaid = image.get("route_overlaid")
+            item["imagery_route_overlaid"] = None if overlaid is None else bool(overlaid)
+            result = classify(
+                image["image_bytes"], image.get("mime_type", "image/jpeg"),
+                api_key or "", model,
+            )
+            if result.get("ai_surface") not in FAMILIES and result.get("ai_surface") is not None:
+                raise ValueError("Classifier returned an unsupported surface family")
+            confidence = float(result.get("confidence"))
+            if not 0.0 <= confidence <= 1.0:
+                raise ValueError("Classifier returned invalid confidence")
+            item["AI_SURFACE"] = result.get("ai_surface")
+            item["confidence"] = round(confidence, 3)
+            item["reason"] = str(result.get("reason") or "")[:500]
+            item["review_status"] = "pending"
+            item["review_required"] = True
+    except SurfaceAIQuotaExceeded:
+        item.update(review_status="deferred_rate_limit", review_required=True,
+                    reason="Rate limit reached; rerun to continue from here.")
+        return item, "quota"
+    except Exception as exc:
+        item.update(review_status="error", review_required=True,
+                    reason=type(exc).__name__,
+                    error_detail=getattr(exc, "raw_reply", None))
+        return item, "error"
+    return item, "ok"
 
 
 def _processed_items(previous: Optional[dict]) -> dict:
@@ -1056,86 +1171,72 @@ def review_uncertain_spans(
     seen_dates = set()
     processed = {}
     deferred = {}
-    last_call = None
-    for index, candidate in enumerate(selected):
-        item = {
-            "span_id": _candidate_key(candidate),
-            "claimed_surface": candidate.get("claimed"),
-            "coordinates": candidate.get("coordinates"),
-            "coordinates_crs": candidate.get("coordinates_crs"),
-            "geometry_reason": candidate.get("reason"),
-            "geometry_confidence": candidate.get("confidence"),
-            "known_share": candidate.get("known_share"),
-            "review_status": "pending",
-            "review_required": True,
-            "AI_SURFACE": None,
-            "confidence": None,
-            "imagery_source": None,
-            "imagery_date": None,
-            "imagery_route_overlaid": None,
-            "reason": None,
-            "error_detail": None,
-        }
-        try:
-            if throttle > 0:
-                now = time.monotonic()
-                if last_call is not None and now - last_call < throttle:
-                    time.sleep(throttle - (now - last_call))
-            image = image_provider(candidate)
-            if not image:
-                item.update(review_status="no_imagery", review_required=True,
-                            reason="No imagery available for this span.")
-            else:
-                if not isinstance(image, dict):
-                    raise ValueError("Imagery provider must return an image record")
-                source = str(image.get("source") or "").strip()
-                date = image.get("date")
-                if not source:
-                    raise ValueError("Imagery provider must identify its source")
-                if date is not None and not str(date).strip():
-                    date = None
-                item["imagery_source"] = source
-                item["imagery_date"] = str(date) if date else None
-                overlaid = image.get("route_overlaid")
-                item["imagery_route_overlaid"] = None if overlaid is None else bool(overlaid)
-                if source:
-                    seen_sources.add(source)
-                if date:
-                    seen_dates.add(str(date))
-                result = classify(
-                    image["image_bytes"], image.get("mime_type", "image/jpeg"),
-                    api_key or "", model,
-                )
-                if result.get("ai_surface") not in FAMILIES and result.get("ai_surface") is not None:
-                    raise ValueError("Classifier returned an unsupported surface family")
-                confidence = float(result.get("confidence"))
-                if not 0.0 <= confidence <= 1.0:
-                    raise ValueError("Classifier returned invalid confidence")
-                item["AI_SURFACE"] = result.get("ai_surface")
-                item["confidence"] = round(confidence, 3)
-                item["reason"] = str(result.get("reason") or "")[:500]
-                item["review_status"] = "pending"
-                item["review_required"] = True
-        except SurfaceAIQuotaExceeded:
-            # The whole model chain is out of quota, so no later candidate can
-            # succeed. Stop spending and leave the remainder for a rerun.
-            item.update(review_status="deferred_rate_limit", review_required=True,
-                        reason="Rate limit reached; rerun to continue from here.")
+    # The injected-classifier path is a test seam and stays strictly serial so
+    # tests observe the original call order; only the real provider path — the
+    # one that pays network latency — overlaps calls.
+    concurrency = _review_concurrency() if classifier is None else 1
+    if concurrency > 1:
+        gate = _CallGate(throttle)
+        results = [None] * len(selected)
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = {
+                pool.submit(_review_one, candidate, image_provider, classify,
+                            api_key, model, gate): index
+                for index, candidate in enumerate(selected)
+            }
+            for future in as_completed(futures):
+                index = futures[future]
+                try:
+                    results[index] = future.result()
+                except Exception as exc:  # a worker fault must not fail the run
+                    results[index] = (_queued_item(
+                        selected[index], "error", type(exc).__name__), "error")
+        quota_held = 0
+        for candidate, result in zip(selected, results):
+            item, outcome = result
+            if outcome == "quota":
+                quota_held += 1
             processed[id(candidate)] = item
-            deferred = {id(rest): _deferred(rest) for rest in selected[index + 1:]}
-            break
-        except Exception as exc:
-            item.update(review_status="error", review_required=True,
-                        reason=type(exc).__name__,
-                        error_detail=getattr(exc, "raw_reply", None))
-        else:
-            last_call = time.monotonic()
-        processed[id(candidate)] = item
+        # Every selected span carries its own outcome, so nothing is left in the
+        # separate deferred map; count the quota refusals explicitly.
+        report["deferred_count"] = quota_held
+    else:
+        last_call = None
+
+        def pace():
+            if throttle <= 0:
+                return
+            now = time.monotonic()
+            if last_call is not None and now - last_call < throttle:
+                time.sleep(throttle - (now - last_call))
+
+        for index, candidate in enumerate(selected):
+            item, outcome = _review_one(candidate, image_provider, classify,
+                                        api_key, model, pace)
+            processed[id(candidate)] = item
+            if outcome == "quota":
+                # The whole model chain is out of quota, so no later candidate
+                # can succeed. Stop spending and leave the remainder for a rerun.
+                deferred = {id(rest): _deferred(rest)
+                            for rest in selected[index + 1:]}
+                break
+            if outcome == "ok":
+                last_call = time.monotonic()
+        report["deferred_count"] = len(deferred)
+    for candidate in selected:
+        item = processed.get(id(candidate))
+        if not item:
+            continue
+        source = item.get("imagery_source")
+        date = item.get("imagery_date")
+        if source:
+            seen_sources.add(source)
+        if date:
+            seen_dates.add(str(date))
     if len(seen_sources) == 1:
         report["imagery_source"] = next(iter(seen_sources))
     if len(seen_dates) == 1:
         report["imagery_date"] = next(iter(seen_dates))
-    report["deferred_count"] = len(deferred)
     report["suggestions"] = _ordered_suggestions(
         candidates, resumed, processed, deferred,
         {id(candidate): _not_processed(candidate) for candidate in over_limit})
