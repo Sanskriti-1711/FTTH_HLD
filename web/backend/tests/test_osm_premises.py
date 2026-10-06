@@ -974,13 +974,22 @@ def test_elements_are_classified_into_the_right_tables():
 
 
 def test_every_classified_row_matches_its_table_column_count():
-    """A row with the wrong arity fails the INSERT, so pin it here instead."""
+    """A row with the wrong arity fails the INSERT, so pin it here instead.
+
+    The elements span EVERY table `classify_elements` can fill, so a table
+    gaining a column without its row being updated is caught here.
+    """
     elements = [
         _node(10, {"addr:housenumber": "12"}),
         _way(20, {"building": "apartments", "addr:housenumber": "12"},
              [(13.38, 52.44), (13.381, 52.44), (13.381, 52.441)], closed=True),
         _way(30, {"highway": "service"}, [(13.39, 52.44), (13.39, 52.45)]),
         _way(40, {"landuse": "forest"}, [(13.41, 52.44), (13.411, 52.44), (13.411, 52.441)], closed=True),
+        _way(50, {"railway": "rail"}, [(13.42, 52.44), (13.43, 52.44)]),
+        _way(60, {"waterway": "river"}, [(13.44, 52.44), (13.45, 52.44)]),
+        _node(70, {"natural": "tree"}),
+        _way(80, {"boundary": "protected_area", "name": "Reserve"},
+             [(13.46, 52.44), (13.47, 52.44), (13.47, 52.45)], closed=True),
     ]
     classified = osm_source.classify_elements(elements)
     for table, rows in classified.items():

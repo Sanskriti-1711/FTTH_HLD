@@ -742,6 +742,59 @@ CREATE TABLE IF NOT EXISTS {schema}.landuse (
     boundary TEXT
 );
 
+-- The reference layers the permit crossing/environmental rules read and the
+-- preview draws.  They used to be served only from the curated gis.osm_*
+-- tables, which are loaded for one area by hand, so a preview anywhere else
+-- drew an empty railway/waterway/tree layer.  They are fetched with the area
+-- now and stored here.
+CREATE TABLE IF NOT EXISTS {schema}.railways (
+    osm_id   BIGINT PRIMARY KEY,
+    geom     GEOMETRY(Geometry, 4326),
+    railway  TEXT,
+    name     TEXT,
+    ref      TEXT,
+    service  TEXT,
+    usage    TEXT,
+    bridge   TEXT,
+    tunnel   TEXT,
+    tags     JSONB NOT NULL DEFAULT '{{}}'::jsonb
+);
+
+CREATE TABLE IF NOT EXISTS {schema}.waterways (
+    osm_id       BIGINT PRIMARY KEY,
+    geom         GEOMETRY(Geometry, 4326),
+    waterway     TEXT,
+    name         TEXT,
+    ref          TEXT,
+    intermittent TEXT,
+    tunnel       TEXT,
+    tags         JSONB NOT NULL DEFAULT '{{}}'::jsonb
+);
+
+-- Trees are the individual `natural=tree` NODES.  Only nodes: a row is keyed on
+-- `osm_id` alone, and OSM numbers nodes and ways in separate id spaces, so a
+-- node and a way sharing an id would collapse into one row.
+CREATE TABLE IF NOT EXISTS {schema}.trees (
+    osm_id     BIGINT PRIMARY KEY,
+    geom       GEOMETRY(Geometry, 4326),
+    "natural"  TEXT,
+    leaf_type  TEXT,
+    leaf_cycle TEXT,
+    height     TEXT,
+    name       TEXT,
+    tags       JSONB NOT NULL DEFAULT '{{}}'::jsonb
+);
+
+CREATE TABLE IF NOT EXISTS {schema}.protected_areas (
+    osm_id            BIGINT PRIMARY KEY,
+    geom              GEOMETRY(Geometry, 4326),
+    boundary          TEXT,
+    protect_class     TEXT,
+    protection_title  TEXT,
+    name              TEXT,
+    tags              JSONB NOT NULL DEFAULT '{{}}'::jsonb
+);
+
 -- The FULL OSM tags, so an object can be shown with all of its attributes
 -- rather than only the dozen this module happens to name.  CREATE TABLE IF NOT
 -- EXISTS leaves an existing table alone, so the columns are added explicitly.
@@ -772,6 +825,10 @@ CREATE INDEX IF NOT EXISTS {schema}_buildings_geom_idx    ON {schema}.buildings 
 CREATE INDEX IF NOT EXISTS {schema}_addr_nodes_geom_idx   ON {schema}.address_nodes USING GIST (geom);
 CREATE INDEX IF NOT EXISTS {schema}_roads_geom_idx        ON {schema}.roads USING GIST (geom);
 CREATE INDEX IF NOT EXISTS {schema}_landuse_geom_idx      ON {schema}.landuse USING GIST (geom);
+CREATE INDEX IF NOT EXISTS {schema}_railways_geom_idx         ON {schema}.railways USING GIST (geom);
+CREATE INDEX IF NOT EXISTS {schema}_waterways_geom_idx        ON {schema}.waterways USING GIST (geom);
+CREATE INDEX IF NOT EXISTS {schema}_trees_geom_idx            ON {schema}.trees USING GIST (geom);
+CREATE INDEX IF NOT EXISTS {schema}_protected_areas_geom_idx  ON {schema}.protected_areas USING GIST (geom);
 CREATE INDEX IF NOT EXISTS {schema}_extract_meta_bbox_idx ON {schema}.extract_meta USING GIST (bbox);
 CREATE INDEX IF NOT EXISTS {schema}_boundary_areas_geom_idx ON {schema}.boundary_areas USING GIST (geom);
 """
@@ -785,7 +842,10 @@ CREATE INDEX IF NOT EXISTS {schema}_boundary_areas_geom_idx ON {schema}.boundary
 #             extracts out there have tags = '{}' on every pre-existing row
 #             because that bug, so they are not what v2 is supposed to mean and
 #             must not be served as complete.
-_EXTRACT_VERSION = 3
+#   v3 -> v4  railways, waterways and trees are fetched with the area and stored
+#             in their own tables.  A v3 extract has none of them, so serving it
+#             would draw the empty reference layers this change exists to fill.
+_EXTRACT_VERSION = 4
 
 
 def init_schema() -> None:
@@ -2187,13 +2247,23 @@ def covered_by_cache(bbox: Sequence[float]) -> Optional[Dict[str, Any]]:
     return row
 
 
-# The three groups are fetched independently so one slow group never blocks the
+# The groups are fetched independently so one slow group never blocks the
 # others (Overpass rate-limits and times out per query).
 _OVERPASS_GROUPS: Dict[str, str] = {
     "buildings": 'way["building"];way["building:part"];way["addr:housenumber"]',
     "addresses": 'node["addr:housenumber"]',
     "roads": 'way["highway"]',
     "landuse": 'way["landuse"];way["natural"];way["leisure"];way["boundary"="protected_area"]',
+    # The reference layers the permit rules read and the preview draws.  They
+    # were only ever served from the curated gis.osm_* tables, so outside the
+    # one area those were loaded for the layers came back empty.  Protected
+    # areas are already fetched by the `landuse` group, so they need no group
+    # of their own -- they are classified out of it (see classify_elements).
+    "railways": 'way["railway"]',
+    "waterways": 'way["waterway"]',
+    # Individual trees are nodes; `natural=tree_row` is a different feature and
+    # is not fetched here.
+    "trees": 'node["natural"="tree"]',
 }
 
 
@@ -2252,6 +2322,14 @@ _TABLE_COLUMNS: Dict[str, Tuple[str, ...]] = {
     "roads": ("osm_id", "geom", "highway", "fclass", "name", "ref", "oneway", "bridge",
               "tunnel", "access", "surface", "maxspeed", "lanes", "tags"),
     "landuse": ("osm_id", "geom", "landuse", '"natural"', "leisure", "boundary", "tags"),
+    "railways": ("osm_id", "geom", "railway", "name", "ref", "service", "usage",
+                 "bridge", "tunnel", "tags"),
+    "waterways": ("osm_id", "geom", "waterway", "name", "ref", "intermittent",
+                  "tunnel", "tags"),
+    "trees": ("osm_id", "geom", '"natural"', "leaf_type", "leaf_cycle", "height",
+              "name", "tags"),
+    "protected_areas": ("osm_id", "geom", "boundary", "protect_class",
+                        "protection_title", "name", "tags"),
 }
 
 
@@ -2261,6 +2339,10 @@ def classify_elements(elements: Iterable[Dict[str, Any]]) -> Dict[str, List[Tupl
     addresses: List[Tuple[Any, ...]] = []
     roads: List[Tuple[Any, ...]] = []
     landuse: List[Tuple[Any, ...]] = []
+    railways: List[Tuple[Any, ...]] = []
+    waterways: List[Tuple[Any, ...]] = []
+    trees: List[Tuple[Any, ...]] = []
+    protected_areas: List[Tuple[Any, ...]] = []
 
     for el in elements:
         tags = _tags(el)
@@ -2319,6 +2401,41 @@ def classify_elements(elements: Iterable[Dict[str, Any]]) -> Dict[str, List[Tupl
                 ))
             continue
 
+        if tags.get("railway"):
+            railways.append((
+                osm_id, gj, tags.get("railway"), tags.get("name"),
+                tags.get("ref"), tags.get("service"), tags.get("usage"),
+                tags.get("bridge"), tags.get("tunnel"), ts,
+            ))
+
+        if tags.get("waterway"):
+            waterways.append((
+                osm_id, gj, tags.get("waterway"), tags.get("name"),
+                tags.get("ref"), tags.get("intermittent"), tags.get("tunnel"), ts,
+            ))
+
+        # A protected area is also a landuse: the landuse layer and the
+        # aerial-zone derivation have always read `boundary=protected_area`
+        # from there, so it is added to its own table as well, not moved out.
+        # Like railways and waterways above it deliberately does not `continue`,
+        # which is what keeps the landuse layer unchanged.
+        if tags.get("boundary") == "protected_area":
+            protected_areas.append((
+                osm_id, gj, tags.get("boundary"), tags.get("protect_class"),
+                tags.get("protection_title"), tags.get("name"), ts,
+            ))
+
+        # Trees are individual NODES (see the trees table DDL).  This one does
+        # `continue`: a tree node carries `natural`, so without it the node
+        # would also be stored as a landuse row -- a point in a table the
+        # aerial-zone derivation expects area geometry from.
+        if is_node and tags.get("natural") == "tree":
+            trees.append((
+                osm_id, gj, tags.get("natural"), tags.get("leaf_type"),
+                tags.get("leaf_cycle"), tags.get("height"), tags.get("name"), ts,
+            ))
+            continue
+
         if tags.get("landuse") or tags.get("natural") or tags.get("leisure") or tags.get("boundary"):
             landuse.append((
                 osm_id, gj, tags.get("landuse"), tags.get("natural"),
@@ -2330,6 +2447,10 @@ def classify_elements(elements: Iterable[Dict[str, Any]]) -> Dict[str, List[Tupl
         "address_nodes": addresses,
         "roads": roads,
         "landuse": landuse,
+        "railways": railways,
+        "waterways": waterways,
+        "trees": trees,
+        "protected_areas": protected_areas,
     }
 
 
@@ -2421,6 +2542,9 @@ _FETCH_PHASE_LABELS = {
     "fetching_addresses": "Downloading address points",
     "fetching_roads": "Downloading roads",
     "fetching_landuse": "Downloading landuse and natural areas",
+    "fetching_railways": "Downloading railways",
+    "fetching_waterways": "Downloading waterways",
+    "fetching_trees": "Downloading trees",
     "storing": "Saving the area into the database",
     "ready": "Area data is ready",
     "failed": "The area download failed",
@@ -3526,16 +3650,35 @@ def read_area_rows(polygon: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[
     return buildings, addresses, addr_to_building, roads
 
 
-# Public input-layer names -> their storage table. The `gis.osm_*` tables are
-# curated OSM reference layers already used by the permit engine; they are read
-# here, never overwritten by an area run. Missing optional reference tables
-# return an empty layer rather than hiding the buildings/premises layers.
-_INPUT_LAYER_TABLES = {
-    "railways": "gis.osm_railway",
-    "waterways": "gis.osm_waterway",
-    "boundaries": "gis.osm_admin_boundary",
-    "protected_areas": "gis.osm_protected_area",
-    "trees": "gis.osm_tree",
+# Public input-layer names -> (the area store table, the curated table).
+#
+# The area download writes railways/waterways/trees into the `osm` schema and
+# protected areas come out of the landuse fetch, so the preview draws the layers
+# the selected area actually has instead of only the one area the curated
+# `gis.osm_*` tables were loaded for.  Those curated tables are still read as a
+# fallback when the area store holds nothing for the boundary -- and because the
+# read is clipped to the boundary, the fallback can never show one area another
+# area's data.  A layer an area genuinely has none of stays empty.
+#
+# `boundaries` has no area layer on purpose: administrative boundaries are OSM
+# relations, and the area fetcher builds geometry for nodes and ways only (a
+# relation comes back as members, which `_element_geometry` does not assemble).
+# They are loaded from authoritative datasets by `boundary_dataset_ingest`.
+_INPUT_LAYER_TABLES: Dict[str, Tuple[Optional[str], Optional[str]]] = {
+    "railways": ("railways", "gis.osm_railway"),
+    "waterways": ("waterways", "gis.osm_waterway"),
+    "boundaries": (None, "gis.osm_admin_boundary"),
+    "protected_areas": ("protected_areas", "gis.osm_protected_area"),
+    "trees": ("trees", "gis.osm_tree"),
+}
+
+# The named columns of each area reference table, exposed as feature properties
+# beside the full OSM tag set (which is what a planner actually inspects).
+_AREA_LAYER_COLUMNS: Dict[str, Tuple[str, ...]] = {
+    "railways": ("railway", "name", "ref", "service", "usage", "bridge", "tunnel"),
+    "waterways": ("waterway", "name", "ref", "intermittent", "tunnel"),
+    "trees": ("natural", "leaf_type", "leaf_cycle", "height", "name"),
+    "protected_areas": ("boundary", "protect_class", "protection_title", "name"),
 }
 
 
@@ -3543,6 +3686,17 @@ def _feature(geometry: Optional[Dict[str, Any]], properties: Dict[str, Any]) -> 
     if not geometry:
         return None
     return {"type": "Feature", "geometry": geometry, "properties": properties}
+
+
+def _row_tags(value: Any) -> Dict[str, Any]:
+    """A row's `tags` column as a fresh dict.  jsonb arrives as a dict from
+    psycopg2 and as text from a driver that does not adapt it."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            value = None
+    return dict(value) if isinstance(value, dict) else {}
 
 
 def object_properties(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -3553,13 +3707,7 @@ def object_properties(row: Dict[str, Any]) -> Dict[str, Any]:
     about are added alongside.  Nothing is renamed, so a tag an inspector looks
     for is present under the name OSM uses.
     """
-    tags = row.get("tags")
-    if isinstance(tags, str):
-        try:
-            tags = json.loads(tags)
-        except (TypeError, ValueError):
-            tags = None
-    props: Dict[str, Any] = dict(tags) if isinstance(tags, dict) else {}
+    props: Dict[str, Any] = _row_tags(row.get("tags"))
     # Counted before anything derived is added, so this is the number of real
     # OSM tags on the object.
     tag_count = len(props)
@@ -3632,6 +3780,41 @@ def _reference_features(table: str, polygon: Dict[str, Any]) -> List[Dict[str, A
     return features
 
 
+def _area_reference_features(table: str, polygon: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Read one reference layer out of the area's own OSM store.
+
+    Same contract as `_reference_features`, against the `osm` schema tables the
+    area download writes rather than a curated `gis.osm_*` table.
+    """
+    qualified = f"{OSM_SCHEMA}.{table}"
+    if not _reference_layer_exists(qualified):
+        return []
+    cols = _AREA_LAYER_COLUMNS.get(table, ())
+    # Every column is quoted: `natural` is a reserved word (NATURAL JOIN), so an
+    # unquoted `SELECT ..., natural, ...` is a syntax error.  Quoting a lowercase
+    # identifier changes nothing else -- the row key is still the bare name.
+    named = "".join(f', "{c}"' for c in cols)
+    rows = _query(
+        f"SELECT osm_id, ST_AsGeoJSON(geom) AS geom_json, tags{named} "
+        f"FROM {qualified} WHERE ST_Intersects({_POLYGON_JSON}, geom)",
+        (json.dumps(polygon),),
+    )
+    features = []
+    for row in rows:
+        props = _row_tags(row.get("tags"))
+        # A named column never overwrites the tag it came from: an empty column
+        # blanking out a real `name` would be data loss, not a missing value.
+        for col in cols:
+            value = row.get(col)
+            if value is not None and str(value).strip() != "":
+                props.setdefault(col, value)
+        props.update({"source_table": qualified, "source_id": row.get("osm_id")})
+        item = _feature(_json_geometry(row.get("geom_json")), props)
+        if item:
+            features.append(item)
+    return features
+
+
 def household_method_label(methods: Iterable[str]) -> str:
     """One label for the household methods behind a building's total.
 
@@ -3676,7 +3859,11 @@ def input_layer_geojson(
 
     features: List[Dict[str, Any]] = []
     if key in _INPUT_LAYER_TABLES:
-        features = _reference_features(_INPUT_LAYER_TABLES[key], polygon)
+        area_table, curated_table = _INPUT_LAYER_TABLES[key]
+        if area_table:
+            features = _area_reference_features(area_table, polygon)
+        if not features and curated_table:
+            features = _reference_features(curated_table, polygon)
     else:
         buildings, addresses, addr_to_building, roads = read_area_rows(polygon)
         # Only the two layers that show household counts consult the register,
