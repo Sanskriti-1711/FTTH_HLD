@@ -1627,6 +1627,40 @@ class DuctLayer(QgsProcessingAlgorithm):
     REBASE_PROJECT_DENSIFY_M = 5.0
     REBASE_PROJECT_MAX_JUMP_M = 15.0
 
+    # Snapping every sample to its own nearest trench point (above) is
+    # discontinuous: consecutive samples can land on DIFFERENT trench lines, and
+    # the straight chord between them then cuts across the network. Measured on
+    # the CV1 2DE run: every projected vertex sat 0.00 m from the trench, yet
+    # 2,770 m of the layer (0.75 %, up to 4.4 m per chord) lay off it, and all
+    # of that came from this branch — the router's own edges measure 0.000 m off
+    # the trench (10,208 edges, 117 km), so a routed duct never chords. A chord
+    # within this of the network IS the trench: GEOS rounds the projected points
+    # to the millimetre and a chord along a straight span measures 0.000 m, so
+    # the only chords that fail the test are the ones that cut a corner.
+    REBASE_ON_TRENCH_TOL_M = 0.05
+
+    # How far a projected point may sit from the network when it is attached to
+    # it for the walk's own routing. These points are already ON the trench (they
+    # are nearest-point projections) and the attach search is a few metres wide,
+    # so this only absorbs rounding.
+    REBASE_PROJECT_ROUTE_TOL_M = 1.0
+
+    # When two projected points land on different trench lines, the sample is on
+    # a PARALLEL line and the duct must not cross the street to reach it —
+    # staying on the line it is already on is the answer, as long as that line
+    # passes within this of the sample. Measured on the CV1 2DE run: every such
+    # switch was a 4-8 m chord whose other line is 50-260x further away along
+    # the network (p50 322 m of detour for a 6 m chord).
+    REBASE_STICK_MAX_M = 15.0
+
+    # How far ALONG the trench the projection may travel to stay on the line it
+    # is already on. The router's connected components are no help here: the
+    # trench is 380 pieces but the largest one is most of the network, so "the
+    # nearest point on my own piece" is the parallel line next door again. What
+    # separates the duct's line from the line next to it is how far it is away
+    # ALONG the trench, and that is what this bounds.
+    REBASE_STICK_REACH_M = 30.0
+
     def _route_network(self, corridor_lyr):
         """The trench network as a routed graph — built once, then cached.
 
@@ -1944,6 +1978,207 @@ class DuctLayer(QgsProcessingAlgorithm):
         path = QgsGeometry.fromPolylineXY(coords)
         return None if path.isEmpty() else path
 
+    def _reachable_trench_lookup(self, corridor_lyr, reach_m):
+        """Build ``stick_fn(a, pt)``: the closest point on the trench the duct
+        can actually REACH from ``a`` — a bounded walk along the network.
+
+        Staying on the line the duct is already on is not a question about the
+        router's connected components: the trench is 380 pieces, but the largest
+        one is most of the network, so the nearest point of "my own piece" is
+        the parallel line next door all over again. What separates the duct's
+        line from the line beside it is how far away it is ALONG the trench —
+        two lines that only meet half a kilometre away are not two ways of
+        drawing the same duct. Expanding the graph from ``a`` for ``reach_m``
+        and taking the closest point of what comes back is that test, and it
+        costs one heap pop per trench node in the neighbourhood.
+
+        Returns ``(distance, QgsPointXY)`` or None.
+        """
+        net = self._route_network(corridor_lyr)
+        if net is None:
+            return None
+        adj, _edge_geom, _el, node_xy, _segs = net
+
+        # The walk asks the same questions over and over (a projected line's
+        # samples repeat their start point chord by chord), and each answer is a
+        # Dijkstra. Memoise both the attach and the expansion by the rounded
+        # point, and cache the attaches so a repeated point does not splice
+        # another pair of edges into the cached network every time.
+        attach_cache: dict = {}
+        stick_cache: dict = {}
+
+        def _attach(a_pt):
+            key = (round(a_pt.x(), 2), round(a_pt.y(), 2))
+            hit = attach_cache.get(key, False)
+            if hit is not False:
+                return hit
+            try:
+                out = self._attach_to_network(
+                    net, (a_pt.x(), a_pt.y()), self.REBASE_PROJECT_ROUTE_TOL_M)
+            except Exception:
+                out = (None, None)
+            attach_cache[key] = out
+            return out
+
+        def _stick(a_pt, target_pt):
+            key = (round(a_pt.x(), 2), round(a_pt.y(), 2),
+                   round(target_pt.x(), 2), round(target_pt.y(), 2))
+            if key in stick_cache:
+                return stick_cache[key]
+            ka, pa = _attach(a_pt)
+            if ka is None:
+                stick_cache[key] = None
+                return None
+            px, py = target_pt.x(), target_pt.y()
+            best = None
+            if pa is not None:
+                best = (math.hypot(pa.x() - px, pa.y() - py), pa)
+            reached = {ka: 0.0}
+            heap = [(0.0, ka)]
+            while heap:
+                d, k = heapq.heappop(heap)
+                if d > reached.get(k, 1e18) + 1e-9 or d > reach_m:
+                    continue
+                p = node_xy.get(k)
+                if p is None:
+                    continue
+                for (m, _seg_id, w) in adj.get(k, ()):
+                    q = node_xy.get(m)
+                    if q is None:
+                        continue
+                    dd, fx, fy = self._pt_to_segment(px, py, p, q)
+                    if best is None or dd < best[0]:
+                        best = (dd, QgsPointXY(fx, fy))
+                    nxt = d + w
+                    if nxt <= reach_m and nxt + 1e-9 < reached.get(m, 1e18):
+                        reached[m] = nxt
+                        heapq.heappush(heap, (nxt, m))
+            if best is not None:
+                best = (best[0], QgsPointXY(best[1].x(), best[1].y()))
+            stick_cache[key] = best
+            return best
+
+        return _stick
+
+    def _chord_on_trench(self, a, b, nearest_fn):
+        """Is the straight chord a→b itself trench geometry?
+
+        Samples the chord away from its ends: both ends are ON the network by
+        construction (they are nearest-point projections), so only the middle
+        can betray a chord that cuts a corner.
+        """
+        for t in (0.25, 0.5, 0.75):
+            near = nearest_fn(QgsPointXY(a.x() + (b.x() - a.x()) * t,
+                                         a.y() + (b.y() - a.y()) * t))
+            if near is None or near[0] > self.REBASE_ON_TRENCH_TOL_M:
+                return False
+        return True
+
+    def _trench_path_between(self, corridor_lyr, a_xy, b_xy):
+        """The trench path from one network point to another, ends included.
+
+        Returns the route's coordinates with ``a_xy`` first and ``b_xy`` last,
+        or None when the network offers no path between them.
+
+        The route is a full Dijkstra over the network, and the walk asks for the
+        same pair repeatedly (a line's samples repeat), so the answer is
+        memoised by the rounded endpoints. The cached value is returned as a
+        fresh copy — the caller extends its own list with it.
+        """
+        cache = getattr(self, "_trench_path_cache", None)
+        if cache is None:
+            cache = self._trench_path_cache = {}
+        key = (id(corridor_lyr), round(a_xy.x(), 2), round(a_xy.y(), 2),
+               round(b_xy.x(), 2), round(b_xy.y(), 2))
+        if key in cache:
+            hit = cache[key]
+            if hit is None:
+                return None
+            return [QgsPointXY(x, y) for x, y in hit]
+        try:
+            route = self._trench_route(corridor_lyr, (a_xy.x(), a_xy.y()),
+                                       (b_xy.x(), b_xy.y()),
+                                       self.REBASE_PROJECT_ROUTE_TOL_M)
+        except Exception:
+            route = None
+        coords = None
+        if route is not None and not route.isEmpty():
+            coords = (route.asPolyline() if not route.isMultipart()
+                      else route.asMultiPolyline()[0])
+            if not coords or len(coords) < 2:
+                coords = None
+        if coords is None:
+            cache[key] = None
+            return None
+        if math.hypot(coords[0].x() - a_xy.x(), coords[0].y() - a_xy.y()) > 1e-6:
+            coords.insert(0, QgsPointXY(a_xy.x(), a_xy.y()))
+        if math.hypot(coords[-1].x() - b_xy.x(), coords[-1].y() - b_xy.y()) > 1e-6:
+            coords.append(QgsPointXY(b_xy.x(), b_xy.y()))
+        cache[key] = [(p.x(), p.y()) for p in coords]
+        return coords
+
+    def _walk_off_trench_chords(self, corridor_lyr, pts, nearest_fn, stats=None,
+                                stick_fn=None):
+        """Follow the trench between projected points instead of chording.
+
+        ``pts`` are points the projection has already snapped onto the network.
+        Wherever the chord between two of them leaves the trench (they landed on
+        different trench lines), the duct has to go the way the trench goes: the
+        two lines meet at a corner even when the *feature's* two ends do not
+        connect, which is exactly why the projection was used in the first
+        place. Every such chord is therefore replaced by the trench path between
+        its ends.
+
+        A chord no path can replace means the sample snapped onto a DIFFERENT
+        line than the duct is on — a parallel line the network joins only
+        hundreds of metres away, or not at all. Crossing the street to reach it
+        is what the chord does wrong, so the answer is to stay: ``stick_fn``
+        offers the closest point on the trench the duct can reach from where it
+        already is (``REBASE_STICK_REACH_M`` along the network), and the sample
+        is placed there instead as long as that line passes within
+        ``REBASE_STICK_MAX_M``.
+
+        What is left is a real break in the network — the only way across it is
+        a straight line and the trench under it does not exist. Those are kept
+        and counted in ``stats`` (``walked`` / ``stuck`` / ``gap``), never
+        folded into the geometry silently.
+        """
+        if len(pts) < 2:
+            return pts
+        out = [QgsPointXY(pts[0].x(), pts[0].y())]
+        for p in pts[1:]:
+            a = out[-1]
+            if self._chord_on_trench(a, p, nearest_fn):
+                out.append(QgsPointXY(p.x(), p.y()))
+                continue
+            coords = self._trench_path_between(corridor_lyr, a, p)
+            if coords is not None:
+                if stats is not None:
+                    stats["walked"] = stats.get("walked", 0) + 1
+                out.extend(coords[1:])
+                continue
+            if stick_fn is not None:
+                stay = stick_fn(a, p)
+                if stay is not None and stay[0] <= self.REBASE_STICK_MAX_M:
+                    # Reach the line we are already on the same way any other
+                    # sample is reached: straight when the chord is trench,
+                    # along the trench when the line bends between the two.
+                    if self._chord_on_trench(a, stay[1], nearest_fn):
+                        if stats is not None:
+                            stats["stuck"] = stats.get("stuck", 0) + 1
+                        out.append(QgsPointXY(stay[1].x(), stay[1].y()))
+                        continue
+                    coords = self._trench_path_between(corridor_lyr, a, stay[1])
+                    if coords is not None:
+                        if stats is not None:
+                            stats["stuck"] = stats.get("stuck", 0) + 1
+                        out.extend(coords[1:])
+                        continue
+            if stats is not None:
+                stats["gap"] = stats.get("gap", 0) + 1
+            out.append(QgsPointXY(p.x(), p.y()))
+        return out
+
     def _rebase_distribution_output(self, output_uri, trench_lyr, context, feedback):
         """Keep legacy PDP/pseudo grouping but draw every line on Final_Trenches.
 
@@ -1960,6 +2195,7 @@ class DuctLayer(QgsProcessingAlgorithm):
         if layer is None or not layer.isValid():
             return 0, 0
         changed = unresolved = projected = 0
+        walk_stats = {"walked": 0, "stuck": 0, "gap": 0}
         unresolved_reasons = defaultdict(int)
         # Spatial index over the trench features: the rebase used to scan all
         # 3,58 trenches with two GEOS nearestPoint calls per endpoint per duct
@@ -1973,7 +2209,7 @@ class DuctLayer(QgsProcessingAlgorithm):
         SEARCH_R = 50.0
 
         def _nearest_trench_point(pt_xy):
-            """(distance, QgsPointXY) of the closest trench point, via index."""
+            """(distance, QgsPointXY, fid) of the closest trench point, via index."""
             pt = QgsPointXY(pt_xy)
             pg = QgsGeometry.fromPointXY(pt)
             best = None
@@ -1988,8 +2224,15 @@ class DuctLayer(QgsProcessingAlgorithm):
                 np = near.asPoint()
                 d = math.hypot(np.x() - pt.x(), np.y() - pt.y())
                 if best is None or d < best[0]:
-                    best = (d, np)
+                    best = (d, np, fid)
             return best
+
+        # The walk stays on ONE piece of the network (see
+        # `_walk_off_trench_chords`): switching to a parallel line is what leaves
+        # a chord across the street, and the two lines are often joined only
+        # hundreds of metres away — or not at all.
+        _reachable = self._reachable_trench_lookup(trench_lyr,
+                                                  self.REBASE_STICK_REACH_M)
 
         def _project_onto_trench(part):
             """Snap a legacy part onto the trench when no route connects it.
@@ -1998,6 +2241,11 @@ class DuctLayer(QgsProcessingAlgorithm):
             every point to its nearest trench point, so the published duct
             follows the trench network. Returns the snapped polyline, or None
             when a point has no trench within ``SEARCH_R``.
+
+            The snapped sequence then goes through ``_walk_off_trench_chords``:
+            point-wise snapping is discontinuous between parallel trench lines,
+            so the raw result is only *nearly* on the trench — its vertices are
+            (all of them 0.00 m) but the chords between them cut the corners.
             """
             pts = [QgsPointXY(p.x(), p.y()) for p in part]
             dense = []
@@ -2027,6 +2275,9 @@ class DuctLayer(QgsProcessingAlgorithm):
                         # would draw the chord back across it.
                         return None
                 snapped.append(sp)
+            snapped = self._walk_off_trench_chords(
+                trench_lyr, snapped, _nearest_trench_point, walk_stats,
+                stick_fn=_reachable)
             return snapped if len(snapped) >= 2 else None
 
         if not layer.isEditable():
@@ -2136,10 +2387,20 @@ class DuctLayer(QgsProcessingAlgorithm):
                 f", {projected} projected onto the trench (a broken network "
                 f"offered no connected route)" if projected else ""
             )
+            walk_note = ""
+            if walk_stats["walked"] or walk_stats["stuck"] or walk_stats["gap"]:
+                walk_note = (
+                    f"; projected geometry walked {walk_stats['walked']} "
+                    f"off-trench chord(s) back along the trench, "
+                    f"{walk_stats['stuck']} kept on the line already carried, "
+                    f"{walk_stats['gap']} left across a real break in the "
+                    f"network"
+                )
             feedback.pushInfo(
                 f"Distribution hybrid rebase: {changed - projected} legacy route(s) "
-                f"routed onto Final_Trenches{proj_note}; {unresolved} unresolved "
-                f"route(s) left for review ({reason_summary}).")
+                f"routed onto Final_Trenches{proj_note}{walk_note}; {unresolved} "
+                f"unresolved route(s) left for review ({reason_summary})."
+            )
         return changed, unresolved
 
     def _trench_connector(self, corridor_lyr, a_xy, b_xy, tol_m=1.0,
