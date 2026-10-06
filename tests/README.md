@@ -58,6 +58,14 @@ set "PYTHONPATH=" && set "PYTHONHOME=" && python -m pytest tests\test_lld_mode_a
 
 - Tests in `tests/` use the `qgis_app` fixture from `conftest.py`, which starts
   a headless `QgsApplication` once per session.
+- **One rule set can straddle the two suites, and is split by what each test
+  needs.** The trench-basis rules live in
+  `web/backend/tests/test_trench_basis.py` (the `trench_design` half — GDAL and
+  networkx only, so it runs under Anaconda with the rest of the backend suite)
+  and `tests/test_trench_basis_plugin.py` (the half that reads `trench_layer`
+  and `network_layer`, which import `qgis.core`). The two files pin one rule set
+  and are read together; a file that imports a plugin module from the backend
+  suite breaks the whole backend run at collection.
 - Clear both `PYTHONPATH` and `PYTHONHOME` before running the backend suite by
   hand: QGIS's Python 3.12 packages/stdlib are incompatible with the backend's
   Anaconda Python 3.11. The test harness and server launchers clear both; the

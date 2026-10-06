@@ -17,6 +17,12 @@ other constant:
   along a street is its centreline, the published geometry is laid on the KERB
   band, ramping back to the exact OSM vertex at every end and junction.
 
+The rules that read the plugin algorithms — the shared sidewalk constant, the
+kerb band the cabinet sits at and the generated road filter — are in
+`HLD_Planning_01/tests/test_trench_basis_plugin.py`: `trench_layer` and
+`network_layer` import `qgis.core`, so only QGIS's interpreter can load them,
+and importing them here broke this suite's collection.
+
 Run from the engine backend dir:
 
     cd HLD_Planning_01/web/backend
@@ -34,8 +40,9 @@ _HLD_ROOT = pathlib.Path(__file__).resolve().parents[3]
 if str(_HLD_ROOT) not in sys.path:
     sys.path.insert(0, str(_HLD_ROOT))
 
-from HLDPlanning.algorithms import network_layer as nl  # noqa: E402
-from HLDPlanning.algorithms import trench_layer as tl  # noqa: E402
+# `trench_design` is GDAL + networkx only, which is what makes this half of the
+# rule set runnable on the backend's Anaconda 3.11 interpreter. The QGIS-backed
+# half is HLD_Planning_01/tests/test_trench_basis_plugin.py.
 from HLDPlanning.design import trench_design as td  # noqa: E402
 
 
@@ -105,51 +112,7 @@ def test_every_carriageway_carrier_has_a_width():
         assert c in td.VEHICULAR_WIDTH_M, c
 
 
-# ── the shared sidewalk: the PDP is where the trench is ─────────────────────
-
-def test_the_pdp_and_the_trench_agree_on_where_the_sidewalk_is():
-    """These two constants are the same physical distance and drifted apart once:
-    the trench at 3 m and the PDP at 8 m put cabinets inside the blocks."""
-    assert nl.NetworkLayerAlgorithm.DEFAULT_SIDEWALK == tl.SIDEWALK_OFFSET_M
-
-
-# ── the road filter is generated from the policy ────────────────────────────
-
-def test_the_road_filter_excludes_every_never_class():
-    expr = tl.trench_road_filter_expr()
-    assert "motorway" not in expr, "a motorway must never be dug along"
-    for c in tl.TRENCH_NEVER_CLASSES:
-        assert "'%s'" % c not in expr, c
-
-
-def test_the_road_filter_allows_every_allowed_class():
-    expr = tl.trench_road_filter_expr()
-    for c in tl.TRENCH_ROAD_CLASSES:
-        assert '"fclass"=\'%s\'' % c in expr, c
-
-
-def test_the_trench_class_policy_is_disjoint():
-    assert not [c for c in tl.TRENCH_NEVER_CLASSES if c in tl.TRENCH_ROAD_CLASSES]
-    assert "motorway" in tl.TRENCH_NEVER_CLASSES
-    assert "motorway" not in tl.TRENCH_ROAD_CLASSES
-
-
-def test_the_road_filter_keeps_bridges_and_tunnels_out():
-    expr = tl.trench_road_filter_expr()
-    assert "bridge" in expr and "tunnel" in expr
-
-
 # ── the kerb band: never a trench down the middle of a carriageway ──────────
-
-def test_the_kerb_band_is_the_kerb_the_cabinet_sits_at():
-    """The trench at the kerb and the PDP at the kerb are the same distance.
-
-    A splitter is a street cabinet: laying the trench KERB_OFFSET_M out from the
-    centreline is what leaves the cabinet beside its own trench instead of
-    mid-road or 5 m inside the block.
-    """
-    assert td.KERB_OFFSET_M == nl.NetworkLayerAlgorithm.DEFAULT_SIDEWALK
-
 
 def test_the_pavement_band_and_the_kerb_band_are_one_rule():
     """Three codebases lay the band; they may not drift apart.
@@ -157,6 +120,9 @@ def test_the_pavement_band_and_the_kerb_band_are_one_rule():
     The engine backend cannot import plugin code, so osm_source duplicates the
     carriageway width table. This pins the rules equal and the tables identical
     — a trench, its derived pavement and its splitter cabinet sit on one band.
+    The plugin half of the claim (the same two rules against `trench_layer` and
+    `network_layer`) is in test_trench_basis_plugin.py, which alone can import
+    them.
     """
     import osm_source
     assert osm_source.PAVEMENT_FOOTWAY_INSET_M == td.KERB_FOOTWAY_INSET_M
@@ -164,8 +130,6 @@ def test_the_pavement_band_and_the_kerb_band_are_one_rule():
     for cls in td.VEHICULAR_WIDTH_M:
         assert osm_source.pavement_offset_for(cls) == td.kerb_offset_for(cls)
     assert td.KERB_OFFSET_M == osm_source.PAVEMENT_OFFSET_M
-    assert (td.KERB_OFFSET_M == nl.NetworkLayerAlgorithm.DEFAULT_SIDEWALK
-            == tl.SIDEWALK_OFFSET_M)
 
 
 def test_a_street_with_no_pavement_is_drawn_at_the_kerb_not_the_middle():
