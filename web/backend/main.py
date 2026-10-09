@@ -425,6 +425,28 @@ def _ensure_geojson(gpkg_path: Path, geojson_path: Path) -> bool:
     return _convert_gpkg_to_geojson(gpkg_path, geojson_path)
 
 
+def _export_every_geojson(output_dir: Path) -> int:
+    """Give every GeoPackage on disk an up-to-date GeoJSON beside it.
+
+    ``ONECLICK_OUTPUTS`` lists the layers the RESULTS MAP publishes, and it
+    deliberately leaves some files out: ``Trench_Nodes.gpkg`` is an
+    intermediate the chambers layer already realises, so serving it would put
+    undifferentiated dots beside the chambers they became.  Those files are
+    still DELIVERABLES, though -- the download endpoints fetch ``<layer>.geojson``
+    by name -- and a layer with a GeoPackage but no GeoJSON beside it was
+    silently dropped from every package (the log said "GeoJSON not found").
+    Exporting for every GPKG keeps the packages complete without making the
+    excluded layers public.  Returns how many GeoJSONs it created.
+    """
+    created = 0
+    for gpkg_path in sorted(output_dir.glob("*.gpkg")):
+        geojson_path = gpkg_path.with_suffix(".geojson")
+        existed = geojson_path.exists()
+        if _ensure_geojson(gpkg_path, geojson_path) and not existed:
+            created += 1
+    return created
+
+
 def _register_downloads(project_id: str, output_dir: Path) -> List[Dict[str, Any]]:
     downloads: List[Dict[str, Any]] = []
     for path in output_dir.rglob("*"):
@@ -912,6 +934,20 @@ def _ingest_outputs(
         elif gpkg_path.exists():
             layer_files.setdefault(public_layer, []).append(str(gpkg_path))
 
+    # ── every other GeoPackage gets a GeoJSON too (download completeness) ──
+    # Runs BEFORE the occupancy registry so a layer the map does not publish
+    # (Trench_Nodes) is still a downloadable file rather than a "GeoJSON not
+    # found" line in every package build.
+    try:
+        created = _export_every_geojson(output_dir)
+        if created:
+            _append(
+                project_id, "info",
+                f"Exported {created} extra layer GeoJSON(s) for download.",
+            )
+    except Exception as exc:  # noqa: BLE001 - never fail a completed run
+        _append(project_id, "warning", f"Extra GeoJSON export skipped: {exc}")
+
     # ── occupancy registry (DB-only, after the layers are on disk) ────────
     # Stored at the END: the registry is derived from the duct/cable outputs,
     # and the loop above is what turns each stage's GeoPackage into the GeoJSON
@@ -943,13 +979,17 @@ def _ingest_outputs(
 _BF_VECTOR_EXTS = {".geojson", ".gpkg", ".shp", ".json"}
 
 
-def _match_brownfield_param(filename: str) -> Optional[str]:
+def _match_brownfield_param(filename: str, props: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """Map an uploaded brownfield file to its plugin BF_* parameter by name.
 
     Specific patterns are matched first so e.g. ``bf_feeder_trench.geojson``
-    hits BF_FEEDER_TRENCH and not the generic BF_TRENCHES.
+    hits BF_FEEDER_TRENCH and not the generic BF_TRENCHES.  Unrecognised
+    names fall through to the layer's schema, read from the GeoJSON
+    properties, so the new multi-layer brownfield ZIP (one asset per file,
+    ``bf_existing_<kind>.geojson``) resolves every file.
     """
     lower = filename.lower()
+    # ── 1) Filename is the primary key ──────────────────────────────────
     if "duct" in lower:
         return "BF_DUCTS"
     if "chamber" in lower:
@@ -970,6 +1010,31 @@ def _match_brownfield_param(filename: str) -> Optional[str]:
         return "BF_EXISTING_MFG"
     if "trench" in lower:
         return "BF_TRENCHES"
+    # ── 2) Fall back to the layer's schema when the filename carries no
+    #     recognisable token ──────────────────────────────────────────────
+    if props:
+        kind = str(props.get("ASSET_TYPE") or "").lower()
+        node_type = str(props.get("NODE_TYPE") or "").lower()
+        if kind == "duct":
+            return "BF_DUCTS"
+        if kind == "chamber":
+            return "BF_CHAMBERS"
+        if kind == "pdp":
+            return "BF_EXISTING_PDP"
+        if kind == "mfg":
+            return "BF_EXISTING_MFG"
+        if kind == "fibre":
+            return "BF_FIBRE"
+        if kind == "trench":
+            if node_type == "feeder":
+                return "BF_FEEDER_TRENCH"
+            if node_type == "distribution":
+                return "BF_DIST_TRENCH"
+            return "BF_TRENCHES"
+        if kind == "pole":
+            return "BF_POLES"
+        if kind == "cabinet":
+            return "BF_CABINETS"
     return None
 
 
@@ -1022,6 +1087,24 @@ def _brownfield_args(brownfield_path: Optional[Path], output_dir: Path,
         if not fp.is_file() or fp.suffix.lower() not in _BF_VECTOR_EXTS:
             continue
         param = _match_brownfield_param(fp.name)
+        if param:
+            matches[param] = str(fp)
+            continue
+        # The filename carried no BF_* token. These zips ship one asset per
+        # file under ``bf_existing_<kind>.geojson``; every file has an
+        # ``ASSET_TYPE`` property that maps straight to a BF_* param, so
+        # read the schema once and re-run the resolver with the properties.
+        try:
+            import json
+            data = json.loads(fp.read_text(encoding="utf-8"))
+            props = {}
+            for feature in data.get("features") or []:
+                props = feature.get("properties") or {}
+                if props:
+                    break
+        except (OSError, ValueError):
+            continue
+        param = _match_brownfield_param(fp.name, props)
         if not param:
             continue
         prev = matches.get(param)
