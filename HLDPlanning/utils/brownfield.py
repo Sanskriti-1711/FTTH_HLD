@@ -149,6 +149,7 @@ class BrownfieldRegistry:
         self._fid_to_asset: Dict[int, str] = {}       # spatial index fid -> asset_id
         self._next_sid = 0                            # spatial index feature id counter
         self._used_assets: Set[str] = set()           # assets consumed during routing
+        self._committed: Set[str] = set()             # assets whose capacity is committed
 
         # Counters for auto-generated IDs
         self._counters: Dict[str, int] = {
@@ -329,9 +330,16 @@ class BrownfieldRegistry:
         else:
             verify_part = "N/A"
 
+        # Name the field actually used, not just the fallback: "capacity_default=1"
+        # on a layer whose CAPACITY_TOTAL=4 was being read hid the seeded figure
+        # and made a 4-way chamber with 1 used look full in every log review.
+        cap_src = (f"{capacity_field}" if capacity_field and cap_idx >= 0
+                   else f"default {capacity_default}")
+        used_src = (f"{capacity_used_field}" if capacity_used_field and cap_used_idx >= 0
+                    else "none")
         self._report(
             f"Brownfield: loaded {count} {asset_type} features "
-            f"(capacity_default={capacity_default}, verify: {verify_part})."
+            f"(capacity: {cap_src}, used: {used_src}, verify: {verify_part})."
         )
         return count
 
@@ -349,20 +357,34 @@ class BrownfieldRegistry:
                                 capacity_used_field, verify_field, id_field)
 
     def load_chambers(self, layer: QgsVectorLayer,
+                      capacity_field: Optional[str] = None,
+                      capacity_default: int = 1,
+                      capacity_used_field: Optional[str] = None,
                       verify_field: Optional[str] = None,
                       id_field: Optional[str] = None) -> int:
-        """Load existing chamber points."""
+        """Load existing chamber points.
+
+        A surveyed chamber carries its own CAPACITY_TOTAL/CAPACITY_USED (how
+        many structures/splitters it already holds). Reading them matters
+        because the chamber stages consume that capacity when they reuse the
+        structure: with the old hard-coded default of 1 a chamber surveyed as
+        4-way with 1 used looked almost full, and the seeded figure was
+        dropped from the published layer.
+        """
         return self._load_layer(layer, AssetType.CHAMBER,
-                                capacity_default=1, verify_field=verify_field,
-                                id_field=id_field)
+                                capacity_field, capacity_default,
+                                capacity_used_field, verify_field, id_field)
 
     def load_poles(self, layer: QgsVectorLayer,
+                   capacity_field: Optional[str] = None,
+                   capacity_default: int = 1,
+                   capacity_used_field: Optional[str] = None,
                    verify_field: Optional[str] = None,
                    id_field: Optional[str] = None) -> int:
-        """Load existing pole points."""
+        """Load existing pole points (capacity = cable slots on the pole)."""
         return self._load_layer(layer, AssetType.POLE,
-                                capacity_default=1, verify_field=verify_field,
-                                id_field=id_field)
+                                capacity_field, capacity_default,
+                                capacity_used_field, verify_field, id_field)
 
     def load_fibre(self, layer: QgsVectorLayer,
                    capacity_field: Optional[str] = None,
@@ -395,20 +417,26 @@ class BrownfieldRegistry:
                                 id_field=id_field)
 
     def load_existing_pdps(self, layer: QgsVectorLayer,
+                           capacity_field: Optional[str] = None,
+                           capacity_default: int = 1,
+                           capacity_used_field: Optional[str] = None,
                            verify_field: Optional[str] = None,
                            id_field: Optional[str] = None) -> int:
         """Load existing PDPs as special chamber-type assets."""
         return self._load_layer(layer, AssetType.PDP,
-                                capacity_default=1, verify_field=verify_field,
-                                id_field=id_field)
+                                capacity_field, capacity_default,
+                                capacity_used_field, verify_field, id_field)
 
     def load_existing_mfgs(self, layer: QgsVectorLayer,
+                           capacity_field: Optional[str] = None,
+                           capacity_default: int = 1,
+                           capacity_used_field: Optional[str] = None,
                            verify_field: Optional[str] = None,
                            id_field: Optional[str] = None) -> int:
         """Load existing MFGs as special cabinet-type assets."""
         return self._load_layer(layer, AssetType.MFG,
-                                capacity_default=1, verify_field=verify_field,
-                                id_field=id_field)
+                                capacity_field, capacity_default,
+                                capacity_used_field, verify_field, id_field)
 
     # ── Queries ──────────────────────────────────────────────────────────
 
@@ -520,6 +548,31 @@ class BrownfieldRegistry:
         a["capacity_used"] += amount
         a["reused"] = True
         self._used_assets.add(asset_id)
+        return True
+
+    def commit_capacity(self, asset_id: str, amount: int = 1) -> bool:
+        """Consume an asset's capacity AT MOST ONCE per registry lifetime.
+
+        Reuse classification runs per feature/span, so consuming a way for
+        every span that rides the same asset exhausted a 4-way duct after four
+        spans and then labelled the rest of the SAME corridor "not reused" —
+        the trench and duct stages disagreed about one asset. The design takes
+        an existing asset over once: commit the capacity, then stamp every run
+        that rides it.
+
+        Returns True when the asset had capacity to commit (already committed
+        counts as True).
+        """
+        a = self._assets.get(asset_id)
+        if not a:
+            return False
+        if asset_id in self._committed:
+            return True
+        if not self.has_capacity(asset_id):
+            return False
+        if not self.consume_capacity(asset_id, amount):
+            return False
+        self._committed.add(asset_id)
         return True
 
     # ── Graph edge generation ────────────────────────────────────────────

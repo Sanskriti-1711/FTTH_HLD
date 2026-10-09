@@ -1447,6 +1447,16 @@ def _segment_layer_at_chambers(path, chambers, feedback=None, label="layer",
     i_lm = defn.GetFieldIndex("length_m")
     i_span_len = [defn.GetFieldIndex(nm) for nm in span_len_fields]
     i_span_len = [i for i in i_span_len if i >= 0]
+    # Brownfield reuse travels with the run and has to be re-divided when the
+    # run is cut: the parent's REUSE_LEN_M is metres of ONE run, and copying it
+    # onto every span multiplied the reused length by the number of chambers on
+    # that run (measured: 40 of 72 published trenches reported more reused
+    # metres than their own geometry length — 2,275 m of phantom reuse on one
+    # run, all of it billed away from the BOQ).
+    i_reuse = defn.GetFieldIndex("REUSE_LEN_M")
+    i_status = defn.GetFieldIndex("INFRA_STATUS")
+    reused_span_fix = [0, 0.0]        # [spans re-based, metres no longer claimed]
+    run_state = {"len": 0.0, "reuse": 0.0}
 
     def _mk_coords(coords):
         ls = ogr.Geometry(ogr.wkbLineString)
@@ -1691,6 +1701,20 @@ def _segment_layer_at_chambers(path, chambers, feedback=None, label="layer",
             feat.SetField(i_lm, length)
         for i_f in i_span_len:
             feat.SetField(i_f, length)
+        if i_reuse >= 0 and run_state["reuse"] > 0 and run_state["len"] > 0:
+            # The span's reuse is its SHARE of the run it was cut from, capped
+            # at the span's own length: a run can only ride an existing asset
+            # for as many metres as it is long.
+            share = min(1.0, float(length) / float(run_state["len"]))
+            reuse = min(float(length), float(run_state["reuse"]) * share)
+            feat.SetField(i_reuse, round(reuse, 2))
+            if i_status >= 0:
+                feat.SetField(i_status, "Reused" if reuse >= float(length) - 0.5
+                              else "Mixed")
+            reused_span_fix[0] += 1
+            reused_span_fix[1] += float(run_state["reuse"]) - reuse
+        elif i_reuse >= 0:
+            feat.SetField(i_reuse, 0.0)
 
     planned = []
     runs = 0
@@ -1723,6 +1747,11 @@ def _segment_layer_at_chambers(path, chambers, feedback=None, label="layer",
     lyr.StartTransaction()
     try:
         for feat, spans, whole, run_id in planned:
+            # The run's own length and reuse, read BEFORE any span mutates the
+            # source feature — this is the denominator for the per-span share.
+            run_state["len"] = _geom_len_m(feat)
+            run_state["reuse"] = (float(feat.GetField(i_reuse) or 0.0)
+                                  if i_reuse >= 0 else 0.0)
             if not spans:
                 # Nothing chamber-bounded on this run (``whole`` holds all of
                 # its parts): publish it unchanged as a single unchambered run
@@ -2283,6 +2312,11 @@ def enrich_ducts(feeder_path, dist_path, drop_path, trench_path, chamber_path, f
             ("START_CHAMBER", ogr.OFTString, 16),
             ("END_CHAMBER", ogr.OFTString, 16),
             ("INFRA_STATUS", ogr.OFTString, 24),
+            # Brownfield reuse contract (same fields the trench layers publish),
+            # created here too so a layer built by an older duct pass still
+            # exposes the classification instead of dropping it silently.
+            ("REUSE_LEN_M", ogr.OFTReal),
+            ("REUSE_SOURCE", ogr.OFTString, 64),
         ])
         prof = DUCT_PROFILE[profile_key]
         lyr.StartTransaction()
@@ -2318,7 +2352,12 @@ def enrich_ducts(feeder_path, dist_path, drop_path, trench_path, chamber_path, f
                 occ = (occupied / prof["ways"]) * 100.0
             f.SetField("OCCUPANCY_PCT", round(min(occ, 100.0), 1))
             f.SetField("SPARE_PCT", round(max(0.0, 100.0 - occ), 1))
-            f.SetField("INFRA_STATUS", "Proposed")
+            # Never downgrade a duct the brownfield pass classified as riding an
+            # existing asset — this used to overwrite every REUSE-tagged duct
+            # with "Proposed", so the reuse never reached the published layer or
+            # the BOQ.
+            if not str(_get(lyr, f, "REUSE_SOURCE") or "").strip():
+                f.SetField("INFRA_STATUS", "Proposed")
             pts = list(_line_points(f))
             if pts:
                 mid = pts[len(pts) // 2]

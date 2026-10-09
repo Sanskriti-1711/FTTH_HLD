@@ -282,6 +282,27 @@ class BrownfieldLayerAlgorithm(QgsProcessingAlgorithm):
             cabinet_cap_field = self._auto_detect_field(
                 cabinets, ["capacity_total", "capacity", "ports", "n_ports", "splitter_ports", "cap"]
             )
+        # ── Point assets carry capacity too ───────────────────────────────
+        # A surveyed chamber / PDP / MFG records how many structures it already
+        # holds (CAPACITY_TOTAL / CAPACITY_USED), and a pole records its cable
+        # slots. These used to be loaded with a hard-coded default of 1, so a
+        # 4-way chamber with 1 used — i.e. 3 spare — looked full: the reuse
+        # passes could not consume the spare capacity, and the seeded figures
+        # never reached the published Existing_Infrastructure layer either.
+        node_cap_field = self._auto_detect_field(
+            chambers or existing_pdp or existing_mfg,
+            ["capacity_total", "capacity", "cap", "ways", "ports", "splitter_ports"],
+        )
+        node_used_field = self._auto_detect_field(
+            chambers or existing_pdp or existing_mfg,
+            ["capacity_used", "used", "occupied", "n_used", "structures_used"],
+        )
+        pole_cap_field = self._auto_detect_field(
+            poles, ["capacity_total", "capacity", "cable_slots", "slots", "cap"],
+        )
+        pole_used_field = self._auto_detect_field(
+            poles, ["capacity_used", "used", "occupied", "n_used", "cables"],
+        )
         if not verify_field:
             verify_field = self._auto_detect_field(
                 ducts or chambers or poles or fibre or cabinets or trenches,
@@ -295,6 +316,9 @@ class BrownfieldLayerAlgorithm(QgsProcessingAlgorithm):
             f"fibre_cap_field='{fibre_cap_field or '(default)'}', "
             f"fibre_used_field='{fibre_used_field or '(none)'}', "
             f"cabinet_cap_field='{cabinet_cap_field or '(default)'}', "
+            f"node_cap_field='{node_cap_field or '(default)'}', "
+            f"node_used_field='{node_used_field or '(none)'}', "
+            f"pole_cap_field='{pole_cap_field or '(default)'}', "
             f"verify_field='{verify_field or '(default)'}'"
         ))
 
@@ -308,10 +332,14 @@ class BrownfieldLayerAlgorithm(QgsProcessingAlgorithm):
             verify_field=verify_field or None,
         )
         loaded += registry.load_chambers(
-            chambers, verify_field=verify_field or None
+            chambers, capacity_field=node_cap_field or None,
+            capacity_used_field=node_used_field or None,
+            verify_field=verify_field or None,
         )
         loaded += registry.load_poles(
-            poles, verify_field=verify_field or None
+            poles, capacity_field=pole_cap_field or None,
+            capacity_used_field=pole_used_field or None,
+            verify_field=verify_field or None,
         )
         loaded += registry.load_fibre(
             fibre, capacity_field=fibre_cap_field or None,
@@ -331,10 +359,14 @@ class BrownfieldLayerAlgorithm(QgsProcessingAlgorithm):
             dist_trench, verify_field=verify_field or None
         )
         loaded += registry.load_existing_pdps(
-            existing_pdp, verify_field=verify_field or None
+            existing_pdp, capacity_field=node_cap_field or None,
+            capacity_used_field=node_used_field or None,
+            verify_field=verify_field or None,
         )
         loaded += registry.load_existing_mfgs(
-            existing_mfg, verify_field=verify_field or None
+            existing_mfg, capacity_field=node_cap_field or None,
+            capacity_used_field=node_used_field or None,
+            verify_field=verify_field or None,
         )
 
         if loaded == 0:

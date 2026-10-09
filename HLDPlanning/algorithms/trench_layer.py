@@ -3620,7 +3620,13 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                                     if bf_verify is None:
                                         bf_verify = _verify
                                     try:
-                                        bf_reg.consume_capacity(aid)
+                                        # Commit once per asset, not once per
+                                        # span: every span along the same
+                                        # existing duct rides it, and charging
+                                        # a way for each exhausted the asset
+                                        # and relabelled the rest of that same
+                                        # corridor as not reused.
+                                        bf_reg.commit_capacity(aid)
                                     except Exception:
                                         pass
                                     bf_tagged += 1

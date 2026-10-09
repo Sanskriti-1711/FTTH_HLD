@@ -1091,6 +1091,7 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
         # structure in the ground, so it is labelled Reused and carries the
         # asset id — the design and the BOQ then agree with what already
         # exists instead of billing a new chamber. Placement is unchanged.
+        chamber_reuse_tol_m = 2.0
         bf_reg = None
         bf_asset = None
         try:
@@ -1099,9 +1100,21 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
             bf_reg = BrownfieldRegistry.load_from_project()
             if bf_reg is not None and not bf_reg.has_assets():
                 bf_reg = None
-        except Exception:
+        except Exception as exc:
             bf_reg = None
-        chamber_reuse_tol_m = 2.0
+            feedback.pushWarning(
+                f"  Brownfield: chamber reuse unavailable ({exc!r}).")
+        # Say which way it went: a silent skip is indistinguishable from "no
+        # existing chambers in this run" and hides a broken registry hand-off.
+        if bf_reg is not None:
+            feedback.pushInfo(
+                f"  Brownfield: chamber reuse ACTIVE — "
+                f"{bf_reg.point_asset_count} existing point asset(s) in the "
+                f"registry (tolerance {chamber_reuse_tol_m:g} m).")
+        else:
+            feedback.pushInfo(
+                "  Brownfield: chamber reuse inactive (no existing "
+                "infrastructure loaded for this run).")
         reused = 0
 
         counters = {"HH": 0, "DHH": 0, "MH": 0}
@@ -1156,6 +1169,16 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
                         asset = bf_reg.get_asset(aid)
                         if asset is not None:
                             feat[COMMON_FIELDS.VERIFY_STATUS] = asset["verify_status"]
+                            # Carry the SURVEYED capacity of the structure we are
+                            # reusing, so the published layer says what it really
+                            # holds (a 4-way chamber with 1 used shows 3 spare)
+                            # instead of the placeholder 1.
+                            surveyed_total = int(asset.get("capacity_total") or 0)
+                            conn_now = int(feat[COMMON_FIELDS.CAPACITY_TOTAL] or 0)
+                            feat[COMMON_FIELDS.CAPACITY_TOTAL] = max(
+                                surveyed_total, conn_now)
+                            feat[COMMON_FIELDS.CAPACITY_USED] = max(
+                                0, int(asset.get("capacity_used") or 0))
                         bf_reg.consume_capacity(aid)
                     except Exception:
                         pass

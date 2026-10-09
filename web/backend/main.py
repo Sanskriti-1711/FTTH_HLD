@@ -1660,8 +1660,14 @@ def _run_area_pipeline(
     country_code: str = "",
     input_type: str = "",
     postcode: str = "",
+    brownfield_path: Optional[Path] = None,
 ) -> None:
-    """Generate an area's input files, then run the UNCHANGED pipeline on them."""
+    """Generate an area's input files, then run the UNCHANGED pipeline on them.
+
+    ``brownfield_path`` (optional) is an uploaded existing-infrastructure
+    archive; it is passed straight through to the pipeline, which feeds its
+    layers as BF_* inputs and enables reuse.
+    """
     task = _task(project_id)
     task.update({
         "status": "running",
@@ -1757,21 +1763,50 @@ def _run_area_pipeline(
         "extract": extract,
     }
 
+    if brownfield_path:
+        _append(
+            project_id, "info",
+            "Brownfield archive supplied with the area run (%s); enabling "
+            "existing-infrastructure reuse." % brownfield_path.name,
+        )
+
     _run_pipeline(
         project_id,
         Path(built["excel_path"]),
         Path(built["roads_path"]),
         output_dir,
         poly_method,
+        brownfield_path,
     )
 
 
 @app.post("/ftth/hld/run-from-area", status_code=202)
 async def run_from_area(
     background_tasks: BackgroundTasks,
-    payload: Dict[str, Any] = Body(...),
+    request: Request,
 ) -> Dict[str, Any]:
-    """Start a full HLD run from an area — no files to prepare."""
+    """Start a full HLD run from an area — no files to prepare.
+
+    Accepts JSON (no files) or multipart form data with an optional
+    ``brownfield`` archive, so a run-by-area can reuse existing infrastructure
+    exactly like a manual upload does.  The area fields and the JSON contract
+    are identical either way; only the transport differs.
+    """
+    content_type = (request.headers.get("content-type") or "").lower()
+    brownfield_upload: Optional[UploadFile] = None
+    if ("multipart/form-data" in content_type
+            or "application/x-www-form-urlencoded" in content_type):
+        form = await request.form()
+        payload = {k: v for k, v in form.items() if not hasattr(v, "filename")}
+        candidate = form.get("brownfield")
+        if candidate is not None and getattr(candidate, "filename", ""):
+            brownfield_upload = candidate
+    else:
+        try:
+            payload = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON body")
+
     area, country_code, input_type = _area_request(payload)
     postcode = str((payload or {}).get("postcode") or "")
     project_id = str((payload or {}).get("project_id") or uuid.uuid4().hex)
@@ -1783,6 +1818,12 @@ async def run_from_area(
 
     output_dir = OUTPUT_DIR / project_id
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    brownfield_path: Optional[Path] = None
+    if brownfield_upload is not None:
+        brownfield_path = _save_upload(
+            brownfield_upload, output_dir / "inputs", "brownfield.zip"
+        )
 
     task = _task(project_id)
     task.update({
@@ -1808,7 +1849,7 @@ async def run_from_area(
 
     background_tasks.add_task(
         _run_area_pipeline, project_id, area, output_dir, poly_method,
-        country_code, input_type, postcode,
+        country_code, input_type, postcode, brownfield_path,
     )
     return _public_task(project_id)
 

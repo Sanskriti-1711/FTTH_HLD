@@ -131,6 +131,15 @@ _FINAL_FIELDS: Tuple[Tuple[str, object], ...] = (
     ("SPAN_KIND", QMetaType.Type.QString),
     ("INFRA_STATUS", QMetaType.Type.QString),
     ("VERIFY_STATUS", QMetaType.Type.QString),
+    # ── Brownfield reuse ──────────────────────────────────────────────────
+    # The metres of this span that ride an EXISTING duct/trench, and which
+    # asset they ride. The BOQ bills ``length_m - REUSE_LEN_M``; without it a
+    # corridor the client already owns was billed as new trench, because the
+    # designer — the only trench implementation in production — never stamped
+    # reuse at all (the consolidated trench layer did, but the designer output
+    # replaces it).
+    ("REUSE_LEN_M", QMetaType.Type.Double),
+    ("REUSE_SOURCE", QMetaType.Type.QString),
     ("SURFACE", QMetaType.Type.QString),
     ("REINSTATE", QMetaType.Type.QString),
     ("sidewalk", QMetaType.Type.QString),
@@ -489,6 +498,12 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
                 sum(1 for r in final_rows if r["trench_type"] == "Garden"),
                 nodes.featureCount() if nodes else 0,
                 drills.featureCount() if drills else 0))
+
+        # ── Brownfield reuse BEFORE publishing ────────────────────────────
+        # Every trench layer below (Final_Trenches, the Feeder/Garden mirrors,
+        # the DISTRIBUTION spine and its per-address fan-out) is written from
+        # `final_rows`, so stamping the rows here covers all of them at once.
+        self._classify_brownfield_reuse(final_rows, feedback)
 
         sinks: Dict[str, object] = {}
 
@@ -2327,6 +2342,59 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
         result = processing.run(alg_id, out, context=context, feedback=feedback,
                                 is_child_algorithm=True)
         return _as_layer(result.get("OUTPUT"), context, hint)
+
+    # ---- brownfield reuse ------------------------------------------------
+    @staticmethod
+    def _classify_brownfield_reuse(rows: List[dict], feedback) -> dict:
+        """Stamp REUSE_LEN_M / REUSE_SOURCE / INFRA_STATUS on the designer's spans.
+
+        A span that FOLLOWS an existing duct/trench for most of its length (and
+        that asset still has spare capacity) is that asset reused, not new
+        construction: stamp the reused metres, name the asset, and consume the
+        capacity. The rule lives in ``utils/reuse.py`` so the designer and the
+        consolidated trench layer classify identically.
+        """
+        from ..utils.reuse import BrownfieldLineIndex, stamp_row
+
+        stats = {"reused": 0, "mixed": 0, "reuse_len": 0.0, "assets": 0}
+        try:
+            index = BrownfieldLineIndex.build()
+        except Exception as exc:
+            feedback.pushWarning(
+                _tr("Brownfield: reuse classification skipped ({0!r}).").format(exc))
+            for row in rows:
+                row.setdefault("REUSE_LEN_M", 0.0)
+            return stats
+
+        if index is None:
+            for row in rows:
+                row.setdefault("REUSE_LEN_M", 0.0)
+            feedback.pushInfo(_tr(
+                "  Brownfield: reuse inactive (no existing infrastructure "
+                "loaded for this run)."))
+            return stats
+
+        assets = set()
+        for row in rows:
+            result = index.classify_geometry(row.get("_geom"))
+            stamp_row(row, result,
+                      proposed_status=row.get("INFRA_STATUS") or "New")
+            if not result.matched:
+                continue
+            assets.update(result.sources)
+            stats["reuse_len"] += result.reuse_len
+            if result.status == "Reused":
+                stats["reused"] += 1
+            else:
+                stats["mixed"] += 1
+        stats["assets"] = len(assets)
+        feedback.pushInfo(_tr(
+            "  Brownfield: {0} span(s) wholly reuse an existing asset, {1} "
+            "partly ({2} m of trench rides {3} existing asset(s)); "
+            "REUSE_LEN_M/INFRA_STATUS carried to the BOQ.").format(
+                stats["reused"], stats["mixed"],
+                round(stats["reuse_len"], 1), stats["assets"]))
+        return stats
 
     # ---- sinks ----------------------------------------------------------
     def _write_rows(self, parameters, context, key, rows: List[dict], spec,

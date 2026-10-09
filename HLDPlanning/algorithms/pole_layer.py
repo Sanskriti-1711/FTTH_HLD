@@ -262,6 +262,7 @@ class PoleLayerAlgorithm(QgsProcessingAlgorithm):
         # existing surveyed pole is the SAME asset. Label it Reused and carry
         # the registry id, so a brownfield area is not billed for poles it
         # already owns. Placement is unchanged.
+        pole_reuse_tol_m = 2.0
         bf_reg = None
         bf_asset = None
         try:
@@ -270,9 +271,18 @@ class PoleLayerAlgorithm(QgsProcessingAlgorithm):
             bf_reg = BrownfieldRegistry.load_from_project()
             if bf_reg is not None and not bf_reg.has_assets():
                 bf_reg = None
-        except Exception:
+        except Exception as exc:
             bf_reg = None
-        pole_reuse_tol_m = 2.0
+            feedback.pushWarning(f"  Brownfield: pole reuse unavailable ({exc!r}).")
+        if bf_reg is not None:
+            feedback.pushInfo(
+                f"  Brownfield: pole reuse ACTIVE — "
+                f"{len(bf_reg.assets_by_type(bf_asset.POLE))} existing pole(s) in "
+                f"the registry (tolerance {pole_reuse_tol_m:g} m).")
+        else:
+            feedback.pushInfo(
+                "  Brownfield: pole reuse inactive (no existing infrastructure "
+                "loaded for this run).")
         reused_poles = 0
 
         counters = {"Pole": 0, "h7m": 0, "h9m": 0}
@@ -321,6 +331,11 @@ class PoleLayerAlgorithm(QgsProcessingAlgorithm):
                         asset = bf_reg.get_asset(aid)
                         if asset is not None:
                             feat[COMMON_FIELDS.VERIFY_STATUS] = asset["verify_status"]
+                            feat[COMMON_FIELDS.CAPACITY_TOTAL] = max(
+                                int(asset.get("capacity_total") or 0),
+                                int(feat[COMMON_FIELDS.CAPACITY_TOTAL] or 0))
+                            feat[COMMON_FIELDS.CAPACITY_USED] = max(
+                                0, int(asset.get("capacity_used") or 0))
                         bf_reg.consume_capacity(aid)
                     except Exception:
                         pass

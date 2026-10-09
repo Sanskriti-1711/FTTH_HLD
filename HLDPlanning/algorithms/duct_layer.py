@@ -939,6 +939,14 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
         fields.append(QgsField("side",      QMetaType.Type.QString))
         fields.append(QgsField("duct_uid",  QMetaType.Type.Int))
         fields.append(QgsField("color",     QMetaType.Type.QString))
+        # Brownfield reuse: the metres of this duct that ride an existing
+        # duct/trench and which asset. This is the distribution-duct builder the
+        # designer cascade actually runs (Feeder: 0, Dist: 258 on the minimal
+        # run), so without these columns the published layer carried no reuse at
+        # all even when a duct retraced an existing one.
+        fields.append(QgsField("REUSE_LEN_M", QMetaType.Type.Double))
+        fields.append(QgsField("REUSE_SOURCE", QMetaType.Type.QString))
+        fields.append(QgsField("INFRA_STATUS", QMetaType.Type.QString))
 
         sink, out_id = self._make_sink(
             p, self.O_DUCTS, context, feedback,
@@ -947,6 +955,14 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
         if sink is None:
             raise QgsProcessingException(self.invalidSinkError(p, self.O_DUCTS))
         
+
+        # Brownfield reuse index, built once for the whole pass. Only ducts and
+        # trenches can be ridden, and a full asset is skipped once its spare
+        # capacity is consumed (shared rule — see utils/reuse.py).
+        from ..utils.reuse import BrownfieldLineIndex, stamp_feature
+        reuse_idx = BrownfieldLineIndex.build()
+        _fi_reuse = {f.name().upper(): i for i, f in enumerate(fields)}
+        reuse_counts = {"n": 0, "len": 0.0, "assets": set()}
 
         # Side classifier by proximity to the left/right layers
         def _min_dist_to_layer(pt_xy: QgsPointXY, layer: QgsVectorLayer, idx: QgsSpatialIndex, search_r: float) -> float:
@@ -1130,6 +1146,14 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
                     f["side"]      = side_name
                     f["duct_uid"]  = state_uid
                     f["color"]     = distribution_color(side_name, duct_idx)
+                    f["INFRA_STATUS"] = "Proposed"
+                    if reuse_idx is not None:
+                        res = reuse_idx.classify_geometry(geom)
+                        stamp_feature(f, _fi_reuse, res)
+                        if res.matched:
+                            reuse_counts["n"] += 1
+                            reuse_counts["len"] += res.reuse_len
+                            reuse_counts["assets"].update(res.sources)
                     sink.addFeature(f, QgsFeatureSink.FastInsert)
                     total += 1
                     state_uid += 1
@@ -1142,6 +1166,12 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
 
         if sink:
             del sink
+
+        if reuse_idx is not None:
+            feedback.pushInfo(
+                f"  Brownfield: {reuse_counts['n']} distribution duct(s) ride "
+                f"an existing asset ({reuse_counts['len']:,.1f} m reused, "
+                f"{len(reuse_counts['assets'])} asset(s) consumed).")
 
         return {self.O_DUCTS: out_id}
 
@@ -2780,6 +2810,11 @@ class DuctLayer(QgsProcessingAlgorithm):
             ("length_m", QMetaType.Type.Double),
             ("REVIEW", QMetaType.Type.Int),
             ("INFRA_STATUS", QMetaType.Type.QString),
+            # Brownfield reuse: how many metres of this duct ride an existing
+            # asset, and which asset — the same contract the trench layers
+            # publish, so the BOQ bills only the new metres.
+            ("REUSE_LEN_M", QMetaType.Type.Double),
+            ("REUSE_SOURCE", QMetaType.Type.QString),
         ):
             fields.append(QgsField(nm, t))
 
@@ -2817,6 +2852,39 @@ class DuctLayer(QgsProcessingAlgorithm):
                     runs_uri, context, run_fields, QgsWkbTypes.MultiLineString, crs)
             except Exception:
                 runs_sink, runs_id = None, None
+
+        # Field-name -> index maps for the reuse stamping. The two sinks carry
+        # different schemas (only the component sink has the aggregate columns),
+        # so each keeps its own map.
+        _fi_run = {f.name().upper(): i for i, f in enumerate(run_fields)}
+        _fi_final = {f.name().upper(): i for i, f in enumerate(fields)}
+
+        # ── Brownfield reuse index ───────────────────────────────────────────
+        # A route duct that follows an existing duct/trench for most of its
+        # length IS that asset reused, not new material. Stamp REUSE_LEN_M /
+        # REUSE_SOURCE and consume the spare ways, exactly as the trench
+        # stages classify their runs. Classified once per duct geometry: the
+        # run-level and component-level sinks publish the same geometry, and
+        # consuming twice would burn through an asset's spare capacity.
+        from ..utils.reuse import BrownfieldLineIndex, stamp_feature
+        reuse_idx = BrownfieldLineIndex.build()
+        reuse_cache = {}
+        reuse_counts = {"reused": 0, "mixed": 0, "reuse_len": 0.0}
+        reuse_assets = set()
+
+        def _reuse_for(geom):
+            key = id(geom)
+            cached = reuse_cache.get(key, False)
+            if cached is False:
+                cached = (reuse_idx.classify_geometry(geom)
+                          if reuse_idx is not None else None)
+                reuse_cache[key] = cached
+                if cached is not None and cached.matched:
+                    reuse_assets.update(cached.sources)
+                    reuse_counts["reuse_len"] += cached.reuse_len
+                    reuse_counts["reused" if cached.status == "Reused"
+                                 else "mixed"] += 1
+            return cached
 
         bins = []            # (geom, cable_ids, pdp_ids, poly_ids, n_cables)
         made = 0
@@ -2915,6 +2983,7 @@ class DuctLayer(QgsProcessingAlgorithm):
                     nf["length_m"] = round(float(ug.length()), 2)
                     nf["REVIEW"] = 0
                     nf["INFRA_STATUS"] = "Proposed"
+                    stamp_feature(nf, _fi_run, _reuse_for(ug))
                     runs_sink.addFeature(nf, QgsFeatureSink.FastInsert)
                 made += 1
                 if n_cab > ways:
@@ -2981,6 +3050,7 @@ class DuctLayer(QgsProcessingAlgorithm):
                     nf["length_m"] = round(float(spine.length()), 2)
                     nf["REVIEW"] = 1
                     nf["INFRA_STATUS"] = "Proposed"
+                    stamp_feature(nf, _fi_run, _reuse_for(spine))
                     runs_sink.addFeature(nf, QgsFeatureSink.FastInsert)
                 made += 1
             if missing_regions:
@@ -3103,6 +3173,7 @@ class DuctLayer(QgsProcessingAlgorithm):
             nf["CLUBS"] = len(bins)
             nf["REVIEW"] = 1 if n_cab > ways else 0
             nf["INFRA_STATUS"] = "Proposed"
+            stamp_feature(nf, _fi_final, _reuse_for(ug))
             nf["DUCT_ID"] = f"{profile_key.upper()}-DUCT-{i_bin:03d}"
             sink.addFeature(nf, QgsFeatureSink.FastInsert)
 
@@ -3121,6 +3192,16 @@ class DuctLayer(QgsProcessingAlgorithm):
             f"{len(bins)} duct feature(s) spanning a {corridor_len:,.1f} m "
             f"corridor, {agg_len:,.1f} m of duct material "
             f"({int(ways)} ways each, {agg_used} ways used).")
+        if reuse_idx is not None:
+            feedback.pushInfo(
+                f"  Brownfield: {reuse_counts['reused']} duct(s) wholly reuse an "
+                f"existing asset, {reuse_counts['mixed']} partly "
+                f"({reuse_counts['reuse_len']:,.1f} m of duct material rides "
+                f"{len(reuse_assets)} existing asset(s)).")
+        else:
+            feedback.pushInfo(
+                "  Brownfield: duct reuse inactive (no existing infrastructure "
+                "loaded for this run).")
         return out_id
 
     @staticmethod
