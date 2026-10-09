@@ -1,8 +1,10 @@
 """Unit checks for the shared brownfield reuse rule (utils/reuse.py).
 
-Run with QGIS's Python so qgis.core is importable:
+Run with QGIS's Python launcher so qgis.core is importable. The bare
+apps/Python312/python.exe cannot import qgis (its site-packages are not on
+sys.path); bin/python-qgis.bat sets QGIS_PREFIX_PATH and PYTHONPATH for you:
 
-    "C:/Program Files/QGIS 3.44.6/apps/Python312/python.exe" \
+    "C:/Program Files/QGIS 3.44.6/bin/python-qgis.bat" \
         HLD_Planning_01/tests/test_reuse_rule.py
 
 Checks the three things the rule must get right:
