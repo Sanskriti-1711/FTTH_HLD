@@ -94,12 +94,28 @@ def main_() -> int:
 
     write_aerial_zones(output_dir)
 
+    # A previous run's extracted archive is still in brownfield/. It is an
+    # INPUT directory: leaving it there made a run that supplied no archive
+    # inherit the last one, and its stale files take part in the BF_* matching.
+    bf_dir = output_dir / "brownfield"
+    if bf_dir.is_dir():
+        for stale in bf_dir.iterdir():
+            if stale.is_file():
+                stale.unlink()
+        print("[brownfield] cleared the previous run's extracted inputs")
+
+    # The planner's own archive, AND the occupancy read-back (which
+    # _run_pipeline adds itself whenever project_id is passed — the two are
+    # merged per BF_* parameter now, so neither replaces the other).
+    archive = output_dir / "inputs" / "_brownfield_test.zip"
+    if not archive.is_file():
+        archive = output_dir / "inputs" / "brownfield.zip"
+    archive = archive if archive.is_file() else None
+
     print(f"[run] project={PROJECT_ID} poly_method=3")
-    print("[run] brownfield = this project's own duct occupancy read-back "
-          "(+ any supplied archive)")
-    # brownfield_path=None + project_id -> _brownfield_args exports the stored
-    # occupancy as bf_ducts.geojson and enables reuse.
-    main._run_pipeline(PROJECT_ID, excel, roads, output_dir, 3, None)
+    print(f"[run] brownfield archive = {archive.name if archive else 'none'}"
+          " + this project's own duct occupancy read-back")
+    main._run_pipeline(PROJECT_ID, excel, roads, output_dir, 3, archive)
 
     task = main.tasks.get(PROJECT_ID) or {}
     print(f"[run] status={task.get('status')} stage={task.get('stage')} "

@@ -1038,6 +1038,53 @@ def _match_brownfield_param(filename: str, props: Optional[Dict[str, Any]] = Non
     return None
 
 
+def _merge_brownfield_files(param: str, paths: List[Path],
+                            bf_dir: Path) -> Optional[Path]:
+    """Merge every file that feeds one BF_* parameter into a single GeoJSON.
+
+    Two different files legitimately feed the same parameter: the planner's
+    survey archive ships ``bf_existing_ducts.geojson`` and the occupancy
+    read-back writes ``bf_ducts.geojson``, and both resolve to BF_DUCTS.  The
+    old code let whichever was scanned last win, so an uploaded brownfield
+    could be silently replaced by the derived occupancy layer (and the run
+    then reused the wrong network, or nothing).  Features are collected from
+    every file; a duplicate ``SRC_ID``/``DUCT_ID`` or an identical geometry is
+    written once.
+    """
+    features: List[Dict[str, Any]] = []
+    seen_ids: Set[str] = set()
+    seen_geom: Set[str] = set()
+    for fp in paths:
+        if fp.suffix.lower() not in (".geojson", ".json"):
+            continue
+        try:
+            with fp.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        for feature in data.get("features") or []:
+            props = feature.get("properties") or {}
+            asset_id = str(props.get("SRC_ID") or props.get("DUCT_ID") or "")
+            if asset_id:
+                if asset_id in seen_ids:
+                    continue
+                seen_ids.add(asset_id)
+            else:
+                # No id to compare: fall back to the geometry, so a file that
+                # repeats an asset it has no id for is not added twice.
+                geom_key = json.dumps(feature.get("geometry"), sort_keys=True)
+                if geom_key in seen_geom:
+                    continue
+                seen_geom.add(geom_key)
+            features.append(feature)
+    if not features:
+        return None
+    out = bf_dir / f"bf_merged_{param.lower()}.geojson"
+    with out.open("w", encoding="utf-8") as fh:
+        json.dump({"type": "FeatureCollection", "features": features}, fh)
+    return out
+
+
 def _brownfield_args(brownfield_path: Optional[Path], output_dir: Path,
                      project_id: Optional[str] = None) -> List[str]:
     """Unzip an uploaded brownfield archive and build the plugin BF_* params.
@@ -1079,37 +1126,59 @@ def _brownfield_args(brownfield_path: Optional[Path], output_dir: Path,
     if not have_inputs:
         return []
 
-    matches: Dict[str, str] = {}
+    # ── One BF_* parameter can be fed by MORE THAN ONE file ───────────────
+    # ``bf_ducts.geojson`` (the occupancy read-back) and
+    # ``bf_existing_ducts.geojson`` (the planner's survey archive) both resolve
+    # to BF_DUCTS.  Letting the last one scanned win silently discarded the
+    # uploaded brownfield -- or the read-back -- depending on directory order,
+    # so a run could report reuse from the wrong network, or none at all.
+    # Every file that maps to a parameter is collected, and where several
+    # exist they are MERGED into one GeoJSON for that parameter.
+    candidates: Dict[str, List[Path]] = {}
     # Prefer GeoJSON > GPKG > JSON > SHP when a zip ships the same asset
     # in several formats.
     priority = {".geojson": 3, ".gpkg": 2, ".json": 1, ".shp": 0}
-    for fp in bf_dir.rglob("*"):
+    for fp in sorted(bf_dir.rglob("*")):
         if not fp.is_file() or fp.suffix.lower() not in _BF_VECTOR_EXTS:
             continue
+        if fp.name.startswith("bf_merged_"):
+            continue  # our own merged output, not an input
         param = _match_brownfield_param(fp.name)
-        if param:
-            matches[param] = str(fp)
-            continue
-        # The filename carried no BF_* token. These zips ship one asset per
-        # file under ``bf_existing_<kind>.geojson``; every file has an
-        # ``ASSET_TYPE`` property that maps straight to a BF_* param, so
-        # read the schema once and re-run the resolver with the properties.
-        try:
-            import json
-            data = json.loads(fp.read_text(encoding="utf-8"))
-            props = {}
-            for feature in data.get("features") or []:
-                props = feature.get("properties") or {}
-                if props:
-                    break
-        except (OSError, ValueError):
-            continue
-        param = _match_brownfield_param(fp.name, props)
         if not param:
+            # The filename carried no BF_* token. These zips ship one asset
+            # per file under ``bf_existing_<kind>.geojson``; every file has an
+            # ``ASSET_TYPE`` property that maps straight to a BF_* param, so
+            # read the schema once and re-run the resolver with the properties.
+            try:
+                with fp.open("r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                props = {}
+                for feature in data.get("features") or []:
+                    props = feature.get("properties") or {}
+                    if props:
+                        break
+            except (OSError, ValueError):
+                continue
+            param = _match_brownfield_param(fp.name, props)
+            if not param:
+                continue
+        candidates.setdefault(param, []).append(fp)
+
+    matches: Dict[str, str] = {}
+    for param, paths in sorted(candidates.items()):
+        # Same asset in several formats: the richest format wins.
+        best = max(paths, key=lambda p: priority.get(p.suffix.lower(), -1))
+        if len(paths) == 1:
+            matches[param] = str(best)
             continue
-        prev = matches.get(param)
-        if prev is None or priority[fp.suffix.lower()] > priority[Path(prev).suffix.lower()]:
-            matches[param] = str(fp)
+        merged = _merge_brownfield_files(param, paths, bf_dir)
+        matches[param] = str(merged or best)
+        if merged is not None:
+            _append(
+                project_id, "info",
+                f"Brownfield: merged {len(paths)} file(s) into {param} "
+                f"({', '.join(p.name for p in paths)}).",
+            )
 
     args: List[str] = []
     if matches:
