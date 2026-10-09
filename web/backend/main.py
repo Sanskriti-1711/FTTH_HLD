@@ -1033,7 +1033,27 @@ def _brownfield_args(brownfield_path: Optional[Path], output_dir: Path,
         args.append("USE_BROWNFIELD=true")
         for param in sorted(matches):
             args.append(f"{param}={matches[param]}")
-    return args
+        return args
+
+    # The archive arrived but mapped to no BF_* layer, so the run is about
+    # to continue as greenfield. This used to be a silent empty return: the
+    # area run had already reported "enabling reuse", and a completed run
+    # with no reuse is indistinguishable from the feature never firing.
+    # Name what arrived and what is recognised instead.
+    if project_id:
+        supplied = sorted(
+            str(fp.relative_to(bf_dir)) for fp in bf_dir.rglob("*") if fp.is_file()
+        )
+        _append(
+            project_id, "warning",
+            "Brownfield upload NOT applied - no file matched a BF_* layer name, "
+            "so this run continues WITHOUT reuse. Received: %s. Name layers "
+            "with any of: duct, chamber, pole, fibre/fiber, cabinet, "
+            "feeder+trench, dist+trench, pdp, mfg, trench "
+            "(e.g. bf_existing_ducts.geojson)."
+            % (", ".join(supplied) or "no vector files"),
+        )
+    return []
 
 
 # ── OSM reference layers → design constraints ─────────────────────────────
@@ -1766,8 +1786,9 @@ def _run_area_pipeline(
     if brownfield_path:
         _append(
             project_id, "info",
-            "Brownfield archive supplied with the area run (%s); enabling "
-            "existing-infrastructure reuse." % brownfield_path.name,
+            "Brownfield archive supplied with the area run (%s); matching "
+            "it against the BF_* layer names the pipeline accepts."
+            % brownfield_path.name,
         )
 
     _run_pipeline(
