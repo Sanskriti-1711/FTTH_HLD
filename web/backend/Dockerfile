@@ -37,7 +37,7 @@ RUN apt-get update -qq && \
     rm -rf /var/lib/apt/lists/* && \
     python3 -m pip install --no-cache-dir --break-system-packages \
         --no-binary shapely \
-        pandas geopandas openpyxl shapely networkx
+        pandas geopandas openpyxl shapely==2.1.2 networkx
 
 # Register HLDPlanning plugin with qgis_process so it appears in the algorithm list.
 RUN mkdir -p /root/.local/share/QGIS/QGIS3/profiles/default/python/plugins && \
