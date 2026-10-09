@@ -46,6 +46,8 @@ Separation rules (HLD review):
     the PDP id) instead of stacking a second chamber next to it.
 """
 import math
+import os
+
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     QgsProcessing, QgsProcessingAlgorithm,
@@ -107,6 +109,15 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
     CONN_RADIUS_M = 3.0         # ducts within this radius count as 'connected'
     TRENCH_JOIN_M = 3.0         # parent trench join tolerance
     TRENCH_SNAP_M = 5.0         # max shift to snap a chamber ONTO the trench path
+    # How close a planned chamber must be to an existing (brownfield)
+    # chamber/PDP to be the SAME structure in the ground.  The old 2.0 m was
+    # tighter than the pipeline's own placement tolerance: a chamber may be
+    # shifted up to TRENCH_SNAP_M (5.0 m) to sit on the trench path, so the
+    # closest genuine pair measured 3.31 m and nothing was ever reused.  5.0 m
+    # cannot create an ambiguous match either -- MIN_STRUCTURE_SEPARATION_M
+    # keeps two PLANNED structures 10.0 m apart, so at most one of them can
+    # fall inside this radius.  Override with CHAMBER_REUSE_TOL_M.
+    CHAMBER_REUSE_TOL_M = 5.0
 
     # HLD review rules: chambers must sit inside the design boundary, and out
     # of buildings EXCEPT high-density PDPs (> PDP_INBUILDING_HH homes), where
@@ -1091,7 +1102,12 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
         # structure in the ground, so it is labelled Reused and carries the
         # asset id — the design and the BOQ then agree with what already
         # exists instead of billing a new chamber. Placement is unchanged.
-        chamber_reuse_tol_m = 2.0
+        chamber_reuse_tol_m = self.CHAMBER_REUSE_TOL_M
+        try:
+            chamber_reuse_tol_m = float(
+                os.environ.get("CHAMBER_REUSE_TOL_M") or chamber_reuse_tol_m)
+        except (TypeError, ValueError):
+            pass
         bf_reg = None
         bf_asset = None
         try:
@@ -1116,6 +1132,10 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
                 "  Brownfield: chamber reuse inactive (no existing "
                 "infrastructure loaded for this run).")
         reused = 0
+        # The closest out-of-tolerance existing structure, so a run that reuses
+        # nothing can say HOW close it came instead of looking like the
+        # registry held nothing at all.
+        nearest_miss = float("inf")
 
         counters = {"HH": 0, "DHH": 0, "MH": 0}
         reason_counts = {}
@@ -1156,10 +1176,16 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
             if bf_reg is not None:
                 try:
                     hit = bf_reg.find_nearest_point_asset(
-                        QgsPointXY(x, y), chamber_reuse_tol_m,
+                        QgsPointXY(x, y), max(chamber_reuse_tol_m, 50.0),
                         asset_types={bf_asset.CHAMBER, bf_asset.PDP},
                     )
                 except Exception:
+                    hit = None
+                if hit is not None and hit[1] > chamber_reuse_tol_m:
+                    # Found one, but too far to be the same structure: record
+                    # the distance and treat it as no match.
+                    if hit[1] < nearest_miss:
+                        nearest_miss = hit[1]
                     hit = None
                 if hit is not None:
                     aid = hit[0]
@@ -1208,8 +1234,11 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
                f"chamber/PDP within {chamber_reuse_tol_m:g} m "
                f"(INFRA_STATUS={InfraStatus.REUSED}, REUSE_SOURCE set)."
                if reused else
-               "\n  Brownfield: no planned chamber sat on an existing "
-               "chamber/PDP (within the reuse tolerance)."
+               (f"\n  Brownfield: no planned chamber sat on an existing "
+                f"chamber/PDP within {chamber_reuse_tol_m:g} m "
+                + (f"(the closest was {nearest_miss:.2f} m)."
+                   if nearest_miss != float("inf")
+                   else "(the registry holds no chamber/PDP)."))
                if bf_reg is not None else "")))
 
         result = {}
