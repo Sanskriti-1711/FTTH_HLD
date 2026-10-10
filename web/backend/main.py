@@ -1038,6 +1038,51 @@ def _match_brownfield_param(filename: str, props: Optional[Dict[str, Any]] = Non
     return None
 
 
+def _geojson_crs(path: Path) -> str:
+    """The CRS a brownfield GeoJSON declares, as ``EPSG:<code>``.
+
+    A GeoJSON with no ``crs`` member is lon/lat by definition (RFC 7946), and
+    that default is the trap here: the occupancy read-back is written as plain
+    lon/lat with no ``crs`` member, while an uploaded archive is projected
+    EPSG:25833 and says so.  Merging the two produced ONE layer carrying both
+    degrees and metres, and the loader reprojected all of it as a single CRS —
+    which put the uploaded assets ~900 km from the design and silently turned
+    every reuse opportunity into zero.  Returns "" when it cannot tell.
+    """
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return ""
+    name = str(((doc.get("crs") or {}).get("properties") or {}).get("name") or "")
+    if not name:
+        return "EPSG:4326"
+    match = re.search(r"EPSG[:]{1,2}(\d+)", name)
+    return f"EPSG:{match.group(1)}" if match else ""
+
+
+def _reproject_brownfield_file(path: Path, target_crs: str,
+                               bf_dir: Path) -> Optional[Path]:
+    """Reproject one GeoJSON to ``target_crs`` so it can be merged safely.
+
+    Uses ogr2ogr, which ships with QGIS and is already how this module
+    converts GeoPackages, so nothing new is required at run time.
+    """
+    ogr2ogr = shutil.which("ogr2ogr")
+    if not ogr2ogr:
+        return None
+    out = bf_dir / f"bf_reproj_{path.stem}.geojson"
+    try:
+        result = subprocess.run(
+            [ogr2ogr, "-f", "GeoJSON", "-t_srs", target_crs,
+             str(out), str(path)],
+            capture_output=True, text=True, timeout=600,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out if result.returncode == 0 and out.exists() else None
+
+
 def _merge_brownfield_files(param: str, paths: List[Path],
                             bf_dir: Path) -> Optional[Path]:
     """Merge every file that feeds one BF_* parameter into a single GeoJSON.
@@ -1051,10 +1096,27 @@ def _merge_brownfield_files(param: str, paths: List[Path],
     every file; a duplicate ``SRC_ID``/``DUCT_ID`` or an identical geometry is
     written once.
     """
+    # ── One CRS for the merged layer ──────────────────────────────────────
+    # Blending sources that disagree produced a layer holding BOTH degrees and
+    # metres; the loader then reprojected all of it once and the mismatched
+    # assets landed in the wrong country. A declared CRS wins over the
+    # RFC-7946 lon/lat default, and every source is brought to that CRS first.
+    declared = [c for c in (_geojson_crs(p) for p in paths) if c]
+    target_crs = next((c for c in declared if c != "EPSG:4326"),
+                      declared[0] if declared else "EPSG:4326")
+    sources: List[Path] = []
+    for fp in paths:
+        crs = _geojson_crs(fp)
+        if crs == target_crs or not crs:
+            sources.append(fp)
+            continue
+        converted = _reproject_brownfield_file(fp, target_crs, bf_dir)
+        sources.append(converted or fp)
+
     features: List[Dict[str, Any]] = []
     seen_ids: Set[str] = set()
     seen_geom: Set[str] = set()
-    for fp in paths:
+    for fp in sources:
         if fp.suffix.lower() not in (".geojson", ".json"):
             continue
         try:
@@ -1080,8 +1142,16 @@ def _merge_brownfield_files(param: str, paths: List[Path],
     if not features:
         return None
     out = bf_dir / f"bf_merged_{param.lower()}.geojson"
+    # The declared CRS travels with the file: without it a reader falls back to
+    # lon/lat and every projected vertex is read as a degree.
+    doc: Dict[str, Any] = {"type": "FeatureCollection", "features": features}
+    if target_crs and target_crs != "EPSG:4326":
+        doc["crs"] = {
+            "type": "name",
+            "properties": {"name": f"urn:ogc:def:crs:EPSG::{target_crs.split(':')[1]}"},
+        }
     with out.open("w", encoding="utf-8") as fh:
-        json.dump({"type": "FeatureCollection", "features": features}, fh)
+        json.dump(doc, fh)
     return out
 
 

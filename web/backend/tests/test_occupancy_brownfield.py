@@ -21,7 +21,10 @@ Run from the engine backend dir:
 """
 
 import json
+import shutil
 from pathlib import Path
+
+import pytest
 
 import occupancy
 import postgis
@@ -183,6 +186,75 @@ def test_a_survey_duct_file_and_the_read_back_are_merged_not_overwritten(tmp_pat
     )
     # The survey asset AND the read-back asset, not one replacing the other.
     assert ids == ["OCC-D1", "SRV-D1"]
+
+
+def test_geojson_crs_reads_the_declared_code_and_defaults_to_wgs84(tmp_path):
+    import main
+
+    plain = tmp_path / "plain.geojson"
+    plain.write_text(json.dumps({"type": "FeatureCollection", "features": []}),
+                     encoding="utf-8")
+    # RFC 7946: no `crs` member means lon/lat.
+    assert main._geojson_crs(plain) == "EPSG:4326"
+
+    proj = tmp_path / "proj.geojson"
+    proj.write_text(json.dumps({
+        "type": "FeatureCollection", "features": [],
+        "crs": {"type": "name",
+                "properties": {"name": "urn:ogc:def:crs:EPSG::25833"}},
+    }), encoding="utf-8")
+    assert main._geojson_crs(proj) == "EPSG:25833"
+
+
+def test_merging_sources_in_different_crs_yields_one_crs(tmp_path, monkeypatch):
+    """The occupancy read-back is lon/lat with no `crs` member; an uploaded
+    archive is projected and says so. Blending them produced ONE layer carrying
+    degrees AND metres, which the loader reprojected as a single CRS — so the
+    uploaded assets landed ~900 km from the design and every reuse opportunity
+    silently read as zero."""
+    import main
+
+    if not shutil.which("ogr2ogr"):
+        pytest.skip("ogr2ogr not available to reproject")
+
+    # A real Berlin vertex, in the two shapes the engine actually writes.
+    lonlat = {
+        "type": "FeatureCollection",
+        "features": [{"type": "Feature", "geometry": {"type": "Point",
+                                                       "coordinates": [13.3700, 52.4480]},
+                      "properties": {"DUCT_ID": "OCC-1", "capacity_total": 4,
+                                     "capacity_used": 1}}],
+    }
+    projected = {
+        "type": "FeatureCollection",
+        "crs": {"type": "name",
+                "properties": {"name": "urn:ogc:def:crs:EPSG::25833"}},
+        "features": [{"type": "Feature", "geometry": {"type": "Point",
+                                                       "coordinates": [389000.0, 5812000.0]},
+                      "properties": {"SRC_ID": "SRV-1", "CAPACITY_TOTAL": 2,
+                                     "CAPACITY_USED": 0}}],
+    }
+    bf_dir = tmp_path / "brownfield"
+    bf_dir.mkdir()
+    (bf_dir / "bf_ducts.geojson").write_text(json.dumps(lonlat), encoding="utf-8")
+    (bf_dir / "bf_existing_ducts.geojson").write_text(
+        json.dumps(projected), encoding="utf-8")
+
+    merged = main._merge_brownfield_files(
+        "BF_DUCTS",
+        [bf_dir / "bf_ducts.geojson", bf_dir / "bf_existing_ducts.geojson"],
+        bf_dir,
+    )
+    doc = json.loads(merged.read_text(encoding="utf-8"))
+
+    assert len(doc["features"]) == 2
+    # One CRS for the layer, declaring the projected one...
+    assert doc["crs"]["properties"]["name"].endswith("25833")
+    # ...and every vertex really in it, so nothing sits 900 km away.
+    for feature in doc["features"]:
+        x, y = feature["geometry"]["coordinates"]
+        assert 380000 < x < 400000, (x, y)
+        assert 5800000 < y < 5820000, (x, y)
 
 
 def test_a_duplicate_asset_is_merged_once(tmp_path, monkeypatch):
