@@ -205,6 +205,7 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
             COMMON_FIELDS.CROSSINGS,
             COMMON_FIELDS.PERMIT_REQUIRED,
             COMMON_FIELDS.AERIAL_REASON,
+            "POLE_SOURCE",
             COMMON_FIELDS.INFRA_STATUS,
             COMMON_FIELDS.VERIFY_STATUS,
             COMMON_FIELDS.STAGE,
@@ -222,6 +223,7 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
             COMMON_FIELDS.LENGTH_M,
             COMMON_FIELDS.SOURCE_NODE,
             COMMON_FIELDS.UTIL_PCT,
+            "POLE_SOURCE",
             COMMON_FIELDS.INFRA_STATUS,
             COMMON_FIELDS.VERIFY_STATUS,
             COMMON_FIELDS.STAGE,
@@ -356,7 +358,18 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
             return True, ""
 
         def _nearest_pole(pt: QgsPointXY):
-            """Return (pole_id, pole_geom, distance_m) or None."""
+            """Return (pole_id, pole_geom, distance_m, source) or None.
+
+            ``source`` is the layer the pole came from — ``existing`` for the
+            brownfield/existing inventory, ``planned`` for the poles this run
+            designs. It is carried out of here because this is the only place
+            that knows it, and "did this drop hang off plant that exists, or
+            off a pole we still have to build?" is the first question anyone
+            reviewing an aerial design asks.
+            """
+            # (distance, feature, geometry, source) — one list so the nearest
+            # pole wins whichever layer it came from, which is the rule that
+            # makes reuse preferable without being mandatory.
             candidates = []
             for fid in pole_idx.nearestNeighbor(pt, 5):
                 feat = poles.getFeature(fid)
@@ -369,7 +382,7 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
                 if not eligible:
                     continue
                 d = float(g.distance(QgsGeometry.fromPointXY(pt)))
-                candidates.append((d, feat, g))
+                candidates.append((d, feat, g, "planned"))
 
             for fid in bf_pole_idx.nearestNeighbor(pt, 5):
                 feat = bf_poles.getFeature(fid)
@@ -382,7 +395,7 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
                 if not eligible:
                     continue
                 d = float(g.distance(QgsGeometry.fromPointXY(pt)))
-                candidates.append((d, feat, g))
+                candidates.append((d, feat, g, "existing"))
 
             if not candidates:
                 return None
@@ -393,9 +406,9 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
             usable = [c for c in candidates if c[0] > self.MIN_SPAN_M]
             if not usable:
                 return None
-            d, feat, g = usable[0]
+            d, feat, g, source = usable[0]
             pid = str(feat[COMMON_FIELDS.POLE_ID] or feat["POLE_ID"] or feat["pole_id"] or "")
-            return pid, g, d
+            return pid, g, d, source
 
         def _approx_meters(p1, p2):
             """Distance between two points in **metres**.
@@ -541,6 +554,7 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
             # the leg geometry is the span — routing from the nearest pole
             # instead published a 38.6 m span where the field builds ~18.6 m.
             anchor_id, anchor_pt, anchor_dist, path = "", None, 0.0, None
+            anchor_source = ""
             start_pt = leg_start.get(addr) if addr else None
             if start_pt is not None:
                 host = _building_at(start_pt, addr)
@@ -548,13 +562,17 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
                     anchor_id = "BLDG-%s" % host
                     anchor_pt = start_pt
                     path = leg_coords.get(addr)
+                    # A house-to-house span hangs off a BUILDING, not a pole:
+                    # neither existing plant nor a planned pole, and saying so
+                    # is what stops "existing" from being read as a pole count.
+                    anchor_source = "building"
                     building_anchored += 1
             if not anchor_id:
                 nearest = _nearest_pole(pt)
                 if nearest is None:
                     skipped_no_pole += 1
                     continue
-                anchor_id, anchor_geom, anchor_dist = nearest
+                anchor_id, anchor_geom, anchor_dist, anchor_source = nearest
                 anchor_pt = (
                     anchor_geom.centroid().asPoint()
                     if anchor_geom.wkbType() == QgsWkbTypes.PointGeometry
@@ -568,6 +586,7 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
                 "f": f, "pt": pt, "addr": addr, "hh_count": hh_count,
                 "anchor_id": anchor_id, "anchor_pt": anchor_pt,
                 "anchor_dist": anchor_dist, "path": path,
+                "anchor_source": anchor_source,
             })
 
         feedback.pushInfo(self.tr(
@@ -761,6 +780,12 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
                     or next((leg_reason[k] for k in leg_reason
                              if k and addr_val and k in str(addr_val)), "")
                     or "hlv_evaluation"),
+                # Provenance, from the layer the anchor pole was found in:
+                # `existing` = eligible plant already in the ground (the
+                # brownfield/existing inventory), `planned` = a pole this run
+                # designs, `building` = a house-to-house span. Empty when
+                # nothing could be resolved.
+                "POLE_SOURCE": item.get("anchor_source") or "",
                 COMMON_FIELDS.INFRA_STATUS: "Proposed",
                 COMMON_FIELDS.VERIFY_STATUS: "Assumed",
                 COMMON_FIELDS.STAGE: "HLD",
@@ -779,6 +804,9 @@ class AerialDropLayerAlgorithm(QgsProcessingAlgorithm):
                 COMMON_FIELDS.LENGTH_M: round(length_m, 1),
                 COMMON_FIELDS.SOURCE_NODE: str(anchor_id or ""),
                 COMMON_FIELDS.UTIL_PCT: min(100.0, round(((hh_count + self.RESERVED_SPARE_FIBERS) / float(fiber_count)) * 100.0, 1)),
+                # Same anchor as the span, so the same provenance: the cable
+                # hangs off the pole the span does.
+                "POLE_SOURCE": item.get("anchor_source") or "",
                 COMMON_FIELDS.INFRA_STATUS: "Proposed",
                 COMMON_FIELDS.VERIFY_STATUS: "Assumed",
                 COMMON_FIELDS.STAGE: "HLD",

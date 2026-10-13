@@ -190,6 +190,12 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
 
     # HLD_attr civil layers
     P_AERIAL_ZONES = "AERIAL_ZONES"
+    # Permit lead times per authority/street (docs/aerial planning.docx Rule 7).
+    # Optional and any geometry: polygons are authority/service areas, lines a
+    # per-street register, points a depot. With a layer the permit-delay drop
+    # trigger fires where the authority is actually slow; without one it can
+    # only be the project-wide number, which is why it ships off.
+    P_PERMIT_DELAYS = "PERMIT_DELAYS"
     OUT_CHAMBERS = "OUT_CHAMBERS"
     OUT_POLES = "OUT_POLES"
     OUT_AERIAL_TRENCHES = "OUT_AERIAL_TRENCHES"
@@ -264,6 +270,17 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
     # drop legs on the pole line and publishes Aerial_Drops) and the aerial
     # legs it classifies come out of the trench stage.
     _TR_AERIAL_IN = "INPUT_AERIAL_ZONES"
+    # The trench stage's own parameter for existing poles: the docx drop chain
+    # asks "ELSE IF existing telecom pole within 50 m -> Aerial", which cannot
+    # be answered without a pole inventory. Fed from BF_POLES, so a project
+    # with no brownfield archive simply leaves the step unmeasured.
+    _TR_EXISTING_POLES = "INPUT_EXISTING_POLES"
+    # Permit lead times per authority/street (the docx's Rule 7). Optional, and
+    # the reason the permit-delay trigger can be switched ON: per drop it fires
+    # where the authority is slow, instead of across a whole ward off one
+    # project-wide number. Supplied by the engine when the project carries
+    # inputs/permit_delays.geojson.
+    _TR_PERMIT_DELAYS = "INPUT_PERMIT_DELAYS"
     _TR_AERIAL_DROPS = "OUT_AERIAL_DROPS"
     # The designer's structural nodes: published by the trench stage and
     # consumed by the chamber stage as its primary candidates.
@@ -537,6 +554,12 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             self.P_AERIAL_ZONES,
             self.tr("07 Civil — Aerial Zones [polygons] (blank = no poles planned)"),
             [QgsProcessing.TypeVectorPolygon], optional=True
+        ))
+        self.addParameter(QgsProcessingParameterVectorLayer(
+            self.P_PERMIT_DELAYS,
+            self.tr("04 Trench — Permit lead times [any geometry] "
+                    "(lead_time_days; blank = project-wide only)"),
+            [QgsProcessing.TypeVectorAnyGeometry], optional=True
         ))
         self.addParameter(QgsProcessingParameterVectorLayer(
             self.P_PREMISES,
@@ -1080,6 +1103,23 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
                         ", ".join(sorted(restricted)) or "none",
                         total - len(restricted)))
             params[self._TR_AERIAL_IN] = zones
+        bf_poles = self.parameterAsVectorLayer(parameters, self.P_BF_POLES, context)
+        if (bf_poles is not None and bf_poles.isValid()
+                and bf_poles.featureCount() > 0):
+            params[self._TR_EXISTING_POLES] = bf_poles
+            feedback.pushInfo(self.tr(
+                "Trench stage: {0} existing pole(s) supplied — the docx "
+                "'existing telecom pole within 50 m' drop step can fire."
+            ).format(bf_poles.featureCount()))
+        permit_layers = self.parameterAsVectorLayer(
+            parameters, self.P_PERMIT_DELAYS, context)
+        if (permit_layers is not None and permit_layers.isValid()
+                and permit_layers.featureCount() > 0):
+            params[self._TR_PERMIT_DELAYS] = permit_layers
+            feedback.pushInfo(self.tr(
+                "Trench stage: {0} permit lead-time feature(s) supplied — the "
+                "docx 'permit delay > 60 days' drop step is per drop."
+            ).format(permit_layers.featureCount()))
         engine, invalid = TRENCH_ENGINE.resolve()
         if invalid:
             feedback.pushWarning(self.tr(

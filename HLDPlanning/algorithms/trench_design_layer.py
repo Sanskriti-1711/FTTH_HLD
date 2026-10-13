@@ -79,6 +79,7 @@ from qgis.core import (
 from qgis import processing
 
 from .trench_layer import TrenchLayerAlgorithm
+from ..utils.params import AERIAL_DECISION
 from ..utils.fields import first_field_case_insensitive as _pick_field
 from ..utils.layer_io import as_layer as _as_layer
 from ..utils.geometry_ops import unary_union_geoms as _unary_union_geoms
@@ -97,6 +98,19 @@ TRENCH_DEPTH_MM = {"Open Cut": 900, "HDD": 900, "Garden": 450}
 SIDEWALK_OFFSET_M = 3.0
 SIDEWALK_SEGMENTS = 8
 AOI_BUFFER_M = 100.0
+
+
+def permit_field_names() -> Tuple[str, ...]:
+    """The lead-time spellings the designer accepts — one source of truth.
+
+    Imported lazily so the feedback message stays available even if the
+    designer module cannot be loaded (it needs networkx + GDAL).
+    """
+    try:
+        from ..design.aerial_feasibility import PERMIT_DELAY_FIELDS
+    except Exception:  # pragma: no cover - reported elsewhere, not here
+        return ("lead_time_days", "permit_delay_days", "lead_days", "days")
+    return tuple(PERMIT_DELAY_FIELDS)
 
 _TIER_GEOM = {
     "Feeder": QgsWkbTypes.MultiLineString,        # legacy: MULTILINESTRING
@@ -210,6 +224,25 @@ _AERIAL_FIELDS: Tuple[Tuple[str, object], ...] = (
     ("DEPTH_MM", QMetaType.Type.Int),
     ("length_m", QMetaType.Type.Double),
     ("AERIAL_REASON", QMetaType.Type.QString),
+    # ── the docx's pole-route condition, and what carried the decision ─────
+    # The designer answers both on its own Aerial_Drops (``FIELD_AERIAL`` in
+    # design/trench_design.py) and this stage used to drop them while copying
+    # the row into the published layer, so the served design could not say
+    # whether the docx's "existing pole route available" condition held for a
+    # drop, nor why the point model chose the leg. Both are the first questions
+    # a reviewer asks of an aerial layer, so the fields are carried through
+    # rather than recomputed by whoever needs them.
+    #
+    # ``POLE_ROUTE`` (this layer) is the drop-stage reading — is an existing
+    # pole in reach, i.e. must the run provide the pole route. ``POLE_SOURCE``
+    # (Aerial_Spans / Aerial_Cable, written by `aerial_drop_planner`) is the
+    # other question — which plant the built span was anchored on (``existing``
+    # / ``planned`` / ``building``). They can disagree on one premise and both
+    # be right; measured on project `24cd3573` (2026-10-13) they do on 31 of 59.
+    ("POLE_ROUTE", QMetaType.Type.QString),
+    ("EXISTING_POLE_M", QMetaType.Type.Double),
+    ("AERIAL_SCORE", QMetaType.Type.Double),
+    ("AERIAL_FACTS", QMetaType.Type.QString),
     ("INFRA_STATUS", QMetaType.Type.QString),
     ("VERIFY_STATUS", QMetaType.Type.QString),
     ("EXCAVATION", QMetaType.Type.Int),
@@ -397,11 +430,73 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
                 "Aerial zones: {0} polygon(s) → the designer classifies the "
                 "drop legs that cannot be dug.").format(zones.featureCount()))
 
+        # Existing poles (the brownfield archive's BF_POLES, or any inventory
+        # the pipeline supplies): the docx drop chain's "existing telecom pole
+        # within 50 m" step. Optional, and absent means the step is skipped.
+        poles_dst = None
+        poles = self._layer(parameters, self.P_EXISTING_POLES, context)
+        if poles is not None and poles.featureCount() > 0:
+            poles_dst = self._dump_points(
+                poles, os.path.join(work, "Existing_Poles.gpkg"),
+                context, feedback)
+            feedback.pushInfo(_tr(
+                "Existing poles: {0} point(s) → the docx 'existing telecom "
+                "pole within 50 m' drop step.").format(poles.featureCount()))
+
+        aerial_model, invalid_model = AERIAL_DECISION.resolve_model()
+        if invalid_model:
+            feedback.pushWarning(_tr(
+                "{0}={1} is not an aerial decision model ({2}) — using {3}."
+            ).format(AERIAL_DECISION.MODEL_ENV, invalid_model,
+                     "/".join(AERIAL_DECISION.MODELS), aerial_model))
+        permit_days = AERIAL_DECISION.permit_days()
+        feedback.pushInfo(_tr(
+            "Aerial decision: {0} model{1}.").format(
+                aerial_model,
+                "" if aerial_model != AERIAL_DECISION.SCORE
+                else " (points, not the first condition that fires)"))
+
+        # Permit lead times (the docx's Rule 7 input). Optional, and any vector
+        # type: the designer looks up the lead time at the premise, so with a
+        # layer the permit-delay trigger fires per drop instead of costing a
+        # whole ward its trench off one project-wide number. The layer is
+        # handed over as it arrived — the designer reads the lead-time field
+        # itself, so no schema has to be agreed here.
+        permit_dst = None
+        permits = self._layer(parameters, self.P_PERMIT_DELAYS, context)
+        if permits is not None and permits.featureCount() > 0:
+            permit_dst = self._dump_permit_delays(
+                permits, os.path.join(work, "Permit_Delays.gpkg"),
+                context, feedback)
+            if permit_dst:
+                feedback.pushInfo(_tr(
+                    "Permit lead times: {0} feature(s) → the docx 'permit delay "
+                    "> 60 days' drop step becomes per drop.").format(
+                        permits.featureCount()))
+            else:
+                # A layer with no readable lead time is not a layer with no
+                # delay: say so rather than letting the trigger fall silently
+                # back to the project-wide number.
+                feedback.pushWarning(_tr(
+                    "Permit lead times: the layer carries no readable lead-time "
+                    "field (looked for {0}) — the permit-delay trigger stays "
+                    "project-wide.").format("/".join(permit_field_names())))
+
         out_dir = os.path.join(work, "design")
         cfg = {
             "mfg": src["mfg"], "pdps": src["pdps"], "objects": src["objects"],
             "polygons": src["polygons"], "roads": src["roads"], "out": out_dir,
-            "aerial": aerial_dst, "target_epsg": int(target_epsg),
+            "aerial": aerial_dst, "existing_poles": poles_dst,
+            "permit_delays": permit_dst,
+            # Which of the docx's two business decisions to apply, and the
+            # project-wide permit lead time a premise outside every permit area
+            # falls back to. Both are engine settings (AERIAL_DECISION /
+            # AERIAL_PERMIT_DELAY_DAYS), read the same way TRENCH_ENGINE is:
+            # the run parameters are a fixed set the upload form knows nothing
+            # about, and the layer carries the decision either way.
+            "aerial_decision_model": aerial_model,
+            "permit_delay_days": permit_days,
+            "target_epsg": int(target_epsg),
             # The ONE-SIDED kerb band is OFF, on the operator's instruction after
             # reviewing it: it moved the whole carriageway-carried network onto
             # one kerb and changed the shape that was approved. It is superseded
@@ -669,6 +764,91 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
             raise QgsProcessingException(_tr(
                 "Could not materialise a trench-designer input: {0}").format(path))
         return path
+
+    @staticmethod
+    def _dump_permit_delays(layer: QgsVectorLayer, path: str, context,
+                            feedback) -> Optional[str]:
+        """Materialise permit lead times with ONE canonical field, or ``None``.
+
+        The same reasoning as ``_dump_points``: a handover file must not be able
+        to fail the run that reads it. A permit register carrying both
+        ``LEAD_TIME_DAYS`` and ``lead_time_days`` is perfectly valid GeoJSON and
+        refused by GeoPackage ("Cannot create field lead_time_days. A field with
+        the same name already exists."), so the layer is rebuilt around the
+        single field the designer reads, resolved from the spellings a register
+        actually uses. Returns ``None`` when no lead time can be read at all —
+        the caller then reports it instead of pretending the authority is fast.
+        """
+        from ..design.aerial_feasibility import PERMIT_DELAY_FIELDS
+
+        names = layer.fields().names()
+        src_field = None
+        for want in PERMIT_DELAY_FIELDS:
+            # The first accepted SPELLING wins, and within one spelling the
+            # first field the layer holds — the same precedence the designer's
+            # ``_value_any`` applies when it reads the file back, so the dump
+            # cannot state a different lead time from the one that was read.
+            match = next((n for n in names
+                          if n.lower() == want.lower()), None)
+            if match is not None:
+                src_field = match
+                break
+        if src_field is None:
+            return None
+
+        crs = layer.crs().authid() if layer.crs().isValid() else "EPSG:4326"
+        kind = QgsWkbTypes.displayString(layer.wkbType()) or "Unknown"
+        out = QgsVectorLayer(
+            "%s?crs=%s" % (kind, crs), "Permit_Delays", "memory")
+        provider = out.dataProvider()
+        provider.addAttributes([QgsField("lead_time_days", QMetaType.Type.Double)])
+        out.updateFields()
+
+        feats = []
+        for f in layer.getFeatures():
+            g = f.geometry()
+            if g is None or g.isNull():
+                continue
+            try:
+                days = float(f[src_field])
+            except (TypeError, ValueError):
+                continue
+            nf = QgsFeature(out.fields())
+            nf.setGeometry(g)
+            nf.setAttribute("lead_time_days", days)
+            feats.append(nf)
+        if not feats:
+            return None
+        provider.addFeatures(feats)
+        out.updateExtents()
+        return TrenchDesignLayerAlgorithm._dump(out, path, context, feedback)
+
+    @staticmethod
+    def _dump_points(layer: QgsVectorLayer, path: str, context, feedback) -> str:
+        """Materialise only the POINTS of a layer — its attributes are dropped.
+
+        The drop chain asks one question of a pole ("is there an existing
+        telecom pole within 50 m?"), so a pole's own fields never reach the
+        designer, and dropping them removes a failure mode: a pole file whose
+        fields differ only by case (a planner's `CAPACITY_TOTAL` next to a
+        brownfield archive's `capacity_total`) is fine in GeoJSON and refused by
+        GeoPackage — "Cannot create field capacity_total. A field with the same
+        name already exists." A survey file must never be able to fail the run
+        that reads it.
+        """
+        crs = layer.crs().authid() if layer.crs().isValid() else "EPSG:4326"
+        out = QgsVectorLayer("Point?crs=" + crs, "Existing_Poles", "memory")
+        feats = []
+        for f in layer.getFeatures():
+            g = f.geometry()
+            if g is None or g.isNull():
+                continue
+            nf = QgsFeature()
+            nf.setGeometry(QgsGeometry(g))
+            feats.append(nf)
+        if feats:
+            out.dataProvider().addFeatures(feats)
+        return TrenchDesignLayerAlgorithm._dump(out, path, context, feedback)
 
     @staticmethod
     def _read_gpkg(path: str, name: str) -> Optional[QgsVectorLayer]:
@@ -2124,6 +2304,15 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
                 "DEPTH_MM": 0,
                 "length_m": round(float(length or 0.0), 2),
                 "AERIAL_REASON": g(f, "AERIAL_REASON"),
+                # The pole-route condition and the point model's receipt: the
+                # designer measured them, so the published layer states them
+                # instead of leaving a reviewer to re-run the design. Blank/
+                # None means the designer did not measure it (no pole layer
+                # supplied; chain model), which is not the same as "none".
+                "POLE_ROUTE": g(f, "POLE_ROUTE"),
+                "EXISTING_POLE_M": g(f, "EXISTING_POLE_M"),
+                "AERIAL_SCORE": g(f, "AERIAL_SCORE"),
+                "AERIAL_FACTS": g(f, "AERIAL_FACTS"),
                 "INFRA_STATUS": g(f, "INFRA_STATUS", "New") or "New",
                 "VERIFY_STATUS": "Designed",
                 # Nothing is dug for an aerial leg — the flag is the contract

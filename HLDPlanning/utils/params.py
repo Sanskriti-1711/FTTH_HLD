@@ -77,6 +77,56 @@ class TRENCH_ENGINE:
         return ALG.TRENCH_DESIGN
 
 
+class AERIAL_DECISION:
+    """How the docx's aerial business decision is made, and its permit input.
+
+    ``docs/aerial planning.docx`` gives TWO ways to decide a drop, and both are
+    implemented (``design/aerial_feasibility``):
+
+    * ``chain`` — the IF-chain in its own order (the default);
+    * ``score`` — "Instead of many IF conditions, assign points", where the
+      facts add up instead of the first one that fires deciding.
+
+    Selected the same way the trench engine is (``TRENCH_ENGINE``), because the
+    engine's run parameters are a fixed set the upload form knows nothing
+    about: an environment setting on the engine, or ``--aerial-decision-model``
+    on the standalone designer. Nothing about the failure mode changes if the
+    setting is wrong — the file carries the whole decision either way.
+    """
+
+    MODEL_ENV = "AERIAL_DECISION"
+    CHAIN = "chain"
+    SCORE = "score"
+    MODELS = (CHAIN, SCORE)
+    DEFAULT = CHAIN
+
+    # The project-wide permit lead time, used as the FALLBACK for a premise no
+    # permit-delay area covers. 0/blank means "unknown", never a measured zero.
+    PERMIT_DAYS_ENV = "AERIAL_PERMIT_DELAY_DAYS"
+
+    @classmethod
+    def resolve_model(cls, raw=None):
+        """Return ``(model, invalid_raw)`` — the valid models, nothing else."""
+        if raw is None:
+            raw = os.environ.get(cls.MODEL_ENV) or ""
+        value = raw.strip().lower()
+        if not value:
+            return cls.DEFAULT, None
+        if value in cls.MODELS:
+            return value, None
+        return cls.DEFAULT, raw.strip()
+
+    @classmethod
+    def permit_days(cls, raw=None):
+        """The project-wide permit lead time in days, 0.0 when not declared."""
+        if raw is None:
+            raw = os.environ.get(cls.PERMIT_DAYS_ENV) or ""
+        try:
+            return float(str(raw).strip())
+        except (TypeError, ValueError):
+            return 0.0
+
+
 # Vendor/customer profile keys that can be overridden per deployment
 class PROFILE_KEYS:
     DEFAULT_COUNTRY = "default_country"     # e.g., "Germany"

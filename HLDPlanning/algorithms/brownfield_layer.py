@@ -26,6 +26,7 @@ from qgis.core import (
     QgsProcessingParameterNumber, QgsProcessingParameterString,
     QgsProcessingException, QgsWkbTypes, QgsFeature, QgsFeatureSink,
     QgsFields, QgsField, QgsGeometry, QgsProject,
+    QgsCoordinateReferenceSystem,
 )
 
 from ..utils.fields import COMMON_FIELDS, THIN_PROFILES, build_fields
@@ -226,6 +227,60 @@ class BrownfieldLayerAlgorithm(QgsProcessingAlgorithm):
                         return f.name()
         return None
 
+    # The grid every published layer uses (ETRS89/UTM32N) — the same fallback
+    # ``trench_design_layer._target_epsg`` uses.
+    PIPELINE_CRS = "EPSG:25833"
+
+    def _target_crs(self, layers):
+        """The CRS the registry must work in — and NOT the first layer's CRS.
+
+        A registry in degrees silently kills every reuse test downstream, and
+        silently is the operative word. ``utils/reuse.REUSE_TOL_M`` is 2.0 and
+        means 2 METRES; with the assets stored in degrees a buffer(2) round a
+        metre-space trench intersects nothing, so a run that sits exactly on
+        existing infrastructure reports 0 reused. A brownfield hand-over is a
+        GeoJSON as often as not, so "the first layer's CRS" is WGS84 exactly
+        when the archive matters most.
+
+        Measured on project 24cd3573 with the planner's archive: 36 assets
+        loaded (all of them within 0.0 m of the design) and **0 reused** —
+        every chamber, pole and trench classified Proposed, because the reuse
+        passes were comparing degrees against metres. The stage's own
+        reprojection never fired either: it only reprojects a layer whose CRS
+        differs from the registry's, and the registry had ADOPTED 4326.
+
+        So: honour a PROJECTED input CRS, ignore a geographic one, then try the
+        project CRS, then the pipeline grid, and only fall back to the first
+        layer's CRS when nothing projected is available at all. No usable layer
+        means None, which is what keeps the stage's "at least one brownfield
+        layer must be provided" refusal intact.
+        """
+        fallback = None
+        for lyr in layers:
+            try:
+                if lyr is None or not lyr.isValid():
+                    continue
+                crs = lyr.crs()
+            except Exception:
+                continue
+            if fallback is None:
+                fallback = crs
+            try:
+                if crs.isValid() and not crs.isGeographic():
+                    return crs
+            except Exception:
+                continue
+        if fallback is None:
+            return None
+        for candidate in (QgsProject.instance().crs(),
+                          QgsCoordinateReferenceSystem(self.PIPELINE_CRS)):
+            try:
+                if candidate.isValid() and not candidate.isGeographic():
+                    return candidate
+            except Exception:
+                continue
+        return fallback
+
     # ── Processing logic ─────────────────────────────────────────────────────
 
     def processAlgorithm(self, params, context, feedback):
@@ -241,13 +296,9 @@ class BrownfieldLayerAlgorithm(QgsProcessingAlgorithm):
         existing_pdp = self._param_layer(params, self.P_EXISTING_PDP, context)
         existing_mfg = self._param_layer(params, self.P_EXISTING_MFG, context)
 
-        # Determine project CRS from the first non-None layer
-        crs = None
-        for lyr in (ducts, chambers, poles, fibre, cabinets, trenches,
-                     feeder_trench, dist_trench, existing_pdp, existing_mfg):
-            if lyr is not None and lyr.isValid():
-                crs = lyr.crs()
-                break
+        crs = self._target_crs((ducts, chambers, poles, fibre, cabinets,
+                                trenches, feeder_trench, dist_trench,
+                                existing_pdp, existing_mfg))
 
         if crs is None:
             raise QgsProcessingException(

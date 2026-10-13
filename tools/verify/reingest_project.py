@@ -9,14 +9,34 @@ PostGIS first, every page keeps showing the old geometry until this runs.
 Course: it exports only when missing, but the load clears + replaces, so this is
 safe to re-run and never duplicates rows.
 
-Usage:
-    cd HLD_Planning_01/web/backend && set -a && . ../../../.env && set +a && \\
-        python ../../../tmp/reingest_project.py <project_id>
+This script has moved around (tmp/ -> tools/verify/) and the relative paths it
+used went with it, so the engine backend is located by walking UP from this file
+instead of counting parents — that keeps working from either directory.
+
+Usage (any cwd; the project's .env must define the DB credentials):
+    set -a && . .env && set +a && python HLD_Planning_01/tools/verify/reingest_project.py <project_id>
 """
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "HLD_Planning_01" / "web" / "backend"))
+
+def _engine_backend() -> Path:
+    """The nearest ancestor holding ``HLD_Planning_01/web/backend/main.py``."""
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / "HLD_Planning_01" / "web" / "backend"
+        if (candidate / "main.py").is_file():
+            return candidate
+        if (parent / "web" / "backend" / "main.py").is_file():
+            return parent / "web" / "backend"
+    raise SystemExit("!! could not locate HLD_Planning_01/web/backend/main.py")
+
+
+BACKEND = _engine_backend()
+sys.path.insert(0, str(BACKEND))
+# The engine resolves its outputs (and its .env) relative to its own directory.
+import os  # noqa: E402
+
+os.chdir(BACKEND)
 
 import main  # noqa: E402
 

@@ -9,6 +9,7 @@ zones at all and quietly trenched houses standing in parks.
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import sys
@@ -263,3 +264,100 @@ def test_an_unknown_or_blank_class_is_never_restricted():
     for value in ("", None, "residential", "retail", "unknown_class"):
         assert is_restricted_landuse(value) is False
     assert is_restricted_landuse("PARK") is True      # case-insensitive
+
+
+# ---------------------------------------------------------------------------
+# The evidence a run produces must carry fclass, or there is no constraint
+# ---------------------------------------------------------------------------
+#
+# Everything above pins the CONSUMER: an fclass-carrying layer is filtered
+# against RESTRICTED_LANDUSE, and a layer without the field is honoured as-is
+# (a hand-drawn mask). Both are correct, and together they mean the disease can
+# only enter through the producer — whoever writes the zone layer must put
+# ``fclass`` in it. The area-run path does (`write_landuse_geojson`); the re-run
+# helper did not. It wrote the ``/ftth/hld/input-layers`` presentation payload
+# (``osm_id`` / ``landuse`` / ``natural`` / ``leisure`` / ``boundary``) straight
+# into ``inputs/osm/landuse/landuse.geojson``, so the designer took it AS IS:
+# 714 polygons, 1089 ha, 284 of 285 drop legs classified aerial — every house in
+# the ward fed by a pole and an overhead span (measured on the Mariendorf
+# re-run, project 24cd3573).
+
+
+def _rerun_helper():
+    """The re-run helper, imported once (it imports ``main``)."""
+    return importlib.import_module("tmp_rerun_publish")
+
+
+def _stub_zone_writer(monkeypatch, helper, features):
+    """Make the helper's OSM lookups return a canned zone payload."""
+    payload = {"type": "FeatureCollection", "features": features}
+    monkeypatch.setattr(helper.osm_source, "resolve_area",
+                        lambda *a, **k: {"polygon": POLYGON})
+
+    def _write(path, polygon):
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(payload), encoding="utf-8")
+        return str(target)
+
+    monkeypatch.setattr(helper.osm_source, "write_landuse_geojson", _write)
+    return payload
+
+
+def test_the_rerun_helper_writes_the_zone_layer_through_the_fclass_writer(
+        tmp_path, monkeypatch):
+    # The regression itself: the helper used `input_layer_geojson` — the
+    # pre-run REVIEW payload, which has no fclass — so the layer it handed to
+    # AERIAL_ZONES declared the whole ward non-diggable. It must use the writer
+    # that resolves fclass from the store's tags, at the path the consumer
+    # reads (`inputs/osm/landuse/`).
+    helper = _rerun_helper()
+    _stub_zone_writer(monkeypatch, helper, [{
+        "type": "Feature",
+        "geometry": {"type": "Polygon", "coordinates": [[[13.32, 52.42],
+                     [13.33, 52.42], [13.33, 52.43], [13.32, 52.43],
+                     [13.32, 52.42]]]},
+        "properties": {"osm_id": 1, "fclass": "park"},
+    }])
+
+    def _review_payload(*a, **k):
+        raise AssertionError("the review payload must not be used as a zone layer")
+    monkeypatch.setattr(helper.osm_source, "input_layer_geojson", _review_payload)
+
+    out = helper.write_aerial_zones(tmp_path)
+
+    assert out == tmp_path / "inputs" / "osm" / "landuse" / "landuse.geojson"
+    assert out.is_file()
+
+
+def test_the_rerun_helper_refuses_a_zone_layer_without_fclass(tmp_path, monkeypatch):
+    # A raw landuse layer — the shape the review payload has — resolves no
+    # class, so the designer would honour every polygon in it as a no-dig mask.
+    # Refusing it leaves a valid run (legs classified on length and chain only)
+    # instead of a pole-and-span design for the entire ward.
+    helper = _rerun_helper()
+    _stub_zone_writer(monkeypatch, helper, [{
+        "type": "Feature",
+        "geometry": {"type": "Polygon", "coordinates": [[[13.32, 52.42],
+                     [13.33, 52.42], [13.33, 52.43], [13.32, 52.43],
+                     [13.32, 52.42]]]},
+        "properties": {"osm_id": 1, "landuse": "park"},
+    }])
+
+    assert helper.write_aerial_zones(tmp_path) is None
+
+
+def test_the_rerun_helper_keeps_the_zones_when_only_some_rows_carry_fclass(
+        tmp_path, monkeypatch):
+    # The guard is about the layer, not every row: one classless row does not
+    # blank the mask, and the rest of the layer is still a real constraint.
+    helper = _rerun_helper()
+    _stub_zone_writer(monkeypatch, helper, [
+        {"type": "Feature", "geometry": None,
+         "properties": {"osm_id": 1, "fclass": "forest"}},
+        {"type": "Feature", "geometry": None, "properties": {"osm_id": 2}},
+    ])
+
+    out = helper.write_aerial_zones(tmp_path)
+
+    assert out is not None and Path(out).is_file()

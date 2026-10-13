@@ -59,13 +59,29 @@ except ImportError:  # standalone script execution (python design/trench_design.
 # classify the same drop the same way. Geometry is measured here; the rules
 # live there (A11a).
 try:
-    from .aerial_feasibility import (MAX_UG_DROP_M_DEFAULT, MIN_ZONE_AREA_M2,
-                                     crossed_road_class, evaluate_drop_feasibility,
-                                     is_restricted_landuse)
+    from .aerial_feasibility import (
+        DENSITY_MIN_HOMES_PER_KM, DENSITY_RADIUS_M, EXISTING_POLE_TRIGGER_M,
+        MAX_UG_DROP_M_DEFAULT, MIN_ZONE_AREA_M2, PERMIT_DELAY_FIELDS,
+        PERMIT_DELAY_TRIGGER_DAYS,
+        NH_CLASSES, POLE_LOADING_LIMIT, SCORE_AERIAL_ABOVE, SCORE_UG_BELOW,
+        SETBACK_TRIGGER_M, TRENCH_LENGTH_RURAL_M, TRENCH_LENGTH_URBAN_M,
+        SCORE_BY_FACT,
+        crossing_flags, crossed_carriageway, crossed_road_class,
+        density_per_km, drop_chain_reason, drop_score,
+        evaluate_drop_feasibility, is_concrete_surface, is_nh_class,
+        is_restricted_landuse, nearest_street_m, point_segment_m)
 except ImportError:  # standalone script execution
-    from aerial_feasibility import (MAX_UG_DROP_M_DEFAULT, MIN_ZONE_AREA_M2,
-                                    crossed_road_class, evaluate_drop_feasibility,
-                                    is_restricted_landuse)
+    from aerial_feasibility import (
+        DENSITY_MIN_HOMES_PER_KM, DENSITY_RADIUS_M, EXISTING_POLE_TRIGGER_M,
+        MAX_UG_DROP_M_DEFAULT, MIN_ZONE_AREA_M2, PERMIT_DELAY_FIELDS,
+        PERMIT_DELAY_TRIGGER_DAYS,
+        NH_CLASSES, POLE_LOADING_LIMIT, SCORE_AERIAL_ABOVE, SCORE_UG_BELOW,
+        SETBACK_TRIGGER_M, TRENCH_LENGTH_RURAL_M, TRENCH_LENGTH_URBAN_M,
+        SCORE_BY_FACT,
+        crossing_flags, crossed_carriageway, crossed_road_class,
+        density_per_km, drop_chain_reason, drop_score,
+        evaluate_drop_feasibility, is_concrete_surface, is_nh_class,
+        is_restricted_landuse, nearest_street_m, point_segment_m)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Parameters
@@ -278,6 +294,89 @@ class Params:
     # network is served aerial. Independent of ``aerial_max_leg_m``: that rule
     # is about one garden leg's length, this one about the whole drop.
     max_ug_drop_m: float = MAX_UG_DROP_M_DEFAULT
+    # docs/aerial planning.docx, the drop decision chain + its switches. The
+    # chain is applied in the docx's own order and whichever step fires is
+    # recorded as AERIAL_REASON:
+    #
+    #     setback            the customer sits further from the street than
+    #                        ``aerial_setback_m``
+    #     road_crossing      the drop must reach the far side of a public
+    #                        carriageway (the docx's Scenario 2: "instead of UG
+    #                        road crossing: Pole -> Pole -> House")
+    #     driveway_crossing  a driveway / service aisle / field track is cut
+    #     existing_pole      an existing telecom pole stands within
+    #                        ``aerial_pole_m`` of the premise
+    #     trench_length      the drop's new trenching is over the limit
+    #                        (urban 100 m / rural 300 m)
+    #     low_density        fewer homes per km of street than the threshold
+    #     permit_delay       the permit is delayed past the limit
+    #
+    # The four chain steps default ON — they are the docx's own switch values
+    # (``setback_trigger``, ``road_crossing_trigger``, ``driveway_crossing_
+    # trigger``, and the 50 m pole rule) — and the three §4 business triggers
+    # default OFF, because their inputs are project-side facts the engine does
+    # not hold: an urban/rural flag, the permit register, and a per-premise
+    # density that has to be computed against the street network. A drop
+    # classified aerial here still has to pass the mandatory pole / span /
+    # clearance conditions at the aerial stage, so "eligible" never means
+    # "built".
+    aerial_road_crossing: bool = True
+    aerial_driveway_crossing: bool = True
+    aerial_setback: bool = True
+    aerial_setback_m: float = SETBACK_TRIGGER_M
+    # The docx asks to EVALUATE on the setback ("ELSE IF customer setback >
+    # 20 m -> Evaluate Aerial"), and its mandatory pole / span / clearance
+    # conditions are what decide the build. Converting every evaluated leg is
+    # therefore not the default: the evaluation is recorded on the leg
+    # (``aerial_evaluation``) and in the report
+    # (``aerial_evaluated_by_reason``) and the drop stays a trench, which on
+    # the Berlin ward is 50 of 275 legs. Set this to build them aerial.
+    aerial_setback_convert: bool = False
+    aerial_pole: bool = True
+    aerial_pole_m: float = EXISTING_POLE_TRIGGER_M
+    aerial_trench: bool = False
+    aerial_trench_m: float = TRENCH_LENGTH_URBAN_M
+    aerial_trench_rural_m: float = TRENCH_LENGTH_RURAL_M
+    urban: bool = True
+    aerial_density: bool = False
+    aerial_density_min: float = DENSITY_MIN_HOMES_PER_KM
+    aerial_density_radius_m: float = DENSITY_RADIUS_M
+    aerial_permit: bool = False
+    permit_delay_days: float = 0.0
+    aerial_permit_delay_days: float = PERMIT_DELAY_TRIGGER_DAYS
+    # ── the permit-delay INPUT ──────────────────────────────────────────────
+    # ``permit_delay_days`` above is a PROJECT-wide number, which is why the
+    # trigger ships off: with it on, one slow authority put 200 of 260 legs of
+    # a ward overhead (docs/stages/AERIAL.md §5). This is the per-area input the
+    # docx's Rule 7 actually reasons about — a layer of authority/service areas
+    # carrying the expected lead time in days, looked up at the premise. With a
+    # layer supplied, ``permit_delay_days`` becomes the fallback for a premise
+    # no area covers, and the trigger fires per drop instead of per project.
+    #
+    # Field name, in order: ``lead_time_days`` / ``permit_delay_days`` /
+    # ``lead_days`` / ``days`` (case-insensitive). Polygons are matched by
+    # containment; lines and points by proximity (PERMIT_LOOKUP_M).
+    permit_delays: str = ""
+    # ── the docx's alternative decision model ───────────────────────────────
+    # "chain" = the IF-chain in the docx's own order (default).
+    # "score" = "Instead of many IF conditions, assign points" — the docx's
+    #   12 weights and its three bands. The facts ADD UP instead of the first
+    #   one that fires deciding, which is what makes the §4 triggers usable.
+    # In both models ``zone`` / ``unreachable`` / ``distance_threshold`` stay
+    # hard rules (underground is not permitted there, or the network does not
+    # reach) — the score replaces the chain, not the physical constraints.
+    aerial_decision_model: str = "chain"
+    # The docx's middle band is "Score 20-50 -> Cost comparison", which the drop
+    # stage cannot price (no aerial-vs-UG rates here). It is reported by name
+    # and left trenched; set this when the project has done that comparison.
+    aerial_score_compare_aerial: bool = False
+    # "High customer density -20" needs a threshold the docx does not state, so
+    # it is not awarded until a project sets one. None = line reported as
+    # unscored, never guessed.
+    aerial_density_high: Optional[float] = None
+    # "Metro city core -30": the docx does not define a core, so it is a
+    # DECLARED project fact like ``urban`` / ``rural``, not an inferred one.
+    metro_core: bool = False
     # The kerb band (see KERB_OFFSET_M / kerb_offset_for): geometry along a
     # carriageway is drawn at the pavement band instead of on the centreline.
     # 0 disables the rule. With kerb_offset_per_class the value only gates the
@@ -662,6 +761,29 @@ def _value(feat, name: str):
     return v
 
 
+def _value_any(feat, names: Sequence[str]):
+    """First non-empty value among ``names`` (OGR's lookup is case-insensitive).
+
+    Used for fields whose spelling differs between producers — a pole line from
+    the planner, from a survey export and from a brownfield archive do not
+    agree on ``HEIGHT_M`` vs ``height``, and a missing one must not read as a
+    measurement.
+    """
+    for name in names:
+        v = _value(feat, name)
+        if v is not None and str(v).strip() != "":
+            return v
+    return None
+
+
+def _float_or_none(value) -> Optional[float]:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out
+
+
 def _read_points(path: str, target_epsg: int, bbox=None) -> List[dict]:
     ds = ogr.Open(path)
     if ds is None:
@@ -708,6 +830,22 @@ def _read_points(path: str, target_epsg: int, bbox=None) -> List[dict]:
                 "fclass": _value(f, "fclass"),
                 # ground condition (rock/water/...) for the aerial scorer
                 "TERRAIN": _value(f, "TERRAIN"),
+                # Pole condition, for the docx's "pole loading > 80%" line and
+                # for pole PROVENANCE (an eligible existing pole is what the
+                # drop hangs off; a planned one has to be built). Read with the
+                # spellings the planner, a survey export and a brownfield
+                # archive each use, and left None rather than defaulted: a
+                # missing height is not a 0 m pole.
+                "HEIGHT_M": _float_or_none(_value_any(
+                    f, ("HEIGHT_M", "height_m", "HEIGHT", "height"))),
+                "CAPACITY_TOTAL": _float_or_none(_value_any(
+                    f, ("CAPACITY_TOTAL", "capacity_total", "CAPACITY",
+                        "capacity"))),
+                "CAPACITY_USED": _float_or_none(_value_any(
+                    f, ("CAPACITY_USED", "capacity_used", "CABLE_CNT",
+                        "cable_count"))),
+                "POLE_ID": _value_any(f, ("POLE_ID", "pole_id", "id")),
+                "VERIFY_STATUS": _value(f, "VERIFY_STATUS"),
             })
     ds = None
     return out
@@ -2179,6 +2317,29 @@ FIELD_AERIAL = (
     ("CONSTRUCTION_METHOD", ogr.OFTString), ("EXCAVATION", ogr.OFTInteger),
     ("length_m", ogr.OFTReal), ("AERIAL_REASON", ogr.OFTString),
     ("INFRA_STATUS", ogr.OFTString), ("MFG_ID", ogr.OFTString),
+    # ── the docx's own first mandatory condition: is there a pole route ────
+    # ``POLE_ROUTE`` answers "Existing pole route available" (docs/aerial
+    # planning.docx §4) for THIS DROP: ``existing`` when a pole from the
+    # existing/brownfield inventory stands within ``aerial_pole_m`` (the docx's
+    # 50 m), ``planned`` when the run has to provide the pole route itself, and
+    # blank when no pole layer was supplied at all — absent evidence, not
+    # "planned". ``EXISTING_POLE_M`` is the measurement behind the verdict, so
+    # it can be re-derived instead of trusted.
+    #
+    # It is deliberately NOT called ``POLE_SOURCE``: that name belongs to
+    # ``Aerial_Spans``/``Aerial_Cable``, where it answers a different question —
+    # which plant the built span was actually anchored on (``existing`` /
+    # ``planned`` / ``building``, the last for a house-to-house ``chain`` leg).
+    # Measured on project `24cd3573` (2026-10-13) the two disagree on 31 of 59
+    # premises (18 drops in reach of an existing pole are anchored on a pole
+    # this run designs, 1 on a building, 12 more are anchored on a building
+    # without an existing pole in reach), and each is true of the thing it
+    # describes — so the fields must not share a name, or a reviewer joining
+    # the two layers reads a contradiction.
+    ("POLE_ROUTE", ogr.OFTString), ("EXISTING_POLE_M", ogr.OFTReal),
+    # The docx point model's receipt, on the drop itself: its score and the
+    # facts that carried it. Empty under the default chain model.
+    ("AERIAL_SCORE", ogr.OFTReal), ("AERIAL_FACTS", ogr.OFTString),
 )
 FIELD_NODE = (
     ("NODE_ID", ogr.OFTString), ("NODE_TYPE", ogr.OFTString),
@@ -2288,22 +2449,433 @@ def _in_zone(zone_polys, x: float, y: float) -> bool:
     return False
 
 
+# A drop leg is built aerial for ``zone`` only when restricted land is what the
+# leg is IN: at least this share of its sampled points. The rule used to be
+# "any sampled point inside", and on the Berlin ward (project 24cd3573, 285 drop
+# legs) that made 5 legs aerial whose HOUSE end sat 2-10 m inside an OSM
+# ``park`` / ``allotments`` polygon — measured at 4-29 % of the leg, always at
+# the house end — plus 2 more through the ``chain`` rule hanging off them. A
+# house plot OSM maps as parkland is still reached from the street, and those
+# last metres are a hand-dug Garden leg, not an overhead span, so a leg that
+# merely clips a zone at one end stays trenched. ``chain`` is unaffected: a leg
+# branching off a genuinely aerial one is still aerial, because a trench cannot
+# start in mid-air.
+ZONE_AERIAL_SHARE = 0.5
+
+
+def _leg_sample_points(coords, samples: int = 6):
+    """Points spread ALONG the leg's own path, in proportion to its length.
+
+    The straight chord from the first point to the last is NOT the leg:
+    ``_split_drop_legs``' legs follow the street to the network, so a chord test
+    classifies a leg aerial for crossing a zone the leg itself never enters.
+    Spacing the samples by arc length (rather than putting the same count on
+    every vertex) keeps the share honest when a leg's segments differ in length:
+    a 90 m run and a 10 m one must not weigh the same.
+    """
+    if len(coords) < 2:
+        return list(coords)
+    total = _coords_len(coords)
+    if total <= 0:
+        return [(coords[0][0], coords[0][1])]
+    count = max(2, samples * (len(coords) - 1))
+    return [_point_at_arc(coords, total * i / float(count))
+            for i in range(count + 1)]
+
+
+def _leg_zone_share(zone_polys, coords, samples: int = 6) -> float:
+    """Share of the leg's sampled points that fall inside an aerial zone."""
+    pts = _leg_sample_points(coords, samples)
+    if not pts:
+        return 0.0
+    inside = sum(1 for x, y in pts if _in_zone(zone_polys, x, y))
+    return inside / float(len(pts))
+
+
 def _leg_in_zone(zone_polys, leg: dict, samples: int = 6) -> bool:
-    """True when any sampled point of the leg falls inside an aerial zone.
+    """True when the leg lies **predominantly** inside an aerial zone.
 
     Sampling the whole leg (not just its midpoint) matters: an aerial zone is
-    often a park the leg crosses, so a midpoint-only test misses it.
+    often a park the leg crosses, so a midpoint-only test misses it. Sampling
+    it ALONG its own vertices matters for the opposite reason (see
+    ``_leg_sample_points``), and requiring a majority of those samples
+    (``ZONE_AERIAL_SHARE``) matters most: a leg that merely touches a zone can
+    still be trenched, and treating a clipped zone edge as "do not dig here"
+    built overhead spans over house plots OSM happens to tag as parkland.
     """
     if not zone_polys:
         return False
-    (ax, ay), (bx, by) = leg["coords"][0], leg["coords"][-1]
-    for i in range(samples + 1):
-        t = i / float(samples)
-        x = ax + (bx - ax) * t
-        y = ay + (by - ay) * t
-        if _in_zone(zone_polys, x, y):
-            return True
-    return False
+    coords = list(leg.get("coords") or [])
+    if len(coords) < 2:
+        return False
+    return _leg_zone_share(zone_polys, coords, samples) >= ZONE_AERIAL_SHARE
+
+
+# AERIAL_CHAIN_PATCH
+def _chain_convertible(params: Params, reason: str) -> bool:
+    """Does this docx step convert the leg, or only record the evaluation?
+
+    ``setback`` is the chain's "Evaluate Aerial" step: the evaluation runs and
+    is recorded either way, but building the drop overhead is the project's
+    call (``Params.aerial_setback_convert``), because the mandatory conditions
+    — an existing pole route, pole loading, span and clearance — are what the
+    docx requires before a drop may actually go overhead. Every other step is
+    the docx's own decision ("road crossing required -> Aerial"), so it
+    converts.
+    """
+    if reason == "setback":
+        return bool(params.aerial_setback_convert)
+    return True
+
+
+def _nearest_point_m(point, points) -> Optional[float]:
+    """Distance from ``point`` to the nearest of ``points`` (premise points).
+
+    ``None`` when nothing could be measured — the caller passes that on to the
+    rule rather than letting a 0 stand in for "not measured".
+    """
+    best: Optional[float] = None
+    for pt in points or ():
+        try:
+            d = math.hypot(float(pt["x"]) - float(point[0]),
+                           float(pt["y"]) - float(point[1]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if best is None or d < best:
+            best = d
+    return best
+
+
+def _permit_trigger_on(params: Params, permit_areas) -> bool:
+    """Is the docx's permit-delay step allowed to fire?
+
+    ``Params.aerial_permit`` is the explicit switch (off by default), but a
+    per-drop permit layer is an opt-in in its own right: the step shipped off
+    precisely because one project-wide number put a whole ward overhead
+    (docs/stages/AERIAL.md §5), and that objection disappears once the lead time
+    is the layer's own per-premise value. A planner who supplies a permit
+    register is stating the authority's lead times — the run then applies the
+    docx's rule to them instead of ignoring the evidence it was handed.
+    """
+    return bool(params.aerial_permit) or bool(permit_areas)
+
+
+def _drop_chain_reason(leg: dict, params: Params, road_parts=None,
+                       poles=None, houses=None, permit_areas=None) -> str:
+    """The docx drop-chain reason for this leg, or ``""`` (buried).
+
+    The docx's chain, in its own order: the customer sits further from the
+    street than the setback (``setback``); the leg has to reach the far side of
+    a public carriageway (``road_crossing``) or of a driveway / service aisle /
+    field track (``driveway_crossing``); an existing telecom pole stands within
+    ``aerial_pole_m`` of the premise (``existing_pole``). Behind those, the §4
+    business triggers the drop stage is the only place to apply:
+    ``trench_length``, ``low_density`` and ``permit_delay``.
+
+    Measuring the facts is this module's job; the order, the switches and the
+    limits live in ``design/aerial_feasibility.drop_chain_reason``. Only facts
+    a caller can supply are measured: with no pole layer the pole step is
+    skipped (``None`` is "not measured", never "no pole" — an unreadable layer
+    must not read as a clear 50 m), and the density, the one costly fact (every
+    premise against the street length), is worked out only when its trigger is
+    on. The docx's first step, "IF existing drop duct available -> UG Drop", is
+    not applied here for the same reason the scorer does not apply it: the drop
+    stage has no duct registry (see ``_drop_feasibility_reason``).
+    """
+    coords = list(leg.get("coords") or [])
+    house = leg.get("house") or {}
+    point = (house.get("x"), house.get("y"))
+    measured = point[0] is not None and point[1] is not None
+
+    road_crossing = driveway_crossing = False
+    if road_parts and (params.aerial_road_crossing
+                       or params.aerial_driveway_crossing):
+        road_crossing, driveway_crossing = crossing_flags(
+            coords, road_parts, road=params.aerial_road_crossing,
+            driveway=params.aerial_driveway_crossing)
+
+    setback_m = (nearest_street_m(point, road_parts)
+                 if (measured and road_parts) else None)
+    nearest_pole_m = (_nearest_point_m(point, poles)
+                      if (measured and poles) else None)
+    density_km = None
+    if params.aerial_density and measured and houses:
+        density_km = density_per_km(point, houses, road_parts,
+                                    params.aerial_density_radius_m)
+
+    # The permit fact: the layer's own value at this premise when there is one,
+    # else the project-wide number. ``None`` is "not measured".
+    permit_days = None
+    if measured:
+        if permit_areas:
+            permit_days = _permit_delay_days(point, permit_areas,
+                                             params.permit_delay_days)
+        elif params.permit_delay_days > 0:
+            permit_days = params.permit_delay_days
+
+    return drop_chain_reason(
+        setback_m=setback_m, road_crossing=road_crossing,
+        driveway_crossing=driveway_crossing, nearest_pole_m=nearest_pole_m,
+        trench_m=leg.get("length"), urban=params.urban, density_km=density_km,
+        permit_delay_days=permit_days,
+        setback_trigger=params.aerial_setback, pole_trigger=params.aerial_pole,
+        trench_trigger=params.aerial_trench,
+        density_trigger=params.aerial_density,
+        permit_trigger=_permit_trigger_on(params, permit_areas),
+        setback_limit_m=params.aerial_setback_m,
+        pole_limit_m=params.aerial_pole_m,
+        trench_urban_m=params.aerial_trench_m,
+        trench_rural_m=params.aerial_trench_rural_m,
+        density_min=params.aerial_density_min,
+        permit_limit_days=params.aerial_permit_delay_days)
+
+
+# ── the docx's point model: measure the facts, then let the points add up ───
+
+# How far from the house a carriageway still counts as "the road this drop is
+# on" for the docx's "Concrete road +15" line. The crossing surface is always
+# read; this only covers the case where the drop runs along a concrete street
+# without crossing it.
+CONCRETE_ROAD_LOOKUP_M = 30.0
+
+# How near a permit-delay feature a premise must be for a LINE/POINT permit
+# layer to apply to it (polygons are matched by containment, which needs no
+# radius). 100 m is one street's width-plus-segment: a premise between two
+# mapped authorities takes the nearer one.
+PERMIT_LOOKUP_M = 100.0
+
+def _read_permit_delays(path: str, target_epsg: int) -> List[dict]:
+    """Permit-delay areas ``{"geom", "days", "name"}`` from a layer.
+
+    Any geometry type is accepted: an authority is an AREA (matched by
+    containment), while a per-street permit register is a LINE and a single
+    depot is a POINT (both matched by proximity, ``PERMIT_LOOKUP_M``). A
+    feature whose lead time cannot be read as a number is skipped and counted
+    by the caller, because "no value" and "no delay" are different facts.
+    """
+    ds = ogr.Open(path)
+    if ds is None:
+        raise SystemExit(f"cannot open {path}")
+    out: List[dict] = []
+    for li in range(ds.GetLayerCount()):
+        lyr = ds.GetLayer(li)
+        tr = _transform(lyr.GetSpatialRef(), target_epsg)
+        for f in lyr:
+            g = f.GetGeometryRef()
+            if g is None or g.IsEmpty():
+                continue
+            days = _float_or_none(_value_any(f, PERMIT_DELAY_FIELDS))
+            if days is None:
+                continue
+            geom = g.Clone()
+            if tr is not None:
+                geom.Transform(tr)
+            out.append({
+                "geom": geom,
+                "days": days,
+                "name": str(_value_any(f, ("name", "authority", "area")) or ""),
+            })
+    ds = None
+    return out
+
+
+def _permit_delay_days(point, permit_areas, fallback: float) -> Optional[float]:
+    """The permit lead time that applies at ``point``, or ``None`` unmeasured.
+
+    Precedence: the **smallest containing area**, else the nearest line/point
+    within ``PERMIT_LOOKUP_M``, else the project-wide ``fallback``.
+
+    Smallest rather than first: a permit register naturally carries a coarse
+    fallback polygon (the municipality) under specific ones (the road or water
+    authority inside it), and taking the first containing feature would make the
+    answer depend on the order the file happens to be written in. Preferring the
+    smallest containing area is order-independent and means the same thing —
+    the more specific authority wins.
+
+    ``None`` is returned only when the premise could not be measured at all —
+    that is what keeps "this authority is fast" apart from "we never asked",
+    and only the first is a fact the chain may act on.
+    """
+    if point[0] is None or point[1] is None:
+        return None
+    if not permit_areas:
+        return None
+    pt = ogr.Geometry(ogr.wkbPoint)
+    pt.AddPoint(float(point[0]), float(point[1]))
+    best_area: Optional[Tuple[float, float]] = None
+    best_near: Optional[Tuple[float, float]] = None
+    for area in permit_areas:
+        geom = area["geom"]
+        name = geom.GetGeometryName()
+        if name in ("POLYGON", "MULTIPOLYGON"):
+            if not (geom.Contains(pt) or geom.Touches(pt)):
+                continue
+            size = geom.GetArea()
+            if best_area is None or size < best_area[0]:
+                best_area = (size, area["days"])
+            continue
+        d = geom.Distance(pt)
+        if d <= PERMIT_LOOKUP_M and (best_near is None or d < best_near[0]):
+            best_near = (d, area["days"])
+    if best_area is not None:
+        return best_area[1]
+    if best_near is not None:
+        return best_near[1]
+    return fallback
+
+
+def _nearest_pole_info(point, poles, limit_m: float) -> Tuple[Optional[float], dict]:
+    """``(distance, pole)`` for the nearest pole, and whether it is within limit.
+
+    Returns ``(None, {})`` when nothing could be measured.
+    """
+    best: Optional[float] = None
+    best_pole: dict = {}
+    for pt in poles or ():
+        try:
+            d = math.hypot(float(pt["x"]) - float(point[0]),
+                           float(pt["y"]) - float(point[1]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if best is None or d < best:
+            best, best_pole = d, pt
+    return best, best_pole
+
+
+def _pole_loading_pct(pole: dict) -> Optional[float]:
+    """The pole's own loading, or ``None`` when it does not state one."""
+    total = pole.get("CAPACITY_TOTAL")
+    used = pole.get("CAPACITY_USED")
+    if not total or total <= 0 or used is None:
+        return None
+    return 100.0 * float(used) / float(total)
+
+
+def _road_surface_near(point, road_parts, max_m: float = CONCRETE_ROAD_LOOKUP_M
+                       ) -> Optional[str]:
+    """Surface tag of the nearest carriageway within ``max_m`` of ``point``.
+
+    ``None`` when no road part carries a usable ``surface`` field at all, so
+    "untagged" and "asphalt" are never confused.
+    """
+    best: Optional[float] = None
+    surface: Optional[str] = None
+    for part in road_parts or ():
+        coords = part[0]
+        tags = part[2] if len(part) > 2 else {}
+        tag = str((tags or {}).get("surface") or "").strip().lower()
+        if not tag:
+            continue
+        for a, b in zip(coords, coords[1:]):
+            d = point_segment_m(point, a, b)
+            if d > max_m:
+                continue
+            if best is None or d < best:
+                best, surface = d, tag
+    return surface
+
+
+def _drop_score_facts(leg: dict, params: Params, road_parts=None, poles=None,
+                      houses=None, permit_areas=None) -> dict:
+    """The docx point model's facts for one leg, measured where they can be.
+
+    Everything the caller cannot measure stays ``None`` (and lands in the
+    score's ``notes``): an unreadable pole layer must not read as "no pole",
+    which is the difference between 0 points and 25. The duct line is always
+    unmeasured here — the drop stage holds no duct registry — which is the same
+    reason the chain leaves its first step to the scorer.
+    """
+    coords = list(leg.get("coords") or [])
+    house = leg.get("house") or {}
+    point = (house.get("x"), house.get("y"))
+    measured = point[0] is not None and point[1] is not None
+
+    nearest_pole_m, pole = (_nearest_pole_info(point, poles, params.aerial_pole_m)
+                            if (measured and poles) else (None, {}))
+    crosses_nh = None
+    if road_parts:
+        crosses_nh = crossed_road_class(coords, road_parts,
+                                       classes=NH_CLASSES) is not None
+    concrete = None
+    if measured and road_parts:
+        surface = _road_surface_near(point, road_parts)
+        crossed = crossed_carriageway(coords, road_parts)
+        if crossed is not None:
+            for part in road_parts:
+                if str(part[1] or "").strip().lower() == crossed[0]:
+                    tag = str((part[2] if len(part) > 2 else {}).get("surface")
+                              or "").strip().lower()
+                    if tag:
+                        surface = tag
+                    break
+        concrete = None if surface is None else is_concrete_surface(surface)
+
+    density_km = None
+    if measured and houses and (params.aerial_density or params.aerial_decision_model == "score"):
+        density_km = density_per_km(point, houses, road_parts,
+                                    params.aerial_density_radius_m)
+
+    # The permit fact is only measured when the docx's step is allowed to fire,
+    # so the two models share one switch: a supplied register switches it on
+    # (``_permit_trigger_on``), the project-wide number still needs the switch.
+    permit_days = None
+    if measured and _permit_trigger_on(params, permit_areas):
+        if permit_areas:
+            permit_days = _permit_delay_days(point, permit_areas,
+                                             params.permit_delay_days)
+        elif params.permit_delay_days > 0:
+            permit_days = params.permit_delay_days
+
+    return {
+        "spare_duct": None,
+        "existing_poles": (nearest_pole_m is not None
+                           and nearest_pole_m <= params.aerial_pole_m),
+        "terrain": house.get("TERRAIN"),
+        "concrete_road": concrete,
+        "crosses_nh": crosses_nh,
+        "density_km": density_km,
+        "permit_delay_days": permit_days,
+        "metro_core": bool(params.metro_core),
+        "pole_loading_pct": _pole_loading_pct(pole) if pole else None,
+        "nearest_pole_m": nearest_pole_m,
+    }
+
+
+def _drop_score_reason(leg: dict, params: Params, road_parts=None, poles=None,
+                       houses=None, permit_areas=None) -> Tuple[str, dict]:
+    """``(reason, score)`` for this leg under the docx's point model.
+
+    ``""`` means the score band puts the drop underground; ``"score_aerial"``
+    is the docx's aerial band (and its cost-comparison band when the project
+    asked for that). The score itself is always returned, so a leg that stayed
+    trenched can still say why.
+    """
+    facts = _drop_score_facts(leg, params, road_parts, poles, houses,
+                              permit_areas)
+    result = drop_score(
+        spare_duct=facts["spare_duct"], existing_poles=facts["existing_poles"],
+        terrain=facts["terrain"], concrete_road=facts["concrete_road"],
+        crosses_nh=facts["crosses_nh"], density_km=facts["density_km"],
+        permit_delay_days=facts["permit_delay_days"],
+        metro_core=facts["metro_core"],
+        pole_loading_pct=facts["pole_loading_pct"],
+        density_low_min=params.aerial_density_min,
+        density_high_min=params.aerial_density_high,
+        permit_limit_days=params.aerial_permit_delay_days,
+        pole_loading_limit=POLE_LOADING_LIMIT,
+        compare_aerial=params.aerial_score_compare_aerial)
+    payload = {
+        "score": result.score, "points": result.points,
+        "facts": result.firing, "notes": result.notes,
+        "decision": result.decision, "nearest_pole_m": facts["nearest_pole_m"],
+    }
+    if result.decision != "aerial":
+        return "", payload
+    # The docx's middle band is reported apart from the aerial band: one is the
+    # model's own verdict, the other its "Cost comparison" the project decided.
+    if result.score > SCORE_AERIAL_ABOVE:
+        return "score_aerial", payload
+    return "score_compare", payload
 
 
 def _drop_feasibility_reason(leg: dict, params: Params,
@@ -2333,23 +2905,38 @@ def _drop_feasibility_reason(leg: dict, params: Params,
 
 
 def _split_drop_legs(legs: Sequence[dict], zone_polys, params: Params, log,
-                     road_parts=None
+                     road_parts=None, poles=None, houses=None,
+                     permit_areas=None
                      ) -> Tuple[List[dict], List[dict]]:
     """Split house drop legs into (trenched, aerial).
 
     Aerial rules, in order:
 
-    1. ``zone``   — the leg lies inside an aerial zone: underground is not
-       permitted there, so the drop is built aerial.
+    1. ``zone``   — the leg lies **predominantly** inside an aerial zone (at
+       least ``ZONE_AERIAL_SHARE`` of it): underground is not permitted there,
+       so the drop is built aerial. A leg that only clips a zone is trenched —
+       see ``_leg_in_zone``.
     2. **feasibility** — the shared scorer (``_drop_feasibility_reason``)
        says the drop cannot economically be buried. The leg then carries the
        scorer's own reason: ``distance_threshold`` (further than
        ``max_ug_drop_m`` from the network), ``major_road_crossing`` (it
        crosses a motorway/trunk/primary/secondary carriageway), or
        ``terrain_constraint`` (rocky / waterlogged premise ground).
-    3. ``length`` — the leg is longer than ``aerial_max_leg_m`` (when set):
+    3. **the docx drop chain** (``_drop_chain_reason``) — the leg cannot be
+       buried on the docx's own grounds, in its own order: ``setback`` (the
+       customer sits further from the street than ``aerial_setback_m``),
+       ``road_crossing`` / ``driveway_crossing`` (the leg has to reach the far
+       side of a carriageway — "ELSE IF road crossing required -> Aerial", its
+       Scenario 2 "instead of UG road crossing: Pole -> Pole -> House" — a
+       crossing costs a road opening, an HDD and reinstatement for one
+       premise's drop), ``existing_pole`` (an existing telecom pole within
+       ``aerial_pole_m``), then the §4 business triggers when a project turns
+       them on: ``trench_length``, ``low_density``, ``permit_delay``. Rule 2
+       still runs first, so a leg crossing a *barrier* road reports
+       ``major_road_crossing`` rather than ``road_crossing``.
+    4. ``length`` — the leg is longer than ``aerial_max_leg_m`` (when set):
        the spur can neither be a garden trench nor economically open-cut.
-    4. ``chain``  — the leg **branches off an aerial leg**: the drop already
+    5. ``chain``  — the leg **branches off an aerial leg**: the drop already
        went aerial further out, and a trench cannot start in mid-air. Legs are
        walked in creation order (nearest the mains first), so a parent is
        always classified before its children.
@@ -2368,6 +2955,8 @@ def _split_drop_legs(legs: Sequence[dict], zone_polys, params: Params, log,
     trenched: List[dict] = []
     aerial: List[dict] = []
     aerial_idx: Set[int] = set()
+    evaluated: Dict[str, int] = defaultdict(int)
+    scored_model = params.aerial_decision_model == "score"
     for i, leg in enumerate(legs):
         item = dict(leg)
         parent = item.get("parent", -1)
@@ -2377,6 +2966,26 @@ def _split_drop_legs(legs: Sequence[dict], zone_polys, params: Params, log,
             reason = "zone"
         else:
             reason = _drop_feasibility_reason(item, params, road_parts)
+        if not reason and scored_model:
+            # The docx's point model is the alternative to the CHAIN, not to the
+            # physical constraints above: they have already run, so a leg the
+            # scorer refused cannot score its way back underground. The score
+            # is kept on the leg either way — a leg the model left trenched has
+            # to be able to say why it did.
+            reason, scored = _drop_score_reason(item, params, road_parts, poles,
+                                                houses, permit_areas)
+            # Kept on the leg whatever the band: a leg the model left trenched
+            # has to be able to say why, and the caller counts both lists.
+            item["aerial_score"] = scored
+        elif not reason:
+            reason = _drop_chain_reason(item, params, road_parts, poles, houses,
+                                        permit_areas)
+            if reason and not _chain_convertible(params, reason):
+                # The step fired but only on evaluation: the receipt goes on
+                # the leg (and into the report) and the leg stays a trench.
+                item["aerial_evaluation"] = reason
+                evaluated[reason] += 1
+                reason = ""
         if not reason and params.aerial_max_leg_m and item["length"] > params.aerial_max_leg_m:
             reason = "length"
         if not reason and parent >= 0 and parent in aerial_idx:
@@ -2388,6 +2997,13 @@ def _split_drop_legs(legs: Sequence[dict], zone_polys, params: Params, log,
             aerial_idx.add(i)
         else:
             trenched.append(item)
+    if evaluated:
+        # Say so, and say what it would cost: an evaluation nobody can see is
+        # indistinguishable from a step that never ran.
+        log("docx drop evaluation: %d leg(s) evaluated aerial and left "
+            "trenched (%s) - set aerial_setback_convert to build them aerial"
+            % (sum(evaluated.values()),
+               ", ".join(f"{k}: {v}" for k, v in sorted(evaluated.items()))))
     return trenched, aerial
 
 
@@ -3192,6 +3808,11 @@ def design(cfg: dict) -> dict:
     pdps = _read_points(cfg["pdps"], params.target_epsg)
     houses = _read_points(cfg["objects"], params.target_epsg)
     mfgs = _read_points(cfg["mfg"], params.target_epsg)
+    # Existing telecom poles — the docx's "existing telecom pole within 50 m"
+    # step. Optional: the brownfield archive's BF_POLES, or any pole inventory
+    # the caller supplies. Absent means the step is skipped, never guessed.
+    existing_poles = (_read_points(cfg["existing_poles"], params.target_epsg)
+                      if cfg.get("existing_poles") else [])
     polygons = _read_points(cfg["polygons"], params.target_epsg)
     if not mfgs:
         raise SystemExit("no MFG point found")
@@ -3199,6 +3820,28 @@ def design(cfg: dict) -> dict:
         raise SystemExit("no PDP found")
     log(f"plan: {len(mfgs)} MFG, {len(pdps)} PDP, {len(houses)} house/premise, "
         f"{len(polygons)} polygon")
+    if existing_poles:
+        log(f"existing poles: {len(existing_poles)} point(s) - the docx's "
+            f"'existing telecom pole within 50 m' step can fire")
+
+    # Permit lead times per authority / street — the docx's Rule 7 input. An
+    # optional layer: with one, ``permit_delay`` fires per drop; without one,
+    # only the project-wide ``permit_delay_days`` exists and the trigger still
+    # ships off, because a single number for a whole ward puts every leg
+    # overhead (docs/stages/AERIAL.md §5).
+    permit_delays: List[dict] = []
+    if cfg.get("permit_delays"):
+        permit_delays = _read_permit_delays(cfg["permit_delays"], params.target_epsg)
+        if permit_delays:
+            days = sorted(a["days"] for a in permit_delays)
+            log("permit delays: %d area(s)/line(s), lead time %.0f-%.0f day(s)"
+                % (len(permit_delays), days[0], days[-1]))
+        else:
+            log("permit delays: the layer carries no readable lead time (looked "
+                "for %s) - the permit-delay trigger stays project-wide"
+                % "/".join(PERMIT_DELAY_FIELDS))
+    score_bands: Dict[str, int] = defaultdict(int)
+    score_facts: Dict[str, int] = defaultdict(int)
 
     xs = [p["x"] for p in pdps] + [h["x"] for h in houses] + [m["x"] for m in mfgs]
     ys = [p["y"] for p in pdps] + [h["y"] for h in houses] + [m["y"] for m in mfgs]
@@ -3369,8 +4012,20 @@ def design(cfg: dict) -> dict:
                          if r.mfg == mfg_id and r.src != "house-drop"]
         group_legs = design_garden_legs(group_network, group_houses, params, log)
         group_legs, group_aerial = _split_drop_legs(
-            group_legs, aerial_polys, params, log, road_parts=vehicular
+            group_legs, aerial_polys, params, log, road_parts=vehicular,
+            poles=existing_poles, houses=houses,
+            permit_areas=permit_delays,
         )
+        for leg in group_legs:
+            band = (leg.get("aerial_score") or {}).get("decision")
+            if band:
+                score_bands[band] += 1
+        for leg in group_aerial:
+            band = (leg.get("aerial_score") or {}).get("decision")
+            if band:
+                score_bands[band] += 1
+            for fact in (leg.get("aerial_score") or {}).get("facts") or []:
+                score_facts[fact] += 1
         for leg in group_legs + group_aerial:
             leg["mfg_id"] = mfg_id
             leg["house"].setdefault("MFG_ID", mfg_id)
@@ -3383,6 +4038,17 @@ def design(cfg: dict) -> dict:
         log("aerial drops: %d leg(s) (%.1f m) built aerial - %s"
             % (len(aerial_legs), sum(leg["length"] for leg in aerial_legs),
                ", ".join(f"{k}: {v}" for k, v in sorted(by_reason.items()))))
+    if params.aerial_decision_model == "score":
+        # A point model is only reviewable if the bands and the points that
+        # carried each leg are on the record: "42 aerial" is not a decision
+        # anyone can check, "42 aerial, 30 of them on existing poles and 12 on
+        # permits" is.
+        log("docx scoring model: %d leg(s) scored - %s; points on the aerial "
+            "legs: %s"
+            % (sum(score_bands.values()),
+               ", ".join(f"{k}: {v}" for k, v in sorted(score_bands.items())),
+               ", ".join(f"{k}: {v}" for k, v in sorted(score_facts.items()))
+               or "none"))
     for leg in legs:
         _house = leg["house"]
         # ── orientation ─────────────────────────────────────────────────
@@ -3679,6 +4345,22 @@ def design(cfg: dict) -> dict:
     # ── aerial drops (house legs built aerial, never excavated) ───────────
     aerial_rows = []
     for i, leg in enumerate(aerial_legs):
+        # The docx's pole-route condition, measured at the drop: the nearest
+        # existing pole and whether it is inside the trigger distance. Blank
+        # (not "planned") when no pole layer was supplied — absent evidence
+        # must not be published as a finding.
+        house = leg["house"]
+        pole_route: Optional[str] = None
+        existing_pole_m: Optional[float] = None
+        if existing_poles:
+            near_m, _pole = _nearest_pole_info(
+                (house.get("x"), house.get("y")), existing_poles,
+                params.aerial_pole_m)
+            if near_m is not None:
+                existing_pole_m = round(near_m, 2)
+                pole_route = ("existing"
+                              if near_m <= params.aerial_pole_m else "planned")
+        scored = leg.get("aerial_score") or {}
         aerial_rows.append({
             "DROP_ID": "AD-%05d" % (i + 1),
             "POLYGON_ID": leg["house"].get("POLYGON_ID") or None,
@@ -3695,6 +4377,9 @@ def design(cfg: dict) -> dict:
             "length_m": round(leg["length"], 2),
             "AERIAL_REASON": leg["aerial_reason"],
             "INFRA_STATUS": "New", "MFG_ID": leg.get("mfg_id"),
+            "POLE_ROUTE": pole_route, "EXISTING_POLE_M": existing_pole_m,
+            "AERIAL_SCORE": scored.get("score"),
+            "AERIAL_FACTS": ",".join(scored.get("facts") or []) or None,
             "geom": _make_multiline([leg["coords"]]),
         })
     _write_lines(os.path.join(out_dir, "Aerial_Drops.gpkg"), "Aerial_Drops",
@@ -3763,9 +4448,33 @@ def design(cfg: dict) -> dict:
             for mfg_id in sorted(mfg_houses)
         },
         "aerial_legs": len(aerial_rows),
+        # The docx's "Evaluate Aerial" step, counted separately: these legs
+        # were evaluated and left trenched (see Params.aerial_setback_convert).
+        "aerial_evaluated_by_reason": _count_by(
+            [{"r": leg.get("aerial_evaluation")} for leg in legs
+             if leg.get("aerial_evaluation")], "r"),
         "aerial_length_m": round(sum(r["length_m"] for r in aerial_rows), 1),
         "aerial_by_reason": _count_by(
             [{"r": r["AERIAL_REASON"]} for r in aerial_rows], "r"),
+        # The docx's "existing pole route available" condition per drop: an
+        # existing pole in reach (no civils) or a pole route the run has to
+        # build. Blank rows are drops classified with no pole inventory
+        # supplied, which is a third, honest answer. This is the DROP stage's
+        # reading; which plant the built span hangs off is `POLE_SOURCE` on
+        # `Aerial_Spans` (see FIELD_AERIAL).
+        "aerial_pole_route": _count_by(
+            [{"r": r["POLE_ROUTE"]} for r in aerial_rows], "r"),
+        # The docx point model, when a project selects it: which band each leg
+        # landed in and which facts carried the aerial ones. Empty under the
+        # default chain model.
+        "aerial_score_bands": dict(sorted(score_bands.items())),
+        "aerial_score_by_fact": dict(sorted(score_facts.items())),
+        "permit_delays": {
+            "areas": len(permit_delays),
+            "min_days": round(min([a["days"] for a in permit_delays] or [0]), 1),
+            "max_days": round(max([a["days"] for a in permit_delays] or [0]), 1),
+            "project_fallback_days": params.permit_delay_days,
+        },
         # Corridor restriction count: spans crossing land where underground is
         # not permitted. They are still excavated spans (feeder/distribution are
         # UG-only per docs/aerial planning.docx) — this is permit evidence, not
@@ -3838,6 +4547,86 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--max-ug-drop", type=float, default=MAX_UG_DROP_M_DEFAULT,
                     help="house-to-network distance beyond which a drop is "
                          "built aerial instead of buried (economical UG limit)")
+    ap.add_argument("--no-aerial-road-crossing", dest="aerial_road_crossing",
+                    action="store_false",
+                    help="keep a drop that crosses a carriageway buried "
+                         "(docx road_crossing_trigger, on by default)")
+    ap.add_argument("--no-aerial-driveway-crossing",
+                    dest="aerial_driveway_crossing", action="store_false",
+                    help="keep a drop that crosses a driveway/service aisle "
+                         "buried (docx driveway_crossing_trigger, on by default)")
+    ap.add_argument("--existing-poles", default=None,
+                    help="existing telecom poles (BF_POLES or a pole "
+                         "inventory): feeds the docx 'existing telecom pole "
+                         "within 50 m' step")
+    ap.add_argument("--no-aerial-setback", dest="aerial_setback",
+                    action="store_false",
+                    help="ignore the customer-setback step (on by default)")
+    ap.add_argument("--aerial-setback-convert", dest="aerial_setback_convert",
+                    action="store_true",
+                    help="build the setback-evaluated drops aerial (off by "
+                         "default: the docx says Evaluate Aerial)")
+    ap.add_argument("--aerial-setback-m", type=float, default=SETBACK_TRIGGER_M,
+                    help="customer setback beyond which the drop is evaluated "
+                         "aerial (docx: 20 m)")
+    ap.add_argument("--no-aerial-pole", dest="aerial_pole",
+                    action="store_false",
+                    help="ignore the existing-pole step (on by default)")
+    ap.add_argument("--aerial-pole-m", type=float,
+                    default=EXISTING_POLE_TRIGGER_M,
+                    help="how close an existing pole must stand to serve a "
+                         "drop (docx: 50 m)")
+    ap.add_argument("--aerial-trench", action="store_true",
+                    help="aerial when the drop's new trenching is over the "
+                         "limit (off by default: needs the urban/rural flag)")
+    ap.add_argument("--aerial-trench-m", type=float,
+                    default=TRENCH_LENGTH_URBAN_M,
+                    help="urban new-trenching limit (docx: 100 m)")
+    ap.add_argument("--aerial-trench-rural-m", type=float,
+                    default=TRENCH_LENGTH_RURAL_M,
+                    help="rural new-trenching limit (docx: 300 m)")
+    ap.add_argument("--rural", dest="urban", action="store_false",
+                    help="use the rural new-trenching limit")
+    ap.add_argument("--aerial-density", action="store_true",
+                    help="aerial below the customer-density threshold (off by "
+                         "default: computed per premise against the streets)")
+    ap.add_argument("--aerial-density-min", type=float,
+                    default=DENSITY_MIN_HOMES_PER_KM,
+                    help="homes per km of street below which a drop may go "
+                         "aerial (docx: 20)")
+    ap.add_argument("--aerial-density-radius-m", type=float,
+                    default=DENSITY_RADIUS_M,
+                    help="radius the customer density is measured over")
+    ap.add_argument("--aerial-density-high", type=float, default=None,
+                    help="homes per km of street above which the docx's 'high "
+                         "customer density -20' line scores (unset = the line is "
+                         "reported unscored, never guessed)")
+    ap.add_argument("--aerial-permit", action="store_true",
+                    help="aerial when the permit delay is over the limit (off "
+                         "by default: the engine holds no permit register)")
+    ap.add_argument("--permit-delays", default=None,
+                    help="permit-delay layer: authority/service areas (polygons) "
+                         "or a per-street register (lines/points) carrying the "
+                         "expected lead time in days, so the permit-delay trigger "
+                         "fires per drop instead of per project")
+    ap.add_argument("--permit-delay-days", type=float, default=0.0,
+                    help="this project's permit delay in days - the fallback for "
+                         "a premise no permit-delay area covers (0 = unknown)")
+    ap.add_argument("--aerial-permit-delay-days", type=float,
+                    default=PERMIT_DELAY_TRIGGER_DAYS,
+                    help="permit delay beyond which a drop may go aerial "
+                         "(docx: 60 days)")
+    ap.add_argument("--aerial-decision-model", choices=("chain", "score"),
+                    default="chain",
+                    help="how the docx's business decision is made: the IF-chain "
+                         "in its own order (default) or its point model, where "
+                         "the facts add up")
+    ap.add_argument("--aerial-score-compare-aerial", action="store_true",
+                    help="under --aerial-decision-model score, build the docx's "
+                         "middle band ('Cost comparison') aerial instead of "
+                         "leaving it underground")
+    ap.add_argument("--metro-core", action="store_true",
+                    help="declare this project a metro city core (docx: -30)")
     ap.add_argument("--target-epsg", type=int, default=25833)
     ap.add_argument("--simplify-tol", type=float, default=2.5)
     ap.add_argument("--max-garden", type=float, default=60.0)
@@ -3863,6 +4652,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "aerial": args.aerial,
         "aerial_max_leg_m": args.aerial_max_leg,
         "max_ug_drop_m": args.max_ug_drop,
+        "aerial_road_crossing": args.aerial_road_crossing,
+        "aerial_driveway_crossing": args.aerial_driveway_crossing,
+        "existing_poles": args.existing_poles,
+        "permit_delays": args.permit_delays,
+        "aerial_setback": args.aerial_setback,
+        "aerial_setback_m": args.aerial_setback_m,
+        "aerial_setback_convert": args.aerial_setback_convert,
+        "aerial_pole": args.aerial_pole,
+        "aerial_pole_m": args.aerial_pole_m,
+        "aerial_trench": args.aerial_trench,
+        "aerial_trench_m": args.aerial_trench_m,
+        "aerial_trench_rural_m": args.aerial_trench_rural_m,
+        "urban": args.urban,
+        "aerial_density": args.aerial_density,
+        "aerial_density_min": args.aerial_density_min,
+        "aerial_density_radius_m": args.aerial_density_radius_m,
+        "aerial_permit": args.aerial_permit,
+        "permit_delay_days": args.permit_delay_days,
+        "aerial_permit_delay_days": args.aerial_permit_delay_days,
+        "aerial_decision_model": args.aerial_decision_model,
+        "aerial_score_compare_aerial": args.aerial_score_compare_aerial,
+        "aerial_density_high": args.aerial_density_high,
+        "metro_core": args.metro_core,
         "target_epsg": args.target_epsg, "simplify_tol_m": args.simplify_tol,
         "max_garden_m": args.max_garden,
         "crossing_merge_m": args.crossing_merge,

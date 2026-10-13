@@ -30,6 +30,7 @@ from qgis.core import (
     QgsField,
     QgsGeometry,
     QgsPointXY,
+    QgsProject,
     QgsVectorLayer,
 )
 from qgis.PyQt.QtCore import QMetaType
@@ -82,8 +83,8 @@ class _Steps:
         self.step = n
 
 
-def _point_layer(coords, name):
-    lyr = QgsVectorLayer(f"Point?crs={CRS_AUTHID}", name, "memory")
+def _point_layer(coords, name, crs=CRS_AUTHID):
+    lyr = QgsVectorLayer(f"Point?crs={crs}", name, "memory")
     assert lyr.isValid()
     pr = lyr.dataProvider()
     pr.addAttributes([QgsField("id", QMetaType.Type.QString)])
@@ -112,6 +113,76 @@ def _context():
     ctx = QgsProcessingContext()
     _CONTEXTS.append(ctx)
     return ctx
+
+
+def _algorithm():
+    from HLDPlanning.algorithms.brownfield_layer import BrownfieldLayerAlgorithm
+    return BrownfieldLayerAlgorithm()
+
+
+def test_a_geographic_archive_never_leaves_the_registry_in_degrees():
+    """A WGS84 brownfield hand-over must not put the registry in degrees.
+
+    ``utils/reuse.REUSE_TOL_M`` is 2.0 and means 2 METRES. With the assets
+    stored in degrees every reuse test downstream compares a metre-space design
+    against a degree-space registry and matches NOTHING, and the loader's own
+    reprojection never fires either -- it only reprojects a layer whose CRS
+    differs from the registry's, so a registry that had ADOPTED 4326 reprojected
+    nothing. Measured on project 24cd3573 with the planner's archive: 36 assets
+    loaded, every one of them within 0.0 m of the design, and **0 reused**
+    (every trench span, duct, chamber and pole stamped Proposed).
+    """
+    wgs = _point_layer([(13.37, 52.44)], "chambers", crs="EPSG:4326")
+    crs = _algorithm()._target_crs([wgs])
+    assert crs is not None
+    assert not crs.isGeographic(), (
+        "a geographic archive left the registry in degrees, so every "
+        "metre-space reuse test matches nothing")
+
+
+def test_a_projected_input_crs_is_honoured():
+    wgs = _point_layer([(13.37, 52.44)], "chambers", crs="EPSG:4326")
+    utm = _point_layer([(400000.0, 5800000.0)], "ducts", crs="EPSG:25833")
+    assert _algorithm()._target_crs([wgs, utm]).postgisSrid() == 25833
+
+
+def test_the_project_crs_is_used_when_no_input_is_projected():
+    project = QgsProject.instance()
+    previous = project.crs()
+    try:
+        project.setCrs(QgsCoordinateReferenceSystem("EPSG:3857"))
+        wgs = _point_layer([(13.37, 52.44)], "chambers", crs="EPSG:4326")
+        assert _algorithm()._target_crs([wgs]).postgisSrid() == 3857
+    finally:
+        project.setCrs(previous)
+
+
+def test_no_usable_layer_still_has_no_crs_at_all():
+    # the stage's "at least one brownfield layer must be provided" refusal
+    # depends on this being None rather than the fallback grid
+    assert _algorithm()._target_crs([None, None]) is None
+
+
+def test_a_wgs84_layer_is_reprojected_and_never_dropped():
+    """The loader must TRANSFORM a mismatched layer, not throw it away.
+
+    It used to call ``processing.run("native:reprojectlayer")`` and hand the
+    result to ``as_layer()`` — which got the layer ID of a context-registered
+    sink, refused the string and returned 0, so EVERY feature of a layer whose
+    CRS differed was silently dropped. That was invisible for as long as the
+    registry adopted the archive's own CRS (nothing differed); project
+    24cd3573 lost all 36 assets the moment the registry worked in the project
+    CRS (36 loaded -> 0 loaded, 0 written).
+    """
+    wgs = _point_layer([(13.3775, 52.4480)], "chambers", crs="EPSG:4326")
+    reg = BrownfieldRegistry(QgsCoordinateReferenceSystem("EPSG:25833"), _Fb())
+    assert reg.load_chambers(wgs, id_field="id") == 1
+
+    pt = reg.get_asset(reg.asset_ids()[0])["geom"].asPoint()
+    assert pt.x() > 1000 and pt.y() > 1000, \
+        f"geometry is still in degrees: {pt.x()}, {pt.y()}"
+    assert 200000 < pt.x() < 800000 and 5500000 < pt.y() < 6200000, \
+        f"not a Berlin UTM32N coordinate: {pt.x()}, {pt.y()}"
 
 
 def test_reuse_gate_hides_a_stored_registry():

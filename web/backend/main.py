@@ -463,6 +463,100 @@ def _register_downloads(project_id: str, output_dir: Path) -> List[Dict[str, Any
     return sorted(downloads, key=lambda item: item["name"])
 
 
+def _downloads_are_stale(downloads: Optional[List[Dict[str, Any]]], output_dir: Path) -> bool:
+    """Does the recorded download list still describe what is on disk?
+
+    The list was only ever built when it was EMPTY, so a run whose last stages
+    wrote their files after the publish kept the previous design's list for
+    good: the pole and aerial stages of one project wrote two hours after its
+    publish, and every aerial layer and the poles stayed invisible in the
+    Downloads panel and in both packages while the files sat on disk (20 files,
+    including ``Poles.gpkg`` and all three ``Aerial_*`` layers).  Existence is
+    not freshness here either -- the directory is the truth. Names are enough
+    to tell: a file that appeared is a download no one can see, and one that
+    vanished is a link that 404s.
+    """
+    if not output_dir.is_dir():
+        return False
+    on_disk = {
+        path.relative_to(output_dir).as_posix()
+        for path in output_dir.rglob("*")
+        if path.is_file() and path.suffix.lower() in DOWNLOAD_EXTS
+    }
+    recorded = {
+        item.get("name")
+        for item in (downloads or [])
+        if isinstance(item, dict) and item.get("name")
+    }
+    return on_disk != recorded
+
+
+def _layer_output_names() -> Set[str]:
+    """The layer files a run publishes, GeoPackage and GeoJSON alike."""
+    names: Set[str] = set()
+    for _public, gpkg_name, geojson_name in ONECLICK_OUTPUTS:
+        names.add(gpkg_name)
+        names.add(geojson_name)
+    return names
+
+
+def _drop_stale_outputs(project_id: str, output_dir: Path,
+                        started_at: float) -> List[str]:
+    """Delete published layer files THIS run did not write.
+
+    Every stage is supposed to rewrite its own output, and most do — but a
+    stage with nothing to publish returns early without ever creating its sink.
+    The pole + aerial stages are the ones that do: "Aerial Drop Layer: no
+    premise flagged aerial_required — nothing to build" leaves the PREVIOUS
+    run's ``Aerial_Spans.gpkg`` / ``Aerial_Cable.gpkg`` in place, and
+    ``_ingest_outputs`` publishes whatever file is there. Project 24cd3573 is
+    the measurement: a run the designer itself logged as "Aerial drops: none —
+    every drop leg could be trenched" still served 6 aerial drops, 8 aerial
+    spans and 8 aerial cables on the map, which is exactly what "not every drop
+    cable is supposed to be aerial" looks like from the portal.
+
+    The rule is the same one ``_ensure_geojson`` already applies to a single
+    layer -- freshness, not existence -- applied to the whole set. Staleness is
+    judged from the GeoPackage, which is what the pipeline itself writes; the
+    GeoJSON beside it is this engine's own conversion, and a twin is removed
+    only when its GeoPackage was not rewritten (otherwise every run would
+    "delete" the twins it is about to regenerate and report a dozen layers it
+    did not actually skip). Returns the names deleted. Never raises: a file the
+    OS will not release is reported and left alone rather than failing the run.
+    """
+    published = _layer_output_names()
+    deleted: List[str] = []
+    # Filesystem mtime granularity (and the pipeline's own clock skew) must not
+    # make the run's OWN first write look stale — compare against a start time
+    # nudged back a couple of seconds.
+    cutoff = float(started_at) - 2.0
+    for name in sorted(published):
+        gpkg = output_dir / name
+        if gpkg.suffix.lower() != ".gpkg":
+            continue  # the twin is handled with its GeoPackage
+        twin = output_dir / (gpkg.stem + ".geojson")
+        try:
+            if gpkg.is_file() and gpkg.stat().st_mtime >= cutoff:
+                continue  # this run rewrote the layer
+        except OSError:
+            continue
+        for path in (gpkg, twin):
+            try:
+                if path.is_file():
+                    path.unlink()
+                    deleted.append(path.name)
+            except OSError:
+                continue
+    if deleted:
+        _append(
+            project_id, "warning",
+            "Removed " + str(len(deleted)) + " layer file(s) this run did not write, "
+            "so the previous design is not served as if it were current: "
+            + ", ".join(deleted) + ".",
+        )
+    return deleted
+
+
 def _gpkg_is_intact(path: Path) -> bool:
     """Is this GeoPackage a finished, readable file?
 
@@ -1155,59 +1249,16 @@ def _merge_brownfield_files(param: str, paths: List[Path],
     return out
 
 
-def _brownfield_args(brownfield_path: Optional[Path], output_dir: Path,
-                     project_id: Optional[str] = None) -> List[str]:
-    """Unzip an uploaded brownfield archive and build the plugin BF_* params.
+def _collect_brownfield_candidates(bf_dir: Path) -> Dict[str, List[Path]]:
+    """Every file in ``bf_dir`` that maps to a BF_* parameter, by parameter.
 
-    Returns qgis_process ``--`` style args (e.g. ``USE_BROWNFIELD=true``,
-    ``BF_DUCTS=<path>``) or an empty list when nothing was supplied.
-
-    ``project_id`` enables the occupancy read-back: the last run's duct
-    occupancy is the spare capacity this run must consume before laying new
-    duct, so it is exported as ``bf_ducts.geojson`` (merged with any uploaded
-    duct file) and fed as BF_DUCTS. A fresh project id has no stored
-    occupancy, so this is a no-op there.
+    ``bf_ducts.geojson`` (the occupancy read-back) and ``bf_existing_ducts
+    .geojson`` (the planner's survey archive) both resolve to BF_DUCTS, which is
+    why callers collect them all and merge instead of letting the last one
+    scanned win. A filename with no BF_* token is re-resolved from its own
+    ``ASSET_TYPE`` property, the schema these archives ship.
     """
-    bf_dir = output_dir / "brownfield"
-    have_inputs = False
-    if brownfield_path and brownfield_path.exists():
-        bf_dir.mkdir(parents=True, exist_ok=True)
-        if zipfile.is_zipfile(brownfield_path):
-            with zipfile.ZipFile(brownfield_path) as zf:
-                base = str(bf_dir.resolve())
-                for member in zf.namelist():
-                    dest = (bf_dir / member).resolve()
-                    if not str(dest).startswith(base):
-                        continue  # skip path-traversal entries
-                    zf.extract(member, bf_dir)
-        else:
-            shutil.copy2(brownfield_path, bf_dir / brownfield_path.name)
-        have_inputs = True
-
-    # ── Occupancy read-back: previous run's spare duct ways → BF_DUCTS ────
-    # Derived, never fatal (and merged with the uploaded file when one exists).
-    if project_id:
-        try:
-            if occupancy.write_duct_brownfield(project_id, bf_dir) is not None:
-                have_inputs = True
-        except Exception:
-            pass
-
-    if not have_inputs:
-        return []
-
-    # ── One BF_* parameter can be fed by MORE THAN ONE file ───────────────
-    # ``bf_ducts.geojson`` (the occupancy read-back) and
-    # ``bf_existing_ducts.geojson`` (the planner's survey archive) both resolve
-    # to BF_DUCTS.  Letting the last one scanned win silently discarded the
-    # uploaded brownfield -- or the read-back -- depending on directory order,
-    # so a run could report reuse from the wrong network, or none at all.
-    # Every file that maps to a parameter is collected, and where several
-    # exist they are MERGED into one GeoJSON for that parameter.
     candidates: Dict[str, List[Path]] = {}
-    # Prefer GeoJSON > GPKG > JSON > SHP when a zip ships the same asset
-    # in several formats.
-    priority = {".geojson": 3, ".gpkg": 2, ".json": 1, ".shp": 0}
     for fp in sorted(bf_dir.rglob("*")):
         if not fp.is_file() or fp.suffix.lower() not in _BF_VECTOR_EXTS:
             continue
@@ -1233,6 +1284,84 @@ def _brownfield_args(brownfield_path: Optional[Path], output_dir: Path,
             if not param:
                 continue
         candidates.setdefault(param, []).append(fp)
+    return candidates
+
+
+def _brownfield_args(brownfield_path: Optional[Path], output_dir: Path,
+                     project_id: Optional[str] = None) -> List[str]:
+    """Unzip an uploaded brownfield archive and build the plugin BF_* params.
+
+    Returns qgis_process ``--`` style args (e.g. ``USE_BROWNFIELD=true``,
+    ``BF_DUCTS=<path>``) or an empty list when nothing was supplied.
+
+    ``project_id`` enables the occupancy read-back: the last run's duct
+    occupancy is the spare capacity this run must consume before laying new
+    duct, so it is exported as ``bf_ducts.geojson`` and fed as BF_DUCTS (as is
+    the project's own trench network). A fresh project id has no stored
+    occupancy, so this is a no-op there.
+
+    **An uploaded archive wins for the parameters it carries.** The read-backs
+    export the project's WHOLE stored network -- every trench and every duct
+    with a spare way, over the whole ward -- so merging them into an uploaded
+    archive turned a handover of one region into a copy of the design: the
+    project that motivated this had 240 read-back line features against an
+    archive of 8 layers, and the "Existing infrastructure" layer on the map
+    covered everything. The read-back still runs for the asset types the
+    archive does not name, so an archive may legitimately carry only some
+    layers.
+    """
+    bf_dir = output_dir / "brownfield"
+    have_inputs = False
+    if brownfield_path and brownfield_path.exists():
+        bf_dir.mkdir(parents=True, exist_ok=True)
+        if zipfile.is_zipfile(brownfield_path):
+            with zipfile.ZipFile(brownfield_path) as zf:
+                base = str(bf_dir.resolve())
+                for member in zf.namelist():
+                    dest = (bf_dir / member).resolve()
+                    if not str(dest).startswith(base):
+                        continue  # skip path-traversal entries
+                    zf.extract(member, bf_dir)
+        else:
+            shutil.copy2(brownfield_path, bf_dir / brownfield_path.name)
+        have_inputs = True
+
+    uploaded = _collect_brownfield_candidates(bf_dir) if have_inputs else {}
+
+    # ── Read-backs: what the project ALREADY has feeds the run ────────────
+    # Both are derived, they fill only what the archive left empty, and they
+    # are never fatal.
+    if project_id:
+        # Spare duct ways → BF_DUCTS (capacity read-back).
+        if "BF_DUCTS" not in uploaded:
+            try:
+                if occupancy.write_duct_brownfield(project_id, bf_dir) is not None:
+                    have_inputs = True
+            except Exception:
+                pass
+        # The project's own trench network → BF_FEEDER_TRENCH /
+        # BF_DIST_TRENCH / BF_TRENCHES. "Reuse before rebuild": a re-run was
+        # previously planned with only whatever trench files an uploaded
+        # archive carried -- one Berlin project was fed a Birmingham archive,
+        # so nothing was within a kilometre of the work and the design could
+        # not reuse a single trench it had planned itself.
+        if not ({"BF_FEEDER_TRENCH", "BF_DIST_TRENCH", "BF_TRENCHES"} & set(uploaded)):
+            try:
+                if occupancy.write_trench_brownfield(project_id, bf_dir):
+                    have_inputs = True
+            except Exception:
+                pass
+
+    if not have_inputs:
+        return []
+
+    # ── One BF_* parameter can be fed by MORE THAN ONE file ───────────────
+    # Every file that maps to a parameter is collected, and where several
+    # exist they are MERGED into one GeoJSON for that parameter.
+    candidates: Dict[str, List[Path]] = _collect_brownfield_candidates(bf_dir)
+    # Prefer GeoJSON > GPKG > JSON > SHP when a zip ships the same asset
+    # in several formats.
+    priority = {".geojson": 3, ".gpkg": 2, ".json": 1, ".shp": 0}
 
     matches: Dict[str, str] = {}
     for param, paths in sorted(candidates.items()):
@@ -1255,6 +1384,11 @@ def _brownfield_args(brownfield_path: Optional[Path], output_dir: Path,
         args.append("USE_BROWNFIELD=true")
         for param in sorted(matches):
             args.append(f"{param}={matches[param]}")
+        # BF_POLES does double duty inside the pipeline: the reuse path takes
+        # it as the existing pole line, and the trench stage is handed the same
+        # layer as INPUT_EXISTING_POLES for the docx drop chain's "existing
+        # telecom pole within 50 m" step (see oneclick.run_trench_layer). No
+        # command-line parameter is needed for that.
         return args
 
     # The archive arrived but mapped to no BF_* layer, so the run is about
@@ -1361,7 +1495,8 @@ def _extract_zip_layer(zip_path: Path, prefer: Optional[str] = None) -> Optional
 
 
 def _osm_constraint_args(
-    output_dir: Path, project_id: str, log: bool = True
+    output_dir: Path, project_id: str, log: bool = True,
+    permit_path: Optional[str] = None,
 ) -> List[str]:
     """POLY_BARRIER_EXTRA=… / AERIAL_ZONES=… args from inputs/osm/.
 
@@ -1418,8 +1553,9 @@ def _osm_constraint_args(
                     "OSM landuse input feeding AERIAL_ZONES — restricted "
                     "landuse classifies non-diggable drop legs aerial.")
 
-    if args:
-        _write_design_input_map(output_dir, barrier_paths, aerial_path)
+    if args or permit_path:
+        _write_design_input_map(output_dir, barrier_paths, aerial_path,
+                                permit_path)
     elif log:
         _append(project_id, "info",
                 "No OSM constraint inputs (or none readable) — polygon "
@@ -1428,7 +1564,8 @@ def _osm_constraint_args(
 
 
 def _write_design_input_map(
-    output_dir: Path, barrier_paths: List[str], aerial_path: Optional[str]
+    output_dir: Path, barrier_paths: List[str], aerial_path: Optional[str],
+    permit_path: Optional[str] = None,
 ) -> None:
     """Record which constraints a run carried — beside the outputs, where a
     reviewer looking at the finished design can find it."""
@@ -1436,10 +1573,13 @@ def _write_design_input_map(
         payload = {
             "poly_barrier_extra": list(barrier_paths),
             "aerial_zones": aerial_path,
+            "permit_delays": permit_path,
             "note": (
                 "OSM reference layers bound to the design: barriers gate the "
                 "polygon growth rule; landuse derives aerial zones for the "
-                "trench stage's non-diggable drop classification."
+                "trench stage's non-diggable drop classification. Permit "
+                "lead times turn the docx's permit-delay drop step into a per-"
+                "drop rule instead of one project-wide number."
             ),
         }
         (output_dir / "design_inputs.json").write_text(
@@ -1447,6 +1587,61 @@ def _write_design_input_map(
         )
     except OSError:
         pass
+
+
+# Where a project's permit lead times live, in the order they are looked for.
+# A directory works like the OSM keys (the first readable vector file wins) so
+# a planner can drop a bundle in without renaming anything inside it.
+PERMIT_DELAY_DIRS = ("permit_delays", "permits")
+PERMIT_DELAY_FILES = ("permit_delays.geojson", "permit_delays.gpkg",
+                      "permit_delays.json")
+
+
+def _permit_delay_args(
+    output_dir: Path, project_id: str, log: bool = True
+) -> Tuple[List[str], Optional[str]]:
+    """``PERMIT_DELAYS=<path>`` when the project carries a permit lead-time layer.
+
+    The docx's Rule 7 is "permit_lead_time > 60 days → aerial_preferred", and
+    the drop stage shipped that trigger OFF for one reason: a single project
+    number fired on **200 of 260** legs of a ward and put them all overhead
+    (docs/stages/AERIAL.md §5). A layer gives the trigger a value per premise,
+    so it can be switched on.
+
+    Optional in every sense: absent, unreadable or of the wrong type leaves the
+    run exactly as it was (the trigger then still needs the project-wide
+    number). Returns ``(args, path)`` — the path is recorded in
+    ``design_inputs.json`` so the finished design says whether it had one.
+    """
+    inputs = output_dir / "inputs"
+    resolved: Optional[str] = None
+    if inputs.is_dir():
+        for name in PERMIT_DELAY_FILES:
+            candidate = inputs / name
+            if candidate.is_file():
+                resolved = _vector_layer_arg(candidate)
+                if resolved:
+                    break
+        if not resolved:
+            for key in PERMIT_DELAY_DIRS:
+                folder = inputs / key
+                if not folder.is_dir():
+                    continue
+                for candidate in sorted(folder.iterdir()):
+                    if candidate.is_file() and candidate.name != "design_inputs.json":
+                        resolved = _vector_layer_arg(candidate)
+                        if resolved:
+                            break
+                if resolved:
+                    break
+    if not resolved:
+        return [], None
+    if log:
+        _append(project_id, "info",
+                "Permit lead-time input feeding PERMIT_DELAYS — the docx's "
+                "'permit delay > 60 days' drop step is per drop, not per "
+                "project.")
+    return [f"PERMIT_DELAYS={resolved}"], resolved
 
 
 def _run_pipeline(
@@ -1495,13 +1690,19 @@ def _run_pipeline(
         if bf_args:
             cmd.extend(bf_args)
             _append(project_id, "info", "Brownfield upload detected; enabling reuse.")
-        osm_args = _osm_constraint_args(output_dir, project_id)
+        permit_args, permit_path = _permit_delay_args(output_dir, project_id)
+        osm_args = _osm_constraint_args(output_dir, project_id,
+                                        permit_path=permit_path)
         if osm_args:
             cmd.extend(osm_args)
+        if permit_args:
+            cmd.extend(permit_args)
         if os.name == "nt" and qgis.lower().endswith((".bat", ".cmd")):
             cmd = " ".join(_quote_cmd_arg(part) for part in cmd)
 
+        run_started = time.time()
         _run_command(project_id, cmd, output_dir)
+        _drop_stale_outputs(project_id, output_dir, run_started)
         layers = _ingest_outputs(project_id, output_dir)
         downloads = _register_downloads(project_id, output_dir)
 
@@ -2120,11 +2321,80 @@ def get_input_layer(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         raise _area_error(exc) from exc
 
 
+@app.middleware("http")
+async def _live_reads_are_never_cached(request, call_next):
+    """Mark the live reads uncacheable, so a browser cannot replay a run.
+
+    ``/ftth/hld/results/...`` answers with THIS run's state, and a 200 GET with
+    no cache directive is cacheable: a planner who re-publishes a project and
+    reloads the page can be shown the previous answer — the previous layer
+    list, the previous geometry — which is indistinguishable from "the publish
+    did nothing". Downloads and map tiles keep their caching: a download is one
+    immutable file per name, a tile is a rendered pixel grid, and both are
+    re-requested constantly.
+    """
+    response = await call_next(request)
+    path = request.url.path
+    if path.startswith("/ftth/hld/results") or path == "/ftth/projects":
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def _as_utc(value: Any) -> Optional[datetime]:
+    """A timestamp from either side of the wire, as an aware UTC datetime.
+
+    A task carries ``_now()`` (an ISO string) and a project row carries a
+    ``timestamptz`` (a datetime), so the two can only be compared once both are
+    the same shape. An unparseable or missing value is None, never "now": an
+    unknown timestamp must not win a freshness comparison.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _row_is_newer(project: Dict[str, Any], task: Dict[str, Any]) -> bool:
+    """Was this project row published AFTER this process last touched the task?
+
+    The row is the record that outlives the engine, and it is what every
+    publish writes -- a re-run started from another process, a re-ingest, an
+    LLD re-plan. An engine that ran a project earlier in its own life holds
+    that run in memory, and this endpoint used to read the row only when the
+    project was UNKNOWN to it, so a later publish was invisible on the results
+    page: the page kept serving the older layer list -- a stale aerial route
+    included -- until the engine happened to be restarted.
+    """
+    published = _as_utc(project.get("updated_at"))
+    touched = _as_utc(task.get("updated_at"))
+    if published is None or touched is None:
+        return False
+    return published > touched
+
+
 @app.get("/ftth/hld/results/{project_id}")
 def get_results(project_id: str) -> Dict[str, Any]:
-    if project_id not in tasks and postgis.is_available():
-        project = postgis.get_project(project_id)
-        if project:
+    # Read the row when the project is unknown here, and ALSO when a publish
+    # has landed since this process last touched the task: a completed run held
+    # in memory must not outrank a newer publish (see _row_is_newer). An
+    # in-flight run stays authoritative -- its own thread owns the task.
+    project = None
+    if postgis.is_available():
+        try:
+            project = postgis.get_project(project_id)
+        except Exception as exc:  # noqa: BLE001 - the disk restore below serves
+            _append(project_id, "warning",
+                    f"Project row unreadable ({exc}); serving this run from memory.")
+    if project:
+        if project_id not in tasks or (
+            tasks[project_id].get("status") not in ("running", "queued")
+            and _row_is_newer(project, tasks[project_id])
+        ):
             task = _task(project_id)
             task.update(
                 {
@@ -2173,18 +2443,21 @@ def get_results(project_id: str) -> Dict[str, Any]:
     if task.get("status") in ("running", "queued") and not _owned_in_process(project_id):
         _recover_orphan_run(project_id, task)
     # Downloads may be empty in the DB row (older runs) even though the
-    # design package files exist on disk — surface them and persist back.
-    if not (task.get("downloads") or []):
-        output_dir = OUTPUT_DIR / project_id
-        if output_dir.is_dir():
-            downloads = _register_downloads(project_id, output_dir)
-            if downloads:
-                task["downloads"] = downloads
-                try:
-                    if postgis.is_available():
-                        postgis.update_project_downloads(project_id, downloads)
-                except Exception:
-                    pass
+    # design package files exist on disk — surface them and persist back. A
+    # list that is already there can still be STALE (see _downloads_are_stale:
+    # a run that finished after its publish leaves the previous design's files
+    # recorded), and then the Downloads panel and both packages are missing
+    # layers whose files are right there on disk.
+    output_dir = OUTPUT_DIR / project_id
+    if _downloads_are_stale(task.get("downloads"), output_dir):
+        downloads = _register_downloads(project_id, output_dir)
+        if downloads:
+            task["downloads"] = downloads
+            try:
+                if postgis.is_available():
+                    postgis.update_project_downloads(project_id, downloads)
+            except Exception:
+                pass
     return _public_task(project_id)
 
 

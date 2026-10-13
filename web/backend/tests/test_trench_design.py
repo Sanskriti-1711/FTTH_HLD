@@ -461,13 +461,52 @@ def test_aerial_zone_moves_the_leg_out_of_the_trench_layer():
     assert aerial[0]["aerial_reason"] == "zone"
 
 
-def test_aerial_zone_is_detected_anywhere_along_the_leg():
-    # zone only near the far end — a midpoint-only test would miss it
+def test_a_zone_the_leg_mostly_lies_in_moves_it_aerial():
+    # the zone covers 5 of the leg's 7 samples (71 %) — underground is not
+    # permitted across most of the leg, so the drop is built aerial
+    p = td.Params()
+    trenched, aerial = td._split_drop_legs(
+        _legs(), td._zone_polygons(_zone([(-5, 2), (5, 2), (5, 15), (-5, 15)])),
+        p, lambda m: None)
+    assert [leg["house"]["ADDR_ID"] for leg in aerial] == ["in"]
+    assert [leg["house"]["ADDR_ID"] for leg in trenched] == ["out"]
+
+
+def test_a_leg_that_only_clips_a_zone_stays_trenched():
+    """A zone the leg merely touches at one end is not grounds for aerial.
+
+    Project 24cd3573 (the Berlin ward, 285 drop legs) is where this was
+    measured: 5 legs came back aerial because their HOUSE end sat 2-10 m inside
+    an OSM ``park`` / ``allotments`` polygon — 4-29 % of the leg, always at the
+    house end — and 2 more by the ``chain`` rule hanging off them. Such a plot
+    is still reached from the street, so those last metres are a hand-dug Garden
+    leg instead of the overhead span the old "any sampled point inside" test
+    produced.
+    """
     p = td.Params()
     trenched, aerial = td._split_drop_legs(
         _legs(), td._zone_polygons(_zone([(-5, 8), (5, 8), (5, 15), (-5, 15)])),
         p, lambda m: None)
-    assert [leg["house"]["ADDR_ID"] for leg in aerial] == ["in"]
+    assert [leg["house"]["ADDR_ID"] for leg in trenched] == ["in", "out"]
+    assert aerial == []
+
+
+def test_the_zone_test_walks_the_leg_and_not_its_chord():
+    """A leg that bends around a zone must not be judged by a straight line.
+
+    The legs follow the street to the network, so the chord from the house to
+    the network end can cross a park the leg itself never enters.
+    """
+    p = td.Params()
+    legs = [{"coords": [(0.0, 0.0), (0.0, 20.0), (20.0, 20.0)], "length": 40.0,
+             "type": "Garden", "house": {"ADDR_ID": "around"}}]
+    # the chord (0,0) -> (20,20) passes through this park; the leg does not
+    trenched, aerial = td._split_drop_legs(
+        legs, td._zone_polygons(_zone([(8, 8), (12, 8), (12, 12), (8, 12)])),
+        p, lambda m: None)
+    assert [leg["house"]["ADDR_ID"] for leg in trenched] == ["around"]
+    assert aerial == []
+
 
 
 def test_no_zone_and_no_length_rule_keeps_every_leg_trenched():
@@ -521,13 +560,122 @@ def test_running_alongside_a_major_road_is_not_a_crossing():
     assert aerial == []
 
 
-def test_minor_road_crossings_stay_trenched():
+def test_a_residential_road_crossing_moves_the_drop_aerial():
+    """docs/aerial planning.docx, drop decision chain: "ELSE IF road crossing
+    required -> Aerial" (``road_crossing_trigger: true``), restated by its
+    Scenario 2 ("instead of UG road crossing: Pole -> Pole -> House").
+
+    This used to stay trenched, on the reading that only the *barrier* classes
+    (``major_road_crossing``) justified going overhead. The docx does not say
+    that: a residential street is not free to open either — a single premise's
+    drop needs a road opening, an HDD and reinstatement — so the crossing
+    trigger fires on any carriageway.
+    """
     legs = [{"coords": [(0.0, -10.0), (0.0, 10.0)], "length": 20.0,
              "type": "Garden", "house": {"ADDR_ID": "cross"}}]
     residential = [([(-50.0, 0.0), (50.0, 0.0)], "residential", {})]
     trenched, aerial = td._split_drop_legs(
         legs, None, td.Params(), lambda m: None, residential)
+    assert trenched == []
+    assert aerial[0]["aerial_reason"] == "road_crossing"
+
+
+def test_the_road_crossing_trigger_is_switchable():
+    """``road_crossing_trigger: false`` is the pre-docx behaviour: buried."""
+    legs = [{"coords": [(0.0, -10.0), (0.0, 10.0)], "length": 20.0,
+             "type": "Garden", "house": {"ADDR_ID": "cross"}}]
+    residential = [([(-50.0, 0.0), (50.0, 0.0)], "residential", {})]
+    trenched, aerial = td._split_drop_legs(
+        legs, None, td.Params(aerial_road_crossing=False), lambda m: None,
+        residential)
+    assert [leg["house"]["ADDR_ID"] for leg in trenched] == ["cross"]
+    assert aerial == []
+
+
+def test_a_driveway_crossing_is_its_own_reason():
+    """The docx names the driveway separately (``driveway_crossing_trigger``):
+    a service aisle / field track is cheaper to cut than a road, so it gets its
+    own reason rather than being reported as a road crossing."""
+    legs = [{"coords": [(0.0, -10.0), (0.0, 10.0)], "length": 20.0,
+             "type": "Garden", "house": {"ADDR_ID": "drive"}}]
+    service = [([(-50.0, 0.0), (50.0, 0.0)], "service", {})]
+    _t, aerial = td._split_drop_legs(
+        legs, None, td.Params(), lambda m: None, service)
+    assert aerial[0]["aerial_reason"] == "driveway_crossing"
+    # … and it is switchable on its own
+    trenched, aerial = td._split_drop_legs(
+        legs, None, td.Params(aerial_driveway_crossing=False), lambda m: None,
+        service)
     assert len(trenched) == 1 and aerial == []
+
+
+def test_a_driveway_is_still_reported_when_the_road_trigger_is_off():
+    """A leg crossing a driveway AND a street is a driveway crossing when only
+    that trigger is on — the disabled category must not mask it."""
+    legs = [{"coords": [(0.0, -10.0), (0.0, 20.0)], "length": 30.0,
+             "type": "Garden", "house": {"ADDR_ID": "both"}}]
+    roads = [([(-50.0, 0.0), (50.0, 0.0)], "residential", {}),
+             ([(50.0, 3.0), (0.0, 3.0), (-50.0, 3.0)], "footway", {}),
+             ([(-50.0, 5.0), (50.0, 5.0)], "service", {})]
+    _t, aerial = td._split_drop_legs(
+        legs, None, td.Params(aerial_road_crossing=False), lambda m: None,
+        roads)
+    assert aerial[0]["aerial_reason"] == "driveway_crossing"
+
+
+def test_a_road_crossing_outranks_a_driveway_crossing():
+    legs = [{"coords": [(0.0, -10.0), (0.0, 20.0)], "length": 30.0,
+             "type": "Garden", "house": {"ADDR_ID": "both"}}]
+    roads = [([(-50.0, 0.0), (50.0, 0.0)], "residential", {}),
+             ([(-50.0, 5.0), (50.0, 5.0)], "service", {})]
+    _t, aerial = td._split_drop_legs(
+        legs, None, td.Params(), lambda m: None, roads)
+    assert aerial[0]["aerial_reason"] == "road_crossing"
+
+
+def test_crossing_a_footway_is_not_a_road_crossing():
+    """The pavement is what the leg is expected to follow: reaching a house over
+    a footway is the normal case, not grounds for a pole."""
+    legs = [{"coords": [(0.0, -10.0), (0.0, 10.0)], "length": 20.0,
+             "type": "Garden", "house": {"ADDR_ID": "pavement"}}]
+    for cls in ("footway", "path", "pedestrian", "cycleway", "steps",
+                "sidewalk"):
+        trenched, aerial = td._split_drop_legs(
+            legs, None, td.Params(), lambda m: None,
+            [([(-50.0, 0.0), (50.0, 0.0)], cls, {})])
+        assert len(trenched) == 1, cls
+        assert aerial == [], cls
+
+
+def test_running_alongside_a_residential_road_is_not_a_crossing():
+    legs = [{"coords": [(0.0, 5.0), (50.0, 5.0)], "length": 50.0,
+             "type": "Garden", "house": {"ADDR_ID": "along"}}]
+    residential = [([(-50.0, 0.0), (150.0, 0.0)], "residential", {})]
+    trenched, aerial = td._split_drop_legs(
+        legs, None, td.Params(), lambda m: None, residential)
+    assert [leg["house"]["ADDR_ID"] for leg in trenched] == ["along"]
+    assert aerial == []
+
+
+def test_the_crossing_rule_needs_road_geometry():
+    """A caller with no carriageway layer must not invent a crossing."""
+    legs = [{"coords": [(0.0, -10.0), (0.0, 10.0)], "length": 20.0,
+             "type": "Garden", "house": {"ADDR_ID": "no-roads"}}]
+    trenched, aerial = td._split_drop_legs(
+        legs, None, td.Params(), lambda m: None, None)
+    assert len(trenched) == 1 and aerial == []
+
+
+def test_a_barrier_crossing_still_reports_the_scorers_reason():
+    """Rule order: the shared scorer runs first, so a primary crossing keeps
+    reporting ``major_road_crossing`` rather than the generic crossing trigger.
+    """
+    legs = [{"coords": [(0.0, -10.0), (0.0, 10.0)], "length": 20.0,
+             "type": "Garden", "house": {"ADDR_ID": "trunk"}}]
+    trunk = [([(-50.0, 0.0), (50.0, 0.0)], "trunk", {})]
+    _t, aerial = td._split_drop_legs(
+        legs, None, td.Params(), lambda m: None, trunk)
+    assert aerial[0]["aerial_reason"] == "major_road_crossing"
 
 
 def test_rocky_premise_ground_moves_the_drop_aerial():
@@ -617,8 +765,11 @@ def test_aerial_propagates_down_a_drop_chain():
     (``aerial_reason == 'chain'``), so every trenched leg roots on the network.
     """
     p = td.Params()
-    # zone covers only the first 5 m of the parent leg (y <= 5)
-    zone = td._zone_polygons(_zone([(-5, -5), (5, -5), (5, 5), (-5, 5)]))
+    # The zone covers the first 7 m of the parent's 10 m (y <= 7): the parent is
+    # aerial under the majority rule (`_leg_in_zone`), which is all this test
+    # needs — the point is what happens to the legs CHAINED onto it. It used to
+    # cover exactly 5 m, which is now the 50 % boundary itself.
+    zone = td._zone_polygons(_zone([(-5, -5), (5, -5), (5, 7), (-5, 7)]))
     legs = [
         {"coords": [(0.0, 0.0), (0.0, 10.0)], "length": 10.0,
          "type": "Garden", "house": {"ADDR_ID": "in-zone"}, "parent": -1},
@@ -1268,3 +1419,151 @@ def test_surface_for_kerb_band_disabled_is_asphalt():
     assert td._surface_for("Distribution", "Open Cut", "residential",
                            kerb_offset_m=0.0) == ("Asphalt", "Full")
 
+
+
+# ── the docx drop chain, through the designer ────────────────────────────────
+#
+# ``_drop_chain_reason`` measures the facts (setback, crossings, nearest
+# existing pole, the leg's own length, homes/km, permit delay) and the shared
+# table applies the chain. These tests pin what a leg comes back as.
+
+def _chain_leg(house_xy=(0.0, 11.0), length=10.0, addr="chain"):
+    """One garden leg at the origin, with the house point the chain measures."""
+    return {"coords": [(0.0, 0.0), (0.0, float(length))], "length": float(length),
+            "type": "Garden",
+            "house": {"ADDR_ID": addr, "x": house_xy[0], "y": house_xy[1]}}
+
+
+def _distant_road(y=-40.0):
+    """A street far enough away to be no crossing, and a setback on its own."""
+    return [([(-50.0, y), (50.0, y)], "residential", {})]
+
+
+def test_a_deep_setback_is_evaluated_and_left_trenched_by_default():
+    """The docx says "Evaluate Aerial", so the receipt is recorded, not the build."""
+    trenched, aerial = td._split_drop_legs(
+        [_chain_leg()], None, td.Params(aerial_pole=False), lambda m: None,
+        _distant_road())
+    assert aerial == []
+    assert [leg["house"]["ADDR_ID"] for leg in trenched] == ["chain"]
+    assert trenched[0]["aerial_evaluation"] == "setback"
+
+
+def test_the_setback_step_converts_when_the_project_asks_for_it():
+    trenched, aerial = td._split_drop_legs(
+        [_chain_leg()], None,
+        td.Params(aerial_pole=False, aerial_setback_convert=True),
+        lambda m: None, _distant_road())
+    assert trenched == []
+    assert aerial[0]["aerial_reason"] == "setback"
+
+
+def test_the_setback_step_is_switchable():
+    trenched, aerial = td._split_drop_legs(
+        [_chain_leg()], None, td.Params(aerial_setback=False), lambda m: None,
+        _distant_road())
+    assert [leg["house"]["ADDR_ID"] for leg in trenched] == ["chain"]
+    assert aerial == []
+
+
+def test_an_existing_pole_within_50_m_moves_the_drop_aerial():
+    poles = [{"x": 0.0, "y": 55.0}]      # 44 m from the house at (0, 11)
+    _t, aerial = td._split_drop_legs(
+        [_chain_leg()], None, td.Params(aerial_setback=False), lambda m: None,
+        _distant_road(), poles=poles)
+    assert aerial and aerial[0]["aerial_reason"] == "existing_pole"
+
+
+def test_a_pole_further_than_50_m_leaves_the_drop_trenched():
+    poles = [{"x": 0.0, "y": 80.0}]
+    trenched, aerial = td._split_drop_legs(
+        [_chain_leg()], None, td.Params(aerial_setback=False), lambda m: None,
+        _distant_road(), poles=poles)
+    assert [leg["house"]["ADDR_ID"] for leg in trenched] == ["chain"]
+    assert aerial == []
+
+
+def test_without_a_pole_layer_the_pole_step_is_skipped():
+    trenched, aerial = td._split_drop_legs(
+        [_chain_leg()], None, td.Params(aerial_setback=False), lambda m: None,
+        _distant_road(), poles=None)
+    assert [leg["house"]["ADDR_ID"] for leg in trenched] == ["chain"]
+    assert aerial == []
+
+
+def test_the_new_trenching_limit_is_opt_in_and_urban_aware():
+    long_leg = _chain_leg(length=150.0)
+    far = [([(-50.0, -400.0), (50.0, -400.0)], "residential", {})]
+    # off by default: 150 m of new trench is still trenched
+    trenched, aerial = td._split_drop_legs(
+        [long_leg], None, td.Params(aerial_setback=False), lambda m: None, far)
+    assert [leg["house"]["ADDR_ID"] for leg in trenched] == ["chain"]
+    # the docx's urban limit is 100 m …
+    _t, aerial = td._split_drop_legs(
+        [long_leg], None, td.Params(aerial_setback=False, aerial_trench=True),
+        lambda m: None, far)
+    assert aerial[0]["aerial_reason"] == "trench_length"
+    # … and the rural one is 300 m, so the same leg stays trenched
+    trenched, aerial = td._split_drop_legs(
+        [long_leg], None,
+        td.Params(aerial_setback=False, aerial_trench=True, urban=False),
+        lambda m: None, far)
+    assert [leg["house"]["ADDR_ID"] for leg in trenched] == ["chain"]
+
+
+def test_the_permit_delay_step_is_opt_in_and_uses_the_docx_limit():
+    p = td.Params(aerial_setback=False, aerial_permit=True,
+                  permit_delay_days=90.0)
+    _t, aerial = td._split_drop_legs(
+        [_chain_leg()], None, p, lambda m: None, _distant_road())
+    assert aerial[0]["aerial_reason"] == "permit_delay"
+    # 90 days is past the docx's 60; 30 is not
+    p2 = td.Params(aerial_setback=False, aerial_permit=True,
+                   permit_delay_days=30.0)
+    trenched, aerial = td._split_drop_legs(
+        [_chain_leg()], None, p2, lambda m: None, _distant_road())
+    assert [leg["house"]["ADDR_ID"] for leg in trenched] == ["chain"]
+
+
+def test_the_density_step_reads_the_legs_own_street():
+    # one premise on 100 m of street is 10 homes/km — under the docx's 20
+    sparse = [{"x": 0.0, "y": 11.0}]
+    road = [([(0.0, -9.0), (100.0, -9.0)], "residential", {})]
+    p = td.Params(aerial_setback=False, aerial_density=True)
+    _t, aerial = td._split_drop_legs(
+        [_chain_leg()], None, p, lambda m: None, road, houses=sparse)
+    assert aerial and aerial[0]["aerial_reason"] == "low_density"
+    # 20 homes per km is the threshold, so a dense street stays trenched
+    dense = [{"x": float(i * 5), "y": 11.0} for i in range(20)]
+    trenched, aerial = td._split_drop_legs(
+        [_chain_leg()], None, p, lambda m: None, road, houses=dense)
+    assert [leg["house"]["ADDR_ID"] for leg in trenched] == ["chain"]
+    # and the step is off unless a project switches it on
+    trenched, aerial = td._split_drop_legs(
+        [_chain_leg()], None, td.Params(aerial_setback=False), lambda m: None,
+        road, houses=sparse)
+    assert [leg["house"]["ADDR_ID"] for leg in trenched] == ["chain"]
+
+
+def test_the_chain_reports_the_setback_before_the_road_crossing():
+    """The docx checks the setback first, so that is the reason logged."""
+    legs = [{"coords": [(0.0, -10.0), (0.0, 40.0)], "length": 50.0,
+             "type": "Garden",
+             "house": {"ADDR_ID": "both", "x": 0.0, "y": 41.0}}]
+    roads = [([(-50.0, 0.0), (50.0, 0.0)], "residential", {})]
+    _t, aerial = td._split_drop_legs(
+        legs, None, td.Params(aerial_setback_convert=True), lambda m: None, roads)
+    assert aerial[0]["aerial_reason"] == "setback"
+    # with the setback step off the crossing is what is reported
+    _t, aerial = td._split_drop_legs(
+        legs, None, td.Params(aerial_setback=False), lambda m: None, roads)
+    assert aerial[0]["aerial_reason"] == "road_crossing"
+
+
+def test_a_leg_with_no_house_point_is_still_classified_on_its_crossings():
+    """A leg without an x/y premise point measures no setback — and says so."""
+    legs = [{"coords": [(0.0, -10.0), (0.0, 10.0)], "length": 20.0,
+             "type": "Garden", "house": {"ADDR_ID": "no-point"}}]
+    roads = [([(-50.0, 0.0), (50.0, 0.0)], "residential", {})]
+    _t, aerial = td._split_drop_legs(legs, None, td.Params(), lambda m: None, roads)
+    assert aerial[0]["aerial_reason"] == "road_crossing"

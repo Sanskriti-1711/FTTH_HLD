@@ -20,6 +20,7 @@ import os
 import sqlite3
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -314,3 +315,209 @@ def test_a_live_run_is_never_settled(project):
     task2.update({"status": "running", "stage": "Object Layer", "stage_index": 0})
     main._recover_orphan_run("proj2", task2)
     assert task2["status"] == "running"
+
+
+# ── freshness: what a run is allowed to publish ──────────────────────────────
+
+def test_a_layer_this_run_did_not_write_is_removed_not_published(tmp_path):
+    """A stage with nothing to publish must not leave the previous layer behind.
+
+    The pole + aerial stages return early when no leg is aerial ("nothing to
+    build") and never create their sinks, so ``Aerial_Spans.gpkg`` /
+    ``Aerial_Cable.gpkg`` / ``Aerial_Drops.gpkg`` kept the PREVIOUS run's
+    geometry and the portal served it.  Project 24cd3573: a run the designer
+    logged as "Aerial drops: none - every drop leg could be trenched" still
+    showed 6 aerial drops, 8 aerial spans and 8 aerial cables on the map.
+    """
+    started = time.time()
+    stale = tmp_path / "Aerial_Spans.gpkg"
+    _write_gpkg(stale)
+    fresh = tmp_path / "Final_Trenches.gpkg"
+    _write_gpkg(fresh)
+    unrelated = tmp_path / "notes.txt"
+    unrelated.write_text("not a layer", encoding="utf-8")
+    # Explicit mtimes, so the test does not depend on filesystem resolution.
+    old = started - 600
+    os.utime(stale, (old, old))
+
+    assert main._drop_stale_outputs("stale1", tmp_path, started) == ["Aerial_Spans.gpkg"]
+    assert not stale.exists()
+    assert fresh.exists()          # written by this run: kept
+    assert unrelated.exists()      # not a published layer: untouched
+
+
+def test_the_stale_geojson_twin_goes_too_and_the_run_reports_it(tmp_path):
+    started = time.time()
+    old = started - 600
+    for name in ("Aerial_Cable.gpkg", "Aerial_Cable.geojson"):
+        path = tmp_path / name
+        path.write_text('{"type": "FeatureCollection", "features": []}',
+                        encoding="utf-8")
+        os.utime(path, (old, old))
+
+    deleted = main._drop_stale_outputs("stale2", tmp_path, started)
+    assert sorted(deleted) == ["Aerial_Cable.geojson", "Aerial_Cable.gpkg"]
+    assert not (tmp_path / "Aerial_Cable.geojson").exists()
+
+    messages = "\n".join(
+        str(m.get("text")) for m in main.tasks["stale2"]["messages"]
+    )
+    assert "Aerial_Cable.gpkg" in messages
+    assert "did not write" in messages
+
+
+def test_a_fresh_layer_keeps_its_geojson_twin(tmp_path):
+    """The twin is the engine's own conversion, not the pipeline's output.
+
+    Judging each file by its own mtime deleted the twin of every layer the run
+    DID write (the pipeline writes the GeoPackage; the engine converts it to
+    GeoJSON afterwards), so a clean run reported a dozen layers it never
+    skipped. Staleness follows the GeoPackage.
+    """
+    started = time.time()
+    _write_gpkg(tmp_path / "Chambers.gpkg")          # written by this run
+    twin = tmp_path / "Chambers.geojson"
+    twin.write_text('{"type": "FeatureCollection", "features": []}',
+                    encoding="utf-8")
+    old = started - 600
+    os.utime(twin, (old, old))                       # last run's conversion
+
+    assert main._drop_stale_outputs("stale3", tmp_path, started) == []
+    assert twin.exists()
+    assert (tmp_path / "Chambers.gpkg").exists()
+
+
+def test_a_layer_with_only_a_stale_geojson_is_still_stale(tmp_path):
+    started = time.time()
+    twin = tmp_path / "Aerial_Drops.geojson"
+    twin.write_text('{"type": "FeatureCollection", "features": []}',
+                    encoding="utf-8")
+    old = started - 600
+    os.utime(twin, (old, old))
+
+    assert main._drop_stale_outputs("stale4", tmp_path, started) == [
+        "Aerial_Drops.geojson"]
+    assert not twin.exists()
+
+
+# ── a completed task in memory must not outrank a newer publish ─────────────
+#
+# The results page reads /ftth/hld/results/<id>, and that endpoint used to
+# consult the project row ONLY when the project was unknown to the engine. An
+# engine that had run a project earlier in its own life therefore kept serving
+# that run's layers for good: a re-ingest (or a re-run started from another
+# process) published new layers into PostGIS and onto disk, the page showed the
+# previous design — a stale aerial route included — and nothing short of an
+# engine restart changed it.
+#
+# The row is the record every publish writes, so a completed task older than
+# the row is stale and must be replaced. An in-flight run keeps its own task:
+# its thread is the only thing that knows the live stage.
+
+_BASE = datetime(2026, 10, 12, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _task_utc(minutes: int) -> str:
+    """The shape a task stores: `_now()` is an ISO string."""
+    return (_BASE + timedelta(minutes=minutes)).isoformat(timespec="seconds")
+
+
+def _row_utc(minutes: int) -> datetime:
+    """The shape a project row carries: a `timestamptz`."""
+    return _BASE + timedelta(minutes=minutes)
+
+
+def _publish(monkeypatch, layers, when):
+    """Make PostGIS answer with one published row."""
+    row = {
+        "status": "completed", "updated_at": when, "roads_filename": "r.geojson",
+        "output_dir": None, "downloads": [], "stage_name": "Complete",
+        "stage_index": len(main.PIPELINE_STAGES), "progress": 100,
+        "runner": "qgis_process", "error": None,
+    }
+    monkeypatch.setattr(main.postgis, "is_available", lambda: True)
+    monkeypatch.setattr(main.postgis, "get_project", lambda project_id: row)
+    monkeypatch.setattr(main.postgis, "list_project_layers",
+                        lambda project_id: layers)
+    return row
+
+
+def test_a_completed_task_in_memory_does_not_mask_a_newer_publish(project, monkeypatch):
+    _publish(monkeypatch, [{"name": "brownfield", "feature_count": 36}],
+             _row_utc(5))
+    task = main._task("proj1")
+    task.update({"status": "completed", "updated_at": _task_utc(1),
+                 "layers": [{"name": "aerial_drops", "feature_count": None}]})
+
+    result = main.get_results("proj1")
+
+    assert [layer["name"] for layer in result["layers"]] == ["brownfield"]
+    assert result["_from_db_row"] is True
+
+
+def test_an_in_flight_run_keeps_its_own_layers(project, monkeypatch):
+    _publish(monkeypatch, [{"name": "brownfield"}], _row_utc(5))
+    task = main._task("proj1")
+    task.update({"status": "running", "updated_at": _task_utc(1),
+                 "layers": [{"name": "objects"}]})
+
+    result = main.get_results("proj1")
+
+    assert [layer["name"] for layer in result["layers"]] == ["objects"]
+    assert not result.get("_from_db_row")
+
+
+def test_a_row_older_than_the_task_does_not_replace_it(project, monkeypatch):
+    _publish(monkeypatch, [{"name": "brownfield"}], _row_utc(1))
+    task = main._task("proj1")
+    task.update({"status": "completed", "updated_at": _task_utc(5),
+                 "layers": [{"name": "trenches"}]})
+
+    result = main.get_results("proj1")
+
+    assert [layer["name"] for layer in result["layers"]] == ["trenches"]
+
+
+def test_an_unknown_timestamp_never_wins_a_freshness_comparison():
+    """A naive row timestamp is read as UTC, and a missing one is not "now".
+
+    Postgres hands back an aware ``timestamptz`` and the task is an ISO string,
+    but a naive datetime must still land on the right side of the comparison
+    rather than raising or beating a newer task.
+    """
+    naive_older = datetime(2026, 10, 12, 12, 0, 0)     # = 12:00Z, before 12:01Z
+    naive_newer = datetime(2026, 10, 12, 12, 5, 0)     # = 12:05Z, after 12:01Z
+    assert main._row_is_newer({"updated_at": naive_older},
+                              {"updated_at": _task_utc(1)}) is False
+    assert main._row_is_newer({"updated_at": naive_newer},
+                              {"updated_at": _task_utc(1)}) is True
+    assert main._row_is_newer({"updated_at": None},
+                              {"updated_at": _task_utc(1)}) is False
+    assert main._row_is_newer({"updated_at": "not a timestamp"},
+                              {"updated_at": _task_utc(1)}) is False
+    assert main._row_is_newer({"updated_at": _row_utc(5)},
+                              {"updated_at": None}) is False
+
+
+def test_the_live_reads_are_never_cached(monkeypatch):
+    """A reload must not be answered from the browser's cache.
+
+    The results endpoint reports THIS run's layers, and a 200 GET with no cache
+    directive is cacheable — so a re-published project could keep showing the
+    previous layer list (a stale aerial route included) until a hard refresh.
+    The downloads and tiles keep their caching on purpose.
+    """
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(main, "OUTPUT_DIR", Path("nope-does-not-exist"))
+    main.tasks.clear()
+    client = TestClient(main.app)
+
+    results = client.get("/ftth/hld/results/proj1")
+    assert results.headers.get("cache-control") == "no-store"
+
+    # ... and the routes that SHOULD stay cacheable are untouched.
+    for path in ("/ftth/hld/download/proj1/Objects.gpkg", "/tiles/objects/1/1/1.pbf"):
+        resp = client.get(path)
+        assert resp.headers.get("cache-control") != "no-store", path
+    main.tasks.clear()

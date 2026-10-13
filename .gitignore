@@ -74,3 +74,15 @@ nul
 
 # Runtime logs
 *.log
+
+# --------------------------------------------------
+# Brownfield inputs (Monument Road — clone from HLD outputs, GDAL)
+# Regenerate: HLD_Planning_01/tmp/make_brownfield_monument_road.py
+# --------------------------------------------------
+/tmp/brownfield*
+/tmp/brownfield/
+
+# Brownfield archive staging dir + ZIP written by
+# tools/make_brownfield_layers.py (regenerate, do not commit)
+/brownfield_layers/
+/brownfield_layers.zip

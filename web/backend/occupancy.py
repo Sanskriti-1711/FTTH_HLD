@@ -410,3 +410,127 @@ def write_duct_brownfield(project_id: str, bf_dir: Path) -> Optional[Path]:
     except OSError:
         return None
     return path
+
+
+# Trench tier -> the brownfield file it is fed as. The names carry the tokens
+# the engine's ``_match_brownfield_param`` resolves ("feeder" + "trench" ->
+# BF_FEEDER_TRENCH, "dist" + "trench" -> BF_DIST_TRENCH), so each tier reaches
+# its own pipeline parameter instead of every trench landing on the merged
+# BF_TRENCHES. Anything else goes to the generic file.
+_TRENCH_BF_FILES: Dict[str, str] = {
+    "feeder": "bf_feeder_trench.geojson",
+    "distribution": "bf_distribution_trench.geojson",
+}
+_TRENCH_BF_DEFAULT = "bf_trenches.geojson"
+
+
+def _trench_tier(props: Dict[str, Any]) -> str:
+    """``feeder`` / ``distribution`` / the row's own word for anything else."""
+    raw = str(props.get("TRENCH_TIER") or "").strip()
+    low = raw.lower()
+    if "feeder" in low:
+        return "feeder"
+    if "distribut" in low or low.startswith("dist"):
+        return "distribution"
+    return low or "other"
+
+
+def trench_brownfield_features(project_id: str) -> List[Dict[str, Any]]:
+    """The project's OWN stored trenches as brownfield TRENCH features.
+
+    "Reuse before rebuild": the trench network the project already has is
+    excavation that exists on paper and, once surveyed, in the ground, so a
+    re-run must be planned ON it exactly as the duct read-back consumes spare
+    ways. Without this the only brownfield trenches a re-run ever saw were the
+    ones an uploaded archive happened to carry -- one Berlin project was fed a
+    Birmingham reference archive, so nothing in it was within a kilometre of
+    the work and the design could not reuse a single trench it had planned
+    itself a week earlier.
+
+    Every row keeps its own attributes (``TRENCH_ID``, ``TRENCH_TIER``,
+    ``WIDTH_MM``, ``DEPTH_MM``, ``method``, ``SURFACE``, ...) and gains the
+    fields the brownfield loader keys on, so BF_TRENCHES reads it as existing
+    infrastructure with usable capacity rather than as work to be done.
+    """
+    try:
+        from . import postgis  # package context
+    except ImportError:
+        import postgis  # type: ignore  # top-level engine context
+
+    try:
+        doc = postgis.get_layer_geojson(project_id, "trench_layer")
+    except Exception:  # noqa: BLE001 - the read-back is optional, never fatal
+        return []
+    features: List[Dict[str, Any]] = []
+    for index, feat in enumerate(_features(doc), start=1):
+        geom = feat.get("geometry")
+        if not geom:
+            continue
+        props = dict(feat.get("properties") or {})
+        props.pop("id", None)  # the gis row id is not a design attribute
+        out = dict(props)
+        out["SRC_ID"] = (
+            props.get("SRC_ID") or props.get("TRENCH_ID") or "BF_TRN_%03d" % index
+        )
+        out["STAGE"] = "brownfield"
+        out["ASSET_TYPE"] = "trench"
+        out["INFRA_STATUS"] = "Existing"
+        # The previous run's own status when it recorded one; a trench the
+        # design already planned is Designed, not a field-verified asset.
+        out["VERIFY_STATUS"] = props.get("VERIFY_STATUS") or "Designed"
+        # A trench carries duct or cable, so it has one reusable way. The
+        # loader skips a row with no spare capacity, which is exactly why the
+        # capacity pair has to be here at all (see ``duct_brownfield_features``).
+        out.setdefault("capacity_total", 1)
+        out.setdefault("capacity_used", 0)
+        # Preferred (0.1x), never mandatory: the router may still find a better
+        # path, but the existing trench is consumed before a new one is dug.
+        out["USE_MODE"] = "brownfield"
+        out["trench_type"] = _trench_tier(props)
+        features.append({"type": "Feature", "geometry": geom, "properties": out})
+    return features
+
+
+def write_trench_brownfield(project_id: str, bf_dir: Path) -> List[Path]:
+    """Export the project's stored trenches as brownfield files for a re-run.
+
+    One file per tier (``bf_feeder_trench.geojson`` /
+    ``bf_distribution_trench.geojson``), plus ``bf_trenches.geojson`` for any
+    row whose tier is neither — so BF_FEEDER_TRENCH, BF_DIST_TRENCH and
+    BF_TRENCHES each get the rows that belong to them.
+
+    Merges into files that are already there (an approved-survey trench file,
+    or an operator's own ``bf_*`` input) so both are honoured; read-back rows
+    go last, the same rule as the duct read-back. Returns the files written —
+    empty when the project has no stored trenches. Never raises: a read-back
+    failure must not fail the run it feeds.
+    """
+    try:
+        features = trench_brownfield_features(project_id)
+    except Exception:  # noqa: BLE001
+        return []
+    if not features:
+        return []
+
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for feat in features:
+        tier = str((feat.get("properties") or {}).get("trench_type") or "")
+        name = _TRENCH_BF_FILES.get(tier, _TRENCH_BF_DEFAULT)
+        grouped.setdefault(name, []).append(feat)
+
+    written: List[Path] = []
+    for name, rows in sorted(grouped.items()):
+        try:
+            bf_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return written
+        path = bf_dir / name
+        existing: List[Dict[str, Any]] = []
+        if path.is_file():
+            existing = _features(_load(path))
+        try:
+            _write(path, list(existing) + rows, "EPSG:4326")
+        except OSError:
+            continue
+        written.append(path)
+    return written

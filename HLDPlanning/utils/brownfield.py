@@ -32,7 +32,8 @@ import uuid
 
 from qgis.core import (
     QgsVectorLayer, QgsGeometry, QgsFeature, QgsSpatialIndex, QgsPointXY,
-    QgsWkbTypes, QgsCoordinateReferenceSystem, QgsProcessingFeedback,
+    QgsWkbTypes, QgsCoordinateReferenceSystem, QgsCoordinateTransform,
+    QgsProcessingFeedback, QgsProject,
 )
 
 
@@ -215,24 +216,25 @@ class BrownfieldRegistry:
             self._report(f"Brownfield: no features in {asset_type} layer (skipped).")
             return 0
 
-        # Ensure CRS matches
+        # ── CRS: transform each geometry as it is loaded ───────────────────
+        # NOT with processing.run("native:reprojectlayer"): that returns the
+        # layer ID of a context-registered sink, not a layer, and the loader
+        # then bailed out with "Expected a valid vector layer, got str" — so
+        # every feature of a layer whose CRS differed was DROPPED. The bug was
+        # invisible while the registry adopted the archive's own CRS (nothing
+        # ever differed, nothing to reproject); the moment the registry began
+        # working in the project CRS, the whole brownfield disappeared
+        # (project 24cd3573: 36 assets loaded -> 0 loaded, 0 written). A
+        # geometry transform needs no processing context and cannot half-fail.
+        xform = None
         if layer.crs() != self.crs:
             self._report(
                 f"Brownfield: {asset_type} layer CRS ({layer.crs().authid()}) "
                 f"differs from project CRS ({self.crs.authid()}). Reprojecting..."
             )
-            from qgis import processing
-            from .layer_io import as_layer
             try:
-                layer = as_layer(processing.run(
-                    "native:reprojectlayer",
-                    {
-                        "INPUT": layer,
-                        "TARGET_CRS": self.crs,
-                        "OUTPUT": "TEMPORARY_OUTPUT",
-                    },
-                    is_child_algorithm=True,
-                )["OUTPUT"])
+                xform = QgsCoordinateTransform(layer.crs(), self.crs,
+                                               QgsProject.instance())
             except Exception as exc:
                 self._report(f"Brownfield: reprojection failed for {asset_type}: {exc}")
                 return 0
@@ -269,6 +271,12 @@ class BrownfieldRegistry:
             geom = feat.geometry()
             if not geom or geom.isEmpty():
                 continue
+            if xform is not None:
+                geom = QgsGeometry(geom)
+                try:
+                    geom.transform(xform)
+                except Exception:
+                    continue
 
             # Determine asset ID
             asset_id = None

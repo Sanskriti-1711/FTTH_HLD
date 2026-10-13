@@ -451,6 +451,16 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
     # explicitly passes INPUT_AERIAL_ZONES; absent otherwise so existing runs
     # keep burying long-drop garden trenches exactly as before.
     P_AERIAL_ZONES = "INPUT_AERIAL_ZONES"
+    # Existing poles (brownfield BF_POLES, or any pole inventory). Optional and
+    # only read by the designer engine: it answers the docx drop-chain step
+    # "ELSE IF existing telecom pole within 50 m -> Aerial". Without the layer
+    # the step is skipped rather than guessed.
+    P_EXISTING_POLES = "INPUT_EXISTING_POLES"
+    # Permit lead times per authority / street (the docx's Rule 7 input).
+    # Optional, designer engine only: with a layer the permit-delay trigger
+    # fires per drop; without one only the project-wide number exists, which is
+    # why that trigger ships off (docs/stages/AERIAL.md §5).
+    P_PERMIT_DELAYS = "INPUT_PERMIT_DELAYS"
     # Aerial legs the stage classifies (a drop leg inside an aerial zone, or
     # longer than the UG drop limit) are NOT trenches: they are published here
     # so the map, BOQ and LLD see them as a construction type of their own.
@@ -619,6 +629,19 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(QgsProcessingParameterFeatureSink(
             self.O_AERIAL_DROPS,
             _tr("Aerial Drops (classified, never excavated)"), optional=True))
+        # Existing poles: optional, and only the designer engine reads them —
+        # they answer the docx's "existing telecom pole within 50 m" step.
+        self.addParameter(QgsProcessingParameterVectorLayer(
+            self.P_EXISTING_POLES,
+            _tr("Existing poles [points] (blank = the pole step is skipped)"),
+            [QgsProcessing.TypeVectorPoint], optional=True))
+        # Permit lead times: optional, and only the designer engine reads them.
+        # Any vector type — authority areas (polygons), a per-street register
+        # (lines) or depots (points) — carrying the lead time in days.
+        self.addParameter(QgsProcessingParameterVectorLayer(
+            self.P_PERMIT_DELAYS,
+            _tr("Permit lead times [any geometry] (blank = project-wide only)"),
+            [QgsProcessing.TypeVectorAnyGeometry], optional=True))
         # Structural nodes (designer): the chamber stage's primary candidates.
         self.addParameter(QgsProcessingParameterFeatureSink(
             self.O_TRENCH_NODES,
