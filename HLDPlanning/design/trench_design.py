@@ -2309,6 +2309,17 @@ FIELD_LINE = (
 )
 FIELD_AERIAL = (
     ("DROP_ID", ogr.OFTString), ("POLYGON_ID", ogr.OFTString),
+    # The splitter serving the premise this drop hangs off. The designer already
+    # knows it (the premises layer is its own input, and the house dict carries
+    # the PDP), and the region was published without it — so `Aerial_Drops`
+    # declared a `PDP_ID` column on the stage that consumes it
+    # (`trench_design_layer._AERIAL_FIELDS`) and filled it from this layer, while
+    # this layer had no such column at all: every published aerial drop arrived
+    # with a blank PDP_ID, leaving `POLYGON_ID` as the only way back to the
+    # network. It is the premise's PDP, not a pole-line association invented
+    # here — an aerial leg leaves the network at the same splitter a dug drop
+    # would have.
+    ("PDP_ID", ogr.OFTString),
     ("ADDR_ID", ogr.OFTString), ("households", ogr.OFTReal),
     ("TRENCH_TIER", ogr.OFTString), ("TRENCH_TYPE", ogr.OFTString),
     # Aerial is a METHOD, not just a type string: ``CONSTRUCTION_METHOD =
@@ -4364,6 +4375,14 @@ def design(cfg: dict) -> dict:
         aerial_rows.append({
             "DROP_ID": "AD-%05d" % (i + 1),
             "POLYGON_ID": leg["house"].get("POLYGON_ID") or None,
+            # The splitter that will serve this premise. The house the leg
+            # hangs off already carries its PDP (the premises layer is the
+            # stage's own input), but the row was written without it, so the
+            # published drop could name its region and its address yet not the
+            # splitter it belongs to — the one fact a drop exists to record.
+            # FIELD_AERIAL already declares the column; only the value was
+            # missing.
+            "PDP_ID": leg["house"].get("PDP_ID") or None,
             "ADDR_ID": _addr_of(leg["house"]), "households": _hh_of(leg["house"]),
             # An aerial leg replaces the DROP leg it would have been dug as
             # (docs/aerial planning.docx: aerial is only ever evaluated at the

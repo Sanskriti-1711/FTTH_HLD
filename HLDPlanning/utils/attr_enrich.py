@@ -4538,6 +4538,241 @@ def verify_surface_geometry(out_dir, feedback=None, roads_source=None):
     return report
 
 
+# ── Cable → duct occupancy ───────────────────────────────────────────────────
+# The duct stage runs BEFORE the cable stage (trench → chambers → ducts →
+# cables), so a duct cannot know which cables will be laid in it: the code that
+# would stamp the two columns — `duct_layer._build_route_ducts`, which reads the
+# cable id off the layer it routes from — is only reachable when the cables are
+# planned first. On the published tiers the columns therefore arrived
+# created-but-empty: `cables_carried` blank on all 826 duct rows and `ways_used`
+# 0 on every one of the rows that carried it (measured on project 24cd3573,
+# 2026-10-14; the 6 published feeder cables were attributed to no duct at all).
+#
+# This pass fills them once both tiers exist. A cable is carried by a duct only
+# when the duct's own identity (PDP / polygon) agrees with the cable's AND at
+# least `_DUCT_CARRIED_SHARE` of the duct's length lies within
+# `_DUCT_CARRIED_M` of the cable. Identity comes first because geometry alone
+# cannot separate two ducts laid side by side in the same street: attributing on
+# proximity alone made a 2-way duct report 6 cables (same project, same day),
+# while the identity gate plus the coverage share attributes 224 of 224 drop
+# ducts to exactly one drop cable each and 110 of 418 distribution spans to
+# exactly one trunk each.
+#
+# `ways_used` is clamped to the duct's own `WAYS`, the same rule
+# `occupancy.py.duct_rows` applies (`min(ways_used, ways_total)`), and a duct
+# whose cables exceed its ways is named in the log instead of silently published
+# as impossible. Nothing here re-derives capacity, spare ways or the review
+# flag: it only states WHICH cables are in the duct.
+_DUCT_CARRIED_M = 2.0
+_DUCT_CARRIED_SHARE = 0.8
+
+# (duct tier, cable tier, the CABLE_TYPE values that belong to that tier)
+# Distribution_Cable holds TWO kinds — the trunks and the garden-leg drops — so
+# a tier has to select by type or a drop duct would be offered every trunk in
+# the ward as a candidate.
+_DUCT_CABLE_TIERS = (
+    ("Feeder_Ducts.gpkg", "Feeder_Cable.gpkg", ("Feeder",)),
+    ("Distribution_Ducts.gpkg", "Distribution_Cable.gpkg", ("Distribution",)),
+    ("Drop_Ducts.gpkg", "Distribution_Cable.gpkg", ("Drop",)),
+)
+
+
+def _cable_identity_label(lyr, feat, cable_type):
+    """What to call this cable in `cables_carried`.
+
+    The feeder tier publishes `cable_id`, so a feeder cable is its number. The
+    distribution file carries neither `cable_id` for its trunks nor one for its
+    drops, so each is named by what identifies it: a DROP by its premise (one
+    drop cable per physical service location), a TRUNK by the splitter it
+    leaves and the side it runs on (`PDP00005/LEFT`) — naming a trunk by one of
+    its premises would read as a premise, not as a cable.
+    """
+    def clean(value):
+        # `cables_carried` is a COMMA-separated list, and a shared distribution
+        # trunk carries a comma-separated `PDP_ID` of its own ("pdp00005,
+        # pdp00016") — joining it verbatim split one cable into two on every
+        # reader that parses the list.
+        return str(value).strip().replace(",", "+")
+
+    for name in ("cable_id", "CABLE_ID"):
+        value = _get(lyr, feat, name)
+        if value not in (None, ""):
+            return clean(value)
+    pdp_id = clean(_get(lyr, feat, "PDP_ID") or "")
+    side = clean(_get(lyr, feat, "SIDE") or "")
+    if str(cable_type).strip() == "Drop":
+        addr = _get(lyr, feat, "addr_id") or _get(lyr, feat, "ADDR_ID")
+        if addr not in (None, ""):
+            return clean(addr)
+    if pdp_id and side:
+        return "%s/%s" % (pdp_id, side)
+    if pdp_id or side:
+        return pdp_id or side
+    addr = _get(lyr, feat, "addr_id") or _get(lyr, feat, "ADDR_ID")
+    return clean(addr) if addr not in (None, "") else ""
+
+
+def _carriage_candidates(cable_path, cable_types):
+    """The cables a duct of this tier could carry, with the identity to match on.
+
+    Returns (candidates, unnamed) where each candidate carries its label, its
+    identity sets and its envelope.
+    """
+    if not _HAS_OGR or not os.path.isfile(cable_path):
+        return [], 0
+    try:
+        src = ogr.Open(cable_path, 0)
+    except Exception:
+        return [], 0
+    if src is None:
+        return [], 0
+    lyr = src.GetLayer(0)
+    if lyr is None:
+        return [], 0
+
+    out, unnamed = [], 0
+    for feat in lyr:
+        ctype = str(_get(lyr, feat, "CABLE_TYPE") or "").strip()
+        if cable_types and ctype not in cable_types:
+            continue
+        geom = feat.GetGeometryRef()
+        if geom is None or geom.IsEmpty():
+            continue
+        label = _cable_identity_label(lyr, feat, ctype)
+        if not label:
+            unnamed += 1
+        out.append({
+            "label": label,
+            "geom": geom.Clone(),
+            "pdp": _identity_set(_get(lyr, feat, "PDP_ID"),
+                                 _get(lyr, feat, "PDP_IDS"),
+                                 _get(lyr, feat, "SOURCE_NODE")),
+            "poly": _identity_set(_get(lyr, feat, "POLYGON_ID")),
+            "env": geom.GetEnvelope(),
+        })
+    src = None
+    return out, unnamed
+
+
+def _identity_set(*values):
+    """Uppercased identity tokens from one or more comma-separated fields."""
+    out = set()
+    for value in values:
+        for item in _split_list(value):
+            out.add(item.upper())
+    return out
+
+
+def stamp_duct_occupancy(out_dir, feedback=None):
+    """State which cables each published duct carries (`cables_carried`).
+
+    Returns the number of duct rows attributed. Additive: the duct's own
+    capacity, spare percentage and review flag are left exactly as the duct
+    stage published them.
+    """
+    if not out_dir or not os.path.isdir(out_dir):
+        return 0
+
+    stamped = 0
+    for duct_name, cable_name, cable_types in _DUCT_CABLE_TIERS:
+        duct_path = os.path.join(out_dir, duct_name)
+        cable_path = os.path.join(out_dir, cable_name)
+        if not (os.path.isfile(duct_path) and os.path.isfile(cable_path)):
+            continue
+        candidates, unnamed = _carriage_candidates(cable_path, cable_types)
+        if not candidates:
+            continue
+        ds, lyr = _open_lyr(duct_path)
+        if lyr is None:
+            continue
+        _create_fields(lyr, [
+            ("cables_carried", ogr.OFTString, 240),
+            ("ways_used", ogr.OFTInteger),
+            ("WAYS_TOTAL", ogr.OFTInteger),
+        ])
+
+        tier = duct_name.replace(".gpkg", "")
+        n_rows = n_links = n_over = n_ways_only = 0
+        lyr.StartTransaction()
+        for feat in lyr:
+            geom = feat.GetGeometryRef()
+            if geom is None or geom.IsEmpty():
+                continue
+            ways = int(_num(lyr, feat, "WAYS", 0) or 0)
+            duct_pdp = _identity_set(_get(lyr, feat, "PDP_ID"),
+                                     _get(lyr, feat, "pdp_ids"))
+            duct_poly = _identity_set(_get(lyr, feat, "POLYGON_ID"))
+            env = geom.GetEnvelope()
+
+            carried = []
+            for cand in candidates:
+                if not ((cand["pdp"] & duct_pdp) or (cand["poly"] & duct_poly)):
+                    continue
+                cenv = cand["env"]
+                if (env[0] - _DUCT_CARRIED_M > cenv[1]
+                        or env[1] + _DUCT_CARRIED_M < cenv[0]
+                        or env[2] - _DUCT_CARRIED_M > cenv[3]
+                        or env[3] + _DUCT_CARRIED_M < cenv[2]):
+                    continue
+                try:
+                    share = _covered_share(geom, cand["geom"], _DUCT_CARRIED_M)
+                except Exception:
+                    share = 0.0
+                if share >= _DUCT_CARRIED_SHARE:
+                    carried.append(cand["label"] or "(unnamed)")
+            # `WAYS_TOTAL` is the same fact as `WAYS` under the name the
+            # brownfield loader reads (`capacity_field="WAYS_TOTAL"`, see
+            # `occupancy.py.duct_brownfield_features`). It was written on 100 of
+            # 826 rows, so a read-back could size 12 % of the duct network; the
+            # alias is stamped on every row that has a WAYS, attributed or not.
+            changed = False
+            if ways and not _get(lyr, feat, "WAYS_TOTAL"):
+                feat.SetField("WAYS_TOTAL", int(ways))
+                changed = True
+            if not carried:
+                if changed:
+                    lyr.SetFeature(feat)
+                    n_ways_only += 1
+                continue
+
+            used = len(carried)
+            feat.SetField("cables_carried", ", ".join(carried)[:240])
+            feat.SetField("ways_used", int(min(used, ways) if ways else used))
+            lyr.SetFeature(feat)
+            n_rows += 1
+            n_links += used
+            if ways and used > ways:
+                n_over += 1
+        try:
+            lyr.CommitTransaction()
+        except Exception:
+            pass
+        ds = None
+        stamped += n_rows
+
+        if feedback:
+            if n_rows:
+                note = ("; %d row(s) carry more cables than their own WAYS"
+                        " — stated as carried, clamped in ways_used" % n_over
+                        if n_over else "")
+                feedback.pushInfo(
+                    "  [occupancy] %s: %d row(s) now name the cable(s) they "
+                    "carry (%d link(s))%s" % (tier, n_rows, n_links, note))
+            else:
+                feedback.pushInfo(
+                    "  [occupancy] %s: no row attributed a cable (identity or "
+                    "coverage did not agree)" % tier)
+            if n_ways_only:
+                feedback.pushInfo(
+                    "  [occupancy] %s: WAYS_TOTAL stamped on %d further row(s) "
+                    "(no cable runs along them)" % (tier, n_ways_only))
+            if unnamed:
+                feedback.pushWarning(
+                    "  [occupancy] %s: %d cable(s) could not be named at all "
+                    "— attributed as '(unnamed)'" % (tier, unnamed))
+    return stamped
+
+
 def enrich_all(out_dir, feedback=None, roads_lyr=None):
     """Enrich every pipeline GPKG inside out_dir (no-op when out_dir is empty).
 
@@ -4693,4 +4928,14 @@ def enrich_all(out_dir, feedback=None, roads_lyr=None):
         feedback.pushInfo(
             "  [enrich] Final NetworkManager identity propagation complete."
         )
+    # ── Which cables each duct carries ───────────────────────────────────
+    # Last on purpose: it reads the FINAL duct rows (post-segmentation, post-
+    # fold) and the final cable rows, and must not be overwritten by a later
+    # pass. Additive — it fills `cables_carried` / `ways_used` / `WAYS_TOTAL`
+    # and touches nothing the duct stage decided.
+    try:
+        n += stamp_duct_occupancy(out_dir, feedback)
+    except Exception as exc:
+        if feedback:
+            feedback.pushWarning(f"  [occupancy] Cable-to-duct stamp skipped: {exc}")
     return True

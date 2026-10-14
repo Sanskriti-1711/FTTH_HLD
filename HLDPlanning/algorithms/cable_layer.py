@@ -502,7 +502,7 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
         return buckets
 
     def _group_feeder_cables(self, paths, demands, pid_mfg, edge_geom, edge_len,
-                             pdp_label):
+                             pdp_label, edge_nodes=None):
         """Split an MFG's PDPs across THREE capacity-balanced trunk cables.
 
         Input:
@@ -532,7 +532,8 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
         Returns a list of cable dicts with keys:
           cable_id, members (full edge lists MFG→each PDP), demand, size,
           pdp_ids, splice_of, splice_pt, mfg_id, polygon_id, trunk_no,
-          length, length_capped.
+          length, length_capped, and — when the caller supplies the graph's
+          ``edge_nodes`` map — start_node / end_node.
         """
         ladder = self.FEEDER_LADDER
         max_demand = self.FEEDER_TRUNK_MAX_DEMAND      # 201 = 70% of 288F
@@ -548,6 +549,64 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
         def route_len(segs):
             """Laid length of a trunk: each edge counted once over the union."""
             return sum(edge_len.get(s, 0.0) for s in segs)
+
+        def node_key_str(node):
+            """A graph node key as the layer's own START_NODE convention.
+
+            `_branch_feeder_cables` writes these as "x,y" pairs, and the graph's
+            nodes ARE rounded coordinate pairs (`round_key_xy`), so the pair is
+            the node's identity here, not a geometric approximation of one.
+            """
+            try:
+                return "%0.2f,%0.2f" % (float(node[0]), float(node[1]))
+            except Exception:
+                return ""
+
+        def route_ends(trunk):
+            """(start_node, end_node) of a trunk, from the graph's own nodes.
+
+            The route is the UNION of its members' edges — several PDPs share a
+            corridor, so counting an edge once per member double-counts the
+            shared spine and makes its nodes look interior (measured: the MFG
+            end of a two-PDP trunk vanished and a branch tip was published as the
+            start). Over the union, the route is a tree whose degree-1 nodes are
+            its ends; the MFG side is the end of the first member's first edge
+            (`paths` are MFG→PDP routes), and the published END is the tip
+            farthest from it, i.e. where the cable actually finishes.
+
+            Returns ("", "") when the caller gave no graph: an endpoint that
+            cannot be named is left empty rather than guessed from geometry.
+            """
+            if not edge_nodes:
+                return "", ""
+            degree = {}
+            seen = set()
+            for member in trunk.get("members") or []:
+                for seg in member:
+                    if seg in seen:
+                        continue
+                    seen.add(seg)
+                    uv = edge_nodes.get(seg)
+                    if not uv:
+                        continue
+                    for nd in uv:
+                        degree[nd] = degree.get(nd, 0) + 1
+            ends = [nd for nd, cnt in degree.items() if cnt == 1]
+            if len(ends) < 2:
+                return "", ""
+            members = trunk.get("members") or []
+            origin_pair = edge_nodes.get(members[0][0]) if members and members[0] else None
+            start = next((nd for nd in ends if origin_pair and nd in origin_pair), None)
+            if start is None:
+                start = sorted(ends)[0]
+            others = [nd for nd in ends if nd != start]
+            end = start
+            try:
+                end = max(others, key=lambda nd: (nd[0] - start[0]) ** 2
+                          + (nd[1] - start[1]) ** 2) if others else start
+            except Exception:
+                end = others[0] if others else start
+            return node_key_str(start), node_key_str(end)
 
         # 1) Partition PDPs by MFG.
         by_mfg = defaultdict(list)
@@ -606,6 +665,7 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
             for idx, t in enumerate(trunks, start=1):
                 if not t["members"]:
                     continue
+                _start_node, _end_node = route_ends(t)
                 ordered_members = sorted(
                     zip(t.get("member_lengths", []), t.get("member_pids", [])),
                     reverse=True,
@@ -626,6 +686,14 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
                     "mfg_id": mfg,
                     "polygon_id": "",
                     "trunk_no": idx,
+                    # Both ends of the route, named by the graph nodes the
+                    # trench stage welded. Declared on the layer since the
+                    # beginning and written by `_branch_feeder_cables`, but
+                    # never by this — the path that actually publishes the
+                    # feeder tier — so every published feeder cable ran with
+                    # START_NODE / END_NODE empty.
+                    "start_node": _start_node,
+                    "end_node": _end_node,
                     "length": t["length"],
                     "length_capped": 1 if t.get("hit_length_limit") else 0,
                     "extended_from_pdp": extension_from,
@@ -954,8 +1022,17 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
         # Keep one grouped cable route for multiple PDPs. The route geometry
         # may contain chamber-level branches, but the cable record remains a
         # corridor assembly instead of exploding into one row per graph edge.
+        # Node identity per graph edge, so each published cable can name the two
+        # structural nodes it runs between. Same map `_branch_feeder_cables`
+        # reads; built here because this is the path that publishes.
+        edge_nodes = {}
+        for _u, _links in adj.items():
+            for _v, _seg, _w in _links:
+                edge_nodes.setdefault(_seg, (_u, _v))
+
         cables = self._group_feeder_cables(
-            paths, demands, pid_mfg, edge_geom, edge_len, pdp_label)
+            paths, demands, pid_mfg, edge_geom, edge_len, pdp_label,
+            edge_nodes=edge_nodes)
         feedback.pushInfo(
             f"Feeder corridor grouping: {len(cables)} cable assembly(ies) "
             "covering shared MFG-to-PDP routes.")
