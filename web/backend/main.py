@@ -2461,6 +2461,25 @@ def get_results(project_id: str) -> Dict[str, Any]:
     return _public_task(project_id)
 
 
+# A tier of a GROUPED layer, resolved against the group's files.
+#
+# ONECLICK_OUTPUTS publishes the ducts as three files (Feeder / Distribution /
+# Drop) and the cables as two, all under ONE public name each (`ducts`,
+# `cables`). `_ingest_outputs` therefore keys ``task["files"]`` by the grouped
+# name, so a request for ``feeder_ducts`` found no entry and 404'd — the file it
+# wanted was sitting in the very same list. This maps the tier back to
+# (group, file stem) so both the disk route and the merged-file route can
+# answer it. It is the counterpart of `postgis.get_layer_geojson`'s
+# sublayer/CABLE_TYPE predicates, for projects whose rows predate the tag.
+_LAYER_TIER_FILES: Dict[str, Tuple[str, str]] = {
+    "feeder_ducts": ("ducts", "Feeder_Ducts"),
+    "distribution_ducts": ("ducts", "Distribution_Ducts"),
+    "drop_ducts": ("ducts", "Drop_Ducts"),
+    "feeder_cable": ("cables", "Feeder_Cable"),
+    "distribution_cable": ("cables", "Distribution_Cable"),
+}
+
+
 @app.get("/ftth/hld/results/{project_id}/layers/{layer}")
 def get_layer(project_id: str, layer: str) -> Dict[str, Any]:
     if postgis.is_available():
@@ -2484,14 +2503,22 @@ def get_layer(project_id: str, layer: str) -> Dict[str, Any]:
         if restored is not None:
             task = restored
     if task:
-        files = (task.get("files") or {}).get(layer, [])
+        task_files = task.get("files") or {}
+        files = task_files.get(layer, [])
+        tier = _LAYER_TIER_FILES.get((layer or "").strip().lower())
+        if not files and tier:
+            group, stem = tier
+            files = [
+                fp for fp in (task_files.get(group) or [])
+                if os.path.splitext(os.path.basename(fp))[0].lower() == stem.lower()
+            ]
         geojson_files = [
             fp for fp in files
             if fp.lower().endswith((".geojson", ".json")) and os.path.isfile(fp)
         ]
         if not geojson_files:
             raise HTTPException(status_code=404, detail="Layer not found")
-        if len(geojson_files) == 1:
+        if len(geojson_files) == 1 and not tier:
             with open(geojson_files[0], "r", encoding="utf-8") as f:
                 return json.load(f)
         # Group with multiple sub-layers (e.g. ducts: feeder + distribution + drop):

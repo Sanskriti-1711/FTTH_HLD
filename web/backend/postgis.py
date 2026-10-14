@@ -883,22 +883,61 @@ def get_layer_geojson(
     where = sql.SQL("WHERE project_id = %s")
     params: List[Any] = [project_id]
     if table == "cable_layer":
-        cable_type = {
-            "feeder_cable": "Feeder",
-            "distribution_cable": "Distribution",
+        # Two markers can say which tier a cable row is, and they are not
+        # interchangeable. The ingest stamps every row of a grouped layer with
+        # its own ``sublayer`` (the source file's stem) — that is the marker the
+        # platform's own fallback keys on (``LAYER_STEM_SUBLAYER``) and the one
+        # the results map splits the layer by. ``CABLE_TYPE`` is the cable
+        # builder's own class, and the two disagree on exactly one point: a
+        # garden-leg drop cable is ``CABLE_TYPE = "Drop"`` but rides in the
+        # ``Distribution_Cable`` file, and the map folds it under the
+        # Distribution toggle. Keying on ``CABLE_TYPE = "Distribution"`` alone
+        # answered 56 rows where the store holds 280 under the same name, so the
+        # same layer name counted differently depending on which hop served it.
+        # The sublayer is authoritative when present; CABLE_TYPE is the fallback
+        # for a run ingested before the tag existed.
+        cable_tier = {
+            "feeder_cable": ("Feeder_Cable", ["Feeder"]),
+            "distribution_cable": ("Distribution_Cable", ["Distribution", "Drop"]),
         }.get(requested_layer)
-        if cable_type is not None:
-            where += sql.SQL(" AND properties->>'CABLE_TYPE' = %s")
-            params.append(cable_type)
+        if cable_tier is not None:
+            sublayer, cable_types = cable_tier
+            where += sql.SQL(
+                " AND (properties->>'sublayer' = %s OR ("
+                "properties->>'sublayer' IS NULL"
+                " AND properties->>'CABLE_TYPE' = ANY(%s)))"
+            )
+            params.append(sublayer)
+            params.append(cable_types)
         elif requested_layer not in ("cables", "cable", "cable_layer"):
             # Unrecognised cable sub-layer name — let the caller fall back to
             # the on-disk outputs rather than guessing at a type.
             return None
     elif table == "duct_layer":
-        # Ducts share one table too but carry no feeder / distribution marker
-        # in their properties, so only the grouped name can be resolved here;
-        # the sub-layer names keep falling back to disk as before.
-        if requested_layer not in ("ducts", "duct", "duct_layer"):
+        # Ducts share one table too, and the tier marker IS there: the ingest
+        # stamps every row of a grouped layer with its own ``sublayer`` (the
+        # source file's stem), because the feeder / distribution / drop ducts
+        # are published as three files into this one table — the same way
+        # CABLE_TYPE makes ``feeder_cable`` resolvable above.
+        #
+        # This branch used to return None for every tier name on the belief
+        # that no marker existed, which 404'd ``feeder_ducts`` /
+        # ``distribution_ducts`` / ``drop_ducts`` in **every** project, on
+        # every run — and the "fall back to disk" it relied on could never
+        # fire, because the engine's own file map is keyed by the grouped
+        # public names (``ducts``), never by a tier. The layer was published,
+        # named in the API's layer map, and served to nobody.
+        duct_sublayer = {
+            "feeder_ducts": "Feeder_Ducts",
+            "distribution_ducts": "Distribution_Ducts",
+            "drop_ducts": "Drop_Ducts",
+        }.get(requested_layer)
+        if duct_sublayer is not None:
+            where += sql.SQL(" AND properties->>'sublayer' = %s")
+            params.append(duct_sublayer)
+        elif requested_layer not in ("ducts", "duct", "duct_layer"):
+            # Unrecognised duct sub-layer name — let the caller fall back to
+            # the on-disk outputs rather than guessing at a tier.
             return None
     # Every other table (trenches, chambers, pdps, ...) is one layer = one
     # table, so there is nothing to discriminate on: return all its rows.
