@@ -97,6 +97,30 @@ def _ensure_output_parent_dir(out_spec):
 # accepted while it is still near the cables that ride it (see _corridor_for).
 _CORRIDOR_SNAP_TOL_M = 25.0
 
+# ── Endpoint weld tolerance ────────────────────────────────────────────────
+# The longest gap at which a FREE span end is welded onto the span it touches.
+# Deliberately far tighter than ``node_tol``: that parameter rounds a coordinate
+# onto a lattice to give it a node identity (`utils/geom.round_key_xy`) and says
+# nothing about how far apart two trench spans may lie and still be one network.
+#
+# Why it exists — measured on project 24cd3573 (Mariendorf, 2026-10-13): one MFG
+# and 31 PDPs over 381 trench spans / 9.08 km.
+#   * The published trench layer is ONE component within 0.5 m (380 joins) and
+#     all 31 PDPs sit on the MFG's component: the route exists.
+#   * The graph this algorithm built from it was 80 components, largest 192
+#     edges, and reached 0 of 31 PDPs — so the guards below skipped the MFG and
+#     the run published ZERO feeder ducts behind a green "created: 0" line.
+#   * Cause: breaks exist only where `lineintersections` found a TRUE crossing
+#     plus each span's own ends. 236 of the 762 endpoints sit 0-0.05 m from
+#     another span and 274 more sit exactly on one, but a near-miss never shares
+#     a node — and a lattice snap cannot join two coordinates 1 cm apart that
+#     fall in different cells.
+#   * Welding at 0.05 m: 265 joins, 1-2 components, all 31 PDPs routed (12.67 km
+#     of route). The routed length is IDENTICAL for every weld tolerance from
+#     0.02 m to 0.5 m, so this conservative value adds no route that was not
+#     already physically there — it only joins what already touches.
+WELD_TOL_M = 0.05
+
 
 class AlgFeederDuctsNoSplit(QgsProcessingAlgorithm):
     def shortHelpString(self):
@@ -380,6 +404,51 @@ class AlgFeederDuctsNoSplit(QgsProcessingAlgorithm):
 
         feedback.pushInfo(f"  [timing] Duct MFG/PDP snapping: {_time.time() - t0:.3f}s")
         t0 = _time.time()
+
+        # ── Weld every free span end onto the span it touches ─────────────
+        # The break of the touched span is registered AT THE END'S OWN
+        # COORDINATES, so the pair shares one coordinate and therefore one node
+        # key however node keys are formed. Without this the graph falls apart
+        # at every near-miss T-junction: breaks exist only where
+        # `lineintersections` found a TRUE crossing plus each span's own ends,
+        # so an endpoint that lands *near* another span's interior never shares
+        # a node with it (measured on project 24cd3573: 236 of 762 endpoints
+        # within 0-0.05 m of another span, 270 more exactly on — and the graph
+        # reached 0 of 31 PDPs over a trench layer that is one component).
+        # See WELD_TOL_M at the top of this file for the full measurement.
+        weld_tol = min(node_tol, WELD_TOL_M)
+        welds = 0
+        if weld_tol > EPS:
+            for fid, geom in fid_to_geom.items():
+                L = fid_to_len.get(fid, 0.0)
+                if L <= 0 or not geom:
+                    continue
+                for d_own in (0.0, L):
+                    pt = geom.interpolate(d_own).asPoint()
+                    xy = QgsPointXY(pt.x(), pt.y())
+                    pg = QgsGeometry.fromPointXY(xy)
+                    rect = pg.boundingBox()
+                    rect.grow(weld_tol)
+                    for other in seg_index.intersects(rect):
+                        if other == fid:
+                            continue
+                        og = fid_to_geom.get(other)
+                        if not og:
+                            continue
+                        if og.distance(pg) > weld_tol:
+                            continue
+                        d_other = og.lineLocatePoint(pg)
+                        L_other = fid_to_len.get(other, 0.0)
+                        if d_other <= 1e-6 or (L_other - d_other) <= 1e-6:
+                            continue          # already a shared endpoint
+                        fid_breaks[other].append(d_other)
+                        fid_break_xy[other][d_other] = (xy.x(), xy.y())
+                        welds += 1
+        feedback.pushInfo(
+            f"  [timing] Duct endpoint weld ({welds} join(s) within {weld_tol:.2f} m): "
+            f"{_time.time() - t0:.3f}s"
+        )
+        t0 = _time.time()
         # Build graph from split edges
         adj = defaultdict(list)
         edge_geom, edge_len = {}, {}
@@ -564,6 +633,26 @@ class AlgFeederDuctsNoSplit(QgsProcessingAlgorithm):
                     duct_idx += 1
 
         feedback.pushInfo(f"  [timing] Feeder duct routing/grouping: {_time.time() - t0:.3f}s")
+        if made == 0 and mfg_nodes and pdp_nodes:
+            # A green "created: 0" reads as success. Name what the graph
+            # actually did, because "no route is feasible" and "the graph came
+            # apart" are different findings and only one of them is a design.
+            reach, reach_pdp = set(), 0
+            for _mfg_id, (nk, _f) in mfg_nodes.items():
+                if nk not in adj:
+                    continue
+                d, _parent = dijkstra_with_parents(nk, adj)
+                reach.update(d)
+            for nk, _f in pdp_nodes.values():
+                if nk in reach:
+                    reach_pdp += 1
+            feedback.pushWarning(
+                f"Feeder ducts created: 0 — from {len(mfg_nodes)} MFG anchor(s) the "
+                f"graph reaches {len(reach)} of {len(adj)} node(s) and "
+                f"{reach_pdp} of {len(pdp_nodes)} PDP(s). Either no route is "
+                f"feasible or the trench graph is not welded; see WELD_TOL_M in "
+                f"duct_layer.py."
+            )
         feedback.pushInfo(f"✅ Feeder ducts created: {made}")
         feedback.pushDebugInfo(f"Edges: {len(edge_geom)} Nodes: {len(adj)} MFGs: {len(mfg_nodes)} PDPs: {len(pdp_nodes)}")
 

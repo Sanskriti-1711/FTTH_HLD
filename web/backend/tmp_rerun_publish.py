@@ -45,6 +45,21 @@ os.environ.setdefault("QGIS_PLUGINPATH", str(BACKEND.parent))
 import main  # noqa: E402
 import occupancy  # noqa: E402
 import osm_source  # noqa: E402
+import postgis  # noqa: E402
+
+# A run started from this helper runs in whatever environment the shell has, and
+# with no PG* variables `postgis.is_available()` is False. The pipeline still
+# writes every layer to disk — but `_ingest_outputs` in `_run_pipeline` then
+# skips the whole publish half: nothing reaches `gis.*`, the platform rows keep
+# the PREVIOUS design, and the run reports `completed`. That happened on
+# 2026-10-13: the re-run produced 184 feeder ducts while the map and the permit
+# matrix still read the old rows (0 feeder ducts), with nothing in the output
+# saying so. Say it up front instead.
+if not postgis.is_available():
+    print("[warn] PostGIS is NOT reachable from this process, so this run will "
+          "NOT publish: layers land on disk and the engine serves them, but "
+          "gis.* and the platform rows keep the previous design. Source .env "
+          "(PGDATABASE/PGUSER/PGHOST/PGPORT) before running this helper.")
 
 PROJECT_ID = sys.argv[1] if len(sys.argv) > 1 else "24cd3573f4884a578c1b98a80bbd4040"
 HLD_ROOT = BACKEND.parents[1]
