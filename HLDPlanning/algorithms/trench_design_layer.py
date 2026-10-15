@@ -101,6 +101,8 @@ TRENCH_DEPTH_MM = {"Open Cut": 900, "HDD": 900, "Garden": 450, "Aerial": 0}
 SIDEWALK_OFFSET_M = 3.0
 SIDEWALK_SEGMENTS = 8
 AOI_BUFFER_M = 100.0
+# Main-corridor rows shorter than this are junction residue, not trench.
+TRENCH_SLIVER_M = 0.05
 
 
 def permit_field_names() -> Tuple[str, ...]:
@@ -1821,6 +1823,7 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
 
         consolidated = []
         merged_rows = 0
+        dropped_slivers = 0
         merged_groups = 0
         for key, members in groups.items():
             clusters = []
@@ -1828,6 +1831,9 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
                 geom = row.get("_geom")
                 if geom is None or geom.isEmpty():
                     consolidated.append(row)
+                    continue
+                if key[-1] == "main" and geom.length() < TRENCH_SLIVER_M:
+                    dropped_slivers += 1
                     continue
                 host = None
                 # Only exact/near contact is eligible.  This cannot pull a
@@ -1870,6 +1876,24 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
                 merged_rows += len(cluster) - 1
                 merged_groups += 1
 
+        # Sub-decimetre main-corridor slivers are junction residue, not trench:
+        # the designer emits them where two routes meet, and they published as
+        # the same-street duplicate rows. Drop them; the routes they came from
+        # keep their contact at the junction.
+        kept = []
+        slivers = 0
+        for row in consolidated:
+            geom = row.get("_geom")
+            if (row.get("TRENCH_TIER") != "Garden" and geom is not None
+                    and not geom.isEmpty() and geom.length() < TRENCH_SLIVER_M):
+                slivers += 1
+                continue
+            kept.append(row)
+
+        if feedback and dropped_slivers:
+            feedback.pushInfo(_tr(
+                "Dropped {0} junction sliver(s) under {1} m on the main "
+                "corridor.").format(dropped_slivers, TRENCH_SLIVER_M))
         if feedback and merged_rows:
             feedback.pushInfo(_tr(
                 "Physical trench consolidation: {0} coincident/connected "
@@ -1877,7 +1901,11 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
                 "garden legs and parallel opposite-side routes preserved. "
                 "Chamber splitting remains downstream.").format(
                     merged_rows, merged_groups))
-        return consolidated
+        if feedback and slivers:
+            feedback.pushInfo(
+                "Physical trench consolidation: dropped %d sub-%.2f m "
+                "main-corridor sliver row(s)." % (slivers, TRENCH_SLIVER_M))
+        return kept
 
     @staticmethod
     def _pdp_points(pdps: QgsVectorLayer) -> Dict[str, QgsPointXY]:

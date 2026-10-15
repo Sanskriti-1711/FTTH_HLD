@@ -1925,7 +1925,12 @@ def segment_ducts_at_chambers(feeder_path, dist_path, chamber_path,
 
 DIST_REGION_TOL_M = 2.0        # how far past its own edge a duct may sit
 DIST_REGION_TAP_TOL_M = 0.5    # a pseudo point counts as reached at this distance
-DIST_REGION_LINK_MAX_M = 30.0  # longest link built to reach a region's own point
+# Measured on the 2026-09-21 Berlin run: 7 pseudo points of POLY00004 sat
+# 51-63 m from their own region's duct and were left unconnected at 30 m; the
+# worst distribution coupler (60.06 m off its duct) is one of them. A link is
+# still only ever built ALONG a connected trench path, so 75 m reaches them
+# without any straight chord.
+DIST_REGION_LINK_MAX_M = 75.0  # longest link built to reach a region's own point
 
 
 def _load_polygon_geoms(path):
