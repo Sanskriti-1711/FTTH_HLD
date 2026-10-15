@@ -89,8 +89,11 @@ from ..utils.geom import merge_contiguous_runs as _merge_contiguous_runs
 # Construction catalogue — mirrors HLDPlanning/utils/attr_enrich.py so a
 # designer span carries the same civil attributes as a legacy one.
 # ---------------------------------------------------------------------------
-TRENCH_WIDTH_MM = {"Open Cut": 300, "HDD": 300, "Garden": 150}
-TRENCH_DEPTH_MM = {"Open Cut": 900, "HDD": 900, "Garden": 450}
+# Aerial is the fourth construction class (docs `stages/AERIAL.md` §3) and has
+# NO cross-section — it is not excavated, so a width/depth would be a fabricated
+# trench (attr_enrich's tables already carry the same 0).
+TRENCH_WIDTH_MM = {"Open Cut": 300, "HDD": 300, "Garden": 150, "Aerial": 0}
+TRENCH_DEPTH_MM = {"Open Cut": 900, "HDD": 900, "Garden": 450, "Aerial": 0}
 
 # Derived-layer defaults, taken from the legacy stage's fixed tunables
 # (trench_layer.py: sw_off = 3.0, sw_seg = 8, aoi_buf_dist = 100.0) so the
@@ -603,9 +606,23 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
         sinks: Dict[str, object] = {}
 
         # ── Final_Trenches (MULTILINESTRING, one part per span — legacy parity)
+        # The aerial legs ride along, marked as the Aerial construction class.
+        # They are kept OUT of `final_rows` itself so nothing derived from it
+        # (the tier mirrors the duct stage lays conduit along, the pseudo objects,
+        # the brownfield reuse) treats an overhead leg as civil work — only the
+        # published trench layer gains them, which is the layer the map reads.
+        aerial_rows = self._aerial_trench_rows(out_dir)
+        if aerial_rows:
+            feedback.pushInfo(_tr(
+                "  Aerial legs kept in the network: {0} row(s) ({1} m) "
+                "published in Final_Trenches as TRENCH_TYPE=Aerial (EXCAVATION "
+                "0, no section) — the classification is unchanged, the "
+                "connection is not dropped.").format(
+                    len(aerial_rows),
+                    round(sum(r.get("length_m") or 0 for r in aerial_rows), 1)))
         sinks[self.O_FINAL] = self._write_rows(
-            parameters, context, self.O_FINAL, final_rows, _FINAL_FIELDS,
-            QgsWkbTypes.MultiLineString, target_epsg, feedback)
+            parameters, context, self.O_FINAL, final_rows + aerial_rows,
+            _FINAL_FIELDS, QgsWkbTypes.MultiLineString, target_epsg, feedback)
 
         # ── tier mirrors
         # Feeder and Garden publish the designer's spans as-is. Distribution
@@ -1621,6 +1638,11 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
             end = str(g(f, "END_NODE") or "").strip() or None
             rows.append({
                 "_geom": geom,
+                # `id` is declared on the published layer and was never set, so
+                # every trench row shipped with a blank primary identifier
+                # (`TRENCH_ID` carried the value the column exists for). Same
+                # convention the aerial / node / drill rows already use.
+                "id": g(f, "TRENCH_ID"),
                 "TRENCH_ID": g(f, "TRENCH_ID"),
                 "RUN_ID": g(f, "RUN_ID"),
                 "MFG_ID": g(f, "MFG_ID"),
@@ -1658,6 +1680,105 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
                 "SRC": g(f, "SRC", "trench-designer") or "trench-designer",
                 "AERIAL_ZONE": _as_int(g(f, "AERIAL_ZONE")) or 0,
                 "AERIAL_ZONE_REASON": g(f, "AERIAL_ZONE_REASON"),
+            })
+        return rows
+
+    def _aerial_trench_rows(self, out_dir: str) -> List[dict]:
+        """The aerial legs, published as trench rows of the AERIAL class.
+
+        ``_split_drop_legs`` takes an aerial leg out of the civil network, so the
+        house and its pole end up with no row in ``Final_Trenches`` at all:
+        measured on the published Mariendorf run the trench reached 227 of 285
+        premises and 38 of 48 poles, and **all 58 unreached premises were the
+        aerial ones**. Only the connection was missing — the classification,
+        the geometry and the row contract already exist on the designer's
+        ``Aerial_Drops`` (``TRENCH_TYPE`` Aerial, ``EXCAVATION = 0``, width/depth
+        0, ``CONSTRUCTION_METHOD`` Overhead), and the trench catalogue names
+        Aerial as a construction class.
+
+        So the leg is published as what it is: the same route, marked aerial, so
+        the map can draw it in its own colour while the network still reaches
+        every object point. Nothing is decided here — no leg changes class, no
+        routing and no geometry is touched.
+
+        Goes to ``Final_Trenches`` ONLY, deliberately not to the Garden mirror:
+        the duct stage lays conduit along that mirror's rows, and an aerial leg
+        is never excavated, so marking it must not create a duct.
+        """
+        aerial = self._read_gpkg(os.path.join(out_dir, "Aerial_Drops.gpkg"),
+                                 "Aerial_Drops")
+        if aerial is None:
+            return []
+        names = aerial.fields().names()
+
+        def g(f, name, default=None):
+            return f[name] if name in names and f[name] is not None else default
+
+        rows: List[dict] = []
+        for f in aerial.getFeatures():
+            geom = f.geometry()
+            if geom is None or geom.isEmpty():
+                continue
+            # The target sink is MULTILINESTRING (the designer's own
+            # `Aerial_Drops` already is one). `convertToMultiType` converts IN
+            # PLACE and returns a bool, so the geometry is used as-is.
+            try:
+                geom.convertToMultiType()
+            except Exception:
+                pass
+            multi = geom
+            drop_id = g(f, "id") or g(f, "DROP_ID")
+            addr = g(f, "addr_id") or g(f, "ADDR_ID")
+            addr_s = str(addr).strip() if addr is not None and str(addr).strip() else None
+            hh = _as_float(g(f, "households"))
+            length = _as_float(g(f, "length_m")) or 0.0
+            rows.append({
+                "_geom": multi,
+                "id": drop_id,
+                # The aerial row's own key, so the trench and the aerial layer
+                # cross-reference instead of describing the same leg twice.
+                "TRENCH_ID": drop_id,
+                "RUN_ID": g(f, "RUN_ID"),
+                "MFG_ID": g(f, "MFG_ID"),
+                # The class the pipeline normalises on, in all three aliases it
+                # writes for the other rows.
+                "trench_type": "Aerial",
+                "USAGE_TYPE": "Aerial",
+                "CONSTRUCT": "Aerial",
+                # "Aerial" is not a published tier — the leg it replaces was a
+                # drop leg, and the published tier vocabulary is
+                # Feeder/Distribution/Garden (docs `stages/DUCT_CABLE_RULES.md`).
+                "TRENCH_TIER": "Garden",
+                "PROMOTED_FROM": "Aerial_Drops",
+                "SERVES_TIER": "Garden",
+                "obj_id": addr_s,
+                "addr_id": addr_s,
+                "hhs": None if hh is None else str(int(hh)),
+                "households": hh,
+                "length_m": length,
+                "SPAN_LEN_M": length,
+                "PDP_ID": g(f, "PDP_ID"),
+                "POLYGON_ID": g(f, "POLYGON_ID"),
+                # Not chambered: an overhead leg is not cut at a chamber.
+                "START_CHAMBER": None,
+                "END_CHAMBER": None,
+                "SPAN_INDEX": 1,
+                "SPAN_COUNT": 1,
+                "SPAN_KIND": "Unchambered",
+                "INFRA_STATUS": g(f, "INFRA_STATUS", "New") or "New",
+                "VERIFY_STATUS": g(f, "VERIFY_STATUS", "Designed") or "Designed",
+                # Nothing to dig and nothing to reinstate.
+                "SURFACE": None,
+                "REINSTATE": None,
+                "sidewalk": None,
+                "method": "designed",
+                "WIDTH_MM": 0,
+                "DEPTH_MM": 0,
+                "SRC": "trench-designer-aerial",
+                # It is inside the aerial classification by definition, and the
+                # reason it got there is the designer's own receipt.
+                "AERIAL_ZONE": 1,
+                "AERIAL_ZONE_REASON": g(f, "AERIAL_REASON"),
             })
         return rows
 

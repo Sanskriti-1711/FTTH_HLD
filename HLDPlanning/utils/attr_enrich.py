@@ -4689,6 +4689,7 @@ def stamp_duct_occupancy(out_dir, feedback=None):
             ("cables_carried", ogr.OFTString, 240),
             ("ways_used", ogr.OFTInteger),
             ("WAYS_TOTAL", ogr.OFTInteger),
+            ("STUB_ABSORBED", ogr.OFTInteger),
         ])
 
         tier = duct_name.replace(".gpkg", "")
@@ -4729,7 +4730,21 @@ def stamp_duct_occupancy(out_dir, feedback=None):
             if ways and not _get(lyr, feat, "WAYS_TOTAL"):
                 feat.SetField("WAYS_TOTAL", int(ways))
                 changed = True
+            # An absorbed stub is DELETED (`absorb_chamber_stubs` stamps the flag
+            # and then removes the row), so no published row can be one: 0 is
+            # this column's honest value on every duct the platform serves. Stated
+            # by convention rather than left null, the way VENDOR is named.
+            if _get(lyr, feat, "STUB_ABSORBED") in (None, ""):
+                feat.SetField("STUB_ABSORBED", 0)
+                changed = True
             if not carried:
+                # Nothing runs along this duct. That is an occupancy, not a
+                # measurement that failed: a profile laid for capacity is
+                # deliberately spare, so `ways_used` states 0 instead of staying
+                # null and reading as "unknown".
+                if _get(lyr, feat, "ways_used") in (None, ""):
+                    feat.SetField("ways_used", 0)
+                    changed = True
                 if changed:
                     lyr.SetFeature(feat)
                     n_ways_only += 1
@@ -4770,6 +4785,614 @@ def stamp_duct_occupancy(out_dir, feedback=None):
                 feedback.pushWarning(
                     "  [occupancy] %s: %d cable(s) could not be named at all "
                     "— attributed as '(unnamed)'" % (tier, unnamed))
+    return stamped
+
+
+# ── Columns the pipeline declared but never filled ──────────────────────────
+# Five groups of published columns arrived empty on every row (measured on
+# project 24cd3573, 2026-10-14). Each is filled here from the layer that owns
+# the fact, rather than dropped from the schema — the attribute schedule, the
+# packages and the platform's column set are stable, and a reader asking the
+# question the column exists for gets an answer.
+#
+# Two of them cannot come from a source at all and are stated as conventions
+# instead of being invented silently: no input in this project carries a
+# vendor name or a maintenance-zone inventory (`VENDOR` / `MAINT_ZONE`), and
+# nothing carries an OLT reference (`OLT_POL_ID`). The conventions used are
+# named in the code that writes them.
+
+
+def _dominant(values):
+    """The most common non-empty value; ties break on the value itself."""
+    counts = {}
+    for value in values:
+        token = str(value or "").strip()
+        if token:
+            counts[token] = counts.get(token, 0) + 1
+    if not counts:
+        return ""
+    return max(counts.items(), key=lambda kv: (kv[1], kv[0]))[0]
+
+
+def _mixed_label(values):
+    """One label for several underlying labels: `a`, or `mixed(a,b)`.
+
+    Mirrors `sheet_utils.household_method_label` / `osm_source.household_method_
+    label` so a polygon that sums several premises words it the same way the
+    object layer does.
+    """
+    unique = sorted({str(v or "").strip() for v in values if str(v or "").strip()})
+    if not unique:
+        return ""
+    return unique[0] if len(unique) == 1 else "mixed(" + ",".join(unique) + ")"
+
+
+def _centroid_fields(lyr, feat):
+    """(x, y) in the layer's own CRS and (lat, lon) in WGS84, or Nones."""
+    geom = feat.GetGeometryRef()
+    if geom is None or geom.IsEmpty():
+        return None, None, None, None
+    try:
+        env = geom.GetEnvelope()
+        x, y = (env[0] + env[1]) / 2.0, (env[2] + env[3]) / 2.0
+    except Exception:
+        return None, None, None, None
+    lat = lon = None
+    try:
+        src = lyr.GetSpatialRef()
+        if src is not None:
+            dst = osr.SpatialReference()
+            dst.ImportFromEPSG(4326)
+            dst.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+            clone = src.Clone()
+            try:
+                clone.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+            except Exception:
+                pass
+            xform = osr.CoordinateTransformation(clone, dst)
+            lon, lat, _z = xform.TransformPoint(x, y)
+    except Exception:
+        lat = lon = None
+    return x, y, lat, lon
+
+
+def stamp_polygon_premise_facts(out_dir, feedback=None):
+    """State a service polygon's premise facts from the premises inside it.
+
+    `Polygons` copies the Object layer's field set and then fills only the
+    growth/split fields, so nineteen columns arrived empty on all 31 rows —
+    including the three the layer declares on purpose (`pDp_POL_ID`,
+    `OLT_POL_ID`, `CLUSTER_ID`: `_enrich_for_geom` collects them, but stage 02
+    runs before PDP assignment, so it found nothing to collect). The values ARE
+    on the Object layer, which carries the same POLYGON_ID, so they are joined
+    back here.
+
+    Populated: premises, household_method, CLUSTER_ID, pDp_POL_ID, street,
+    city, "postal cod", SOURCE, GEOCODE_STATUS, GEOCODE_Q, HH, X, Y,
+    LATITUDE, LONGITUDE, OLT_POL_ID.
+
+    `OLT_POL_ID` has no source anywhere in the project (no OLT inventory is
+    supplied), so it is set to the serving MFG — the exchange that hosts the
+    OLT — and named as that convention rather than left to read as a survey
+    reference. `ADDR_ID`, "house numb" and `hnr_additi` stay empty: they
+    identify one BUILDING, and a service polygon has no single one.
+    """
+    if not out_dir or not os.path.isdir(out_dir):
+        return 0
+    obj_path = os.path.join(out_dir, "Objects.gpkg")
+    poly_path = os.path.join(out_dir, "Polygons.gpkg")
+    if not (os.path.isfile(obj_path) and os.path.isfile(poly_path)):
+        return 0
+    try:
+        src = ogr.Open(obj_path, 0)
+    except Exception:
+        return 0
+    if src is None:
+        return 0
+    objs = src.GetLayer(0)
+    if objs is None:
+        return 0
+
+    keys = ("CLUSTER_ID", "pDp_POL_ID", "street", "city", "postal cod",
+            "SOURCE", "GEOCODE_STATUS", "GEOCODE_Q", "household_method")
+    groups = {}
+    for f in objs:
+        poly_id = str(_get(objs, f, "POLYGON_ID") or "").strip()
+        if not poly_id:
+            continue
+        agg = groups.setdefault(poly_id, {"premises": 0})
+        agg["premises"] += 1
+        for key in keys:
+            agg.setdefault(key, []).append(_get(objs, f, key))
+    src = None
+    if not groups:
+        return 0
+
+    ds, lyr = _open_lyr(poly_path)
+    if lyr is None:
+        return 0
+    _create_fields(lyr, [
+        ("premises", ogr.OFTInteger, 0),
+        ("HH", ogr.OFTInteger, 0),
+        ("household_method", ogr.OFTString, 64),
+        ("CLUSTER_ID", ogr.OFTString, 48),
+        ("pDp_POL_ID", ogr.OFTString, 48),
+        ("OLT_POL_ID", ogr.OFTString, 48),
+        ("street", ogr.OFTString, 96),
+        ("city", ogr.OFTString, 64),
+        ("postal cod", ogr.OFTString, 24),
+        ("SOURCE", ogr.OFTString, 48),
+        ("GEOCODE_STATUS", ogr.OFTString, 48),
+        ("GEOCODE_Q", ogr.OFTString, 48),
+        ("X", ogr.OFTReal, 0),
+        ("Y", ogr.OFTReal, 0),
+        ("LATITUDE", ogr.OFTReal, 0),
+        ("LONGITUDE", ogr.OFTReal, 0),
+    ])
+    written = 0
+    lyr.StartTransaction()
+    for feat in lyr:
+        poly_id = str(_get(lyr, feat, "POLYGON_ID") or "").strip()
+        agg = groups.get(poly_id) or {}
+        changed = False
+        if agg:
+            premises = int(agg.get("premises") or 0)
+            if premises:
+                feat.SetField("premises", premises)
+                changed = True
+            for key in ("CLUSTER_ID", "pDp_POL_ID", "street", "city",
+                        "postal cod", "SOURCE"):
+                value = _dominant(agg.get(key) or [])
+                if value:
+                    feat.SetField(key, value)
+                    changed = True
+            for key in ("GEOCODE_STATUS", "GEOCODE_Q"):
+                value = _mixed_label(agg.get(key) or [])
+                if value:
+                    feat.SetField(key, value[:47])
+                    changed = True
+            method = _mixed_label(agg.get("household_method") or [])
+            if not method and _num(lyr, feat, "households", 0) > 0:
+                # The counts in this project come from the operator's input row
+                # itself (Objects.SOURCE = sheet_xy) and no register was loaded;
+                # the method vocabulary already names provenance this way
+                # (`register_uprn`, `register_postcode`, `fallback_one`).
+                method = "input_row"
+            if method:
+                feat.SetField("household_method", method)
+                changed = True
+        households = _num(lyr, feat, "households", 0)
+        if households and not _get(lyr, feat, "HH"):
+            feat.SetField("HH", int(households))
+            changed = True
+        if not _get(lyr, feat, "OLT_POL_ID"):
+            host = _get(lyr, feat, "MFG") or _get(lyr, feat, "MFG_ID")
+            if host:
+                feat.SetField("OLT_POL_ID", str(host))
+                changed = True
+        if not _get(lyr, feat, "X"):
+            x, y, lat, lon = _centroid_fields(lyr, feat)
+            if x is not None:
+                feat.SetField("X", float(x))
+                feat.SetField("Y", float(y))
+                if lat is not None:
+                    feat.SetField("LATITUDE", float(lat))
+                    feat.SetField("LONGITUDE", float(lon))
+                changed = True
+        if changed:
+            lyr.SetFeature(feat)
+            written += 1
+    try:
+        lyr.CommitTransaction()
+    except Exception:
+        pass
+    ds = None
+    # The premises themselves carry the same blank label, for the same reason:
+    # the count came from the operator's input row and no register was loaded.
+    # Stated here so the two layers word one fact one way.
+    labelled = 0
+    try:
+        ds2, obj_lyr = _open_lyr(obj_path)
+        if obj_lyr is not None:
+            _create_fields(obj_lyr, [("household_method", ogr.OFTString, 64)])
+            obj_lyr.StartTransaction()
+            for feat in obj_lyr:
+                if str(_get(obj_lyr, feat, "household_method") or "").strip():
+                    continue
+                if _num(obj_lyr, feat, "households", 0) > 0:
+                    feat.SetField("household_method", "input_row")
+                    obj_lyr.SetFeature(feat)
+                    labelled += 1
+            try:
+                obj_lyr.CommitTransaction()
+            except Exception:
+                pass
+            ds2 = None
+    except Exception as exc:
+        if feedback:
+            feedback.pushWarning(f"  [polygons] premise method label skipped: {exc}")
+    if feedback and labelled:
+        feedback.pushInfo(
+            "  [polygons] %d premise(s) now name how their household count was "
+            "arrived at (input_row — the count is the operator's own input row; "
+            "no register was loaded)." % labelled)
+
+    if feedback and written:
+        feedback.pushInfo(
+            "  [polygons] %d polygon(s) now state their premise facts "
+            "(pDp_POL_ID / CLUSTER_ID / street / premises / household_method / "
+            "centroid); OLT_POL_ID = the serving MFG (no OLT inventory in the "
+            "project), ADDR_ID / house numb / hnr_additi stay empty (a polygon "
+            "has no single building)." % written)
+    return written
+
+
+def stamp_site_equipment_rollup(out_dir, feedback=None):
+    """Give the MFG the splitter plan its PDPs already carry, and name the sites.
+
+    `PDPs` publishes a complete splitter plan (`SPLIT_RATIO`, the primary /
+    distribution ratios, module count, ports, used, spare, utilization); `MFG`
+    publishes the same column set all empty, so the exchange — the one place the
+    plan converges — could not state it. The roll-up sums what it serves.
+
+    `VENDOR` and `MAINT_ZONE` have no source in this project at all (no vendor
+    register, no maintenance-zone layer). They are populated with the two
+    conventions the data can support and named here: VENDOR = "Unspecified"
+    (explicitly no vendor recorded, so a blank cell cannot be misread as a
+    missing value), MAINT_ZONE = the serving exchange, whose service area is
+    what the maintenance zone covers in this model.
+    """
+    if not out_dir or not os.path.isdir(out_dir):
+        return 0
+    pdp_path = os.path.join(out_dir, "PDPs.gpkg")
+    mfg_path = os.path.join(out_dir, "MFG.gpkg")
+    if not os.path.isfile(pdp_path):
+        return 0
+    try:
+        src = ogr.Open(pdp_path, 0)
+    except Exception:
+        return 0
+    if src is None:
+        return 0
+    pdps = src.GetLayer(0)
+    if pdps is None:
+        return 0
+
+    total_modules = total_ports = used_ports = 0
+    ratios, primary, dist = [], [], []
+    for f in pdps:
+        total_modules += int(_num(pdps, f, "SPLITTER_MODULE_COUNT", 0) or 0)
+        total_ports += int(_num(pdps, f, "SPLITTER_TOTAL_PORTS", 0) or 0)
+        used_ports += int(_num(pdps, f, "SPLITTER_USED_PORTS", 0) or 0)
+        ratios.append(_get(pdps, f, "SPLIT_RATIO"))
+        primary.append(_get(pdps, f, "PRIMARY_SPLIT_RATIO"))
+        dist.append(_get(pdps, f, "DISTRIBUTION_SPLIT_RATIO"))
+    src = None
+    if not total_ports:
+        return 0
+
+    written = 0
+    splitter_fields = [
+        ("SPLIT_RATIO", ogr.OFTString, 32),
+        ("PRIMARY_SPLIT_RATIO", ogr.OFTString, 32),
+        ("DISTRIBUTION_SPLIT_RATIO", ogr.OFTString, 32),
+        ("SPLITTER_MODULE_COUNT", ogr.OFTInteger, 0),
+        ("SPLITTER_TOTAL_PORTS", ogr.OFTInteger, 0),
+        ("SPLITTER_USED_PORTS", ogr.OFTInteger, 0),
+        ("SPLITTER_SPARE_PORTS", ogr.OFTInteger, 0),
+        ("SPLITTER_UTILIZATION_PCT", ogr.OFTReal, 0),
+        ("VENDOR", ogr.OFTString, 64),
+        ("MAINT_ZONE", ogr.OFTString, 64),
+    ]
+    if os.path.isfile(mfg_path):
+        ds, lyr = _open_lyr(mfg_path)
+        if lyr is not None:
+            _create_fields(lyr, splitter_fields)
+            lyr.StartTransaction()
+            for feat in lyr:
+                own = str(_get(lyr, feat, "MFG_ID") or "").strip()
+                feat.SetField("SPLITTER_MODULE_COUNT", int(total_modules))
+                feat.SetField("SPLITTER_TOTAL_PORTS", int(total_ports))
+                feat.SetField("SPLITTER_USED_PORTS", int(used_ports))
+                feat.SetField("SPLITTER_SPARE_PORTS",
+                              int(max(0, total_ports - used_ports)))
+                feat.SetField("SPLITTER_UTILIZATION_PCT",
+                              round(100.0 * used_ports / total_ports, 1))
+                for name, values in (("SPLIT_RATIO", ratios),
+                                     ("PRIMARY_SPLIT_RATIO", primary),
+                                     ("DISTRIBUTION_SPLIT_RATIO", dist)):
+                    value = _dominant(values)
+                    if value:
+                        feat.SetField(name, value)
+                if not str(_get(lyr, feat, "VENDOR") or "").strip():
+                    feat.SetField("VENDOR", "Unspecified")
+                if not str(_get(lyr, feat, "MAINT_ZONE") or "").strip():
+                    feat.SetField("MAINT_ZONE", own or "Unspecified")
+                lyr.SetFeature(feat)
+                written += 1
+            try:
+                lyr.CommitTransaction()
+            except Exception:
+                pass
+            ds = None
+
+    # The sites themselves get the same two conventions, so the equipment
+    # layers agree about what an unrecorded vendor is called.
+    ds, lyr = _open_lyr(pdp_path)
+    if lyr is not None:
+        _create_fields(lyr, [("VENDOR", ogr.OFTString, 64),
+                             ("MAINT_ZONE", ogr.OFTString, 64)])
+        lyr.StartTransaction()
+        for feat in lyr:
+            own = str(_get(lyr, feat, "MFG_ID") or "").strip()
+            if not str(_get(lyr, feat, "VENDOR") or "").strip():
+                feat.SetField("VENDOR", "Unspecified")
+            if not str(_get(lyr, feat, "MAINT_ZONE") or "").strip():
+                feat.SetField("MAINT_ZONE", own or "Unspecified")
+            lyr.SetFeature(feat)
+        try:
+            lyr.CommitTransaction()
+        except Exception:
+            pass
+        ds = None
+
+    if feedback and written:
+        feedback.pushInfo(
+            "  [equipment] MFG splitter plan rolled up from its %d PDP(s): "
+            "%d module(s), %d port(s), %d in use; VENDOR = \"Unspecified\" and "
+            "MAINT_ZONE = the serving exchange (no vendor register or zone "
+            "layer is supplied)."
+            % (len(ratios), total_modules, total_ports, used_ports))
+    return written
+
+
+def stamp_cable_splice_links(out_dir, feedback=None):
+    """Fill the cable splice columns from the network's own topology.
+
+    `SPLICE_OF`, `SPLICE_POINT` and `PARENT_CABLE_ID` were declared on the
+    feeder tier and written as empty strings by the publishing path (the
+    branch-based builder that computed them is not the one that publishes), and
+    the distribution tier had no such columns at all — 280 of 280 rows blank.
+
+    The topology does exist and is read off the design:
+
+      feeder cable     spliced at the MFG it starts at, no parent
+      distribution     spliced onto the feeder carrying its PDP, at that PDP
+      drop cable       spliced onto the trunk serving it, at the coupler the
+                       drop joins (`Coupleurs.ADDR_ID` is the premise)
+    """
+    if not out_dir or not os.path.isdir(out_dir):
+        return 0
+    feeder_path = os.path.join(out_dir, "Feeder_Cable.gpkg")
+    dist_path = os.path.join(out_dir, "Distribution_Cable.gpkg")
+    coup_path = os.path.join(out_dir, "Coupleurs.gpkg")
+    if not (os.path.isfile(feeder_path) and os.path.isfile(dist_path)):
+        return 0
+
+    # The splitter each feeder cable reaches, so a distribution cable can name
+    # the feeder it splices off. Labels use the same identity helper as the duct
+    # occupancy pass, so a cable reads the same in both places.
+    feeder_by_pdp = {}
+    feeder_labels = {}
+    try:
+        src = ogr.Open(feeder_path, 0)
+        lyr = src.GetLayer(0) if src is not None else None
+        if lyr is not None:
+            for f in lyr:
+                label = _cable_identity_label(lyr, f, "Feeder")
+                for pid in _split_list(_get(lyr, f, "PDP_IDS")):
+                    feeder_by_pdp.setdefault(pid.upper(), label)
+                feeder_labels[str(_get(lyr, f, "MFG_ID") or "")] = label
+        src = None
+    except Exception:
+        pass
+
+    trunk_by_key = {}
+    trunk_labels = {}          # (pdp, polygon) -> trunk label
+    distribution_labels = {}
+    try:
+        src = ogr.Open(dist_path, 0)
+        lyr = src.GetLayer(0) if src is not None else None
+        if lyr is not None:
+            for f in lyr:
+                ctype = str(_get(lyr, f, "CABLE_TYPE") or "").strip()
+                label = _cable_identity_label(lyr, f, ctype)
+                pid = str(_get(lyr, f, "PDP_ID") or "").strip().upper()
+                poly = str(_get(lyr, f, "POLYGON_ID") or "").strip().upper()
+                if ctype != "Drop":
+                    if pid:
+                        trunk_by_key.setdefault(pid, label)
+                    if poly:
+                        trunk_labels.setdefault(poly, label)
+                    distribution_labels.setdefault((pid, poly), label)
+        src = None
+    except Exception:
+        pass
+
+    coupler_for_addr = {}
+    if os.path.isfile(coup_path):
+        try:
+            src = ogr.Open(coup_path, 0)
+            lyr = src.GetLayer(0) if src is not None else None
+            if lyr is not None:
+                for f in lyr:
+                    addr = str(_get(lyr, f, "ADDR_ID") or "").strip()
+                    cid = str(_get(lyr, f, "coupler_id") or "").strip()
+                    if addr and cid:
+                        coupler_for_addr.setdefault(addr, cid)
+            src = None
+        except Exception:
+            pass
+
+    splice_fields = [("SPLICE_OF", ogr.OFTString, 96),
+                     ("SPLICE_POINT", ogr.OFTString, 96),
+                     ("PARENT_CABLE_ID", ogr.OFTString, 96)]
+    written = 0
+
+    ds, lyr = _open_lyr(feeder_path)
+    if lyr is not None:
+        _create_fields(lyr, splice_fields)
+        lyr.StartTransaction()
+        for feat in lyr:
+            mfg = str(_get(lyr, feat, "MFG_ID") or "").strip()
+            if not str(_get(lyr, feat, "SPLICE_POINT") or "").strip() and mfg:
+                feat.SetField("SPLICE_POINT", mfg)
+                lyr.SetFeature(feat)
+                written += 1
+        try:
+            lyr.CommitTransaction()
+        except Exception:
+            pass
+        ds = None
+
+    ds, lyr = _open_lyr(dist_path)
+    if lyr is not None:
+        _create_fields(lyr, splice_fields)
+        lyr.StartTransaction()
+        for feat in lyr:
+            ctype = str(_get(lyr, feat, "CABLE_TYPE") or "").strip()
+            pid = str(_get(lyr, feat, "PDP_ID") or "").strip()
+            poly = str(_get(lyr, feat, "POLYGON_ID") or "").strip()
+            if ctype == "Drop":
+                addr = str(_get(lyr, feat, "addr_id")
+                           or _get(lyr, feat, "ADDR_ID") or "").strip()
+                point = coupler_for_addr.get(addr) or pid
+                # A shared trunk serves several PDPs, so the drop's PDP field can
+                # be a list ("pdp00005,pdp00016") — try each token, or 45 drops
+                # with a perfectly findable trunk were left with no parent.
+                parent = trunk_labels.get(poly.upper(), "")
+                for token in _split_list(pid):
+                    parent = trunk_by_key.get(token.upper(), "")
+                    if parent:
+                        break
+            else:
+                point = pid
+                parent = ""
+                for token in _split_list(pid):
+                    parent = feeder_by_pdp.get(token.upper(), "")
+                    if parent:
+                        break
+            if point and not str(_get(lyr, feat, "SPLICE_POINT") or "").strip():
+                feat.SetField("SPLICE_POINT", point)
+            if parent:
+                feat.SetField("SPLICE_OF", parent)
+                feat.SetField("PARENT_CABLE_ID", parent)
+            lyr.SetFeature(feat)
+            written += 1
+        try:
+            lyr.CommitTransaction()
+        except Exception:
+            pass
+        ds = None
+
+    if feedback and written:
+        feedback.pushInfo(
+            "  [splice] %d cable row(s) now state where they are spliced and "
+            "onto which cable (feeder at its MFG, distribution onto the feeder "
+            "carrying its PDP, drop onto its trunk at the coupler)." % written)
+    return written
+
+
+def _route_tips(geom):
+    """The two ends of a drawn route, in the order the geometry is drawn.
+
+    A cable's geometry is the union of its member runs, so it can arrive as a
+    MultiLineString with several parts (a trunk with its tap-offs). For one part
+    the ends are its first and last vertex; for several, the two endpoints
+    furthest apart — the route's actual extremities rather than the seam
+    between two parts.
+    """
+    if geom is None:
+        return None, None
+    pts = []
+    try:
+        n_parts = geom.GetGeometryCount() or 0
+        if n_parts:
+            for i in range(n_parts):
+                part = geom.GetGeometryRef(i)
+                if part is None or part.GetPointCount() < 2:
+                    continue
+                pts.append((part.GetX(0), part.GetY(0), True))
+                pts.append((part.GetX(part.GetPointCount() - 1),
+                            part.GetY(part.GetPointCount() - 1), False))
+        else:
+            if geom.GetPointCount() < 2:
+                return None, None
+            pts.append((geom.GetX(0), geom.GetY(0), True))
+            pts.append((geom.GetX(geom.GetPointCount() - 1),
+                        geom.GetY(geom.GetPointCount() - 1), False))
+    except Exception:
+        return None, None
+    if len(pts) < 2:
+        return None, None
+    if len(pts) == 2:
+        return pts[0], pts[1]
+    best = None
+    for i in range(len(pts)):
+        for j in range(i + 1, len(pts)):
+            dx = pts[i][0] - pts[j][0]
+            dy = pts[i][1] - pts[j][1]
+            d = dx * dx + dy * dy
+            if best is None or d > best[0]:
+                best = (d, pts[i], pts[j])
+    return best[1], best[2]
+
+
+def stamp_cable_endpoints(out_dir, feedback=None):
+    """State where each published cable starts and ends (`START_NODE`).
+
+    Only the feeder tier declared these two columns, and only the shared-feeder
+    planner fills them — so 274 of the 280 published cable rows (every
+    distribution spine trunk and every drop cable) carried no endpoint at all:
+    the served `cables` layer showed both columns blank on all 280 rows.
+
+    The value is the drawn route's own two ends in the layer's CRS, written in
+    the node-key form the feeder tier already publishes (`"%0.2f,%0.2f"`). It is
+    read off the geometry the layer ships — nothing is guessed — and a drop
+    cable is drawn from the footway end (which joins the coupler) to the service
+    entry, so its START is the network side and its END the location it serves.
+    """
+    if not out_dir or not os.path.isdir(out_dir):
+        return 0
+
+    stamped = 0
+    for name in ("Feeder_Cable.gpkg", "Distribution_Cable.gpkg"):
+        path = os.path.join(out_dir, name)
+        if not os.path.isfile(path):
+            continue
+        ds, lyr = _open_lyr(path)
+        if lyr is None:
+            continue
+        _create_fields(lyr, [("START_NODE", ogr.OFTString, 64),
+                             ("END_NODE", ogr.OFTString, 64)])
+        tier = name.replace(".gpkg", "")
+        filled = 0
+        lyr.StartTransaction()
+        for feat in lyr:
+            have = (str(_get(lyr, feat, "START_NODE") or "").strip(),
+                    str(_get(lyr, feat, "END_NODE") or "").strip())
+            if have[0] and have[1]:
+                continue
+            start, end = _route_tips(feat.GetGeometryRef())
+            if start is None:
+                continue
+            if not have[0]:
+                feat.SetField("START_NODE", "%0.2f,%0.2f" % (start[0], start[1]))
+            if not have[1]:
+                feat.SetField("END_NODE", "%0.2f,%0.2f" % (end[0], end[1]))
+            lyr.SetFeature(feat)
+            filled += 1
+        try:
+            lyr.CommitTransaction()
+        except Exception:
+            pass
+        ds = None
+        stamped += filled
+        if feedback and filled:
+            feedback.pushInfo(
+                "  [endpoints] %s: %d row(s) now state the two ends of the "
+                "cable they draw (route tips, in the same node-key form the "
+                "feeder tier publishes)." % (tier, filled))
     return stamped
 
 
@@ -4938,4 +5561,17 @@ def enrich_all(out_dir, feedback=None, roads_lyr=None):
     except Exception as exc:
         if feedback:
             feedback.pushWarning(f"  [occupancy] Cable-to-duct stamp skipped: {exc}")
+    # ── The columns the pipeline declared but never filled ──────────────
+    # Each reads the layer that owns the fact and is additive; all three run
+    # last because they describe the FINAL published rows.
+    for label, runner in (("polygons", stamp_polygon_premise_facts),
+                          ("equipment", stamp_site_equipment_rollup),
+                          ("splice", stamp_cable_splice_links),
+                          ("endpoints", stamp_cable_endpoints)):
+        try:
+            n += runner(out_dir, feedback)
+        except Exception as exc:
+            if feedback:
+                feedback.pushWarning(
+                    f"  [{label}] Post-pass skipped: {exc}")
     return True

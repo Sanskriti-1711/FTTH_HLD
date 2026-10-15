@@ -3004,6 +3004,18 @@ def _split_drop_legs(legs: Sequence[dict], zone_polys, params: Params, log,
         if reason:
             item["type"] = "Aerial"
             item["aerial_reason"] = reason
+            # The class this leg would have been dug as. Kept because an aerial
+            # leg can be put BACK underground: it is only allowed to leave the
+            # ground where the UG network reaches
+            # (``_demote_unanchored_aerial_legs``), and a demoted leg has to be
+            # published as the trench it would have been.
+            item["dug_type"] = leg.get("type")
+            if reason == "chain":
+                # A chain leg leaves a BUILDING, so its feed is its parent's
+                # aerial span. Carry the parent's premise address: the ``parent``
+                # index only means something inside this function's own list,
+                # while the demotion pass runs later on a flat, per-MFG list.
+                item["parent_addr"] = _addr_of(legs[parent]["house"])
             aerial.append(item)
             aerial_idx.add(i)
         else:
@@ -3095,6 +3107,133 @@ def _point_seg_dist(x: float, y: float, a: Tuple[float, float],
     t = ((x - a[0]) * dx + (y - a[1]) * dy) / (dx * dx + dy * dy)
     t = max(0.0, min(1.0, t))
     return math.hypot(x - (a[0] + t * dx), y - (a[1] + t * dy))
+
+
+# How close an aerial leg's network end must sit to the published UG network
+# before the leg is allowed to leave the ground. An aerial drop is only a
+# *drop*: the fibre still has to reach the pole it hangs from, and the last
+# underground metre of a drop is the same trench the dug version would have
+# used.
+AERIAL_UG_ANCHOR_M = 1.0
+
+
+# How far the gate bothers to measure a leg's start from the network when it
+# is writing its receipt. The decision itself needs no more than
+# ``AERIAL_UG_ANCHOR_M``; this only bounds the number that gets reported.
+AERIAL_GATE_PROBE_M = 250.0
+
+
+def _demote_unanchored_aerial_legs(aerial_legs: Sequence[dict],
+                                   runs: Sequence["Run"],
+                                   existing_poles, params: Params,
+                                   log,
+                                   stats: Optional[dict] = None
+                                   ) -> Tuple[List[dict], List[dict]]:
+    """Put aerial legs back underground when nothing can feed them.
+
+    An aerial leg replaces a dug drop, so it has to leave the ground at a point
+    the UG network reaches — the "UG to aerial transition". ``pole_layer``
+    plants its first pole at exactly that station (station 0 of the leg) and
+    ``aerial_drop_planner`` hangs the span on the nearest eligible pole. Neither
+    stage can lay conduit, so when the transition is not on the network the pole
+    stands in mid-air and the premise is left with an overhead span and no path
+    back to its PDP — a detached premise that still bills as served.
+
+    That is not hypothetical. The drop legs are cut from the mains **before**
+    ``trim_unserved_tails`` trims them back, so a leg attached to a run the trim
+    later removed keeps its geometry and loses its landing. On project
+    ``24cd3573`` (Berlin, 2026-10-14) 19 of 60 aerial legs started off the
+    network, 7 of them 25-45 m away, and every one of them was anchored anyway.
+
+    A leg stays aerial when either
+
+    * its network end sits on the published UG network (within
+      ``AERIAL_UG_ANCHOR_M``), or
+    * it is a ``chain`` leg whose parent is itself aerial and anchored — a
+      house-to-house span leaves a building, not the ground, so its feed is
+      its parent's, or
+    * an existing pole within ``params.aerial_pole_m`` stands on the network,
+      which is the docx's own "existing telecom pole" condition *and* the feed
+      it needs to be usable.
+
+    Everything else is returned in the second list, for the caller to add back
+    to ``runs`` as the dug leg it would have been.
+    """
+    if not aerial_legs:
+        return [], []
+
+    grid = _SegGrid(cell=25.0)
+    for i, r in enumerate(runs):
+        for j in range(len(r.coords) - 1):
+            grid.add(i, r.coords[j], r.coords[j + 1])
+
+    def _on_network(x: float, y: float) -> bool:
+        return grid.nearest(x, y, AERIAL_UG_ANCHOR_M) < AERIAL_UG_ANCHOR_M
+
+    kept: List[dict] = []
+    demoted: List[dict] = []
+    kept_addrs: Set[str] = set()
+    by_anchor: Dict[str, int] = defaultdict(int)
+    starts: List[Tuple[str, str, float]] = []
+    for leg in aerial_legs:
+        coords = leg.get("coords") or []
+        anchor = ""
+        if coords:
+            x, y = coords[0][0], coords[0][1]
+            starts.append((_addr_of(leg.get("house") or {}) or "?",
+                           leg.get("aerial_reason") or "?",
+                           grid.nearest(x, y, AERIAL_GATE_PROBE_M)))
+            if _on_network(x, y):
+                anchor = "on-network"
+            elif existing_poles:
+                near_m, pole = _nearest_pole_info((x, y), existing_poles,
+                                                  params.aerial_pole_m)
+                if near_m is not None and near_m <= params.aerial_pole_m:
+                    try:
+                        if _on_network(float(pole["x"]), float(pole["y"])):
+                            anchor = "existing-pole-on-network"
+                    except (KeyError, TypeError, ValueError):
+                        pass
+            if not anchor:
+                parent_addr = leg.get("parent_addr")
+                if parent_addr and parent_addr in kept_addrs:
+                    anchor = "chain-from-anchored-parent"
+        if anchor:
+            leg["ug_anchor"] = anchor
+            kept.append(leg)
+            by_anchor[anchor] += 1
+            house = leg.get("house") or {}
+            addr = _addr_of(house)
+            if addr:
+                kept_addrs.add(addr)
+        else:
+            # Name the rule that put the leg back, so a demotion is a finding a
+            # reader can see rather than a silent reassignment.
+            leg["aerial_fallback"] = "no_ug_anchor"
+            demoted.append(leg)
+
+    # State the outcome either way. "0 demoted" is a result a reviewer needs as
+    # much as "8 demoted": it is the difference between a run whose aerial legs
+    # all leave the ground on the network and a run where the gate never ran.
+    log("aerial anchor gate: %d of %d aerial leg(s) have no UG transition on the "
+        "network and were returned to trench%s"
+        % (len(demoted), len(aerial_legs),
+           " (" + ", ".join("%s %d" % kv for kv in sorted(by_anchor.items()))
+           + ")" if by_anchor else ""))
+    if stats is not None:
+        off = [s for s in starts if s[2] >= AERIAL_UG_ANCHOR_M]
+        stats.clear()
+        stats.update({
+            "legs": len(aerial_legs),
+            "demoted": len(demoted),
+            "by_anchor": dict(by_anchor),
+            "legs_starting_off_network": len(off),
+            "worst_start_m": round(max((s[2] for s in starts), default=0.0), 2),
+            "worst": [[a, r, round(d, 2)]
+                      for a, r, d in sorted(starts, key=lambda s: -s[2])[:10]
+                      if d >= AERIAL_UG_ANCHOR_M],
+        })
+    return kept, demoted
 
 
 def _span_coords(sp: dict) -> List[Tuple[float, float]]:
@@ -4151,6 +4290,30 @@ def design(cfg: dict) -> dict:
            sum(1 for r in runs if r.tier == "Distribution"),
            sum(1 for r in runs if r.tier == "Garden")))
 
+    # ── an aerial leg may only leave the ground on the network ──────────────
+    # Re-decided HERE, on the FINAL run set. The drop legs were split while the
+    # mains still existed in full and ``trim_unserved_tails`` has run since, so a
+    # leg that hung off a run the trim removed is now an aerial span with no
+    # landing. This is the last point at which "put it back underground" still
+    # works: every layer below (and the pole/duct stages that read them) is built
+    # from ``runs``.
+    aerial_gate: Dict[str, object] = {}
+    aerial_legs, demoted_aerial = _demote_unanchored_aerial_legs(
+        aerial_legs, runs, existing_poles, params, log, aerial_gate)
+    for leg in demoted_aerial:
+        _house = leg["house"]
+        r = Run(coords=list(reversed(leg["coords"])), tier="Garden", pdp=None,
+                polygon=(_house.get("POLYGON_ID") or None),
+                src="house-drop",
+                addr=_addr_of(_house), hh=_hh_of(_house),
+                mfg=leg.get("mfg_id") or _house.get("MFG_ID"))
+        # The class it would have been dug as — ``type`` was overwritten with
+        # "Aerial" when the leg was classified, so the original is restored from
+        # the copy ``_split_drop_legs`` kept on the leg.
+        r.tier_type = leg.get("dug_type") or "Garden"
+        r.footway_pt = leg["coords"][0]
+        runs.append(r)
+
     # ── drills over carriageways ─────────────────────────────────────────
     drills = detect_drills(vehicular, runs, params, log)
 
@@ -4467,6 +4630,10 @@ def design(cfg: dict) -> dict:
             for mfg_id in sorted(mfg_houses)
         },
         "aerial_legs": len(aerial_rows),
+        # The UG-transition gate's own receipt: how many of the legs the rules
+        # classified aerial had to go back underground because nothing on the
+        # network could feed them, and what the survivors left the ground on.
+        "aerial_gate": dict(aerial_gate),
         # The docx's "Evaluate Aerial" step, counted separately: these legs
         # were evaluated and left trenched (see Params.aerial_setback_convert).
         "aerial_evaluated_by_reason": _count_by(
