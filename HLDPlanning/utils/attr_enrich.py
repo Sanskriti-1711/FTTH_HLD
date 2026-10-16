@@ -2105,6 +2105,111 @@ def _tap_buckets(taps, polys, by_region):
     return no_duct, unknown, untagged
 
 
+# A crossing, not a detour: the longest off-region piece that may be kept to
+# hold a region's duct together. Same order as the tap link limit, because both
+# answer the same question -- how far may a duct run outside its own polygon to
+# stay one duct.
+BRIDGE_RESTORE_MAX_M = DIST_REGION_LINK_MAX_M
+
+
+def _piece_key(pt, tol_m=0.1):
+    """Endpoint key at ``tol_m``, so ends that only nearly touch still join."""
+    return (int(round(pt[0] / tol_m)), int(round(pt[1] / tol_m)))
+
+
+def _restore_bridges(group, env_cov, parts_of, max_len_m=BRIDGE_RESTORE_MAX_M):
+    """Keep the off-region pieces that hold one region's duct together.
+
+    Clipping a duct corridor to its own polygon cuts it wherever the corridor
+    leaves the region. Measured on Berlin 24cd3573, those cuts left the SAME
+    duct (same ``duct_uid``) in up to 5 disconnected pieces inside a single
+    polygon, 2-56 m apart, while the trench under each gap was continuous
+    (0.00 m) -- so a coupler could sit on a fragment with no path back to its
+    PDP. That is a severed route, not a removed spur, and the old report said
+    no route was ever severed.
+
+    A removed piece is restored ONLY when all of these hold:
+      * it is at most ``max_len_m`` long -- a crossing, not a detour,
+      * both its ends touch pieces that are KEPT (in-region),
+      * those two pieces carry the same ``duct_uid`` as the piece itself, so a
+        bridge can never join one duct to a different one, and
+      * they are not already connected, so a real join is never re-added.
+
+    Returns the number of pieces restored; they are added to ``parts_of``.
+    """
+    uid_of = {}
+    for fid, f, _pids, _parts in group:
+        uid = ""
+        try:
+            idx = f.GetFieldIndex("duct_uid")
+            if idx >= 0:
+                uid = str(f.GetField(idx) or "")
+        except Exception:
+            uid = ""
+        uid_of[fid] = uid
+
+    restored = 0
+    done = set()
+    for _pass in range(8):          # a chain of cut pieces needs several passes
+        ends = {}
+        pieces = []
+        for fid, kept in parts_of.items():
+            for coords in kept:
+                i = len(pieces)
+                pieces.append((fid, uid_of.get(fid, "")))
+                for e in (coords[0], coords[-1]):
+                    ends.setdefault(_piece_key(e), []).append(i)
+        parent = list(range(len(pieces)))
+
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        for idxs in ends.values():
+            for other in idxs[1:]:
+                union(idxs[0], other)
+
+        added = False
+        for fid, f, _pids, _parts in group:
+            g = f.GetGeometryRef()
+            if g is None or g.IsEmpty():
+                continue
+            uid = uid_of.get(fid, "")
+            try:
+                off = g.Difference(env_cov)
+            except Exception:      # noqa: BLE001 - one bad piece must not abort
+                continue
+            for coords in _line_parts(off):
+                if len(coords) < 2 or _coords_len(coords) > max_len_m:
+                    continue
+                token = (fid, _piece_key(coords[0]), _piece_key(coords[-1]))
+                if token in done:
+                    continue
+                near_a = [i for i in ends.get(_piece_key(coords[0]), [])
+                          if pieces[i][1] == uid]
+                near_b = [i for i in ends.get(_piece_key(coords[-1]), [])
+                          if pieces[i][1] == uid]
+                if not near_a or not near_b:
+                    continue
+                if find(near_a[0]) == find(near_b[0]):
+                    continue
+                parts_of[fid] = list(parts_of[fid]) + [coords]
+                done.add(token)
+                restored += 1
+                added = True
+
+        if not added:
+            break
+    return restored
+
+
 def _confine_one_layer(path, polys, taps, trench, links, feedback,
                        tol_m, tap_tol_m, report):
     """Clip one layer's rows to their own polygon, then join the region links.
@@ -2134,6 +2239,7 @@ def _confine_one_layer(path, polys, taps, trench, links, feedback,
     already = extended = chords = 0
     joined = 0          # links assembled across multiple trench spans
     unreached = []
+    bridged = 0          # off-region piece(s) kept to hold a duct together
     keep_parts = {}      # fid -> its clipped (+ link) coordinate lists
     emptied = set()      # fid -> nothing of it is in its own region
     no_region = 0        # fid -> no polygon known for the ids the row names
@@ -2176,6 +2282,10 @@ def _confine_one_layer(path, polys, taps, trench, links, feedback,
                     dropped += 1
                     continue
                 parts_of[fid] = kept
+
+            # Removing an off-region piece may be what SEVERS the region's own
+            # duct. Put back the ones that hold it together (see the helper).
+            bridged += _restore_bridges(group, env_cov, parts_of)
 
             if report:
                 for _pid, x, y in mine:
@@ -2286,13 +2396,15 @@ def _confine_one_layer(path, polys, taps, trench, links, feedback,
         if no_region:
             extra += ("; %d row(s) name a region that is not in Polygons and "
                       "were left as they are" % no_region)
+        bridge_note = (
+            ", %d kept as a bridge so a region's own duct stays joined" % bridged
+            if bridged else " (none of it held a duct together)")
         feedback.pushInfo(
             "  [region] Distribution confined to its own polygon: "
-            "%.1f m off-region removed (every off-region piece is a spur, so "
-            "no route was severed), %d empty row(s) dropped of %d; pseudo "
+            "%.1f m off-region removed%s, %d empty row(s) dropped of %d; pseudo "
             "object points reached %d/%d (%d already on a region duct, %d "
             "extended along the trench%s); %d left unconnected%s%s."
-            % (off_len, dropped, len(rows),
+            % (off_len, bridge_note, dropped, len(rows),
                already + extended + joined + chords, len(taps),
                already, extended,
                ((", %d joined span by span along the trench" % joined)
