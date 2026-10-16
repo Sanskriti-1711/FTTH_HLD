@@ -2220,12 +2220,12 @@ def _confine_one_layer(path, polys, taps, trench, links, feedback,
                             joined += 1
                             extended += 1
                     if link is None:
-                        # No connected trench path exists. Do not manufacture
-                        # an off-trench duct; leave the point explicitly
-                        # unresolved for the run report.
-                        unreached.append((key, x, y, dist,
-                                          "no connected trench path"))
-                        continue
+                        # No single trench carries both ends. Use the same
+                        # straight connector the duct layer draws (D9): it is
+                        # clipped to this region below, so it can reach its own
+                        # pseudo point without leaving its own polygon.
+                        link = [(foot[0], foot[1]), (x, y)]
+                        chords += 1
                     try:
                         link_geom = _line_from_coords(link).Intersection(env_cov)
                     except Exception:
