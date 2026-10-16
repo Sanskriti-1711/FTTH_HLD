@@ -1009,40 +1009,6 @@ def _read_polygons_geom(path: str, target_epsg: int) -> Optional[ogr.Geometry]:
     return col
 
 
-def _read_polygons_by_id(path: str, target_epsg: int) -> Dict[str, ogr.Geometry]:
-    """Each service polygon's own geometry, keyed by its ``POLYGON_ID``.
-
-    The spine must know where a region ends so its tree can stay inside it;
-    ``_read_points`` only keeps centroids, so the geometry is read here.
-    Polygons sharing an id are unioned. A layer without ``POLYGON_ID`` yields
-    an empty map, and the spine then routes exactly as before.
-    """
-    ds = ogr.Open(path)
-    if ds is None:
-        return {}
-    by_id: Dict[str, ogr.Geometry] = {}
-    for li in range(ds.GetLayerCount()):
-        lyr = ds.GetLayer(li)
-        idx = lyr.GetLayerDefn().GetFieldIndex("POLYGON_ID")
-        if idx < 0:
-            continue
-        tr = _transform(lyr.GetSpatialRef(), target_epsg)
-        for f in lyr:
-            pid = str(f.GetField(idx) or "").strip()
-            g = f.GetGeometryRef()
-            if not pid or g is None or g.IsEmpty():
-                continue
-            g = g.Clone()
-            if tr is not None:
-                g.Transform(tr)
-            g = g.Buffer(0)
-            if g is None or g.IsEmpty():
-                continue
-            by_id[pid] = g if pid not in by_id else by_id[pid].Union(g)
-    ds = None
-    return by_id
-
-
 def _read_road_parts(path: str, target_epsg: int, bbox=None
                      ) -> Tuple[List[Tuple[List[Tuple[float, float]], str, dict]],
                                 List[Tuple[List[Tuple[float, float]], str, dict]]]:
@@ -1721,33 +1687,8 @@ def design_backbone(sg: StreetGraph, mfg: dict, pdps: Sequence[dict],
     return edges
 
 
-# Street nodes this close outside a polygon edge still count as inside it: the
-# polygon edge and the carriageway kerb rarely coincide to the centimetre.
-REGION_NODE_TOL_M = 2.0
-
-
-def _region_nodes(sg: StreetGraph, region: ogr.Geometry) -> Set[str]:
-    """Street nodes lying inside ``region`` (within ``REGION_NODE_TOL_M``).
-
-    Filtered by envelope first: the polygon test runs only on the nodes that
-    could possibly be inside, which keeps this cheap for a ward of many regions.
-    """
-    zone = region.Buffer(REGION_NODE_TOL_M)
-    minx, maxx, miny, maxy = zone.GetEnvelope()
-    inside: Set[str] = set()
-    for node, (x, y) in sg.node_xy.items():
-        if x < minx or x > maxx or y < miny or y > maxy:
-            continue
-        pt = ogr.Geometry(ogr.wkbPoint)
-        pt.AddPoint_2D(x, y)
-        if zone.Contains(pt):
-            inside.add(node)
-    return inside
-
-
 def design_spine(sg: StreetGraph, pdps: Sequence[dict], houses: Sequence[dict],
-                 params: Params, log,
-                 regions: Optional[Dict[str, ogr.Geometry]] = None
+                 params: Params, log
                  ) -> Tuple[Dict[str, Set[Tuple[str, str]]],
                             Dict[Tuple[str, str], Set[int]]]:
     """Per-PDP shortest-path tree to its houses (shared corridors merge).
@@ -1757,13 +1698,6 @@ def design_spine(sg: StreetGraph, pdps: Sequence[dict], houses: Sequence[dict],
     that edge — so a run assembled from those edges can state exactly which
     premises it was dug for (``Run.addr`` / ``Run.hh``). Several houses usually
     share one edge, which is precisely the case a shared trunk exists for.
-
-    With ``regions`` (POLYGON_ID → polygon), a PDP's tree is first routed over
-    the street nodes inside its OWN polygon. A tree that crosses into a
-    neighbouring polygon is clipped back to its own region later, which leaves
-    the region's pseudo points (its garden-leg ends) with no duct to reach.
-    A house that cannot be reached inside its region falls back to the whole
-    network, so no premise is dropped.
     """
     by_pdp: Dict[str, List[dict]] = defaultdict(list)
     for h in houses:
@@ -1774,8 +1708,7 @@ def design_spine(sg: StreetGraph, pdps: Sequence[dict], houses: Sequence[dict],
     hidx = {id(h): i for i, h in enumerate(houses)}
     edge_houses: Dict[Tuple[str, str], Set[int]] = defaultdict(set)
     per_pdp: Dict[str, Set[Tuple[str, str]]] = {}
-    region_cache: Dict[str, Optional[Set[str]]] = {}
-    served = in_region = fallback = 0
+    served = 0
     for p in pdps:
         pid = str(p.get("PDP_ID") or "")
         src = _snap_anchor(sg, p["x"], p["y"], params.pdp_search_m)
@@ -1788,55 +1721,20 @@ def design_spine(sg: StreetGraph, pdps: Sequence[dict], houses: Sequence[dict],
                 targets.append((h, k))
         if not targets:
             continue
-
-        # The PDP's own region: its POLYGON_ID, else the one most of its
-        # houses carry. No region known → the whole network, as before.
-        allowed: Optional[Set[str]] = None
-        if regions:
-            rid = str(p.get("POLYGON_ID") or "")
-            if not rid:
-                tally: Dict[str, int] = defaultdict(int)
-                for h, _k in targets:
-                    if h.get("POLYGON_ID"):
-                        tally[str(h["POLYGON_ID"])] += 1
-                rid = max(tally, key=tally.get) if tally else ""
-            if rid in regions:
-                if rid not in region_cache:
-                    region_cache[rid] = _region_nodes(sg, regions[rid])
-                allowed = region_cache[rid]
-
-        inside_pred = inside_dist = None
-        if allowed is not None and src in allowed:
-            view = nx.subgraph_view(sg.G, filter_node=allowed.__contains__)
-            try:
-                inside_pred, inside_dist = nx.dijkstra_predecessor_and_distance(
-                    view, src, weight="weight")
-            except Exception:
-                inside_pred = inside_dist = None
-        full_pred = full_dist = None          # whole network, built on demand
-
+        try:
+            _pred, dist = nx.dijkstra_predecessor_and_distance(sg.G, src, weight="weight")
+        except Exception:
+            continue
         edges: Set[Tuple[str, str]] = set()
         for h, t in targets:
-            if inside_dist is not None and t in inside_dist:
-                pred, dist = inside_pred, inside_dist
-                in_region += 1
-            else:
-                if full_dist is None:
-                    try:
-                        full_pred, full_dist = nx.dijkstra_predecessor_and_distance(
-                            sg.G, src, weight="weight")
-                    except Exception:
-                        full_pred, full_dist = {}, {}
-                if t not in full_dist:
-                    continue
-                pred, dist = full_pred, full_dist
-                fallback += 1
+            if t not in dist:
+                continue
             hi = hidx.get(id(h))
             node = t
             guard = 0
             while node != src and guard < 10000:
                 guard += 1
-                preds = pred.get(node) or []
+                preds = _pred.get(node) or []
                 if not preds:
                     break
                 pnode = preds[0]
@@ -1849,9 +1747,7 @@ def design_spine(sg: StreetGraph, pdps: Sequence[dict], houses: Sequence[dict],
         per_pdp[pid] = edges
     paths = {pid: len(e) for pid, e in per_pdp.items()}
     log(f"spine: {sum(paths.values())} street edge(s) across {len(paths)} PDP(s), "
-        f"{served} house(s) routed (edge→house attribution kept); "
-        f"{in_region} inside their own region, {fallback} fell back to the "
-        f"whole network")
+        f"{served} house(s) routed (edge→house attribution kept)")
     return per_pdp, dict(edge_houses)
 
 
@@ -4068,7 +3964,6 @@ def design(cfg: dict) -> dict:
     existing_poles = (_read_points(cfg["existing_poles"], params.target_epsg)
                       if cfg.get("existing_poles") else [])
     polygons = _read_points(cfg["polygons"], params.target_epsg)
-    regions = _read_polygons_by_id(cfg["polygons"], params.target_epsg)
     if not mfgs:
         raise SystemExit("no MFG point found")
     if not pdps:
@@ -4157,8 +4052,7 @@ def design(cfg: dict) -> dict:
             mfg_runs[mfg_id] = []
             continue
         backbone_edges = design_backbone(sg, mfg, group_pdps, params, log)
-        spine_edges, edge_houses = design_spine(sg, group_pdps, group_houses, params, log,
-                                                regions=regions)
+        spine_edges, edge_houses = design_spine(sg, group_pdps, group_houses, params, log)
         feeder_keys = set(backbone_edges)
         dist_keys = set().union(*spine_edges.values()) if spine_edges else set()
         dist_only = dist_keys - feeder_keys
