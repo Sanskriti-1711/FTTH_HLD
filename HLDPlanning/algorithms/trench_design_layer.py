@@ -692,11 +692,6 @@ class TrenchDesignLayerAlgorithm(TrenchLayerAlgorithm):
         self._publish_aerial_drops(parameters, context, work, out_dir,
                                    target_epsg, feedback, sinks)
 
-        # ── the structural nodes (HDD pits, junctions, bends, pulls) — the
-        #    chamber stage's primary candidate source
-        self._publish_trench_nodes(parameters, context, out_dir,
-                                   target_epsg, feedback, sinks)
-
         # ── derived layers
         pseudo_rows = self._pseudo_rows(final_rows)
         sinks[self.O_PSEUDO_HH] = self._write_rows(

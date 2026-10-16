@@ -99,6 +99,7 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
                                     # merges into it instead of stacking
     BEND_ANGLE_DEG = 60.0       # direction change above this gets a structure (rule 6)
     BEND_SPACING_M = 25.0       # min spacing between bend-derived structures
+    BEND_TO_JUNCTION_M = 25.0   # an angle chamber moves to a trench intersection this close, else is dropped
     BEND_MIN_LEG_M = 3.0        # both legs of the angle must be at least this long (snap zigzags)
     DROP_TRANSITION_SPACING_M = 30.0  # min spacing between distribution→drop handholes
     DROP_TRANSITION_MIN_DROPS = 2     # >= drop ducts tapping within CONN_RADIUS_M
@@ -1020,6 +1021,13 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
                 g = f.geometry()
                 if g and not g.isEmpty() and g.type() == QgsWkbTypes.LineGeometry:
                     trench_lines.append(g)
+        # Where trench runs meet: the only places an angle chamber may sit.
+        trench_junctions = [
+            (jx, jy) for jx, jy, jw in self._junction_points(
+                trenches, self.JUNCTION_RADIUS_M)
+            if jw >= self.TRENCH_JUNCTION_MIN] if trenches is not None else []
+        bend_dropped = 0
+        bend_moved = 0
 
         high_density_pdps = set()
         if pdp_lyr is not None and bldg_union is not None:
@@ -1049,6 +1057,22 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
             # line, which sits mid-road while the trench follows the footway —
             # they get a wider snap cap so they still end up ON the path.
             reason0 = cand[7] if len(cand) > 7 else ""
+            # A direction change is not a structure in itself: the chamber
+            # belongs where the trenches meet. Move it to the nearest trench
+            # intersection within BEND_TO_JUNCTION_M, or drop it.
+            if reason0 == "Direction change":
+                best_j, best_d = None, self.BEND_TO_JUNCTION_M
+                for jx, jy in trench_junctions:
+                    d = ((jx - x) ** 2 + (jy - y) ** 2) ** 0.5
+                    if d <= best_d:
+                        best_j, best_d = (jx, jy), d
+                if best_j is None:
+                    bend_dropped += 1
+                    continue
+                x, y = best_j
+                bend_moved += 1
+                cand = tuple(cand[:7]) + ("Trench intersection",)
+                reason0 = "Trench intersection"
             cap = (self.HDD_SNAP_M
                    if reason0 in ("HDD pit", "Designer HDD pit") else None)
             # Rule: snap ONTO the trench path first — the chamber is the
@@ -1081,6 +1105,10 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
             cand = (x, y) + tuple(cand[2:])
             constrained.append(cand)
         candidates = constrained
+        feedback.pushInfo(
+            f"  Direction-change chambers: {bend_moved} moved to a trench "
+            f"intersection, {bend_dropped} dropped (none within "
+            f"{self.BEND_TO_JUNCTION_M:g} m).")
 
         # ── collapse duplicates (highest priority, densest first) ────────
         kept = self._place_structures(candidates)

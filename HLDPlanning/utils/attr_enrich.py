@@ -1271,7 +1271,13 @@ def _link_along_trench(trench_parts, ax, ay, bx, by, tol_m=1.0):
     return best
 
 
-def _trench_network_path(trench_parts, ax, ay, bx, by, tol_m=1.0, cap_m=None):
+# Widest gap, in metres, that a duct may bridge between two trench features
+# when no connected trench chain exists. Used only as a last resort.
+DUCT_TRENCH_BRIDGE_M = 8.0
+
+
+def _trench_network_path(trench_parts, ax, ay, bx, by, tol_m=1.0, cap_m=None,
+                         bridge_m=0.0):
     """The run of trench PIECES carrying (ax, ay) to (bx, by), or None.
 
     Trench is published span by span and cut at every chamber, so the route
@@ -1317,20 +1323,39 @@ def _trench_network_path(trench_parts, ax, ay, bx, by, tol_m=1.0, cap_m=None):
     if na == nb:
         return None          # one feature carries both: _link_along_trench did it
 
-    # Few hops (a link crosses a chamber or two), so plain BFS is enough — and
-    # adjacency is in feature order, so the chain is deterministic.
-    prev = {na: None}
-    q = deque([na])
-    while q:
-        k = q.popleft()
-        if k == nb:
-            break
-        for ei in adj.get(k, ()):
-            cs = parts[ei]
-            other = node_of(*cs[-1]) if node_of(*cs[0]) == k else node_of(*cs[0])
-            if other not in prev:
-                prev[other] = (k, ei)
-                q.append(other)
+    def _bfs():
+        # Few hops (a link crosses a chamber or two), so plain BFS is enough —
+        # and adjacency is in feature order, so the chain is deterministic.
+        prev = {na: None}
+        q = deque([na])
+        while q:
+            k = q.popleft()
+            if k == nb:
+                break
+            for ei in adj.get(k, ()):
+                cs = parts[ei]
+                other = node_of(*cs[-1]) if node_of(*cs[0]) == k else node_of(*cs[0])
+                if other not in prev:
+                    prev[other] = (k, ei)
+                    q.append(other)
+        return prev
+
+    prev = _bfs()
+    if nb not in prev and bridge_m > 0:
+        # No trench chain joins the two points. Only now may a short straight
+        # connector (at most bridge_m) join the reached trench to a trench end
+        # it nearly touches, e.g. a ~7 m gap in the published trench network.
+        reached = list(prev)
+        for k in reached:
+            kx, ky = coords_of[k]
+            for j, (jx, jy) in coords_of.items():
+                if j in prev or math.hypot(jx - kx, jy - ky) > bridge_m:
+                    continue
+                parts.append([(kx, ky), (jx, jy)])
+                ei = len(parts) - 1
+                adj.setdefault(k, []).append(ei)
+                adj.setdefault(j, []).append(ei)
+        prev = _bfs()
     if nb not in prev:
         return None
 
@@ -2189,7 +2214,8 @@ def _confine_one_layer(path, polys, taps, trench, links, feedback,
                         # per chamber pair.
                         link = _trench_network_path(
                             trench, foot[0], foot[1], x, y,
-                            cap_m=max(DIST_REGION_LINK_MAX_M * 20.0, 500.0))
+                            cap_m=max(DIST_REGION_LINK_MAX_M * 20.0, 500.0),
+                            bridge_m=DUCT_TRENCH_BRIDGE_M)
                         if link is not None:
                             joined += 1
                             extended += 1
@@ -3695,7 +3721,6 @@ def verify_duct_continuity(out_dir, feedback=None, include_distribution=True):
 # ordered by how much of the line each one carries.
 _REGION_POINT_LAYERS = (
     ("Chambers.gpkg", "POLYGON_ID", "chamber"),
-    ("Trench_Nodes.gpkg", "POLYGON_ID", "trench node"),
 )
 _REGION_LINE_LAYERS = (
     ("Final_Trenches.gpkg", "POLYGON_ID", "trench span"),
@@ -3932,7 +3957,6 @@ _MFG_IDENTITY_LAYERS = (
     ("Served_Premises.gpkg", "point"),
     ("Chambers.gpkg", "point"),
     ("Poles.gpkg", "point"),
-    ("Trench_Nodes.gpkg", "point"),
     ("Coupleurs.gpkg", "point"),
     ("Feeder_Trench.gpkg", "line"),
     ("Distribution_Trench.gpkg", "line"),
