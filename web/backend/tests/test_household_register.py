@@ -582,11 +582,240 @@ def test_an_explicit_off_on_the_canonical_name_wins(monkeypatch):
     assert hr.register_enabled_from_env() is False
 
 
+def test_the_lookup_asks_for_the_postcodes_in_the_country_s_own_shape(monkeypatch):
+    """`load_register` must normalise the area's postcodes for ITS country.
+
+    The GB default turned every German postcode into "", so `wanted` was empty
+    and the loaded German rows were never queried: the preview returned 16,624
+    heuristic households for Berlin 12105 with the register row for 7,138
+    sitting in the table, and no error anywhere -- because "nothing matched" is
+    deliberately the same answer as "nothing loaded".
+    """
+    calls = []
+
+    class FakeCursor:
+        def execute(self, sql, params=None):
+            calls.append((sql, params))
+
+        def fetchall(self):
+            return []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class FakeConn:
+        def cursor(self):
+            return FakeCursor()
+
+    monkeypatch.setattr(hr, "register_ready", lambda code="GB": True)
+    monkeypatch.setattr(hr.postgis, "get_conn", lambda: FakeConn())
+    hr.load_register("DE", ["12105", "12105 "])
+    by_postcode_sql, by_postcode_params = calls[0]
+    assert by_postcode_params[0] == "DE"
+    assert by_postcode_params[1] == ["12105"]
+
+
+def test_a_german_row_is_keyed_on_the_german_postcode(monkeypatch):
+    """`register_ingest` normalises the key for the COUNTRY it is loading.
+
+    It used the GB default, so every German postcode normalised to "" and the
+    row was dropped: a completed GISCO apportionment (Berlin's 3.78 M people
+    shared onto 3.37 km2, 7,138 households) loaded as "loaded 0", which reads
+    like a country with no data rather than a key of the wrong shape.
+    """
+    monkeypatch.setattr(hr.postgis, "is_available", lambda: True)
+    monkeypatch.setattr(hr, "init_register_schema", lambda: None)
+    captured = {}
+
+    def fake_insert(rows):
+        captured["rows"] = list(rows)
+        return len(captured["rows"])
+
+    monkeypatch.setattr(hr, "_register_insert", fake_insert)
+    loaded = hr.register_ingest(
+        [{"postcode": "12105", "households": 7138, "population": 14277}],
+        source="Eurostat GISCO LAU", country_code="DE",
+    )
+    assert loaded == 1
+    assert captured["rows"][0][:2] == ("DE", "12105")
+    assert captured["rows"][0][3] == 7138
+
+
+def test_a_uk_row_is_unaffected_by_the_country_aware_key(monkeypatch):
+    monkeypatch.setattr(hr.postgis, "is_available", lambda: True)
+    monkeypatch.setattr(hr, "init_register_schema", lambda: None)
+    captured = {}
+
+    def fake_insert(rows):
+        captured["rows"] = list(rows)
+        return len(captured["rows"])
+
+    monkeypatch.setattr(hr, "_register_insert", fake_insert)
+    assert hr.register_ingest(
+        [{"postcode": "b169bh", "households": 12}],
+        source="EPC", country_code="GB",
+    ) == 1
+    assert captured["rows"][0][:2] == ("GB", "B16 9BH")
+
+
 def test_the_register_is_on_by_default_and_the_country_gate_still_binds(monkeypatch):
-    # The register is on by default now; the country gate in
-    # `household_register_for` is what keeps it off outside GB/UK, so a region
-    # the register does not cover never consults it even with no knob set.
+    # The register is on by default, so the country gate in
+    # `household_register_for` is what keeps it off where the register does not
+    # reach, and a country outside it never consults the database at all.
+    #
+    # This used to assert the same thing with "Germany", which was true only
+    # while the register was UK-only. Germany IS covered now (GISCO publishes
+    # it), so that assertion would have passed for the wrong reason -- no German
+    # rows happen to be loaded -- and would have started failing the moment
+    # somebody loaded one. The United States is the honest case: no postcode
+    # shape in POSTCODE_SHAPES, so the gate still excludes it on purpose.
     for name in hr.REGISTER_ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
     assert hr.register_enabled_from_env() is True
-    assert osm_source.household_register_for("Germany", ["B11 3SA"]) is None
+    assert osm_source.household_register_for("United States", ["10001"]) is None
+
+
+# ---------------------------------------------------------------------------
+# Countries other than the UK
+# ---------------------------------------------------------------------------
+#
+# The register used to normalise UK postcodes and nothing else, so a European
+# area had every premise rejected and looked like it had no postcodes at all.
+# The shapes below are the validated ones (see POSTCODE_SHAPES); the point of
+# the parametrisation is that each country's OWN spelling and separators
+# collapse to the one key the register is stored under.
+
+@pytest.mark.parametrize("country,raw,expected", [
+    ("DE", "10115", "10115"),
+    ("DE", "DE-10115", "10115"),       # country-prefixed, as OSM sometimes writes it
+    ("FR", "75001", "75001"),
+    ("FR", "01001 CEDEX", "01001"),    # a business routing suffix, not part of the code
+    ("NL", "1011AB", "1011 AB"),
+    ("NL", "1011 AB", "1011 AB"),
+    ("BE", "1000", "1000"),
+    ("PL", "00001", "00-001"),
+    ("PL", "00-001", "00-001"),
+    ("PT", "3750000", "3750-000"),
+    ("CZ", "100 00", "100 00"),
+    ("SE", "62466", "624 66"),
+    ("LV", "LV-1001", "1001"),        # Latvia's own house style
+    ("LU", "L-1111", "1111"),         # Luxembourg's own house style
+    ("LT", "LT-01100", "01100"),
+    ("IE", "D02 X285", "D02 X285"),   # Eircode
+    ("MT", "VLT 1117", "VLT 1117"),
+    ("EL", "12345", "123 45"),
+    ("IT", "00100", "00100"),
+    ("ES", "04001", "04001"),
+    ("IS", "101", "101"),
+])
+def test_other_countries_normalise_to_their_own_key(country, raw, expected):
+    assert hr.normalize_postcode(raw, country) == expected
+
+
+@pytest.mark.parametrize("country,raw", [
+    ("DE", "1011"),        # a PLZ is five digits
+    ("DE", "rubbish"),
+    ("DE", "B11 3SA"),     # a UK postcode is not a German one
+    ("FR", "1011"),
+    ("NL", "1011"),        # the letters are part of the key
+    ("IS", "1011"),
+    ("XX", "10115"),       # no known postcode system: refuse, never guess
+    ("US", "10001"),
+])
+def test_a_postcode_of_the_wrong_shape_is_refused(country, raw):
+    # A too-permissive rule does not produce a wrong match so much as a
+    # plausible key that matches nothing -- which reads exactly like "this
+    # country has no register loaded".
+    assert hr.normalize_postcode(raw, country) == ""
+
+
+def test_the_default_country_is_still_gb():
+    # Every pre-existing caller passes one argument, so the default has to
+    # behave exactly as the old UK-only function did.
+    assert hr.normalize_postcode("b113sa") == "B11 3SA"
+    assert hr.normalize_postcode("10115") == ""
+    assert hr.normalize_postcode("rubbish") == ""
+
+
+def test_the_register_covers_the_countries_gisco_publishes():
+    # The set is derived from the shape table, so a country cannot be listed
+    # without a shape to key on, nor have a shape without being usable.
+    assert {"GB", "UK"} <= hr.REGISTER_COUNTRIES
+    for code in ("DE", "FR", "NL", "IT", "ES", "PL", "SE"):
+        assert code in hr.REGISTER_COUNTRIES
+    assert hr.REGISTER_COUNTRIES == frozenset(set(hr.POSTCODE_SHAPES) | {"GB", "UK"})
+
+
+def test_an_outward_code_is_only_split_where_a_postcode_has_halves():
+    assert hr.postcode_outward("b11 3sa") == "B11"
+    # A German PLZ is atomic; there is no "outward" half to invent.
+    assert hr.postcode_outward("10115", "DE") == "10115"
+    assert hr.postcode_outward("rubbish", "DE") == ""
+
+
+def test_a_german_register_replaces_the_heuristic_by_postcode():
+    # The end-to-end claim for a non-UK country: a premise carrying a PLZ in
+    # `addr:postcode` is matched and its count comes from the register. Before
+    # the country-aware normalisation every one of these premises normalised to
+    # "" and the register matched nothing at all.
+    premises = [
+        {"households": 3, "Postcode": "10115"},
+        {"households": 5, "Postcode": "10115"},
+        {"households": 4, "Postcode": "10117"},
+    ]
+    rows, stats = hr.apply_register(premises, {"10115": 20, "10117": 6}, {}, "DE")
+    assert stats["postcodes_matched"] == 2
+    assert stats["postcodes_seen"] == 2
+    assert [r["household_method"] for r in rows] == ["register_postcode"] * 3
+    # The register fixes the postcode TOTAL; the estimate only decides the shape
+    # within it, so the parts must reconcile to it exactly.
+    assert sum(r["households"] for r in rows[:2]) == 20
+    assert rows[2]["households"] == 6
+
+
+def test_a_gisco_load_stamps_the_vintages_the_file_states(monkeypatch):
+    """Every row says WHICH release its number came from.
+
+    The source entry used to supply the vintage, and for GISCO that was the
+    literal text "GISCO LAU release (the --year of the file loaded)" -- a
+    description of an argument, recorded on every German row as though it were
+    provenance.  The file states its own year (YEAR, else `POP_<year>`), so that
+    is what goes on the rows.
+    """
+    rows_written = []
+    monkeypatch.setattr(hr.postgis, "is_available", lambda: True)
+    monkeypatch.setattr(hr, "register_purge", lambda *a, **k: 0)
+    monkeypatch.setattr(
+        hr, "register_ingest",
+        lambda rows, *a, **k: (rows_written.append((list(rows), k)), len(list(rows)))[1],
+    )
+    monkeypatch.setattr(
+        hr, "gisco_register_records",
+        lambda path, country, kind: (
+            [{"postcode": "12105", "households": 7138, "population": 14277}],
+            {"postcodes": 1, "vintage": "GISCO LAU 2024 (population at 31 December 2024)"},
+        ),
+    )
+
+    result = hr.ingest_source("gisco", "lau_2024_DE.csv", country_code="DE")
+
+    assert result["vintage"] == "GISCO LAU 2024 (population at 31 December 2024)"
+    assert result["loaded"] == 1
+    _rows, kwargs = rows_written[0]
+    assert kwargs["vintage"] == "GISCO LAU 2024 (population at 31 December 2024)"
+    # A source that states no year keeps its own text rather than an empty cell.
+    assert hr.GISCO_SOURCE["vintage"]
+
+
+def test_a_uk_register_does_not_match_a_german_postcode():
+    # The shape is not merely cosmetic: normalising against the wrong country
+    # must not produce a match, or a UK register would silently decide German
+    # household counts.
+    rows, stats = hr.apply_register(
+        [{"households": 3, "Postcode": "10115"}], {"10115": 99}, {}, "GB")
+    assert stats["postcodes_matched"] == 0
+    assert rows[0]["households"] == 3
+    assert "household_method" not in rows[0]

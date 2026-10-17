@@ -66,6 +66,7 @@ import zipfile
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
+import gisco_lau
 import postgis
 
 # ---------------------------------------------------------------------------
@@ -122,10 +123,90 @@ REGISTER_ENABLED = register_enabled_from_env()
 # thing this module exists to stop.
 MIN_REGISTER_HOUSEHOLDS = 1
 
-# The UK only.  A register keyed on postcodes is a UK-shaped idea, and the
-# matching is deliberately not attempted for any other country rather than
-# guessed at.
-REGISTER_COUNTRIES = frozenset({"GB", "UK"})
+# ---------------------------------------------------------------------------
+# Which countries a postcode-keyed register can cover
+# ---------------------------------------------------------------------------
+#
+# This was GB/UK alone, with the note that "a register keyed on postcodes is a
+# UK-shaped idea".  The objection was never really about the KEY -- a postcode is
+# a fine key anywhere -- it was that no authoritative count existed to put behind
+# it anywhere but the UK.  Eurostat GISCO LAU (see `gisco_lau`) supplies one for
+# Europe, so the register covers every country whose postcode SYSTEM is known
+# well enough to key a join on, and no more: a country absent from the table
+# below still refuses to normalise, because a guessed shape returns a
+# plausible-looking key that matches nothing, which is indistinguishable from a
+# country that simply has no data.
+#
+# The shapes were validated against reference postal data (GeoNames, sampled per
+# country, 2026-10-16): 31 of the 34 countries GISCO publishes matched at
+# >=99.9%.  IE, MT and GR are the exceptions -- GeoNames carries no full Irish or
+# Maltese codes (both are truncated to the routing key) and no Greek file at all,
+# and OSM/Overpass was at capacity when this was written -- so those three carry
+# their DOCUMENTED OFFICIAL shape and are UNVERIFIED.  Treat them accordingly:
+# a load of any of those three should be spot-checked before it is trusted.
+#
+# Each entry is `(shape on the COMPACT form, canonical formatter or None)`.
+# `None` means the compact form IS canonical.
+POSTCODE_SHAPES: Dict[str, Tuple[str, Optional[str]]] = {
+    "AL": (r"\d{4}", None),
+    "AT": (r"\d{4}", None),
+    "BE": (r"\d{4}", None),
+    "BG": (r"\d{4}", None),
+    "CH": (r"\d{4}", None),
+    "CY": (r"\d{4}", None),
+    "CZ": (r"\d{5}", "{0}{1}{2} {3}{4}"),
+    "DE": (r"\d{5}", None),
+    "DK": (r"\d{4}", None),
+    "EE": (r"\d{5}", None),
+    "EL": (r"\d{5}", "{0}{1}{2} {3}{4}"),
+    "ES": (r"\d{5}", None),
+    "FI": (r"\d{5}", None),
+    "FR": (r"\d{5}", None),
+    "HR": (r"\d{5}", None),
+    "HU": (r"\d{4}", None),
+    "IE": (r"[A-Z]\d{2}[A-Z0-9]{4}", "{0}{1}{2} {3}{4}{5}{6}"),
+    "IS": (r"\d{3}", None),
+    "IT": (r"\d{5}", None),
+    "LI": (r"\d{4}", None),
+    "LT": (r"\d{5}", None),
+    "LU": (r"\d{4}", None),
+    "LV": (r"\d{4}", None),
+    "MK": (r"\d{4}", None),
+    "MT": (r"[A-Z]{3}\d{4}", "{0}{1}{2} {3}{4}{5}{6}"),
+    "NL": (r"\d{4}[A-Z]{2}", "{0}{1}{2}{3} {4}{5}"),
+    "NO": (r"\d{4}", None),
+    "PL": (r"\d{5}", "{0}{1}-{2}{3}{4}"),
+    "PT": (r"\d{7}", "{0}{1}{2}{3}-{4}{5}{6}"),
+    "RO": (r"\d{6}", None),
+    "RS": (r"\d{5}", None),
+    "SE": (r"\d{5}", "{0}{1}{2} {3}{4}"),
+    "SI": (r"\d{4}", None),
+    "SK": (r"\d{5}", "{0}{1}{2} {3}{4}"),
+}
+
+# A country code written IN FRONT of the postcode.  Latvia's own house style is
+# "LV-1001" and Luxembourg's is "L-1111"; both appear in OSM `addr:postcode`, so
+# the prefix has to be tolerated.  It carries nothing the row does not already
+# know, because the register row is keyed by `country_code`.
+POSTCODE_CC_PREFIX: Dict[str, Tuple[str, ...]] = {
+    "LU": ("LU", "L"), "LV": ("LV",), "LT": ("LT",), "CH": ("CH",),
+    "DE": ("DE",), "AT": ("AT",), "BE": ("BE",), "DK": ("DK",), "NO": ("NO",),
+    "SE": ("SE",), "FI": ("FI",), "PL": ("PL",), "PT": ("PT",), "NL": ("NL",),
+    "CZ": ("CZ",), "SK": ("SK",), "HU": ("HU",), "RO": ("RO",), "SI": ("SI",),
+    "HR": ("HR",), "EE": ("EE",), "EL": ("EL", "GR"), "IE": ("IE",),
+    "MT": ("MT",),
+}
+
+# A trailing token that is NOT part of the postcode.  French CEDEX is the one
+# with real volume: it is a business mail-routing suffix stacked on a normal
+# 5-digit code ("01001 CEDEX"), so the row's geography is the base code, and
+# without stripping it 28% of French reference codes fail to match.
+POSTCODE_SUFFIX_STRIP: Dict[str, str] = {"FR": r"CEDEX\d*$"}
+
+# Every country the register can key on: GB/UK by the rule below, plus every
+# country with a published postcode shape.  A country in this set still needs
+# its own load -- being listed is permission to try, not a promise of data.
+REGISTER_COUNTRIES = frozenset({"GB", "UK"} | set(POSTCODE_SHAPES))
 
 # The local store, matching osm_source.OSM_SCHEMA. Named here rather than
 # imported so this module stays importable (and testable) with no database.
@@ -146,8 +227,32 @@ OSM_SCHEMA = "osm"
 _INWARD_RE = re.compile(r"^\d[A-Z]{2}$")
 _OUTWARD_RE = re.compile(r"^[A-Z]{1,2}\d[A-Z\d]?$")
 
+# Non-alphanumerics are dropped before any shape is tested, so "B11-3SA",
+# "1234 AB" and "01001 CEDEX" are all reduced to one comparable form first.
+_COMPACT_RE = re.compile(r"[^A-Za-z0-9]")
+_SHAPE_RE: Dict[str, Any] = {
+    code: re.compile(rf"^{shape}$") for code, (shape, _fmt) in POSTCODE_SHAPES.items()
+}
 
-def normalize_postcode(value: Any) -> str:
+
+def _postcode_candidates(code: str, text: str) -> List[str]:
+    """The compact form, then the same with any country-code prefix removed.
+
+    Tried in that order, and a prefix is only ever stripped as a FALLBACK, so a
+    code that is genuinely valid as it stands is never reinterpreted -- which is
+    what keeps "LV1001" from being read as "1001" by mistake if LV ever
+    publishes a bare 4-digit style.
+    """
+    suffix = POSTCODE_SUFFIX_STRIP.get(code)
+    base = re.sub(suffix, "", text) if suffix else text
+    out = [base]
+    for prefix in POSTCODE_CC_PREFIX.get(code, ()):
+        if len(base) > len(prefix) and base.startswith(prefix):
+            out.append(base[len(prefix):])
+    return out
+
+
+def normalize_postcode(value: Any, country_code: str = "GB") -> str:
     """`"b11 3sa"`, `"B113SA"`, `"B11-3SA"` -> `"B11 3SA"`.  `""` when unusable.
 
     Registers, OSM `addr:postcode` and a planner's typing all spell the same
@@ -155,24 +260,54 @@ def normalize_postcode(value: Any) -> str:
     silently returns nothing -- so the register side and the premise side are
     normalised through this one function.
 
-    Anything that is not shaped like a postcode returns "".  That matters more
-    than it looks: a too-permissive rule does not return a wrong match so much as
-    a plausible-looking key that matches nothing, and a register that appears to
-    have no data for an area is indistinguishable from a UK that has none.
+    Anything that is not shaped like a postcode FOR THAT COUNTRY returns "".
+    That matters more than it looks: a too-permissive rule does not return a
+    wrong match so much as a plausible-looking key that matches nothing, and a
+    register that appears to have no data for an area is indistinguishable from
+    a country that has none.
+
+    `country_code` defaults to GB so that every pre-existing caller keeps the
+    exact behaviour it had when this was a UK-only function.  A country with no
+    published shape returns "" rather than falling back to the UK rule: a British
+    postcode shape applied to a German PLZ would reject every row, and the
+    reverse would turn arbitrary text into a key.
     """
-    text = re.sub(r"[^A-Za-z0-9]", "", str(value or "")).upper()
-    if len(text) < 5 or len(text) > 7:
+    code = str(country_code or "GB").strip().upper()
+    text = _COMPACT_RE.sub("", str(value or "")).upper()
+    if not text:
         return ""
-    inward, outward = text[-3:], text[:-3]
-    if not _INWARD_RE.match(inward) or not _OUTWARD_RE.match(outward):
+    if code in ("GB", "UK"):
+        if len(text) < 5 or len(text) > 7:
+            return ""
+        inward, outward = text[-3:], text[:-3]
+        if not _INWARD_RE.match(inward) or not _OUTWARD_RE.match(outward):
+            return ""
+        return f"{outward} {inward}"
+    shape = _SHAPE_RE.get(code)
+    if shape is None:
         return ""
-    return f"{outward} {inward}"
+    formatter = POSTCODE_SHAPES[code][1]
+    for candidate in _postcode_candidates(code, text):
+        if shape.match(candidate):
+            return formatter.format(*candidate) if formatter else candidate
+    return ""
 
 
-def postcode_outward(value: Any) -> str:
-    """The outward code of a postcode (`"B11 3SA"` -> `"B11"`), for area rollups."""
-    full = normalize_postcode(value)
-    return full[:-4].strip() if full else ""
+def postcode_outward(value: Any, country_code: str = "GB") -> str:
+    """The outward code of a postcode (`"B11 3SA"` -> `"B11"`), for area rollups.
+
+    Only the UK splits a postcode into two parts.  Everywhere else the code is
+    atomic -- there is no "outward" half of a German PLZ -- so the whole
+    normalised code is returned, which is the right prefix for a rollup and does
+    not invent a split that does not exist.
+    """
+    full = normalize_postcode(value, country_code)
+    if not full:
+        return ""
+    code = str(country_code or "GB").strip().upper()
+    if code in ("GB", "UK"):
+        return full[:-4].strip()
+    return full
 
 
 # ---------------------------------------------------------------------------
@@ -521,12 +656,71 @@ def read_epc_api(
     yield from records
 
 
+# Eurostat GISCO LAU -- the one source that reaches anywhere outside the UK.
+#
+# It is NOT shaped like the others, and each difference is the point:
+#
+#   * it is keyed on the MUNICIPALITY and publishes no postcode at all, so its
+#     rows must be APPORTIONED onto postcode polygons before they can be loaded
+#     (see `gisco_lau.attribute_population`) -- which means a load needs the
+#     country's postcode polygons already in PostGIS;
+#   * it publishes POPULATION, not dwellings, so the household count is an
+#     ESTIMATE off Eurostat's average household size. `estimated` records that,
+#     because a planner has to be able to tell an estimate from a count, and
+#     every rounded figure merged with a counted one is a lie of omission;
+#   * `country_code` is deliberately EMPTY. 34 countries are published, and which
+#     one is being loaded is a per-invocation decision (`--country`), not a
+#     property of the source;
+#   * the licence restricts USE to non-commercial with attribution, so it is
+#     carried verbatim onto every row a load writes rather than summarised.
+GISCO_SOURCE: Dict[str, Any] = {
+    "name": "Eurostat GISCO LAU (municipal population, apportioned to postcodes)",
+    "kind": "gisco_lau",
+    "country_code": "",
+    # A FALLBACK only: a load replaces this with the vintage read off the file it
+    # loaded (see `gisco_register_records`). It is deliberately not a description
+    # of an argument -- every German row used to carry "the --year of the file
+    # loaded", which states no year at all.
+    "vintage": "GISCO LAU release (the loaded file states no year)",
+    "publisher": "Eurostat / GISCO, European Commission",
+    "url": gisco_lau.GISCO_BASE + "/",
+    "licence": gisco_lau.GISCO_LICENCE,
+    "note": (
+        "LAU are municipalities -- the building blocks of the NUTS hierarchy -- "
+        "and GISCO publishes total resident population for each (31 December). "
+        "There is NO postcode and NO dwelling count in the data: a LAU figure "
+        "is shared out across postcode polygons by area, and the household "
+        "count divides that by Eurostat's average household size "
+        "(ilc_lvph01). Every row is therefore an ESTIMATE with two assumptions "
+        "behind it -- population spread evenly within a municipality, and a "
+        "national average household size -- unlike the UK sources, which are "
+        "counts. Access is anonymous; use is non-commercial only."
+    ),
+    # The household count is real but derived; see `estimated` below.
+    "has_dwellings_count": True,
+    "estimated": True,
+    # Which country, and the postcode polygons to apportion onto, are both
+    # per-invocation rather than properties of the source.
+    "needs_country": True,
+    "needs_postcode_geography": True,
+    # Documents the INPUT file's own columns (this source is not renamable into
+    # postcode/dwellings the way ONSPD is, because it has neither).
+    "fields": {
+        "lau_id": "GISCO_ID",
+        "municipality": "LAU_NAME",
+        "population": "POP_<year>",
+        "area_km2": "AREA_KM2",
+    },
+}
+
+
 REGISTER_SOURCES: Dict[str, Dict[str, Any]] = {
     "onspd": ONSPD_SOURCE,
     "onspd_area": ONSPD_AREA_SOURCE,
     "uprn": UPRN_SOURCE,
     "epc": EPC_SOURCE,
     "epc_api": EPC_API_SOURCE,
+    "gisco": GISCO_SOURCE,
 }
 
 
@@ -858,7 +1052,12 @@ def register_ingest(
     total = 0
     chunk: List[Tuple[Any, ...]] = []
     for rec in records:
-        postcode = normalize_postcode(rec.get("postcode"))
+        # Normalised FOR THIS COUNTRY.  Called with the GB default, every German
+        # postcode normalised to "" and the row was dropped -- so a completed
+        # GISCO apportionment (population 3.78 M shared onto 3.37 km2, 7,138
+        # households) loaded as "purged 0, loaded 0", which reads exactly like a
+        # country with no data instead of a key read with the wrong shape.
+        postcode = normalize_postcode(rec.get("postcode"), code)
         count = parse_count(rec.get("households"))
         if not postcode or count is None or count < MIN_REGISTER_HOUSEHOLDS:
             continue
@@ -902,6 +1101,245 @@ def _register_insert(rows: Sequence[Tuple[Any, ...]]) -> int:
     return len(unique)
 
 
+GISCO_LAU_TABLE = "gisco_lau"
+
+# LAU polygons live beside the register rather than in it: they are an INPUT to
+# building postcode rows, not a register row themselves, and keeping them apart
+# means a geometry load and a register load can be run, re-run and inspected
+# independently.
+#
+# 3035 (LAEA Europe) is used deliberately. It is the equal-area projection for
+# Europe, so `ST_Area` here returns real square metres; the postcode polygons in
+# `boundary_areas` are 4326, where an area is a number in square degrees with no
+# physical meaning, so those are transformed at query time instead.
+_GISCO_LAU_DDL = """
+CREATE TABLE IF NOT EXISTS {schema}.gisco_lau (
+    lau_id       TEXT PRIMARY KEY,
+    country_code TEXT NOT NULL,
+    name         TEXT,
+    geom         GEOMETRY(Geometry, 3035) NOT NULL,
+    loaded_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS {schema}_gisco_lau_geom_idx
+    ON {schema}.gisco_lau USING GIST (geom);
+CREATE INDEX IF NOT EXISTS {schema}_gisco_lau_country_idx
+    ON {schema}.gisco_lau (country_code);
+"""
+
+
+def init_gisco_lau_schema() -> None:
+    with postgis.get_conn().cursor() as cur:
+        cur.execute(_GISCO_LAU_DDL.format(schema=OSM_SCHEMA))
+
+
+def load_gisco_lau_geometry(rows: Iterable[Dict[str, Any]],
+                            country_code: str = "", replace: bool = True) -> int:
+    """Load LAU polygons from `gisco_lau.read_lau_geometries` into PostGIS.
+
+    An operator step with a database, so it is separate from the fetch: a
+    geometry failure and a download failure then read differently, and the
+    polygons can be inspected before a single household count depends on them.
+
+    `replace` is country-scoped, so loading Germany does not delete France.
+    """
+    from psycopg2 import Binary
+
+    if not postgis.is_available():
+        raise RuntimeError("postgis_unavailable")
+    init_gisco_lau_schema()
+    code = str(country_code or "").strip().upper()
+    # Column order here IS the template order below: lau_id, country_code, name,
+    # then the WKB with its own SRID -- because the SRID is read from the GPKG
+    # header rather than assumed, so a 4326 member cannot be loaded as though its
+    # coordinates were metres.
+    payload: List[Tuple[Any, ...]] = []
+    for row in rows:
+        wkb = row.get("wkb") or b""
+        if not wkb:
+            # No polygon means no share of anything; skipping it is better than
+            # storing a row that would silently contribute nothing.
+            continue
+        payload.append((
+            str(row.get("lau_id") or ""),
+            str(row.get("country_code") or code).upper(),
+            row.get("name") or "",
+            Binary(wkb),
+            int(row.get("srid") or 3035),
+        ))
+    if not payload:
+        return 0
+    if replace and code:
+        with postgis.get_conn().cursor() as cur:
+            cur.execute(
+                f"DELETE FROM {OSM_SCHEMA}.{GISCO_LAU_TABLE} WHERE country_code = %s",
+                (code,),
+            )
+    sql = (
+        f"INSERT INTO {OSM_SCHEMA}.{GISCO_LAU_TABLE} "
+        "(lau_id, country_code, name, geom) VALUES %s "
+        "ON CONFLICT (lau_id) DO UPDATE SET "
+        "country_code = EXCLUDED.country_code, name = EXCLUDED.name, "
+        "geom = EXCLUDED.geom, loaded_at = now()"
+    )
+    from psycopg2.extras import execute_values
+    total = 0
+    for start in range(0, len(payload), 2000):
+        chunk = payload[start:start + 2000]
+        with postgis.get_conn().cursor() as cur:
+            execute_values(
+                cur, sql, chunk,
+                template="(%s, %s, %s, ST_Transform(ST_GeomFromWKB(%s, %s), 3035))",
+                page_size=200,
+            )
+        total += len(chunk)
+    return total
+
+
+# How a postcode polygon's shares are measured.  The LAU area comes from the
+# SAME geometry the overlap does, so the two are commensurate and the ratio does
+# not inherit a discrepancy between the published AREA_KM2 and the drawn
+# boundary.  Computing the intersection once per (LAU, postcode) pair, through a
+# LATERAL, matters: written twice (once to filter, once to measure) it is
+# evaluated twice for every pair.
+_GISCO_OVERLAP_SQL = """
+WITH lau AS (
+    SELECT lau_id, geom, ST_Area(geom) / 1000000.0 AS lau_area_km2
+    FROM {schema}.{lau_table}
+    WHERE country_code = %s
+)
+SELECT b.code AS postcode,
+       lau.lau_id,
+       lau.lau_area_km2,
+       ST_Area(part.geom) / 1000000.0 AS overlap_km2
+FROM lau
+JOIN {schema}.boundary_areas b
+  ON b.country_code = %s
+ AND b.kind = %s
+ AND ST_Intersects(lau.geom, ST_Transform(b.geom, 3035))
+CROSS JOIN LATERAL (
+    SELECT ST_Intersection(lau.geom, ST_Transform(b.geom, 3035)) AS geom
+) part
+WHERE NOT ST_IsEmpty(part.geom)
+"""
+
+
+def gisco_lau_overlaps(country_code: str, kind: str = "postcode") -> List[Dict[str, Any]]:
+    """`(postcode, LAU)` overlap areas for a country, from PostGIS.
+
+    Requires BOTH halves to be loaded already: the LAU polygons via
+    `load_gisco_lau_geometry` and the country's postcode polygons in
+    `osm.boundary_areas` under `kind`.  Returns [] only when there genuinely is
+    no overlap; the caller is responsible for telling "no postcodes loaded"
+    apart from "postcodes loaded, nothing intersects", because the first is an
+    operator mistake and the second is a data fact.
+    """
+    from countries import normalize_country_code
+
+    code = normalize_country_code(country_code)
+    with postgis.get_conn().cursor() as cur:
+        cur.execute(
+            _GISCO_OVERLAP_SQL.format(schema=OSM_SCHEMA, lau_table=GISCO_LAU_TABLE),
+            (code, code, str(kind)),
+        )
+        names = [d[0] for d in cur.description]
+        return [dict(zip(names, row)) for row in cur.fetchall()]
+
+
+def gisco_postcode_polygons(country_code: str, kind: str = "postcode") -> int:
+    """How many postcode polygons of `kind` this country has loaded.
+
+    Read separately from the overlap so an empty result can be attributed to the
+    right cause instead of being reported as "this country has no population".
+    """
+    from countries import normalize_country_code
+
+    with postgis.get_conn().cursor() as cur:
+        cur.execute(
+            f"SELECT count(*) FROM {OSM_SCHEMA}.boundary_areas "
+            "WHERE country_code = %s AND kind = %s",
+            (normalize_country_code(country_code), str(kind)),
+        )
+        return int(cur.fetchone()[0] or 0)
+
+
+def gisco_register_records(path: str, country_code: str,
+                           kind: str = "postcode") -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Build postcode register records from a LAU file plus loaded postcode polygons.
+
+    This is the join the whole GISCO path exists for: population lives on the
+    municipality, the register is keyed on the postcode, and the only thing that
+    connects them is geometry.  Raises rather than returning [] when a half is
+    missing, so a misconfigured run cannot look like a country with no data.
+    """
+    from countries import normalize_country_code
+
+    code = normalize_country_code(country_code)
+    if not code:
+        raise ValueError("the gisco source needs a country (--country DE)")
+    if not postgis.is_available():
+        raise RuntimeError("postgis_unavailable")
+
+    with open(path, "r", encoding="utf-8-sig", errors="replace", newline="") as fh:
+        lau_records = list(gisco_lau.parse_lau_csv(fh, code))
+    if not lau_records:
+        raise ValueError(
+            f"{path} holds no LAU rows for {code}; is it the right vintage and "
+            "was --country used when it was fetched?"
+        )
+    population = {r["lau_id"]: r["population"] for r in lau_records}
+    # The vintage travels onto every row a load writes, so it is read from the
+    # file rather than from the source entry: `parse_lau_csv` takes the year from
+    # the CSV's own YEAR / POP_<year> column, and a register row that says 2024 is
+    # what lets a planner tell two loads of the same country apart.
+    vintage = next(
+        (f"GISCO LAU {r['year']} (population at 31 December {r['year']})"
+         for r in lau_records if r.get("year")),
+        "",
+    )
+
+    polygons = gisco_postcode_polygons(code, kind)
+    if not polygons:
+        # The remedy is named, not implied: this is the one step of a European
+        # load that is a separate command, and "load the postcode boundaries"
+        # is not an instruction anybody can follow without being told how.
+        raise ValueError(
+            f"no postcode polygons are loaded for {code} (kind={kind} in "
+            f"{OSM_SCHEMA}.boundary_areas), so a municipality population cannot "
+            "be shared out. Load the postcode boundaries for the area first, "
+            f'e.g. python ingest_boundaries.py --postcodes "<p1>,<p2>" --country {code}'
+        )
+
+    overlaps = gisco_lau_overlaps(code, kind)
+    if not overlaps:
+        raise ValueError(
+            f"{polygons} postcode polygon(s) for {code} do not intersect any "
+            f"loaded LAU polygon. Check that {OSM_SCHEMA}.{GISCO_LAU_TABLE} holds "
+            "this country and that both are in the same CRS."
+        )
+
+    enriched = [
+        {
+            "postcode": row.get("postcode"),
+            "lau_id": row.get("lau_id"),
+            "overlap_km2": row.get("overlap_km2"),
+            "lau_area_km2": row.get("lau_area_km2"),
+            "lau_population": population.get(str(row.get("lau_id"))),
+        }
+        for row in overlaps
+    ]
+    records, stats = gisco_lau.attribute_population(enriched, code)
+    stats.update({
+        "lau_records": len(lau_records),
+        "lau_with_population": sum(1 for v in population.values() if v),
+        "postcode_polygons": polygons,
+        "overlaps": len(overlaps),
+        "kind": kind,
+        "municipalities": len({r["lau_id"] for r in lau_records}),
+        "vintage": vintage,
+    })
+    return records, stats
+
+
 def ingest_source(
     slug: str,
     path: str = "",
@@ -910,11 +1348,16 @@ def ingest_source(
     on_batch: Optional[Any] = None,
     areas: Optional[Sequence[str]] = None,
     postcodes: Optional[Sequence[str]] = None,
+    country_code: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Fetch-and-load front end for one named register source (the CLI's entry).
 
     `path` is the operator's own count-bearing file. Area lookup sources are
     metadata/crosswalk-only and are rejected before any database write.
+
+    `country_code` overrides the source's own country, which exists because GISCO
+    publishes 34 of them and the source entry cannot name one without lying about
+    the other 33. Every other source carries its country and ignores this.
     """
     source = REGISTER_SOURCES.get(slug)
     if source is None:
@@ -924,7 +1367,23 @@ def ingest_source(
             f"{slug} is a postcode geography lookup, not a dwelling-count source; "
             "it cannot be loaded into osm.household_register"
         )
-    if source.get("kind") == "epc_api":
+    effective_country = str(
+        country_code or source.get("country_code") or "GB"
+    ).strip().upper()
+    gisco_stats: Optional[Dict[str, Any]] = None
+    if source.get("kind") == "gisco_lau":
+        # Not a file of postcode counts: a file of MUNICIPAL populations, which
+        # only becomes a register through the geometry already in PostGIS. So it
+        # does not go through `read_register_file` at all.
+        if not path:
+            raise ValueError(
+                f"--source {slug} needs --file <the LAU CSV from fetch_gisco_lau.py>"
+            )
+        records, gisco_stats = gisco_register_records(
+            path, effective_country,
+            str(source.get("postcode_kind") or "postcode"),
+        )
+    elif source.get("kind") == "epc_api":
         # The API takes a postcode FILTER, so a project loads exactly the
         # postcodes it has -- either listed outright or given as outward codes.
         records = read_epc_api(source, list(postcodes or areas or []))
@@ -947,15 +1406,18 @@ def ingest_source(
         return {
             "source": source["name"], "licence": source.get("licence"),
             "vintage": source.get("vintage"), "purged": 0, "loaded": 0,
-            "kind": source.get("kind"), "country_code": source.get("country_code"),
+            "kind": source.get("kind"), "country_code": effective_country,
             "areas": sorted(a.upper() for a in (areas or [])) or None,
         }
     if not postgis.is_available():
         raise RuntimeError("postgis_unavailable")
+    # The vintage written on the rows: the one the loaded file states, when the
+    # source read one, and the source's own text otherwise.
+    row_vintage = (gisco_stats or {}).get("vintage") or source.get("vintage")
     # Replace is source-scoped. A merge must not pass ``source=None`` here:
     # register_purge interprets that as "delete every register row for GB".
     purged = (
-        register_purge(source["country_code"], source=str(source["name"]))
+        register_purge(effective_country, source=str(source["name"]))
         if replace else 0
     )
     loaded = 0
@@ -965,8 +1427,8 @@ def ingest_source(
         if len(batch) >= 5000:
             loaded += register_ingest(
                 batch, source=str(source["name"]),
-                country_code=source["country_code"],
-                vintage=source.get("vintage"), licence=source.get("licence"),
+                country_code=effective_country,
+                vintage=row_vintage, licence=source.get("licence"),
             )
             batch = []
             if on_batch:
@@ -976,21 +1438,35 @@ def ingest_source(
     if batch and (not limit or loaded < limit):
         loaded += register_ingest(
             batch, source=str(source["name"]),
-            country_code=source["country_code"],
-            vintage=source.get("vintage"), licence=source.get("licence"),
+            country_code=effective_country,
+            vintage=row_vintage, licence=source.get("licence"),
         )
     if on_batch:
         on_batch(loaded)
-    return {
+    result = {
         "source": source["name"],
         "licence": source.get("licence"),
-        "vintage": source.get("vintage"),
+        "vintage": row_vintage,
         "purged": purged,
         "loaded": loaded,
         "kind": source.get("kind"),
-        "country_code": source.get("country_code"),
+        "country_code": effective_country,
         "areas": sorted(a.upper() for a in (areas or [])) or None,
     }
+    if gisco_stats is not None:
+        # Carried out so the CLI can report the assumptions the counts rest on
+        # rather than only how many rows landed.
+        result["estimate"] = {
+            "basis": gisco_stats.get("assumption"),
+            "persons_per_household": gisco_stats.get("persons_per_household"),
+            "household_size_published": gisco_stats.get("household_size_published"),
+            "municipalities": gisco_stats.get("lau_records"),
+            "with_population": gisco_stats.get("lau_with_population"),
+            "postcode_polygons": gisco_stats.get("postcode_polygons"),
+            "overlaps": gisco_stats.get("overlaps"),
+            "clamped_lau_totals": gisco_stats.get("clamped_lau_totals", 0),
+        }
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1055,7 +1531,13 @@ def load_register(country_code: str, postcodes: Sequence[str]
     the area rather than a scan of the full register.
     """
     from countries import normalize_country_code
-    wanted = sorted({p for p in (normalize_postcode(pc) for pc in postcodes) if p})
+    # Normalised FOR THIS COUNTRY.  The GB default turned every German postcode
+    # into "", so `wanted` was empty, the register looked up nothing, and the
+    # design quietly fell back to the OSM heuristic while the loaded counts sat
+    # in the table unused -- with no error anywhere, because "no postcode
+    # matched" and "no register loaded" are deliberately the same answer here.
+    code = normalize_country_code(country_code)
+    wanted = sorted({p for p in (normalize_postcode(pc, code) for pc in postcodes) if p})
     meta: Dict[str, Any] = {"available": False, "matched": 0, "requested": len(wanted)}
     if not wanted or not register_ready(country_code):
         return {}, {}, meta
@@ -1187,6 +1669,7 @@ def apply_register(
     premises: Sequence[Dict[str, Any]],
     by_postcode: Dict[str, int],
     by_uprn: Optional[Dict[str, int]] = None,
+    country_code: str = "GB",
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Replace heuristic household counts with register counts where they exist.
 
@@ -1217,8 +1700,13 @@ def apply_register(
     service locations (`below_premise_count`) cannot be honoured without either
     zeroing a location or inflating the total, so the total wins where it can and the
     shortfall is reported.
+
+    `country_code` decides the postcode SHAPE the premises are keyed on, and so
+    must be the country the register was loaded for; the defaults keep the UK
+    behaviour of every existing caller.
     """
     rows = [dict(p) for p in premises]
+    country = str(country_code or "GB").strip().upper()
     stats: Dict[str, Any] = {
         "enabled": False,
         "postcodes_matched": 0,
@@ -1240,7 +1728,7 @@ def apply_register(
     # Group the premise indices by normalised postcode, preserving order.
     groups: Dict[str, List[int]] = {}
     for i, p in enumerate(rows):
-        pc = normalize_postcode(p.get("Postcode"))
+        pc = normalize_postcode(p.get("Postcode"), country)
         if pc:
             groups.setdefault(pc, []).append(i)
     stats["postcodes_seen"] = len(groups)

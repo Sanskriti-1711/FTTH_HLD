@@ -69,6 +69,12 @@ NOMINATIM_REVERSE_URL = "https://nominatim.openstreetmap.org/reverse"
 # same mirror list and fallback the permit loader uses.
 OVERPASS_URLS = (
     "https://overpass-api.de/api/interpreter",
+    # The alternate front end to the SAME cluster.  It is listed separately
+    # because on 2026-10-17 the main host stopped answering inside a 30 s read
+    # while z. answered a Berlin count query in 32 s: one hostname being down is
+    # not the service being down, and a fallback that shares a cluster still
+    # covers that case.
+    "https://z.overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
     "https://overpass.private.coffee/api/interpreter",
 )
@@ -1601,6 +1607,103 @@ def boundary_dataset_by_name(
     return _dataset_row_payload(rows[0]) if rows else None
 
 
+# OSM's own postcode boundaries, stored under their postcode so the ladder does
+# not have to re-find them and the European household register has polygons to
+# apportion a municipality's population onto.  See `persist_postcode_boundary`.
+OSM_POSTCODE_SOURCE = "OpenStreetMap postcode boundary (resolved via Nominatim)"
+
+OSM_POSTCODE_LICENCE = (
+    "(c) OpenStreetMap contributors, ODbL 1.0 "
+    "(https://www.openstreetmap.org/copyright) -- attribution required; the "
+    "polygon is derived from OSM data, not from a government register."
+)
+
+
+def persist_postcode_boundary(
+    country_code: str,
+    postcode: str,
+    resolution: Dict[str, Any],
+) -> bool:
+    """Store the postcode boundary a resolve just found in `osm.boundary_areas`.
+
+    German (and most European) postcodes DO exist in OSM as
+    `boundary=postal_code` relations, so `resolve_area` returns a real polygon
+    for "12105, Berlin" -- and then kept it only in `osm.area_cache`, under the
+    exact label that was searched.  Two callers need the polygon under the
+    POSTCODE instead:
+
+      * `ingest_household_register.py --source gisco` shares a municipality's
+        population out across the postcode polygons in `boundary_areas`.  With
+        none loaded for Germany the load refuses, and "Germany has no household
+        register" then reads like a data gap when what is missing is a rung.
+
+      * the next resolve, where `boundary_dataset_lookup` is the rung that
+        answers when OSM holds no postcode polygon at all.
+
+    Only the OSM object's OWN postcode boundary is stored: the resolution must
+    have come from Nominatim AND matched `boundary`/`postal_code`.  A bounding
+    box, an enclosing city or a ward is not the postcode, and storing one would
+    make every later answer claim a precision it does not have.
+
+    An existing row is left alone.  That is what keeps a government dataset
+    (`kind='postcode'`, e.g. the US ZCTAs) from being overwritten by an OSM
+    polygon for the same code, and it stops a resolve from touching `loaded_at`
+    on every call.
+
+    Returns True when a row was written.  Never raises: a resolve must not fail
+    because its boundary could not be cached.
+    """
+    code = normalize_country_code(country_code)
+    code_post = re.sub(r"\s+", "", str(postcode or "")).upper()
+    if not code or not code_post:
+        return False
+    if str(resolution.get("polygon_source") or "") != "nominatim":
+        return False
+    if str(resolution.get("matched_category") or "") != "boundary":
+        return False
+    if str(resolution.get("matched_type") or "") != "postal_code":
+        return False
+    geometry = resolution.get("polygon") or {}
+    if not isinstance(geometry, dict) or geometry.get("type") not in ("Polygon", "MultiPolygon"):
+        return False
+    try:
+        if not postgis.is_available() or not schema_ready():
+            return False
+        existing = boundary_dataset_lookup(code, code_post)
+        if existing:
+            return False
+        written = boundary_dataset_ingest(
+            [
+                {
+                    "country_code": code,
+                    "code": code_post,
+                    "name": resolution.get("matched") or code_post,
+                    "kind": "postcode",
+                    "admin_level": "postcode",
+                    "geometry": geometry,
+                    "properties": {
+                        "licence": OSM_POSTCODE_LICENCE,
+                        "dataset": OSM_POSTCODE_SOURCE,
+                        "vintage": str(resolution.get("resolved_at") or ""),
+                        "osm_type": resolution.get("osm_type"),
+                        "osm_id": resolution.get("osm_id"),
+                        "note": (
+                            "The OpenStreetMap object tagged boundary=postal_code "
+                            "for this postcode -- the postcode's own boundary, not "
+                            "an enclosing ward or a bounding box. Stored from the "
+                            "area resolve so the household register can apportion "
+                            "onto it and later resolves need no second lookup."
+                        ),
+                    },
+                }
+            ],
+            OSM_POSTCODE_SOURCE,
+        )
+    except Exception:  # noqa: BLE001 - see the docstring
+        return False
+    return bool(written)
+
+
 def dataset_stamp(country_code: str) -> str:
     """A fingerprint of the loaded boundary datasets for a country ("" if none).
 
@@ -1615,6 +1718,14 @@ def dataset_stamp(country_code: str) -> str:
     ingest re-resolves and everything after that is served from cache again.  A
     version constant would have to be bumped by hand on every ingest, which is
     the kind of thing this feature has already been bitten by twice.
+
+    OSM postcode boundaries (`OSM_POSTCODE_SOURCE`) are EXCLUDED, and that is not
+    a detail: they are written BY a resolve (see `persist_postcode_boundary`),
+    so counting them would make every new postcode invalidate the cached
+    resolution the same call had just written -- a cache that never converges,
+    and one Nominatim request per area per new postcode in the country, which is
+    exactly the rate limit this lookup is trying to stay under.  They also do
+    not change the answer for anyone else: a row is keyed on one postcode.
     """
     code_in = normalize_country_code(country_code)
     if not code_in or not schema_ready():
@@ -1622,8 +1733,8 @@ def dataset_stamp(country_code: str) -> str:
     try:
         rows = _query(
             f"SELECT max(loaded_at) AS at FROM {OSM_SCHEMA}.boundary_areas "
-            f"WHERE country_code = %s",
-            (code_in,),
+            f"WHERE country_code = %s AND source <> %s",
+            (code_in, OSM_POSTCODE_SOURCE),
         )
     except Exception:  # noqa: BLE001 - table may not exist yet
         return ""
@@ -1986,6 +2097,13 @@ def resolve_area(area: str, refresh: bool = False, country_code: str = "",
         init_schema()
 
     key = resolution_key(area, code_in)
+    # The postcode this resolution is FOR, used as the key when the boundary is
+    # stored in `osm.boundary_areas`.  It comes from the explicit argument or, for
+    # a bare postcode label, from the label itself -- the same place the rung
+    # below reads it from, so a place resolved twice cannot end up under two keys.
+    stored_code = postcode_in
+    if not stored_code and looks_like_postcode(area):
+        stored_code = re.sub(r"\s+", "", area).upper()
     # Read before the cache: a loaded dataset can change the answer for a country,
     # and a row cached under the previous dataset state must not be served.
     stamp = dataset_stamp(code_in) if schema_ready() else ""
@@ -2002,6 +2120,14 @@ def resolve_area(area: str, refresh: bool = False, country_code: str = "",
             # stamp, or an older one, and must be re-resolved rather than served:
             # otherwise the ingest appears to do nothing.
             if str(resolved.get("dataset_stamp") or "") == stamp:
+                # A row cached before postcode boundaries were stored still
+                # carries the polygon in `resolution`, so the store is brought
+                # up to date on the way out: every German postcode was already
+                # cached, and a cache hit that skipped this would mean the fix
+                # only ever applied to postcodes nobody had resolved yet.
+                persist_postcode_boundary(
+                    str(resolved.get("country_code") or code_in), stored_code, resolved
+                )
                 return resolved
 
     search_area = nominatim_query(area)
@@ -2185,6 +2311,10 @@ def resolve_area(area: str, refresh: bool = False, country_code: str = "",
         "dataset_stamp": stamp,
         **boundary_detail,
     }
+    # Keep a postcode boundary OSM itself supplied, so the register has a
+    # polygon to apportion onto and the next resolve needs no second lookup.
+    persist_postcode_boundary(resolved_cc, stored_code, resolution)
+
     if schema_ready():
         init_schema()
         _execute(
@@ -3086,18 +3216,23 @@ def _sort_key_housenumber(value: Any) -> Tuple[int, float, str]:
     return (1, 0.0, text)
 
 
-def _premise_postcode(item: Dict[str, Any]) -> str:
+def _premise_postcode(item: Dict[str, Any], country_code: str = "GB") -> str:
     """The postcode of a queued premise, from its address or its building.
 
     Address first, then building: a building polygon often carries a postcode
     that its address nodes do not, and vice versa, so either can be the only one
     present. Normalised through the register's own function, because a join that
     misses on `B113SA` vs `B11 3SA` is a join that silently returns nothing.
+
+    `country_code` picks the postcode SHAPE to normalise against, and so must be
+    the area's country: a German PLZ tested against the UK rule returns "" for
+    every premise, which looks exactly like an area with no postcodes.
     """
     addr = item.get("addr") or {}
     building = item.get("building") or {}
     return household_register.normalize_postcode(
-        addr.get("addr_postcode") or building.get("addr_postcode")
+        addr.get("addr_postcode") or building.get("addr_postcode"),
+        country_code,
     )
 
 
@@ -3130,16 +3265,22 @@ def _apply_household_register(
     """
     by_postcode = register.get("by_postcode") or {}
     by_uprn = register.get("by_uprn") or {}
+    # Carried on the register dict rather than re-derived here, so the postcode
+    # SHAPE the premises are keyed on is by construction the one the register was
+    # loaded for -- the two cannot drift apart.
+    country_code = str(register.get("country_code") or "GB")
     flat: List[Dict[str, Any]] = [
         {
             "households": int(item["hh"]),
             "household_method": item["method"],
-            "Postcode": _premise_postcode(item),
+            "Postcode": _premise_postcode(item, country_code),
             "UPRN": _premise_uprn(item),
         }
         for item in pending
     ]
-    resolved, stats = household_register.apply_register(flat, by_postcode, by_uprn)
+    resolved, stats = household_register.apply_register(
+        flat, by_postcode, by_uprn, country_code
+    )
     for item, row in zip(pending, resolved):
         item["hh"] = int(row.get("households") or 1)
         item["method"] = str(row.get("household_method") or item["method"])
@@ -3206,6 +3347,7 @@ def household_register_for(
     if not by_postcode and not by_uprn:
         return None
     return {
+        "country_code": code,
         "by_postcode": by_postcode,
         "by_uprn": by_uprn,
         "source": meta.get("source"),

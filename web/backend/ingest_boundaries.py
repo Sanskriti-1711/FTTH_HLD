@@ -18,6 +18,23 @@ inside it.  The ONS ward polygons are what make either of them narrow.
     python ingest_boundaries.py --source uk-wards --limit 200 --verify=-1.9360,52.5140
     python ingest_boundaries.py --count
 
+`--postcodes` is the second half of the same idea for countries where the
+postcode boundary ALREADY exists in OpenStreetMap.  A German postcode resolves
+to a real `boundary=postal_code` polygon, but that polygon used to live only in
+`osm.area_cache` under the label that was searched -- so
+`ingest_household_register.py --source gisco` had nothing to apportion a
+municipality's population onto.  This mode resolves the named postcodes through
+the engine's own ladder and stores the postcode's own boundary in
+`osm.boundary_areas` under it:
+
+    python ingest_boundaries.py --postcodes "12105,12305" --country DE
+
+One Nominatim request per postcode, at most one a second, so this is for the
+postcodes a project actually needs -- not a country dump.  A postcode whose OSM
+object is not the postcode's own boundary (an office block, the enclosing city,
+a synthetic address label) is reported and NOT stored: a wrong polygon would
+silently make the apportionment count the wrong people.
+
 A re-ingest REPLACES a source's polygons for its country rather than merging
 them: `boundary_dataset_ingest` upserts on (country_code, code), so a newer ONS
 vintage would update the wards that still exist and silently leave an abolished
@@ -33,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -126,6 +144,13 @@ def main() -> int:
     ap.add_argument("--verify", default="",
                     help="after loading, report the loaded polygon containing LON,LAT "
                          "(write --verify=LON,LAT when LON is negative)")
+    ap.add_argument("--postcodes", default="",
+                    help="comma-separated postcodes whose OSM postcode boundary should "
+                         "be stored in osm.boundary_areas (needs --country); this "
+                         "mode ignores --source")
+    ap.add_argument("--country", default="",
+                    help="ISO country code for --postcodes (a postcode shape does not "
+                         "identify a country: five digits are DE, FR, ES, IT, NO...)")
     args = ap.parse_args()
 
     print(f"env:    {ENV_FILE or 'no .env found (database defaults to localhost)'}")
@@ -145,6 +170,49 @@ def main() -> int:
             have = loaded_rows(source["country_code"], source.get("kind"))
             print(f"{slug:<10} {have if have is not None else 'unknown'} "
                   f"{source.get('kind')} polygon(s) for {source.get('country_code')}")
+        return 0
+
+    postcodes = [p.strip() for p in (args.postcodes or "").split(",") if p.strip()]
+    if postcodes:
+        country = osm_source.normalize_country_code(args.country)
+        if not country:
+            print("--postcodes needs --country <ISO code> (a postcode shape does not "
+                  "identify a country)", file=sys.stderr)
+            return 2
+        if not osm_source.postgis.is_available():
+            print("PostGIS is not reachable, so there is nothing to store into.",
+                  file=sys.stderr)
+            return 3
+        stored = 0
+        for index, postcode in enumerate(postcodes):
+            if index:
+                # Nominatim's usage policy is one request a second.  A project
+                # names a handful of postcodes, so waiting is cheaper than
+                # being blocked for the whole session.
+                time.sleep(1.0)
+            label = osm_source.compose_area(postcode=postcode, country_code=country)
+            try:
+                resolution = osm_source.resolve_area(
+                    label, country_code=country,
+                    input_type="postcode", postcode=postcode,
+                )
+            except Exception as exc:  # noqa: BLE001 - reported per postcode, not fatal
+                print(f"{postcode}: could not resolve: {type(exc).__name__}: {exc}",
+                      file=sys.stderr)
+                continue
+            row = osm_source.boundary_dataset_lookup(country, postcode)
+            ok = bool(row) and str(row.get("kind") or "") == "postcode"
+            stored += 1 if ok else 0
+            print(f"{postcode}: {resolution.get('matched') or label}")
+            print(f"      source={resolution.get('polygon_source')} "
+                  f"area={resolution.get('area_km2')} km2 "
+                  f"stored={'yes' if ok else 'NO -- not the postcode boundary'}")
+        print(f"\n{stored} of {len(postcodes)} postcode boundary(ies) stored for "
+              f"{country}")
+        if not stored:
+            print("nothing was stored, so the household register still has no "
+                  "polygon to apportion onto.", file=sys.stderr)
+            return 4
         return 0
 
     source = SOURCES.get(args.source)
