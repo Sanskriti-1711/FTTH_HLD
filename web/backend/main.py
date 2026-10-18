@@ -110,7 +110,8 @@ ONECLICK_OUTPUTS: List[Tuple[str, str, str]] = [
     # `chambers` layer below, which is what a reader of the HLD panel actually
     # needs. Serving it put ~125 undifferentiated dots on the map next to the
     # chambers they had already become, which is noise, not evidence. The file
-    # is still produced and still ships in the Design Package ZIP.
+    # is still produced on the engine, but neither package bundles it: both
+    # ZIPs carry only the files behind the layers this list publishes.
     # (`design` in the LLD keeps it: there it is the designer's own working
     # output, not a finished layer.)
     ("brownfield", "Existing_Infrastructure.gpkg", "Existing_Infrastructure.geojson"),
