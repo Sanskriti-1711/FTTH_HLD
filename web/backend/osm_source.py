@@ -78,6 +78,11 @@ OVERPASS_URLS = (
     "https://overpass.kumi.systems/api/interpreter",
     "https://overpass.private.coffee/api/interpreter",
 )
+# How many times the whole mirror list is tried, and the base pause between
+# rounds (it grows: 1x, 2x, ...).  Two rounds ride out a brief outage without
+# making a user wait minutes for a dead service.
+OVERPASS_ROUNDS = 2
+OVERPASS_RETRY_DELAY_S = 15.0
 
 # Nominatim's usage policy requires an identifying User-Agent.
 USER_AGENT = "fiber-ftth-engine/1.0 (FTTH HLD area inputs)"
@@ -2410,17 +2415,23 @@ def overpass_query(body: str, bbox: Sequence[float], timeout: int = 180) -> Tupl
     scoped = ";".join(re.sub(r"^(node|way|rel)", rf"\1{bbox_arg}", st) for st in statements)
     query = f"[out:json][timeout:{int(timeout)}];({scoped};);out geom;".encode("utf-8")
 
+    # Public Overpass mirrors fail transiently (502/504/500, rate limits), often
+    # all at once. One pass over the mirrors is not enough, so retry the whole
+    # list a bounded number of times with a pause before giving up.
     last: Optional[Exception] = None
-    for url in OVERPASS_URLS:
-        try:
-            payload = _http_json(
-                url, data=query, timeout=float(timeout) + 30.0,
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
-            return list(payload.get("elements") or []), url
-        except Exception as exc:  # noqa: BLE001 - try the next mirror
-            last = exc
-    raise RuntimeError(f"Overpass request failed on all mirrors: {last}") from last
+    for round_no in range(OVERPASS_ROUNDS):
+        if round_no:
+            time.sleep(OVERPASS_RETRY_DELAY_S * round_no)
+        for url in OVERPASS_URLS:
+            try:
+                payload = _http_json(
+                    url, data=query, timeout=float(timeout) + 30.0,
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                )
+                return list(payload.get("elements") or []), url
+            except Exception as exc:  # noqa: BLE001 - try the next mirror
+                last = exc
+    raise RuntimeError(f"Overpass request failed on all mirrors after {OVERPASS_ROUNDS} rounds: {last}") from last
 
 
 def _element_geometry(el: Dict[str, Any]) -> Optional[Dict[str, Any]]:

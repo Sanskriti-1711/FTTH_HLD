@@ -2654,3 +2654,38 @@ def test_household_method_label_names_a_mix_instead_of_picking_one():
     assert osm_source.household_method_label([]) == ""
     assert osm_source.household_method_label(["building_flats", "fallback_one"]) == \
         "mixed(building_flats,fallback_one)"
+
+
+def test_overpass_retries_the_mirror_list_before_failing(monkeypatch):
+    """A transient outage on every mirror in one pass must not fail the area.
+
+    The second round succeeds; the caller gets the elements and the mirror that
+    answered.  The pause between rounds is patched out so the test is instant.
+    """
+    calls = []
+    sleeps = []
+
+    def fake_http_json(url, data=None, timeout=None, headers=None):
+        calls.append(url)
+        if len(calls) <= len(osm_source.OVERPASS_URLS):
+            raise RuntimeError("HTTP Error 504: Gateway Time-out")
+        return {"elements": [{"type": "node", "id": 1}]}
+
+    monkeypatch.setattr(osm_source, "_http_json", fake_http_json)
+    monkeypatch.setattr(osm_source.time, "sleep", lambda s: sleeps.append(s))
+
+    elements, mirror = osm_source.overpass_query("node[building]", (0, 0, 1, 1))
+
+    assert elements == [{"type": "node", "id": 1}]
+    assert mirror == osm_source.OVERPASS_URLS[0]
+    assert len(calls) == len(osm_source.OVERPASS_URLS) + 1
+    assert sleeps == [osm_source.OVERPASS_RETRY_DELAY_S]
+
+
+def test_overpass_gives_up_after_every_round_with_the_cause(monkeypatch):
+    monkeypatch.setattr(osm_source, "_http_json",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("HTTP Error 502")))
+    monkeypatch.setattr(osm_source.time, "sleep", lambda s: None)
+
+    with pytest.raises(RuntimeError, match=f"after {osm_source.OVERPASS_ROUNDS} rounds.*502"):
+        osm_source.overpass_query("node[building]", (0, 0, 1, 1))
