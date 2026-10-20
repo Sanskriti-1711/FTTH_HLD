@@ -44,9 +44,11 @@ import json
 import math
 import os
 import re
+import socket
 import time
 import threading
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -660,7 +662,18 @@ def _http_json(
     timeout: float = 180.0,
     headers: Optional[Dict[str, str]] = None,
 ) -> Any:
-    """GET/POST JSON with a bounded retry.  stdlib only -- no extra dependency."""
+    """GET/POST JSON with a bounded retry.  stdlib only -- no extra dependency.
+
+    A TIMEOUT is not retried here.  The retry exists for a flaky connection; a
+    timeout says the request itself outgrew the budget, and repeating the
+    identical request only repeats the wait.  Measured pathology on a 56 km^2
+    city: the buildings query needed longer than the 210 s budget, so this
+    function retried it three times on the SAME mirror (10.5 minutes), then
+    ``overpass_query`` moved to the next mirror and did it again -- the page sat
+    on "0 of 7 groups" for eight minutes with nothing actually wrong.  A timeout
+    now propagates at once so the next mirror (or a bigger per-group budget) can
+    answer instead.
+    """
     hdrs = {"User-Agent": USER_AGENT}
     if headers:
         hdrs.update(headers)
@@ -670,6 +683,14 @@ def _http_json(
             req = urllib.request.Request(url, data=data, headers=hdrs)
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.URLError as exc:
+            if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+                raise TimeoutError(f"no answer within {timeout:.0f}s") from exc
+            last = exc
+            if attempt < 2:
+                time.sleep(2.0 * (attempt + 1))
+        except (TimeoutError, socket.timeout) as exc:
+            raise TimeoutError(f"no answer within {timeout:.0f}s") from exc
         except Exception as exc:  # noqa: BLE001 - reported to the caller
             last = exc
             if attempt < 2:
@@ -2441,6 +2462,70 @@ def overpass_query(body: str, bbox: Sequence[float], timeout: int = 180) -> Tupl
     raise RuntimeError(f"Overpass request failed on all mirrors after {OVERPASS_ROUNDS} rounds: {last}") from last
 
 
+# A city's buildings are the one query that genuinely needs longer than the
+# 180 s default; everything else is a small reference layer.  Handing the heavy
+# group a 300 s budget is cheaper than letting it time out at 210 s and start
+# over on the next mirror, which is what used to happen.
+_GROUP_TIMEOUT_S: Dict[str, int] = {"buildings": 300}
+
+
+def _group_workers(count: int, workers: Optional[int] = None) -> int:
+    """How many Overpass queries may be in flight at once.
+
+    Bounded on purpose: the mirrors rate-limit per client, and this runs in the
+    same 512 MB container QGIS needs afterwards.  ``OSM_FETCH_WORKERS=1``
+    restores the old one-at-a-time behaviour.
+    """
+    if workers is None:
+        raw = os.environ.get("OSM_FETCH_WORKERS")
+        try:
+            workers = int(raw) if raw not in (None, "") else 3
+        except (TypeError, ValueError):
+            workers = 3
+    return max(1, min(int(workers), max(1, count)))
+
+
+def fetch_groups(groups: Sequence[Tuple[str, str]], bbox: Sequence[float],
+                 workers: Optional[int] = None, on_group=None, on_start=None) -> List[str]:
+    """Fetch every Overpass group CONCURRENTLY, handing each one back as it lands.
+
+    The groups are independent queries, but they used to be fetched one after
+    another, so the download cost the SUM of them: the city's buildings took
+    minutes and the six small reference layers waited behind it.
+
+    ``on_group(name, elements, mirror)`` is called on the CALLER's thread, in
+    completion order. That is deliberate: storing a group writes to the OSM
+    schema, and keeping every write on one thread keeps one connection in play
+    and releases each group's elements as soon as they are stored — the memory
+    profile the container was sized for.
+
+    A group that fails fails the whole fetch (the caller retries the area), the
+    same contract the serial loop had.
+    """
+    groups = list(groups)
+    if not groups:
+        return []
+    done: List[str] = []
+    with ThreadPoolExecutor(max_workers=_group_workers(len(groups), workers)) as pool:
+        futures = {}
+        for name, body in groups:
+            # ``on_start`` runs on the caller's thread as each group is queued,
+            # so the progress the page polls names a group from the moment the
+            # fetch begins instead of sitting on "queued".
+            if on_start is not None:
+                on_start(name)
+            futures[pool.submit(
+                overpass_query, body, bbox, _GROUP_TIMEOUT_S.get(name, 180)
+            )] = name
+        for future in as_completed(futures):
+            name = futures[future]
+            elements, mirror = future.result()
+            if on_group is not None:
+                on_group(name, elements, mirror)
+            done.append(name)
+    return done
+
+
 def _element_geometry(el: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Overpass `out geom` element -> GeoJSON geometry (point/polygon/linestring)."""
     if el.get("type") == "node":
@@ -2805,6 +2890,7 @@ def area_fetch_state(area: str = "", bbox: Optional[Sequence[float]] = None) -> 
         "source": None,
         "counts": {},
         "error": None,
+        "in_flight": [],
     }
     key = _bbox_key(bbox) if bbox is not None else None
     with _FETCH_LOCK:
@@ -2823,6 +2909,11 @@ def area_fetch_state(area: str = "", bbox: Optional[Sequence[float]] = None) -> 
                     "source": entry.get("source"),
                     "counts": entry.get("counts") or {},
                     "error": entry.get("error"),
+                    # The groups downloading RIGHT NOW.  With the groups fetched
+                    # concurrently there is no single "current" one, and a page
+                    # that only showed a done-count looked stuck on the biggest
+                    # query; this names it.
+                    "in_flight": list(entry.get("in_flight") or ()),
                 }
             )
     if result["started_at"]:
@@ -2847,6 +2938,7 @@ def _set_fetch_state(
     source: Optional[str] = None,
     counts: Optional[Dict[str, int]] = None,
     error: Optional[str] = None,
+    in_flight: Optional[Sequence[str]] = None,
     reset: bool = False,
 ) -> None:
     with _FETCH_LOCK:
@@ -2862,6 +2954,7 @@ def _set_fetch_state(
                 "source": None,
                 "counts": {},
                 "error": None,
+                "in_flight": [],
             },
         )
         if reset:
@@ -2875,6 +2968,7 @@ def _set_fetch_state(
             entry["counts"] = {}
             entry["error"] = None
             entry["finished_at"] = None
+            entry["in_flight"] = []
             entry["started_at"] = _now().isoformat(timespec="seconds")
         entry["state"] = state
         if groups_done is not None:
@@ -2887,6 +2981,8 @@ def _set_fetch_state(
             entry["counts"] = counts
         if error is not None:
             entry["error"] = error
+        if in_flight is not None:
+            entry["in_flight"] = list(in_flight)
         entry["updated_at"] = _now().isoformat(timespec="seconds")
         if state in ("ready", "failed"):
             entry["finished_at"] = entry["updated_at"]
@@ -2904,32 +3000,57 @@ def _run_area_fetch(key: str, area: str, bbox: Sequence[float]) -> None:
     # the platform has ever seen, and extract_meta is what the cache check and
     # the provenance line read.
     counts: Dict[str, int] = {}
+    in_flight: List[str] = []
+
+    def _starting_group(group: str) -> None:
+        """Log + report the phase as a group is queued (fetch thread)."""
+        in_flight.append(group)
+        meminfo.trace(f"osm fetch {key[:8]} requesting {group}")
+        _set_fetch_state(
+            key, f"fetching_{in_flight[0]}", groups_done=done,
+            in_flight=list(in_flight),
+        )
+
+    def _store_group(group: str, group_elements: List[Dict[str, Any]], mirror: str) -> None:
+        """Store one group and record the progress.  Runs on the fetch thread."""
+        nonlocal done, mirror_used
+        done += 1
+        mirror_used = mirror
+        # Store each group as it arrives instead of holding every element in
+        # memory until the last one lands: a city download is tens of
+        # thousands of elements, and the ones already in make the counts and
+        # the point layers available to anything reading the store.
+        for table, written in (store_overpass_elements(group_elements) or {}).items():
+            counts[table] = counts.get(table, 0) + int(written or 0)
+        # The parsed group and the row tuples built from it are dead from
+        # here on.  Dropping the reference is not enough under glibc -- the
+        # arena stays -- and this runs in the same 512 MB container QGIS
+        # will need, so hand it back before the next group is stored.
+        del group_elements
+        meminfo.trace(f"osm fetch {key[:8]} stored {group}")
+        meminfo.trim()
+        try:
+            in_flight.remove(group)
+        except ValueError:
+            pass
+        # The phase names the group we have been waiting on longest, so it does
+        # not flip between the several queries in flight at the same time.
+        phase = f"fetching_{in_flight[0]}" if in_flight else "storing"
+        _set_fetch_state(
+            key, phase, groups_done=done, detail=mirror_used,
+            counts=dict(counts), in_flight=list(in_flight),
+        )
+
     try:
         # Every attempt starts from zero, whether it was started here or
         # entered directly through ensure_area_data().
         _set_fetch_state(key, "queued", groups_done=0, reset=True)
-        for group, body in groups:
-            _set_fetch_state(key, f"fetching_{group}", groups_done=done)
-            meminfo.trace(f"osm fetch {key[:8]} requesting {group}")
-            group_elements, mirror_used = overpass_query(body, bbox)
-            done += 1
-            # Store each group as it arrives instead of holding every element in
-            # memory until the last one lands: a city download is tens of
-            # thousands of elements, and the ones already in make the counts and
-            # the point layers available to anything reading the store.
-            for table, written in (store_overpass_elements(group_elements) or {}).items():
-                counts[table] = counts.get(table, 0) + int(written or 0)
-            # The parsed group and the row tuples built from it are dead from
-            # here on.  Dropping the reference is not enough under glibc -- the
-            # arena stays -- and this runs in the same 512 MB container QGIS
-            # will need, so hand it back before asking for the next group.
-            del group_elements
-            meminfo.trace(f"osm fetch {key[:8]} stored {group}")
-            meminfo.trim()
-            _set_fetch_state(
-                key, f"fetching_{group}", groups_done=done, detail=mirror_used,
-                counts=dict(counts),
-            )
+        # The seven groups are independent queries and are fetched CONCURRENTLY:
+        # one after another, the download cost the sum of them, so a city's
+        # buildings (minutes on their own) held the six small reference layers
+        # back and the page showed "0 of 7 groups" the whole time.  Storing still
+        # happens here, one group at a time, as each lands.
+        fetch_groups(groups, bbox, on_group=_store_group, on_start=_starting_group)
         _set_fetch_state(key, "storing", groups_done=len(groups), detail=mirror_used)
         _execute(
             f"INSERT INTO {OSM_SCHEMA}.extract_meta (area_key, source, detail, bbox, counts, version) "
