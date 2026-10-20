@@ -582,3 +582,62 @@ def test_a_row_with_no_owner_is_left_alone(monkeypatch, tmp_path):
 
     assert main._recover_orphan_from_row({"project_id": "old-run", "status": "running"}) is None
     assert main.tasks.get("old-run") is None
+
+
+# ── writing the row the project list reads ─────────────────────────────────
+
+def test_a_dropped_connection_is_retried_before_the_stage_is_lost(monkeypatch):
+    """The row is the only thing the list and the restart guard can read.
+
+    Measured 2026-10-20 (run e8135f4c): the row was last written at 13:40:56
+    with "Object Layer 0 %" while the task itself reached "Duct Layer 55 %" at
+    13:56:43. The write is best-effort by design -- it must never fail a status
+    read -- but a connection that died mid-run has to be retried on a fresh one,
+    or every later stage becomes invisible.
+    """
+    calls = []
+    closed = []
+
+    def upsert(*a, **k):
+        calls.append(k.get("stage_name"))
+        if len(calls) == 1:
+            raise RuntimeError("connection already closed")
+
+    monkeypatch.setattr(main.postgis, "is_available", lambda: True)
+    monkeypatch.setattr(main.postgis, "upsert_project", upsert)
+    monkeypatch.setattr(main.postgis, "close_conn", lambda: closed.append(True))
+
+    main._persist_project_state("run1", {"status": "running", "stage": "Duct Layer",
+                                         "stage_index": 5, "progress": 55})
+
+    assert calls == ["Duct Layer", "Duct Layer"]
+    assert closed == [True]
+
+
+def test_a_write_that_keeps_failing_is_reported_not_swallowed(monkeypatch, capsys):
+    monkeypatch.setattr(main.postgis, "is_available", lambda: True)
+    monkeypatch.setattr(main.postgis, "close_conn", lambda: None)
+
+    def upsert(*a, **k):
+        raise RuntimeError("server closed the connection unexpectedly")
+
+    monkeypatch.setattr(main.postgis, "upsert_project", upsert)
+
+    main._persist_project_state("run2", {"status": "running", "stage": "Duct Layer"})
+
+    out = capsys.readouterr().out
+    assert "[persist] run2 could not be written" in out
+    assert "server closed the connection unexpectedly" in out
+
+
+def test_a_missing_database_is_reported_once_per_run(monkeypatch, capsys):
+    monkeypatch.setattr(main.postgis, "is_available", lambda: False)
+    monkeypatch.setattr(main.postgis, "psycopg2", object())
+    main._PERSIST_UNAVAILABLE.clear()
+
+    for _ in range(3):
+        main._persist_project_state("run3", {"status": "running", "stage": "Duct Layer"})
+
+    out = capsys.readouterr().out
+    assert out.count("[persist] run3 not written: PostGIS unavailable") == 1
+    main._PERSIST_UNAVAILABLE.clear()

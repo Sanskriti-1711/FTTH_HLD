@@ -1116,6 +1116,11 @@ def _settle_orphan(
         _persist_project_state(project_id, task)
 
 
+# Projects already reported as unpublishable, so a missing database logs once
+# per run instead of once per stage.
+_PERSIST_UNAVAILABLE: set = set()
+
+
 def _persist_project_state(
     project_id: str,
     task: Dict[str, Any],
@@ -1128,6 +1133,12 @@ def _persist_project_state(
     and invisible again after the next restart.
     """
     if not postgis.is_available():
+        # Worth a line, once per run: with psycopg2 missing this is normal local
+        # development, but on a deployment it means the project list and the
+        # restart guard are blind to every stage after this one.
+        if postgis.psycopg2 is not None and project_id not in _PERSIST_UNAVAILABLE:
+            _PERSIST_UNAVAILABLE.add(project_id)
+            print(f"[persist] {project_id[:8]} not written: PostGIS unavailable", flush=True)
         return
     status = str(task.get("status") or "unknown")
     progress = int(task.get("progress") or 0)
@@ -1135,7 +1146,7 @@ def _persist_project_state(
     # before it broke would otherwise sit in the project list looking finished.
     if status != "completed":
         progress = min(progress, 99)
-    try:
+    def write() -> None:
         postgis.upsert_project(
             project_id,
             status=status,
@@ -1149,8 +1160,31 @@ def _persist_project_state(
             stage_index=int(task.get("stage_index") or 0),
             stage_count=int(task.get("stage_count") or len(PIPELINE_STAGES)),
         )
-    except Exception:  # noqa: BLE001 - never fail a status read on a write
-        pass
+
+    # A write that fails must be retried on a fresh connection and, failing that,
+    # SAID OUT LOUD. Swallowing it silently is how run e8135f4c sat at
+    # "Object Layer 0 %" in the project list for 16 minutes on 2026-10-20 while
+    # the pipeline was in the Duct Layer: the row is the only thing the platform
+    # list and the restart guard can read, so a dead connection turns every
+    # later stage invisible with nothing anywhere reporting a problem.
+    try:
+        write()
+        return
+    except Exception as first:  # noqa: BLE001 - never fail a status read on a write
+        try:
+            postgis.close_conn()
+            write()
+            print(
+                f"[persist] {project_id[:8]} needed a fresh connection "
+                f"({type(first).__name__})",
+                flush=True,
+            )
+        except Exception as second:  # noqa: BLE001
+            print(
+                f"[persist] {project_id[:8]} could not be written: "
+                f"{type(second).__name__}: {second}",
+                flush=True,
+            )
 
 
 def _owned_in_process(project_id: str) -> bool:
