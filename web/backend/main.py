@@ -2129,12 +2129,114 @@ def _run_pipeline(
 def startup() -> None:
     if postgis.is_available():
         postgis.init_schema()
+    # Prime the snapshot off the request path so the first probe after a boot
+    # reports real counts instead of `pending` -- without boot waiting on them.
+    _refresh_store_in_background()
 
 
-@app.get("/")
-@app.get("/health")
-def health() -> Dict[str, Any]:
-    qgis = _find_qgis_process()
+# ---------------------------------------------------------------------------
+# /health is a LIVENESS probe, so it must answer in milliseconds.
+#
+# It used to read the whole store on every call: postgis.db_info() plus
+# osm_source.osm_status(), which is four `SELECT count(*)` scans -- measured
+# 2026-10-20 against the store this engine actually serves, 1,175,963 buildings,
+# 435,185 roads, 129,652 address nodes and 117,254 landuse rows -- and answered
+# in 0.86-0.96 s (2.7 s on the first call after an idle spell).  Two callers pay
+# that: keep-warm.yml pings it every ten minutes so the free Render service never
+# sleeps, and it is the probe a platform health check uses.  A probe that takes
+# ~1 s is a probe that can be reported as "engine down" while the engine is
+# perfectly healthy, and any monitoring that probes in a burst turns into a burst
+# of full-table scans against a free-tier database.
+#
+# So the store half is a CACHED SNAPSHOT with a TTL: /health answers from it
+# immediately and refreshes it on a background thread (one at a time), while
+# /health/deep does the live read for an operator who needs the truth right now.
+# The age is reported rather than hidden -- `store_cache.age_seconds` growing
+# without bound is itself the signal that the database stopped answering, which
+# is the one thing the old blocking probe could tell and could not tell quickly.
+# ---------------------------------------------------------------------------
+HEALTH_STORE_TTL = float(os.environ.get("FTTH_HEALTH_STORE_TTL", "300"))
+_health_store_lock = threading.Lock()
+_health_snapshot: Dict[str, Any] = {}
+_health_snapshot_at = 0.0
+_health_snapshot_error: Optional[str] = None
+_health_refreshing = False
+
+
+def _store_snapshot() -> Dict[str, Any]:
+    """The expensive half of /health: real database round-trips."""
+    return {"postgis": postgis.db_info(), "osm": _osm_health()}
+
+
+def _refresh_store() -> None:
+    """Re-read the store and publish it.
+
+    Never raises: a database hiccup must not fail the probe.  A failed read keeps
+    the last good snapshot, because "the database is down" has to be reported
+    *next to* the data rather than instead of it -- an operator still needs to
+    see what the store last held to tell an outage from an empty install.
+    """
+    global _health_snapshot, _health_snapshot_at, _health_snapshot_error, _health_refreshing
+    snapshot: Dict[str, Any] = {}
+    error: Optional[str] = None
+    try:
+        snapshot = _store_snapshot()
+    except Exception as exc:  # noqa: BLE001
+        error = str(exc)
+    with _health_store_lock:
+        if error is None:
+            _health_snapshot = snapshot
+            _health_snapshot_at = time.time()
+        _health_snapshot_error = error
+        _health_refreshing = False
+
+
+def _refresh_store_in_background() -> None:
+    """Start one refresh; concurrent callers share it instead of adding their own."""
+    global _health_refreshing
+    with _health_store_lock:
+        if _health_refreshing:
+            return
+        _health_refreshing = True
+    threading.Thread(target=_refresh_store, name="health-store", daemon=True).start()
+
+
+def _store_block(*, live: bool) -> Dict[str, Any]:
+    """The store half of /health, from the cache unless ``live``."""
+    if live:
+        # The one caller that wants to wait for the database: /health/deep.
+        _refresh_store()
+    with _health_store_lock:
+        age = round(time.time() - _health_snapshot_at, 1) if _health_snapshot_at else None
+        stale = age is None or age >= HEALTH_STORE_TTL
+        snapshot = dict(_health_snapshot)
+        error = _health_snapshot_error
+        refreshing = _health_refreshing
+    if not live and stale:
+        _refresh_store_in_background()
+        refreshing = True
+    block = dict(snapshot)
+    block["store_cache"] = {
+        "checked_at": (
+            datetime.fromtimestamp(_health_snapshot_at, timezone.utc).isoformat(timespec="seconds")
+            if _health_snapshot_at else None
+        ),
+        "age_seconds": age,
+        "ttl_seconds": HEALTH_STORE_TTL,
+        "stale": stale,
+        "refreshing": refreshing,
+    }
+    if error is not None:
+        block["store_cache"]["error"] = error
+    if not snapshot:
+        # First probe after a boot: the snapshot is being read right now.  Honest
+        # and instant beats blocking the probe on four table scans.
+        block["store_cache"]["pending"] = True
+    return block
+
+
+def _health_body(*, live: bool) -> Dict[str, Any]:
+    store = _store_block(live=live)
     return {
         "status": "ok",
         "service": "ftth-engine-api",
@@ -2144,10 +2246,13 @@ def health() -> Dict[str, Any]:
         # free instance), so how much of it this process holds is honest health
         # information, not diagnostics-only.
         "memory": meminfo.report(),
-        "qgis_process": qgis,
-        "postgis": postgis.db_info(),
-        "osm": _osm_health(),
+        "qgis_process": _find_qgis_process(),
+        "postgis": store.get("postgis", {}),
+        "osm": store.get("osm", {}),
+        "store_cache": store["store_cache"],
         "endpoints": [
+            "GET /health",
+            "GET /health/deep",
             "POST /ftth/hld/run",
             "POST /ftth/hld/resolve-area",
             "GET /ftth/hld/area-fetch?area=...&bbox=lon_w,lon_e,lat_s,lat_n",
@@ -2164,6 +2269,18 @@ def health() -> Dict[str, Any]:
             "DELETE /ftth/hld/projects/{project_id}",
         ],
     }
+
+
+@app.get("/")
+@app.get("/health")
+def health() -> Dict[str, Any]:
+    return _health_body(live=False)
+
+
+@app.get("/health/deep")
+def health_deep() -> Dict[str, Any]:
+    """The same body as /health, read live.  Slow by design; not for probes."""
+    return _health_body(live=True)
 
 
 @app.post("/ftth/hld/run", status_code=202)
