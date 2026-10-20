@@ -463,11 +463,20 @@ def _run_command_remote(project_id: str, cmd: Union[List[str], str],
         for line in batch.get("lines") or []:
             _consume_pipeline_line(project_id, line)
         offset = int(batch.get("offset") or offset)
-        if batch.get("state") in ("done", "failed"):
+        state = batch.get("state")
+        if state == "unknown":
+            # The worker restarted and lost the job; its store starts empty, so
+            # polling would never end.  Say it and stop instead of hanging.
+            raise RuntimeError(
+                "The QGIS worker restarted and lost this run. Run it again."
+            )
+        if state in ("done", "failed", "canceled"):
             break
         time.sleep(QGIS_WORKER_POLL_S)
 
     status = json.loads(_worker_call(job, timeout=120) or b"{}")
+    if status.get("state") == "canceled":
+        raise RuntimeError("The run was stopped.")
     code = status.get("exit_code")
     if status.get("state") == "failed" or code not in (0, None):
         raise RuntimeError(status.get("error") or f"qgis_process exited with code {code}")
@@ -1102,6 +1111,12 @@ def _recover_orphan_from_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "error": row.get("error"),
         "output_dir": row.get("output_dir") or str(OUTPUT_DIR / project_id),
         "downloads": row.get("downloads") or [],
+        # The stage is the ONLY surviving evidence that the run did any work:
+        # the output files go with the container, and without this a run killed
+        # at the duct layer was reported as "never wrote any output".
+        "stage": row.get("stage_name") or task.get("stage"),
+        "stage_index": int(row.get("stage_index") or task.get("stage_index") or 0),
+        "progress": int(row.get("progress") or task.get("progress") or 0),
         "_from_db_row": True,
     })
     # The list must stay cheap: settle the row, leave the ingest to the results
@@ -2986,6 +3001,35 @@ def tiles(layer: str, z: int, x: int, y: int, project_id: str) -> Response:
         media_type="application/vnd.mapbox-vector-tile",
         headers={"Cache-Control": "public, max-age=300"},
     )
+
+
+@app.post("/ftth/hld/projects/{project_id}/stop", status_code=200)
+def stop_project(project_id: str) -> Dict[str, Any]:
+    """Stop a run that is in flight.
+
+    Only a worker run can be stopped from here: the worker owns the process, and
+    it reports the job as canceled, which ends the run through the ONE normal
+    failure path -- settling the row here as well would race the polling thread
+    and leave two different messages for one run.
+    """
+    task = tasks.get(project_id)
+    if not task or task.get("status") not in ("running", "queued"):
+        raise HTTPException(status_code=404, detail="No run is in flight for this project.")
+    if not QGIS_WORKER_URL:
+        raise HTTPException(
+            status_code=409,
+            detail="Stopping a run needs the QGIS worker; this engine runs the pipeline itself.",
+        )
+    try:
+        answer = json.loads(
+            _worker_call(f"/jobs/{project_id}", method="DELETE", timeout=60) or b"{}"
+        )
+    except (urllib.error.URLError, OSError) as exc:
+        raise HTTPException(
+            status_code=502, detail=f"The QGIS worker did not answer: {exc}"
+        ) from exc
+    _append(project_id, "warning", "Stop requested: the pipeline is being killed.")
+    return {"project_id": project_id, "worker": answer}
 
 
 @app.delete("/ftth/hld/projects/{project_id}", status_code=200)

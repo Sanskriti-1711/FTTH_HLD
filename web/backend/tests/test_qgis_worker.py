@@ -182,6 +182,101 @@ def test_a_second_job_waits_for_the_first(tmp_path, monkeypatch):
 
 # ── the engine's side ──────────────────────────────────────────────────────
 
+def test_a_running_job_can_be_stopped(tmp_path, monkeypatch):
+    """Stopping a run used to mean restarting the worker, which lost every job."""
+    server = _server(tmp_path, monkeypatch)
+    slow = (
+        "import pathlib, sys, time\n"
+        "print('Running Trench Layer')\n"
+        "time.sleep(30)\n"
+        "pathlib.Path(sys.argv[1], 'should_not_exist.gpkg').write_bytes(b'x')\n"
+    )
+    try:
+        _call(server, "/jobs/p1/inputs", data=_zip({}), method="PUT")
+        _call(server, "/jobs/p1", method="POST",
+              data=json.dumps({"args": ["-c", slow, str(tmp_path / "p1")]}).encode())
+        deadline = time.time() + 20
+        while time.time() < deadline and _call(server, "/jobs/p1")["state"] != "running":
+            time.sleep(0.05)
+
+        _call(server, "/jobs/p1", method="DELETE")
+        deadline = time.time() + 20
+        while time.time() < deadline and _call(server, "/jobs/p1")["state"] != "canceled":
+            time.sleep(0.1)
+
+        assert _call(server, "/jobs/p1")["state"] == "canceled"
+        assert not (tmp_path / "p1" / "should_not_exist.gpkg").exists()
+    finally:
+        server.shutdown()
+
+
+def test_a_queued_job_can_be_stopped_before_it_starts(tmp_path, monkeypatch):
+    server = _server(tmp_path, monkeypatch, concurrency=1)
+    slow = "import sys, time\ntime.sleep(5)\n"
+    try:
+        for job in ("p1", "p2"):
+            _call(server, f"/jobs/{job}/inputs", data=_zip({}), method="PUT")
+        _call(server, "/jobs/p1", method="POST",
+              data=json.dumps({"args": ["-c", slow]}).encode())
+        _call(server, "/jobs/p2", method="POST",
+              data=json.dumps({"args": ["-c", slow]}).encode())
+
+        _call(server, "/jobs/p2", method="DELETE")
+
+        assert _call(server, "/jobs/p2")["state"] == "canceled"
+    finally:
+        server.shutdown()
+
+
+def test_a_lost_job_fails_the_run_instead_of_polling_forever(tmp_path, monkeypatch):
+    """A worker restart empties its job store: "unknown" must end the wait."""
+    project = tmp_path / "proj1"
+    project.mkdir()
+    calls = []
+
+    def fake_call(path, data=None, method="GET", timeout=120):
+        calls.append((method, path))
+        if method == "PUT" or method == "POST":
+            return b"{}"
+        return b'{"state": "unknown", "lines": [], "offset": 0}'
+
+    monkeypatch.setattr(main, "QGIS_WORKER_URL", "http://worker")
+    monkeypatch.setattr(main, "_worker_call", fake_call)
+    monkeypatch.setattr(main, "_persist_project_state", lambda *a, **k: None)
+
+    with pytest.raises(RuntimeError) as exc:
+        main._run_command_remote("proj1", ["qgis_process", "run", "x"], project)
+
+    assert "lost this run" in str(exc.value)
+    assert len([c for c in calls if c[0] == "GET"]) == 1
+
+
+def test_the_stop_endpoint_kills_the_worker_job(monkeypatch):
+    killed = []
+
+    def fake_call(path, data=None, method="GET", timeout=120):
+        killed.append((method, path))
+        return b'{"state": "canceling"}'
+
+    task = main._task("proj-stop")
+    task.update({"status": "running", "stage": "Duct Layer", "stage_index": 5})
+    monkeypatch.setattr(main, "QGIS_WORKER_URL", "http://worker")
+    monkeypatch.setattr(main, "_worker_call", fake_call)
+
+    answer = main.stop_project("proj-stop")
+
+    assert killed == [("DELETE", "/jobs/proj-stop")]
+    assert answer["worker"]["state"] == "canceling"
+    assert any("Stop requested" in m["text"] for m in task["messages"])
+
+
+def test_the_stop_endpoint_refuses_when_nothing_is_running(monkeypatch):
+    monkeypatch.setattr(main, "QGIS_WORKER_URL", "http://worker")
+    with pytest.raises(main.HTTPException) as exc:
+        main.stop_project("never-started")
+    assert exc.value.status_code == 404
+
+
 def test_the_engine_collects_a_worker_run_into_the_same_directory(tmp_path, monkeypatch):
     """End to end: argv in, stdout relayed, outputs unpacked, manifest applied."""
     outputs = tmp_path / "outputs"

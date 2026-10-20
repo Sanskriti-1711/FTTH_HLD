@@ -35,6 +35,7 @@ import io
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -182,8 +183,11 @@ def _run_qgis(job_id: str, job: Dict[str, Any], out_dir: Path,
             errors="replace",
             bufsize=1,
             env=env,
+            # Its own session, so cancel_job() can signal the whole tree.
+            start_new_session=True,
         )
         job["pid"] = process.pid
+        job["process"] = process
         meminfo.trace(f"worker job {job_id[:8]} started", pid=process.pid)
         for line in iter(process.stdout.readline, ""):
             text = line.rstrip("\n")
@@ -197,7 +201,11 @@ def _run_qgis(job_id: str, job: Dict[str, Any], out_dir: Path,
         code = process.wait()
         with _lock:
             job["exit_code"] = code
-            job["state"] = "done" if code == 0 else "failed"
+            if job.get("canceled"):
+                job["state"] = "canceled"
+                job["error"] = "stopped on request"
+            else:
+                job["state"] = "done" if code == 0 else "failed"
             job["finished_at"] = time.time()
             # The manifest is written HERE, not by the API: only the worker
             # knows which files this run touched.
@@ -212,6 +220,45 @@ def _run_qgis(job_id: str, job: Dict[str, Any], out_dir: Path,
             job["error"] = str(exc)
             job["finished_at"] = time.time()
         meminfo.trace(f"worker job {job_id[:8]} failed", error=str(exc)[:120])
+
+
+def cancel_job(job_id: str) -> Dict[str, Any]:
+    """Stop a queued or running job.
+
+    A run that has to be stopped (a stuck stage, a wrong area) previously could
+    only be ended by restarting the worker, which threw away every other job's
+    state with it.
+    """
+    job = _job(job_id)
+    if job["state"] == "queued":
+        with _sched:
+            try:
+                _queue.remove(job_id)
+            except ValueError:
+                pass
+        with _lock:
+            job.update({"state": "canceled", "finished_at": time.time(),
+                        "error": "canceled before it started"})
+        return {"state": "canceled", "job_id": job_id}
+    process = job.get("process")
+    if job["state"] == "running" and process is not None:
+        with _lock:
+            job["canceled"] = True
+        try:
+            if os.name == "nt":
+                process.terminate()
+            else:
+                # The child runs in its own session: qgis_process starts
+                # workers of its own, and killing only the parent leaves them
+                # writing outputs.
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        except OSError:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+        return {"state": "canceling", "job_id": job_id}
+    return {"state": job["state"], "job_id": job_id}
 
 
 def _snapshot(out_dir: Path) -> Dict[str, int]:
@@ -373,6 +420,18 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, unpack_inputs(parts[1], self._body()))
             except (ValueError, zipfile.BadZipFile) as exc:
                 self._send(400, {"detail": str(exc)})
+            return
+        self._send(404, {"detail": "not found"})
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        parts = [p for p in urlparse(self.path).path.split("/") if p]
+        if len(parts) == 2 and parts[0] == "jobs":
+            if not self._authorised():
+                return
+            try:
+                self._send(200, cancel_job(parts[1]))
+            except Exception as exc:  # noqa: BLE001 - never drop the connection
+                self._send(500, {"detail": f"could not stop the job: {exc}"})
             return
         self._send(404, {"detail": "not found"})
 
