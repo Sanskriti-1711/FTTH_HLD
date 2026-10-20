@@ -86,3 +86,26 @@ def test_a_roomy_instance_does_not_blame_memory(tmp_path, monkeypatch):
     error = _failed_without_output(tmp_path, monkeypatch, 4096.0)
 
     assert "memory" not in error
+
+
+def test_a_killed_run_keeps_the_stage_its_row_had_reached(tmp_path, monkeypatch):
+    """The container's disk is ephemeral: after a kill the outputs are gone.
+
+    "No files" therefore does not mean "no work" -- a run that spent twenty
+    minutes in the duct layer was being reported as "Resolve area, 0 %", which
+    is the opposite of what happened.
+    """
+    monkeypatch.setattr(main, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(main.meminfo, "limit_mb", lambda: 512.0)
+    monkeypatch.setattr(main, "_persist_project_state", lambda *a, **k: None)
+    task = main._task("proj-killed")
+    task.update({"status": "running", "stage": "Duct Layer", "stage_index": 5,
+                 "progress": 55})
+
+    main._recover_orphan_run("proj-killed", task)
+
+    assert task["status"] == "failed"
+    assert task["stage"] == "Duct Layer"
+    assert task["stage_index"] == 5
+    assert task["progress"] == 55
+    assert "Duct Layer" in task["error"] and "55 %" in task["error"]

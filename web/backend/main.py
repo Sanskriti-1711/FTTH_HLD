@@ -7,6 +7,7 @@ tiles for MapLibre or any other client.
 
 from __future__ import annotations
 
+import gc
 import json
 import math
 import os
@@ -710,20 +711,33 @@ def _recover_orphan_run(
     output_dir = OUTPUT_DIR / project_id
     info = _stage_from_outputs(output_dir)
     if info is None:
-        # Nothing on disk: the run never got as far as writing an output.  On a
-        # memory-capped instance the process being KILLED for exceeding the cap
-        # is by far the most common way in here (the platform logs it as
-        # `oomKilled`, which nothing inside the process can see), so the message
-        # names that instead of blaming a restart the planner cannot act on.
+        # An empty output directory.  On a memory-capped instance the process
+        # being KILLED for exceeding the cap is by far the most common way in
+        # here (the platform logs it as `oomKilled`, which nothing inside the
+        # process can see), so the message names that rather than a restart the
+        # planner cannot act on.
+        #
+        # "No files" is NOT "no work": the container's filesystem is ephemeral,
+        # so a restart takes the output directory with it.  The stage the run had
+        # reached survives in its row (persisted at every stage), and reporting
+        # "Resolve area 0 %" for a run that spent twenty minutes in the duct
+        # layer told the planner the opposite of what happened.
         limit = meminfo.limit_mb()
+        reached_index = int(task.get("stage_index") or 0)
+        reached_name = task.get("stage") or "Resolve area"
+        reached_progress = int(task.get("progress") or 0)
+        reached = (
+            f" while it was at the {reached_name} ({reached_progress} %)"
+            if reached_index > 0 else " before this run wrote any output"
+        )
         _settle_orphan(
             project_id, task, "failed",
-            "The engine process was killed or restarted before this run wrote "
-            "any output. "
+            f"The engine process was killed or restarted{reached}. "
             + (f"This instance has {limit:.0f} MB of memory and running out of "
                "it is the usual cause. " if limit and limit <= 1024 else "")
             + "Run it again.",
-            stage_name="Resolve area", stage_index=0, progress=0,
+            stage_name=reached_name, stage_index=reached_index,
+            progress=reached_progress,
         )
         return
 
@@ -1758,6 +1772,7 @@ def _run_pipeline(
 
         # Hand the area build's freed arenas back before QGIS starts: the two
         # peaks would otherwise be added together in one 512 MB container.
+        gc.collect()
         meminfo.trim()
         meminfo.trace(f"run {project_id[:8]} starting qgis_process")
         _append(
@@ -2287,10 +2302,18 @@ def _run_area_pipeline(
             % brownfield_path.name,
         )
 
+    excel_path = Path(built["excel_path"])
+    roads_path = Path(built["roads_path"])
+    # The area build's working set (premises, households, the workbook object) is
+    # finished with.  QGIS is about to ask for the same container's memory, so
+    # drop the references and collect before spawning it.
+    del built
+    gc.collect()
+
     _run_pipeline(
         project_id,
-        Path(built["excel_path"]),
-        Path(built["roads_path"]),
+        excel_path,
+        roads_path,
         output_dir,
         poly_method,
         brownfield_path,
