@@ -8,6 +8,7 @@ tiles for MapLibre or any other client.
 from __future__ import annotations
 
 import gc
+import io
 import json
 import math
 import os
@@ -17,6 +18,8 @@ import sqlite3
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 import zipfile
 from collections import Counter, deque
@@ -169,6 +172,22 @@ ORPHAN_BROKEN_SECONDS = int(os.environ.get("HLD_ORPHAN_BROKEN_SECONDS", "300"))
 # enough not to flood the platform log for an hour-long run.
 MEMORY_SAMPLE_SECONDS = int(os.environ.get("HLD_MEMORY_SAMPLE_SECONDS", "20"))
 
+# Run qgis_process on a separate instance.  Unset means "run it here", which is
+# exactly the previous behaviour -- local development and any single-box
+# deployment keep working untouched, and the split is opt-in per deployment.
+#
+# Measured on 2026-10-20: the engine holds 66-128 MB and qgis_process 443 MB
+# (peak 455) for a 3.5 km2 ward, so the two cannot share a 512 MB container.
+# Separated, QGIS has a whole one to itself.
+QGIS_WORKER_URL = os.environ.get("FTTH_QGIS_WORKER_URL", "").strip()
+QGIS_WORKER_TOKEN = os.environ.get("QGIS_WORKER_TOKEN", "")
+# How often the worker's job log is polled. Two seconds keeps the stage strip
+# live without a request per stdout line.
+QGIS_WORKER_POLL_S = float(os.environ.get("FTTH_QGIS_WORKER_POLL", "2"))
+# The worker's manifest of files THIS run wrote.  It travels inside the result
+# zip and is removed after use -- see _extract_into().
+WORKER_MANIFEST = "._written.json"
+
 # Guards the recovery of one project: two status polls arriving together must
 # not both ingest the outputs.
 _recover_lock = threading.Lock()
@@ -316,7 +335,164 @@ def _quote_cmd_arg(arg: str) -> str:
     return '"' + arg.replace('"', r'\"') + '"'
 
 
-def _run_command(project_id: str, cmd: Union[List[str], str], output_dir: Path) -> None:
+def _consume_pipeline_line(project_id: str, text: str) -> None:
+    """Append one qgis_process line and move the stage it names.
+
+    Shared by the local child's stdout and the worker's relayed log: the two
+    paths must produce identical progress, or a worker run would leave the
+    status page stuck while the pipeline was actually moving.
+    """
+    text = text.strip()
+    if not text:
+        return
+    _append(project_id, "info", text)
+    # Only the pipeline's own "Running <Stage>" progress line moves the
+    # stage. A loose substring match over every line also fired on prose —
+    # "Trench layers normalized at chambers" is emitted right AFTER the
+    # chamber stage and dragged the reported stage back to Trench — and the
+    # six-name list could not match the chamber/pole/aerial lines at all.
+    lowered = text.lower()
+    for idx, stage in enumerate(PIPELINE_STAGES):
+        if f"running {stage.lower()}" in lowered:
+            task = _task(project_id)
+            if task.get("stage") == stage and task.get("stage_index") == idx:
+                continue
+            task["stage"] = stage
+            task["stage_index"] = idx
+            task["progress"] = int((idx / len(PIPELINE_STAGES)) * 100)
+            task["updated_at"] = _now()
+            # Persisted, not just in memory: this is the only record of
+            # where the run was when the engine restarts, and it is what the
+            # platform's project list shows while the run is in flight.
+            _persist_project_state(project_id, task)
+
+
+def _zip_directory(path: Path) -> bytes:
+    """A whole output directory as a zip, for the worker's inputs."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for item in sorted(path.rglob("*")):
+            if item.is_file():
+                archive.write(item, item.relative_to(path).as_posix())
+    return buffer.getvalue()
+
+
+def _extract_into(payload: bytes, dest: Path) -> List[str]:
+    """Unpack a worker result into ``dest``; returns the files it wrote.
+
+    mtimes are restored by ``extractall``, but freshness is taken from the
+    worker's own manifest: the two services are separate clocks, and a file
+    written one second before this process took its start time would otherwise
+    look stale.
+    """
+    dest.mkdir(parents=True, exist_ok=True)
+    written: List[str] = []
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        for member in archive.infolist():
+            name = member.filename.replace("\\", "/")
+            if name.startswith("/") or ".." in Path(name).parts:
+                raise RuntimeError(f"unsafe path in the worker's result: {name}")
+        archive.extractall(dest)
+        manifest = dest / WORKER_MANIFEST
+        if manifest.is_file():
+            try:
+                written = list(json.loads(manifest.read_text(encoding="utf-8")) or [])
+            except (OSError, ValueError):
+                written = []
+            manifest.unlink(missing_ok=True)
+    return written
+
+
+def _worker_call(path: str, data: Optional[bytes] = None, method: str = "GET",
+                 timeout: float = 120.0) -> Any:
+    """One request to the QGIS worker, with its shared-secret header."""
+    request = urllib.request.Request(QGIS_WORKER_URL.rstrip("/") + path,
+                                     data=data, method=method)
+    if QGIS_WORKER_TOKEN:
+        request.add_header("X-FTTH-Token", QGIS_WORKER_TOKEN)
+    if data is not None:
+        request.add_header("Content-Type", "application/octet-stream")
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        body = response.read()
+    return body
+
+
+def _run_command_remote(project_id: str, cmd: Union[List[str], str],
+                        output_dir: Path) -> List[str]:
+    """Run the pipeline on the QGIS worker and collect its outputs.
+
+    The arguments are built HERE and shipped as-is: ``BF_DUCTS``,
+    ``PERMIT_DELAYS`` and ``POLY_BARRIER_EXTRA`` are absolute paths under
+    ``outputs/<project>/``, and the worker unpacks to the same layout, so the
+    same strings resolve on both sides.
+    """
+    if not isinstance(cmd, list) or len(cmd) < 2:
+        raise RuntimeError("the QGIS worker needs an argument list, not a shell string")
+    timeout = int(os.environ.get("QGIS_PROCESS_TIMEOUT", "10800"))
+    started = time.time()
+    job = f"/jobs/{project_id}"
+    try:
+        _worker_call(f"{job}/inputs", data=_zip_directory(output_dir),
+                     method="PUT", timeout=900)
+        _worker_call(job, data=json.dumps({"args": cmd[1:]}).encode("utf-8"),
+                     method="POST", timeout=120)
+    except (urllib.error.URLError, OSError) as exc:
+        raise RuntimeError(
+            f"The QGIS worker at {QGIS_WORKER_URL} is unreachable: {exc}"
+        ) from exc
+    _append(project_id, "info", f"Running on the QGIS worker at {QGIS_WORKER_URL}.")
+
+    offset = 0
+    unreachable = 0
+    while True:
+        if time.time() - started > timeout:
+            raise RuntimeError(f"qgis_process timed out after {timeout} seconds")
+        try:
+            batch = json.loads(_worker_call(f"{job}/log?offset={offset}", timeout=120) or b"{}")
+            unreachable = 0
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            # A worker restart mid-run is a lost job, not a hang: say so after a
+            # few consecutive misses instead of waiting out the 3-hour budget.
+            unreachable += 1
+            if unreachable >= 5:
+                raise RuntimeError(
+                    f"The QGIS worker stopped answering during this run: {exc}"
+                ) from exc
+            time.sleep(QGIS_WORKER_POLL_S)
+            continue
+        for line in batch.get("lines") or []:
+            _consume_pipeline_line(project_id, line)
+        offset = int(batch.get("offset") or offset)
+        if batch.get("state") in ("done", "failed"):
+            break
+        time.sleep(QGIS_WORKER_POLL_S)
+
+    status = json.loads(_worker_call(job, timeout=120) or b"{}")
+    code = status.get("exit_code")
+    if status.get("state") == "failed" or code not in (0, None):
+        raise RuntimeError(status.get("error") or f"qgis_process exited with code {code}")
+    written = _extract_into(_worker_call(f"{job}/result", timeout=900), output_dir)
+    _append(
+        project_id, "info",
+        "qgis_process finished on the worker; %d output file(s) collected." % len(written),
+    )
+    memory = status.get("memory") or {}
+    if memory.get("peak_rss_mb"):
+        meminfo.trace(f"run {project_id[:8]} worker", worker_peak_mb=memory.get("peak_rss_mb"),
+                      worker_limit_mb=memory.get("limit_mb"))
+    return written
+
+
+def _run_command(project_id: str, cmd: Union[List[str], str],
+                 output_dir: Path) -> Optional[List[str]]:
+    """Run qgis_process -- here, or on the worker when one is configured.
+
+    Returns the files the run wrote when the worker reports them (the caller
+    uses that list instead of mtimes, which two separate clocks cannot be
+    compared across); ``None`` on the local path, where mtimes are trustworthy.
+    """
+    if QGIS_WORKER_URL:
+        return _run_command_remote(project_id, cmd, output_dir)
     env = os.environ.copy()
     env.setdefault("QT_QPA_PLATFORM", "offscreen")
     env.setdefault("QGIS_PLUGINPATH", str(ROOT_DIR))
@@ -373,29 +549,7 @@ def _run_command(project_id: str, cmd: Union[List[str], str], output_dir: Path) 
     # (Nominatim geocoding takes 1.2s per address — without streaming,
     # the frontend sees 0% until the entire pipeline finishes.)
     for line in iter(process.stdout.readline, ""):
-        text = line.strip()
-        if not text:
-            continue
-        _append(project_id, "info", text)
-        # Only the pipeline's own "Running <Stage>" progress line moves the
-        # stage. A loose substring match over every line also fired on prose —
-        # "Trench layers normalized at chambers" is emitted right AFTER the
-        # chamber stage and dragged the reported stage back to Trench — and the
-        # six-name list could not match the chamber/pole/aerial lines at all.
-        lowered = text.lower()
-        for idx, stage in enumerate(PIPELINE_STAGES):
-            if f"running {stage.lower()}" in lowered:
-                task = _task(project_id)
-                if task.get("stage") == stage and task.get("stage_index") == idx:
-                    continue
-                task["stage"] = stage
-                task["stage_index"] = idx
-                task["progress"] = int((idx / len(PIPELINE_STAGES)) * 100)
-                task["updated_at"] = _now()
-                # Persisted, not just in memory: this is the only record of
-                # where the run was when the engine restarts, and it is what the
-                # platform's project list shows while the run is in flight.
-                _persist_project_state(project_id, task)
+        _consume_pipeline_line(project_id, line)
 
     process.stdout.close()
     timeout = int(os.environ.get("QGIS_PROCESS_TIMEOUT", "10800"))
@@ -549,7 +703,8 @@ def _layer_output_names() -> Set[str]:
 
 
 def _drop_stale_outputs(project_id: str, output_dir: Path,
-                        started_at: float) -> List[str]:
+                        started_at: float,
+                        written: Optional[List[str]] = None) -> List[str]:
     """Delete published layer files THIS run did not write.
 
     Every stage is supposed to rewrite its own output, and most do — but a
@@ -578,13 +733,20 @@ def _drop_stale_outputs(project_id: str, output_dir: Path,
     # make the run's OWN first write look stale — compare against a start time
     # nudged back a couple of seconds.
     cutoff = float(started_at) - 2.0
+    # A run on the QGIS worker reports the files it actually wrote.  That list,
+    # not an mtime, is the only sound test across two containers: their clocks
+    # differ by more than the granularity this comparison relies on.
+    fresh_names = {name.replace("\\", "/") for name in written} if written is not None else None
     for name in sorted(published):
         gpkg = output_dir / name
         if gpkg.suffix.lower() != ".gpkg":
             continue  # the twin is handled with its GeoPackage
         twin = output_dir / (gpkg.stem + ".geojson")
         try:
-            if gpkg.is_file() and gpkg.stat().st_mtime >= cutoff:
+            if fresh_names is not None:
+                if gpkg.is_file() and name in fresh_names:
+                    continue  # the worker wrote this layer in this run
+            elif gpkg.is_file() and gpkg.stat().st_mtime >= cutoff:
                 continue  # this run rewrote the layer
         except OSError:
             continue
@@ -1782,8 +1944,10 @@ def _run_pipeline(
                f"{meminfo.limit_mb():.0f} MB" if meminfo.limit_mb() else "the host"),
         )
         run_started = time.time()
-        _run_command(project_id, cmd, output_dir)
-        _drop_stale_outputs(project_id, output_dir, run_started)
+        # The worker reports what it wrote; the local child's files are judged by
+        # mtime, which is sound because both are on this filesystem.
+        written = _run_command(project_id, cmd, output_dir)
+        _drop_stale_outputs(project_id, output_dir, run_started, written=written)
         layers = _ingest_outputs(project_id, output_dir)
         downloads = _register_downloads(project_id, output_dir)
 
