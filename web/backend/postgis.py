@@ -283,6 +283,14 @@ def init_schema() -> None:
             ("stage_name", "TEXT"),
             ("stage_index", "INTEGER"),
             ("stage_count", "INTEGER"),
+            # Which engine deployment wrote the row.  The project table is
+            # SHARED (a laptop engine and the Render engine read the same
+            # PostGIS), and orphan recovery works on "no thread in this
+            # process owns it" -- without this, whichever deployment polled the
+            # project list first declared the other's live run dead.  Measured
+            # 2026-10-20: a local run was settled as failed by the 512 MB
+            # Render engine five seconds after that deploy went live.
+            ("engine_instance", "TEXT"),
         ]
         for col, ddl in _engine_extras:
             try:
@@ -419,6 +427,13 @@ def init_schema() -> None:
 # ---------------------------------------------------------------------------
 
 
+# Which deployment this process is.  Set FTTH_ENGINE_INSTANCE per deployment
+# (e.g. "render-engine") so orphan recovery can tell its own runs from another
+# engine's runs in the shared project table; "local" is the default a laptop
+# gets without configuring anything.
+ENGINE_INSTANCE = os.environ.get("FTTH_ENGINE_INSTANCE", "").strip() or "local"
+
+
 def upsert_project(
     project_id: str,
     *,
@@ -433,6 +448,7 @@ def upsert_project(
     stage_name: Optional[str] = None,
     stage_index: Optional[int] = None,
     stage_count: Optional[int] = None,
+    engine_instance: Optional[str] = None,
 ) -> None:
     """Insert/update a project row (shared with Django's ftth_projects).
 
@@ -453,11 +469,15 @@ def upsert_project(
                 """
                 INSERT INTO {projects} (
                     project_id, status, roads_filename, runner, qgis_version,
-                    error, output_dir, downloads, progress, created_at, updated_at
+                    error, output_dir, downloads, progress, engine_instance,
+                    created_at, updated_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s, 0), now(), now())
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s, 0), %s, now(), now())
                 ON CONFLICT (project_id) DO UPDATE SET
                     status = EXCLUDED.status,
+                    engine_instance = COALESCE(
+                        EXCLUDED.engine_instance, {projects}.engine_instance
+                    ),
                     progress = COALESCE(%s, {projects}.progress),
                     roads_filename = COALESCE(
                         EXCLUDED.roads_filename, {projects}.roads_filename
@@ -486,6 +506,7 @@ def upsert_project(
                 output_dir,
                 Json(downloads or []),
                 progress,
+                engine_instance or ENGINE_INSTANCE,
                 progress,
             ),
         )

@@ -1103,6 +1103,19 @@ def _recover_orphan_from_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     project_id = str(row.get("project_id") or "")
     if not project_id or _owned_in_process(project_id):
         return None
+    # The project table is SHARED between deployments (a laptop engine and the
+    # Render engine read the same PostGIS), and "no thread here owns it" is not
+    # proof of death -- it is equally proof that ANOTHER engine owns it.  On
+    # 2026-10-20 a local run was settled as failed by the 512 MB Render engine
+    # because that deployment could not see the laptop's thread.
+    owner = str(row.get("engine_instance") or "").strip()
+    if owner and owner != postgis.ENGINE_INSTANCE:
+        logger_note = (
+            f"project {project_id[:8]} is owned by engine '{owner}', not "
+            f"'{postgis.ENGINE_INSTANCE}'; leaving it alone"
+        )
+        print(f"[ownership] {logger_note}", flush=True)
+        return None
     task = _task(project_id)
     task.update({
         "status": row.get("status"),

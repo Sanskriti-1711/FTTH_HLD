@@ -521,3 +521,57 @@ def test_the_live_reads_are_never_cached(monkeypatch):
         resp = client.get(path)
         assert resp.headers.get("cache-control") != "no-store", path
     main.tasks.clear()
+
+
+# ── which engine owns a row ────────────────────────────────────────────────
+
+def test_a_run_owned_by_another_engine_is_left_alone(monkeypatch):
+    """The project table is shared; "no thread here" is not proof of death.
+
+    Measured 2026-10-20: a run started on the laptop engine at 12:5x was settled
+    as failed by the 512 MB Render engine five seconds after that deploy went
+    live, because the Render process could not see the laptop's thread -- and
+    the planner lost the run.
+    """
+    monkeypatch.setattr(main.postgis, "ENGINE_INSTANCE", "local")
+    main.tasks.clear()
+
+    row = {
+        "project_id": "foreign-run", "status": "running",
+        "stage_name": "Duct Layer", "stage_index": 5, "progress": 55,
+        "engine_instance": "render-engine",
+    }
+
+    assert main._recover_orphan_from_row(row) is None
+    assert main.tasks.get("foreign-run") is None
+
+
+def test_a_run_owned_by_this_engine_is_still_recovered(monkeypatch, tmp_path):
+    monkeypatch.setattr(main.postgis, "ENGINE_INSTANCE", "local")
+    monkeypatch.setattr(main, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(main, "_persist_project_state", lambda *a, **k: None)
+    main.tasks.clear()
+
+    row = {
+        "project_id": "my-run", "status": "running",
+        "stage_name": "Duct Layer", "stage_index": 5, "progress": 55,
+        "engine_instance": "local",
+    }
+
+    task = main._recover_orphan_from_row(row)
+
+    assert task is not None
+    assert task["status"] == "failed"
+    assert task["stage"] == "Duct Layer" and task["progress"] == 55
+
+
+def test_a_row_from_before_the_column_existed_is_still_recovered(monkeypatch, tmp_path):
+    """Old rows carry no owner; they must not be left running for ever."""
+    monkeypatch.setattr(main.postgis, "ENGINE_INSTANCE", "local")
+    monkeypatch.setattr(main, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(main, "_persist_project_state", lambda *a, **k: None)
+    main.tasks.clear()
+
+    task = main._recover_orphan_from_row({"project_id": "old-run", "status": "running"})
+
+    assert task is not None and task["status"] == "failed"
