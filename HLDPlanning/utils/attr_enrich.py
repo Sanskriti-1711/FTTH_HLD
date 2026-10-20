@@ -1084,12 +1084,30 @@ def _project_chambers_on_part(coords, chambers, tol_m):
     total = cum[-1]
     if total <= 0:
         return []
+    # Most chambers are nowhere near this part: on the Berlin design the duct
+    # layer has 92 chambers and ~1,100 parts, so every projection walked all 92
+    # of them (and every vertex of the part) to keep the two or three that can
+    # actually cut it. Both filters below are exact, not approximations: a point
+    # outside the part's box inflated by ``tol_m`` is necessarily more than
+    # ``tol_m`` from the part, and the same holds per segment.
+    xs = [c[0] for c in coords]
+    ys = [c[1] for c in coords]
+    min_x, max_x = min(xs) - tol_m, max(xs) + tol_m
+    min_y, max_y = min(ys) - tol_m, max(ys) + tol_m
+
     hits = []
     for cx, cy, cid in chambers:
+        if cx < min_x or cx > max_x or cy < min_y or cy > max_y:
+            continue
         best = None
         for i in range(len(coords) - 1):
             ax, ay = coords[i]
             bx, by = coords[i + 1]
+            if (cx < (ax if ax < bx else bx) - tol_m
+                    or cx > (ax if ax > bx else bx) + tol_m
+                    or cy < (ay if ay < by else by) - tol_m
+                    or cy > (ay if ay > by else by) + tol_m):
+                continue
             dx, dy = bx - ax, by - ay
             seg2 = dx * dx + dy * dy
             if seg2 <= 0:
@@ -1509,14 +1527,68 @@ def _segment_layer_at_chambers(path, chambers, feedback=None, label="layer",
                  "too_far": 0, "behind": 0, "no_piece": 0,
                  "behind_open": 0}
 
-    def _nearest_trench(x, y):
+    # ── the nearest trench, from an envelope grid ────────────────────────
+    # ``_extend_ends`` asks this question twice per published duct row, and the
+    # answer is only ever used as "is there trench within 1 m here". Scanning
+    # every trench piece for it made this the slowest pass of the whole
+    # enrichment: measured on the 2026-10-17 Berlin design, 2,498 questions x
+    # ~2,000 trench pieces = 11.8M ``_measure_along`` calls (profiled: 58.5 s of
+    # the 123 s phase). Bucketing the pieces by a 25 m envelope grid answers the
+    # same question from the handful of candidates that can be within a metre,
+    # and stays exact: a piece whose nearest point is <= max_m away has its
+    # envelope within max_m of the query point, so it is always in a cell the
+    # query visits.
+    _TRENCH_CELL_M = 25.0
+    # A piece covering more cells than this (a very long line) is not worth
+    # gridding; it goes in a fallback list every query still sees.
+    _TRENCH_MAX_CELLS = 4096
+    trench_grid = {}
+    trench_large = []
+    for _pi, _cs in enumerate(trench_parts):
+        if len(_cs) < 2:
+            continue
+        _xs = [p[0] for p in _cs]
+        _ys = [p[1] for p in _cs]
+        _cx0 = int(math.floor(min(_xs) / _TRENCH_CELL_M))
+        _cx1 = int(math.floor(max(_xs) / _TRENCH_CELL_M))
+        _cy0 = int(math.floor(min(_ys) / _TRENCH_CELL_M))
+        _cy1 = int(math.floor(max(_ys) / _TRENCH_CELL_M))
+        if (_cx1 - _cx0 + 1) * (_cy1 - _cy0 + 1) > _TRENCH_MAX_CELLS:
+            trench_large.append(_pi)
+            continue
+        for _cx in range(_cx0, _cx1 + 1):
+            for _cy in range(_cy0, _cy1 + 1):
+                trench_grid.setdefault((_cx, _cy), []).append(_pi)
+
+    def _nearest_trench(x, y, max_m=1.0):
+        """``(dist, coords, along, foot_x, foot_y)`` for the nearest trench piece.
+
+        Returns ``None`` when no piece is within ``max_m`` — the caller treats
+        that exactly as it treated a distance above its own 1 m gate, so the
+        counters (``no_trench``) do not change.
+        """
+        if not trench_parts:
+            return None
+        candidates = set(trench_large)
+        lo_x = int(math.floor((x - max_m) / _TRENCH_CELL_M))
+        hi_x = int(math.floor((x + max_m) / _TRENCH_CELL_M))
+        lo_y = int(math.floor((y - max_m) / _TRENCH_CELL_M))
+        hi_y = int(math.floor((y + max_m) / _TRENCH_CELL_M))
+        for cx in range(lo_x, hi_x + 1):
+            for cy in range(lo_y, hi_y + 1):
+                candidates.update(trench_grid.get((cx, cy), ()))
         best = None
-        for cs in trench_parts:
+        # Ascending piece order keeps the original tie-breaking: the first
+        # piece at the lowest distance wins, exactly as the full scan did.
+        for _pi in sorted(candidates):
+            cs = trench_parts[_pi]
             m = _measure_along(cs, x, y)
             if m is None:
                 continue
             if best is None or m[0] < best[0]:
                 best = (m[0], cs, m[1], m[2], m[3])
+        if best is not None and best[0] > max_m:
+            return None
         return best
 
     # Every published span piece, snapshotted BEFORE the loop rewrites any of
