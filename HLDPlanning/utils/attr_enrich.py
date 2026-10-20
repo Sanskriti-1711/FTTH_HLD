@@ -4511,6 +4511,40 @@ def _previous_surface_review(path):
     return data if isinstance(data, dict) else None
 
 
+def _surface_review_sidecar(out_dir, status, reason, feedback=None):
+    """Leave a separate AI review artifact for a run that reviewed no spans.
+
+    The results page reads a missing ``surface_ai_review.json`` as "no AI review
+    report for this run", which a reader cannot tell apart from the feature
+    being broken. Every run therefore writes its own artifact: the real review
+    when the pass runs, and a short report naming why it did not otherwise.
+    Writing it also replaces the previous run's artifact, so a reused output
+    directory never presents stale evidence as this run's.
+
+    Returns the summary the surface report carries, or None when even the
+    sidecar could not be written. Never raises: the review is optional and must
+    not fail a design run.
+    """
+    try:
+        from ..design import surface_ai_review as ai_review
+        review = ai_review.empty_report(status, reason)
+        ai_review.write_review_report(out_dir, review)
+    except Exception as exc:
+        if feedback:
+            feedback.pushWarning(
+                "  [verify] Surface AI review artifact not written: %s"
+                % type(exc).__name__)
+        return None
+    if feedback:
+        feedback.pushInfo("  [verify] Surface AI review: %s — %s." % (status, reason))
+    return {
+        "status": review.get("status"),
+        "candidate_count": 0,
+        "resumed_count": 0,
+        "artifact": "surface_ai_review.json",
+    }
+
+
 @_profiled("verify_surface_geometry")
 def verify_surface_geometry(out_dir, feedback=None, roads_source=None):
     """Flag trenches whose drawn position contradicts the SURFACE they claim.
@@ -4533,10 +4567,15 @@ def verify_surface_geometry(out_dir, feedback=None, roads_source=None):
               "no_claim": 0, "flags": [], "uncertain_spans": []}
     trench_path = os.path.join(out_dir, "Final_Trenches.gpkg")
     if not os.path.isfile(trench_path):
+        _surface_review_sidecar(out_dir, "skipped",
+                                "No Final_Trenches.gpkg to review.", feedback)
         return report
     if roads_source is None:
         if feedback:
             feedback.pushInfo("  [verify] Surfaces: no roads layer — skipped.")
+        _surface_review_sidecar(out_dir, "skipped",
+                                "No roads layer to compare the spans against.",
+                                feedback)
         return report
 
     # The trenches are the authority on units: the OSM roads bundle is WGS84
@@ -4546,6 +4585,9 @@ def verify_surface_geometry(out_dir, feedback=None, roads_source=None):
     # no evidence and flags nothing. Reproject the roads into the trench CRS.
     t_ds, t_lyr = _open_lyr(trench_path)
     if t_lyr is None:
+        _surface_review_sidecar(out_dir, "skipped",
+                                "Final_Trenches.gpkg could not be opened.",
+                                feedback)
         return report
     trench_srs = t_lyr.GetSpatialRef()
     t_ds = None
@@ -4614,6 +4656,8 @@ def verify_surface_geometry(out_dir, feedback=None, roads_source=None):
     if not spans:
         if feedback:
             feedback.pushInfo("  [verify] Surfaces: no trench spans — skipped.")
+        _surface_review_sidecar(out_dir, "skipped",
+                                "No trench spans to review.", feedback)
         return report
 
     trench_crs_name = None
@@ -4636,12 +4680,14 @@ def verify_surface_geometry(out_dir, feedback=None, roads_source=None):
     review_path = os.path.join(out_dir, "surface_ai_review.json")
     if not ai_enabled:
         # A reused output directory must not expose a previous run's review as
-        # evidence for this run. Delete only our own sidecar, best-effort.
-        try:
-            if os.path.isfile(review_path):
-                os.remove(review_path)
-        except OSError:
-            pass
+        # evidence for this run, and a missing sidecar is what the results page
+        # reports as "no AI review report". Write this run's own artifact saying
+        # why nothing was reviewed; that also replaces the previous one.
+        summary = _surface_review_sidecar(
+            out_dir, "disabled",
+            "Set SURFACE_AI_REVIEW=1 to enable imagery review.", feedback)
+        if summary:
+            report["ai_review"] = summary
     if ai_enabled:
         try:
             from ..design import surface_ai_review as ai_review
@@ -4662,7 +4708,12 @@ def verify_surface_geometry(out_dir, feedback=None, roads_source=None):
                     "  [verify] Surface AI review: %d uncertain span(s), status %s."
                     % (review.get("candidate_count", 0), review.get("status")))
         except Exception as exc:
-            # Optional review must never fail or modify the design run.
+            # Optional review must never fail or modify the design run, but it
+            # must not vanish either: the failure becomes this run's artifact.
+            summary = _surface_review_sidecar(
+                out_dir, "error", type(exc).__name__, feedback)
+            if summary:
+                report["ai_review"] = summary
             if feedback:
                 feedback.pushWarning(
                     "  [verify] Surface AI review skipped: %s" % type(exc).__name__)

@@ -160,6 +160,9 @@ def _empty_report(status: str, reason: Optional[str] = None) -> dict:
     }
 
 
+empty_report = _empty_report
+
+
 _CONFIGURED_IMAGE_PROVIDER = None
 
 
