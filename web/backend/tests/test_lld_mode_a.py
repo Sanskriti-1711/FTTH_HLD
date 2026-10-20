@@ -473,6 +473,30 @@ def test_path_ending_at_uses_metre_scale_radius():
     assert engine._path_ending_at(line, (0.001, 0.0)) is line
 
 
+def test_drop_planning_routes_from_cable_part_that_ends_at_premise():
+    """A multi-part cable whose first part is far away must still feed the
+    drop from the part that actually ends at the premise (regression)."""
+    premise = (0.0, 0.0)
+    far_part = [[0.001, 0.001], [0.002, 0.001]]
+    serving_part = [[0.003, 0.0], [premise[0] + 0.00005, premise[1]]]
+    by_layer = {
+        "objects": [{
+            "geometry": {"type": "Point", "coordinates": list(premise)},
+            "properties": {"feature_id": "p1"},
+        }],
+        "distribution_cable": [{
+            "geometry": {"type": "MultiLineString", "coordinates": [far_part, serving_part]},
+            "properties": {},
+        }],
+        "drop_ducts": [],
+    }
+    engine._plan_drop_connections(by_layer)
+    drops = by_layer["drop_ducts"]
+    assert drops, "a drop duct should be created for the premise"
+    end = drops[-1]["geometry"]["coordinates"][-1]
+    assert ((end[0] - premise[0]) ** 2 + (end[1] - premise[1]) ** 2) ** 0.5 <= engine.DROP_CONNECT_TOL
+
+
 def test_mode_b_brownfield_writer_rejects_unapproved_features(tmp_path):
     """Mode B brownfield files may only contain approved survey features."""
     feats = []
