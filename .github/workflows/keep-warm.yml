@@ -1,22 +1,40 @@
-name: Keep the engine and the QGIS worker awake
+name: Keep the engine and the fibre backend awake
 
 # Render's free plan stops a web service after 15 minutes without traffic, and a
 # cold start measured 42s. That was long enough to empty the country dropdown
 # (the gateway gave it 15s back then) and to make every first visit of the day
-# feel broken. This pings /health often enough that the service never idles.
+# feel broken. This pings /health often enough that the services never idle.
 #
-# Two limits worth knowing, because both make this best-effort rather than a
-# guarantee:
+# ── The hour budget is the constraint, and it is shared ────────────────────────
+# Render grants **750 free instance hours per workspace per calendar month**,
+# shared across every free web service, and a service only spends them while it
+# is RUNNING (a spun-down service is free). Three services awake 24/7 would be
+# ~2,160 h/mo: the workspace would exhaust its budget about ten days into the
+# month and Render SUSPENDS free web services until the next calendar month —
+# every service down at once, which is far worse than a cold start.
+#
+# Hence a window: WARM_FROM_UTC=07 to WARM_TO_UTC=18 is 11 h/day, so
+# engine + backend cost 2 x 11 x 30 = **660 h/mo**, leaving ~90 h of headroom for
+# your own traffic outside the window. Outside it, services are allowed to sleep
+# and the first visit pays the ~45 s boot.
+#
+# ── The QGIS worker is deliberately NOT warmed ────────────────────────────────
+# It is only needed while a run is in flight, a run is not idle so it does not
+# sleep mid-run, and the engine now waits up to 180 s for it to boot before
+# queueing a job (FTTH_QGIS_WORKER_WAKE). Warming it 24/7 would cost 730 h on
+# its own — the whole budget for a service that needs none of it.
+#
+# ── Two limits, both deliberate ───────────────────────────────────────────────
 #   * GitHub does not promise schedule timing -- under load a run can be late by
 #     several minutes. 10 minutes against a 15-minute idle window leaves room
-#     for that, but a long delay plus a long outage can still let it sleep. The
-#     UI is built to survive that: the country list retries once and then says
-#     so instead of showing an empty dropdown.
+#     for that, but a long delay plus an outage can still let a service sleep.
+#     The UI is built to survive that (the country list retries once and then
+#     says so; the engine's worker wait covers the QGIS side).
 #   * GitHub disables scheduled workflows in a repository with no activity for
 #     60 days, so this needs a push (or a manual run) now and then.
 #
-# The repository is public, so the runs are free rather than drawn from the
-# private-repo minute quota.
+# The repository is public, so the runs do not draw on the private-repo minute
+# quota.
 
 on:
   schedule:
@@ -27,39 +45,49 @@ concurrency:
   group: keep-warm
   cancel-in-progress: false
 
+env:
+  WARM_FROM_UTC: '7'
+  WARM_TO_UTC: '18'
+
 jobs:
   ping:
-    name: Ping the engine's /health
+    name: Ping the services that sleep
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Wake ftth-planning and report what it says
+      - name: Is it inside the warm window?
+        id: window
         run: |
-          set -o pipefail
-          # 120s covers a 42s cold start plus Render's boot queue, and is still
-          # short enough that a run cannot overlap the next schedule tick.
-          code=$(curl -sS -o /tmp/health.json -w '%{http_code}' -m 120 \
-            https://ftth-planning.onrender.com/health || echo 000)
-          echo "http_status=$code"
-          head -c 400 /tmp/health.json || true
-          if [ "$code" != "200" ]; then
-            echo "::warning::engine /health answered $code (a cold boot is expected occasionally; a run of failures is not)"
-            exit 1
+          hour=$(date -u +%H)
+          # A manual dispatch always warms, so the workflow can be tested at any
+          # hour without waiting for the window (and without editing the file).
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] ||
+             { [ "$hour" -ge "$WARM_FROM_UTC" ] && [ "$hour" -lt "$WARM_TO_UTC" ]; }; then
+            echo "warm=true" >> "$GITHUB_OUTPUT"
+            echo "warming (utc hour $hour)"
+          else
+            echo "warm=false" >> "$GITHUB_OUTPUT"
+            echo "outside the window (utc hour $hour): letting them sleep, this costs nothing"
           fi
 
-      # The worker sleeps on the same 15-minute clock, and it is the one that
-      # matters more: a sleeping engine only delays a request, but a sleeping
-      # worker used to fail a run outright (2026-10-20: "HTTP Error 502: Bad
-      # Gateway" 34 s after a run started). The engine now waits out a boot, so
-      # this is the second line of defence rather than the only one.
-      - name: Wake the QGIS worker
+      # 120s covers a 42s cold start plus Render's boot queue, and is still short
+      # enough that a run cannot overlap the next schedule tick.
+      - name: Wake the engine and the fibre backend
+        if: steps.window.outputs.warm == 'true'
         run: |
           set -o pipefail
-          code=$(curl -sS -o /tmp/worker.json -w '%{http_code}' -m 120 \
-            https://ftth-qgis-worker.onrender.com/health || echo 000)
-          echo "http_status=$code"
-          head -c 200 /tmp/worker.json || true
-          if [ "$code" != "200" ]; then
-            echo "::warning::worker /health answered $code (a cold boot is expected occasionally; a run of failures is not)"
-            exit 1
-          fi
+          failed=0
+          probe() {
+            name=$1; url=$2
+            code=$(curl -sS -o "/tmp/$name.json" -w '%{http_code}' -m 120 "$url" || echo 000)
+            echo "$name http_status=$code"
+            head -c 300 "/tmp/$name.json" || true
+            echo
+            if [ "$code" != "200" ]; then
+              echo "::warning::$name /health answered $code (a cold boot is expected occasionally; a run of failures is not)"
+              failed=1
+            fi
+          }
+          probe engine  https://ftth-planning.onrender.com/health
+          probe backend https://fibre-backend-wml3.onrender.com/healthz
+          exit "$failed"
