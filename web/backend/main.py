@@ -2821,12 +2821,12 @@ def projects(limit: int = 50) -> List[Dict[str, Any]]:
 # ======================================================================
 
 LLD_LAYER_ORDER = [
-    "objects", "polygons", "pdps", "mfg",
+    "objects", "polygons", "pdps", "mfg", "mfg_service_areas",
     "final_trenches",
     "feeder_cable", "distribution_cable", "aerial_cable",
     "feeder_ducts", "distribution_ducts", "drop_ducts",
     "coupleurs",
-    "chambers", "poles", "trench_nodes",
+    "chambers", "poles",
     "aerial_spans", "aerial_drops",
     "existing_infrastructure", "existing_infrastructure_points",
     "brownfield",
@@ -2836,7 +2836,9 @@ LLD_LAYER_ORDER = [
 # trenches are mirrored into final_trenches (trench_type=Garden) like the HLD
 # pipeline does, so a separate garden_trench layer would be redundant and
 # confusing in the LLD results window.
-LLD_EXCLUDED_LAYERS = {"garden_trench"}
+# trench_nodes is a trench joint, not a trench: every node is realised by a
+# chamber, which is the published layer. The HLD never publishes it either.
+LLD_EXCLUDED_LAYERS = {"garden_trench", "trench_nodes"}
 
 lld_tasks: Dict[str, Dict[str, Any]] = {}
 
@@ -3802,6 +3804,18 @@ def _inherit_trench_sub_layer_attributes(by_layer: Dict[str, List[Dict[str, Any]
 DROP_CONNECT_TOL = 0.0001
 
 
+def _path_ending_at(ln: List[Any], o: Any) -> List[Any]:
+    """Return a path along `ln` that ENDS at the premise `o`.
+
+    `DROP_CONNECT_TOL` is in degrees, so the distance is the square root of the
+    squared sum. Comparing the squared value against it made the radius about
+    1 km instead of about 10 m.
+    """
+    if len(ln) >= 2 and ((ln[0][0] - o[0]) ** 2 + (ln[0][1] - o[1]) ** 2) ** 0.5 <= DROP_CONNECT_TOL:
+        return [ln[1], ln[0]]
+    return ln
+
+
 def _project_point_on_segment(p: Any, a: Any, b: Any) -> List[float]:
     """Foot of the perpendicular from p onto segment [a, b] (nearest endpoint
     when the projection falls outside the segment)."""
@@ -3994,12 +4008,6 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
                     return f
         return None
 
-    def path_ending_at(ln: List[Any], o: Any) -> List[Any]:
-        """Return a path along `ln` that ENDS at the premise."""
-        if len(ln) >= 2 and ((ln[0][0] - o[0]) ** 2 + (ln[0][1] - o[1]) ** 2) <= DROP_CONNECT_TOL:
-            return [ln[1], ln[0]]
-        return ln
-
     def _nearest_pole_id(o: Any) -> Optional[str]:
         poles = by_layer.get("poles") or []
         best_d, best_id = float("inf"), None
@@ -4067,12 +4075,12 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
         serving_duct = serving_feature("drop_ducts", o)
         path: List[Any] = []
         if not has_drop and has_cable and serving_cable is not None:
-            ln = path_ending_at(
+            ln = _path_ending_at(
                 _line_strings(serving_cable.get("geometry"))[0], o
             )
             path = ln[-2:] if len(ln) >= 2 else ln
         elif not has_cable and has_drop and serving_duct is not None:
-            path = path_ending_at(_line_strings(serving_duct.get("geometry"))[0], o)
+            path = _path_ending_at(_line_strings(serving_duct.get("geometry"))[0], o)
         else:
             # Both missing — route from the nearest distribution-duct network
             # point (footway side).

@@ -414,6 +414,8 @@ def test_mode_a_output_contract(mode_a_env):
     layer_names = {name[:-8] for name in files}
     # No excluded layer (garden_trench) may escape as a standalone output.
     assert not (layer_names & engine.LLD_EXCLUDED_LAYERS)
+    # trench_nodes is a joint, never a published trench layer.
+    assert "trench_nodes" not in layer_names
     # Every emitted layer is part of the public contract.
     assert layer_names <= set(engine.LLD_LAYER_ORDER), layer_names - set(engine.LLD_LAYER_ORDER)
     # Any shared trunks retain their 48F floor and enough capacity for
@@ -451,6 +453,24 @@ def test_mode_a_approved_dataset_without_changes_is_still_valid(mode_a_env):
     assert task["status"] == "completed"
     assert task["validation"]["summary"]["continuity_issues"] == 0
     assert task["validation"]["summary"]["drop_issues"] == 0
+
+
+def test_lld_layer_contract_matches_hld_publication():
+    """The LLD publishes the HLD's displayed layers, not its trench joints."""
+    assert "mfg_service_areas" in engine.LLD_LAYER_ORDER
+    assert "poles" in engine.LLD_LAYER_ORDER
+    assert "trench_nodes" not in engine.LLD_LAYER_ORDER
+    assert "trench_nodes" in engine.LLD_EXCLUDED_LAYERS
+    assert len(engine.LLD_LAYER_ORDER) == len(set(engine.LLD_LAYER_ORDER))
+
+
+def test_path_ending_at_uses_metre_scale_radius():
+    """DROP_CONNECT_TOL is degrees (~10 m). A squared distance made it ~1 km."""
+    line = [[0.0, 0.0], [0.01, 0.0]]
+    # ~5 m from the start: the path must be reversed to END at the premise.
+    assert engine._path_ending_at(line, (0.00005, 0.0)) == [line[1], line[0]]
+    # ~110 m from the start: far outside the tolerance, so left as drawn.
+    assert engine._path_ending_at(line, (0.001, 0.0)) is line
 
 
 def test_mode_b_brownfield_writer_rejects_unapproved_features(tmp_path):

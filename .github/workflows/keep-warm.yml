@@ -1,0 +1,48 @@
+name: Keep the engine awake
+
+# Render's free plan stops a web service after 15 minutes without traffic, and a
+# cold start measured 42s. That was long enough to empty the country dropdown
+# (the gateway gave it 15s back then) and to make every first visit of the day
+# feel broken. This pings /health often enough that the service never idles.
+#
+# Two limits worth knowing, because both make this best-effort rather than a
+# guarantee:
+#   * GitHub does not promise schedule timing -- under load a run can be late by
+#     several minutes. 10 minutes against a 15-minute idle window leaves room
+#     for that, but a long delay plus a long outage can still let it sleep. The
+#     UI is built to survive that: the country list retries once and then says
+#     so instead of showing an empty dropdown.
+#   * GitHub disables scheduled workflows in a repository with no activity for
+#     60 days, so this needs a push (or a manual run) now and then.
+#
+# The repository is public, so the runs are free rather than drawn from the
+# private-repo minute quota.
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: keep-warm
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    name: Ping the engine's /health
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Wake ftth-planning and report what it says
+        run: |
+          set -o pipefail
+          # 120s covers a 42s cold start plus Render's boot queue, and is still
+          # short enough that a run cannot overlap the next schedule tick.
+          code=$(curl -sS -o /tmp/health.json -w '%{http_code}' -m 120 \
+            https://ftth-planning.onrender.com/health || echo 000)
+          echo "http_status=$code"
+          head -c 400 /tmp/health.json || true
+          if [ "$code" != "200" ]; then
+            echo "::warning::engine /health answered $code (a cold boot is expected occasionally; a run of failures is not)"
+            exit 1
+          fi

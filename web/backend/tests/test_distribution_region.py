@@ -175,12 +175,15 @@ def test_an_unreached_point_is_joined_to_its_region_duct(tmp_path):
         str(ducts), str(tmp_path / "Polygons.gpkg"), str(tp), feedback=fb)
 
     parts = attr_enrich._line_parts(_rows(ducts)[0][1])
-    # There is no trench carrying the tap point in this fixture. The point is
-    # therefore reported unresolved; no off-trench connector is fabricated.
-    assert len(parts) == 1
+    # There is no trench carrying the tap point in this fixture, so the point is
+    # joined by a straight connector from the duct to it (the duct layer's D9
+    # convention), clipped to the region.
+    assert len(parts) == 2
+    assert [(60.0, 50.0), (60.0, 40.0)] in [list(p) for p in parts]
     text = " ".join(fb.lines)
-    assert "0/1" in text
-    assert "no connected trench path" in text
+    assert "reached 1/1" in text
+    assert "by a straight connector" in text
+    assert "0 left unconnected" in text
 
 
 def test_the_link_follows_the_trench_when_one_carries_both_ends(tmp_path):
@@ -328,9 +331,9 @@ def test_the_runs_layer_is_confined_with_the_ducts(tmp_path):
     for path in (ducts, runs):
         parts = attr_enrich._line_parts(_rows(path)[0][1])
         assert max(x for x, _y in parts[0]) == pytest.approx(102.0, abs=0.05)
-        # The tap is unresolved here because this fixture has no trench path
-        # to (60, 40); both layers must remain identical and on-polygon.
-        assert len(parts) == 1
+        # The tap has no trench path to (60, 40), so it is joined by a straight
+        # connector; both layers must remain identical and on-polygon.
+        assert len(parts) == 2
     # only the ducts layer reports: the runs layer must not restate the figures
     assert " ".join(fb.lines).count("off-region removed") == 1
 

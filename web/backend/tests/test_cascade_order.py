@@ -3,7 +3,7 @@
 The pipeline used to run trench → cable → duct → chamber, which placed the
 civil structures AFTER the routes that are supposed to end at them.  The
 approved order is trench → chambers → ducts → cables: chambers realise the
-designer's Trench_Nodes while the trench evidence is fresh, ducts are then
+trench evidence while the trench stage is fresh, ducts are then
 laid chamber-to-chamber inside the spans, and a cable can only be planned
 where the civil work already exists.
 
@@ -12,8 +12,8 @@ algorithm module cannot be imported without QGIS):
 
   * the physical stage order inside ``execute_pipeline``;
   * the step indices and the stage lists the status page reads from disk;
-  * the C4 wiring — Trench_Nodes saved by the trench stage and bound into
-    the chamber stage as INPUT_TRENCH_NODES;
+  * the chamber stage takes no Trench_Nodes input (INPUT_TRENCH_NODES is
+    None; chambers come from trench intersections and the duct/PDP rules);
   * the two normalization passes (trenches before ducts, cables/ducts after
     the cable stage).
 
@@ -120,29 +120,24 @@ def test_stage_markers_put_duct_files_before_cable_files():
     )
 
 
-# ── C4: the designer's nodes reach the chamber stage ─────────────────────
+# ── chamber inputs: no designer Trench_Nodes in the cascade ──────────────
 
 
-def test_the_trench_stage_publishes_its_structural_nodes():
+def test_the_trench_stage_does_not_publish_trench_nodes():
+    """The cascade no longer carries the designer's Trench_Nodes: the trench
+    stage writes no such layer and the chamber stage is fed from trench
+    intersections and the duct/PDP rules only."""
     body = _execute_pipeline_src()
-    save = body[body.index("# The structural nodes the designer placed"):]
-    assert 'results["trench_nodes"] = self._save_layer_to_gpkg(' in save
-    assert '"Trench_Nodes.gpkg"' in save
-    # …and the save happens while the trench stage is current (step 4), i.e.
-    # before the chamber stage consumes it.
-    trench_to_chamber = body[
-        _stage_offset(body, "# --- Trench Layer ---"):
-        _stage_offset(body, "# --- Chamber Layer (civil structures) ---")
-    ]
-    assert 'results["trench_nodes"]' in trench_to_chamber
+    assert 'results["trench_nodes"]' not in body
+    assert '"Trench_Nodes.gpkg"' not in body
 
 
-def test_the_chamber_stage_binds_the_designer_nodes_as_its_primary_source():
+def test_the_chamber_stage_takes_no_trench_nodes_input():
     run_chamber = ONECLICK_SRC[
         ONECLICK_SRC.index("def run_chamber_layer"):]
     run_chamber = run_chamber[:run_chamber.index("\n    def ")]
-    assert '"INPUT_TRENCH_NODES"' in run_chamber
-    assert 'results.get("trench_nodes")' in run_chamber
+    assert '"INPUT_TRENCH_NODES": None' in run_chamber
+    assert 'results.get("trench_nodes")' not in run_chamber
     # The duct evidence rules cannot fire before the duct stage — the binding
     # must still be passed (as an optional input) rather than dropped.
     assert "INPUT_FEEDER_DUCTS" in run_chamber
