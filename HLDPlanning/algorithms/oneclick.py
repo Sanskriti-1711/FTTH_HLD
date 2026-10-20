@@ -42,6 +42,7 @@ from qgis import processing
 
 from ..utils.params import ALG, LAYERNAMES, TRENCH_ENGINE
 from ..utils import attr_enrich
+from ..utils.run_guard import RunGuard, summarise
 from ..utils.style_utils import apply_simple_line_style
 
 
@@ -1654,6 +1655,11 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         steps = QgsProcessingMultiStepFeedback(9, feedback)
         out_dir = self._output_dir(parameters, context)
         feedback.pushInfo(self.tr("[timing] Pipeline started (output_dir=%s)" % (out_dir or "memory")))
+        # Every stage below runs under a guard: a stage that fails is recorded
+        # and the stages that need it are skipped, but the design that HAS been
+        # built is still published and the run still completes.  Nothing is
+        # silent — run_report.json names the stage, its error and its timing.
+        guard = RunGuard(cancel_check=feedback.isCanceled)
 
         # --- Stage 0: Brownfield (Existing Infrastructure) ---
         self._run_stage_brownfield(parameters, context, steps, feedback, results, out_dir)
@@ -1664,8 +1670,10 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         steps.setCurrentStep(1)
         feedback.pushInfo(self.tr("[5%] Running Object Layer"))
         t0 = time.time()
-        obj = self._run("Object Layer", self.run_object_layer,
-                        parameters, context, steps, feedback)
+        obj = self._guarded_stage(
+            guard, "Object Layer", self.run_object_layer,
+            parameters, context, steps, feedback,
+        )
         results["objects_gpkg"] = obj.get(self._OBJ_GPKG, "")
         results["objects"] = self._object_source(results["objects_gpkg"])
         elapsed = time.time() - t0
@@ -1673,6 +1681,11 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         fc_str = "{} features, ".format(n_obj) if n_obj is not None else ""
         feedback.pushInfo(self.tr("  [timing] Object Layer: {}{:.3f}s".format(fc_str, elapsed)))
         if not results["objects"]:
+            # The one remaining hard failure: with no object layer there is
+            # nothing at all to publish.  The report is written first so the
+            # reason survives on disk.
+            guard.record_failure("Object Layer", self.tr("no GeoPackage was produced"))
+            self._finish_run(guard, out_dir, feedback, results)
             raise QgsProcessingException(self.tr(
                 "Object Layer produced no GeoPackage; cannot continue."
             ))
@@ -1683,8 +1696,11 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         steps.setCurrentStep(2)
         feedback.pushInfo(self.tr("[25%] Running Polygon Layer"))
         t0 = time.time()
-        poly = self._run("Polygon Layer", self.run_polygon_layer,
-                         parameters, context, steps, feedback, results=results)
+        poly = self._guarded_stage(
+            guard, "Polygon Layer", self.run_polygon_layer,
+            parameters, context, steps, feedback, results,
+            needs=("Object Layer",),
+        )
         results["polygons"] = poly.get(self._POLY_OUT)
         elapsed = time.time() - t0
         n_poly = self._fast_count(results["polygons"], context)
@@ -1701,8 +1717,11 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         steps.setCurrentStep(3)
         feedback.pushInfo(self.tr("[40%] Running Network Layer"))
         t0 = time.time()
-        net = self._run("Network Layer", self.run_network_layer,
-                        parameters, context, steps, feedback, results=results)
+        net = self._guarded_stage(
+            guard, "Network Layer", self.run_network_layer,
+            parameters, context, steps, feedback, results,
+            needs=("Object Layer", "Polygon Layer"),
+        )
         results["network"] = net.get(self._NET_EDGES)
         results["pdp"] = net.get(self._NET_ASSIGNED)
         results["mfg"] = net.get(self._NET_MFG)
@@ -1719,36 +1738,54 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         feedback.pushInfo(self.tr("  [timing] Network Layer: {}{:.3f}s".format(fc_str, elapsed)))
         results["pdp"] = self._save_layer_to_gpkg(
             results["pdp"], "PDPs.gpkg", out_dir, context, feedback)
-        final_objects = net.get(self._NET_FINAL_OBJECTS)
-        if final_objects:
-            results["objects"] = final_objects
+        # The network stage can return cleanly and still not have produced the
+        # layer everything downstream routes on, so its outputs are validated
+        # under the same guard: a design with objects, polygons but no network
+        # is still a design the planner can open.
+        def _validate_network():
+            final_objects = net.get(self._NET_FINAL_OBJECTS)
+            if not final_objects:
+                raise PipelineStageError(self._stage_error(
+                    "Network Layer",
+                    self.tr(
+                        "Final_Object_Layer was not produced — objects could not be "
+                        "linked to polygons/PDPs, and the Trench, Cable and Duct "
+                        "stages depend on that linkage."
+                    )
+                ))
+            if not results.get("pdp"):
+                raise PipelineStageError(self._stage_error(
+                    "Network Layer", self.tr("No PDP layer was produced.")
+                ))
+            mfg_override = self.parameterAsVectorLayer(
+                parameters, self.P_TR_MFG, context)
+            if mfg_override is None and results.get("mfg") is None:
+                raise PipelineStageError(self._stage_error(
+                    "Network Layer",
+                    self.tr(
+                        "No MFG point was produced — the Trench (feeder routing) and "
+                        "Duct stages require it. Supply one via '04 Trench — Existing "
+                        "MFG point override' or check the Network stage log."
+                    )
+                ))
+            return final_objects, mfg_override
+
+        validated = guard.run(
+            "Network Layer", _validate_network,
+            needs=("Object Layer", "Polygon Layer"), feedback=feedback,
+        )
+        if validated:
+            final_objects, mfg_override = validated
             results["objects"] = self._save_layer_to_gpkg(
-                results["objects"], "Objects.gpkg", out_dir, context, feedback)
+                final_objects, "Objects.gpkg", out_dir, context, feedback)
+            if mfg_override is not None:
+                feedback.pushInfo(self.tr("Using the user-supplied MFG point override."))
+                results["mfg"] = mfg_override
         else:
-            raise PipelineStageError(self._stage_error(
-                "Network Layer",
-                self.tr(
-                    "Final_Object_Layer was not produced — objects could not be "
-                    "linked to polygons/PDPs, and the Trench, Cable and Duct "
-                    "stages depend on that linkage."
-                )
-            ))
-        if not results.get("pdp"):
-            raise PipelineStageError(self._stage_error(
-                "Network Layer", self.tr("No PDP layer was produced.")
-            ))
-        mfg_override = self.parameterAsVectorLayer(parameters, self.P_TR_MFG, context)
-        if mfg_override is not None:
-            feedback.pushInfo(self.tr("Using the user-supplied MFG point override."))
-            results["mfg"] = mfg_override
-        elif results.get("mfg") is None:
-            raise PipelineStageError(self._stage_error(
-                "Network Layer",
-                self.tr(
-                    "No MFG point was produced — the Trench (feeder routing) and "
-                    "Duct stages require it. Supply one via '04 Trench — Existing "
-                    "MFG point override' or check the Network stage log."
-                )
+            feedback.pushWarning(self.tr(
+                "  [stages] Network output validation failed — the trench, duct and "
+                "cable stages will be skipped; the objects and polygons still "
+                "publish."
             ))
         t_save = time.time()
         results["mfg"] = self._save_layer_to_gpkg(
@@ -1765,8 +1802,11 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         steps.setCurrentStep(4)
         feedback.pushInfo(self.tr("[60%] Running Trench Layer"))
         t0 = time.time()
-        tr = self._run("Trench Layer", self.run_trench_layer,
-                       parameters, context, steps, feedback, results=results)
+        tr = self._guarded_stage(
+            guard, "Trench Layer", self.run_trench_layer,
+            parameters, context, steps, feedback, results,
+            needs=("Network Layer",),
+        )
         results["sidewalk_l"] = tr.get(self._TR_SIDE_L)
         results["sidewalk_r"] = tr.get(self._TR_SIDE_R)
         results["trenches"] = tr.get(self._TR_FINAL)
@@ -1817,9 +1857,12 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         steps.setCurrentStep(5)
         feedback.pushInfo(self.tr("[75%] Running Chamber Layer"))
         t0 = time.time()
-        chambers = self._run("Chamber Layer", self.run_chamber_layer,
-                             parameters, context, steps, feedback, results=results)
-        results["chambers"] = chambers.get("OUT_CHAMBERS") if chambers else None
+        chambers = self._guarded_stage(
+            guard, "Chamber Layer", self.run_chamber_layer,
+            parameters, context, steps, feedback, results,
+            needs=("Trench Layer",),
+        )
+        results["chambers"] = chambers.get("OUT_CHAMBERS")
         elapsed = time.time() - t0
         n_ch = self._fast_count(results.get("chambers"), context)
         fc_str = "{} features, ".format(n_ch) if n_ch is not None else ""
@@ -1855,10 +1898,13 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         # --- Duct Layer ---
         steps.setCurrentStep(6)
         feedback.pushInfo(self.tr("[85%] Running Duct Layer"))
-        self._preflight_duct(results, context, feedback)
         t0 = time.time()
-        duct = self._run("Duct Layer", self.run_duct_layer,
-                         parameters, context, steps, feedback, results=results)
+        duct = self._guarded_stage(
+            guard, "Duct Layer", self.run_duct_layer,
+            parameters, context, steps, feedback, results,
+            needs=("Trench Layer",),
+            preflight=lambda: self._preflight_duct(results, context, feedback),
+        )
         results["ducts"] = duct
         results["duct_runs"] = {
             self._DU_FEEDER_RUNS: duct.get(self._DU_FEEDER_RUNS),
@@ -1906,10 +1952,13 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         # spans, so a cable can only go where a duct exists.
         steps.setCurrentStep(7)
         feedback.pushInfo(self.tr("[95%] Running Cable Layer"))
-        self._preflight_cable(results, context, feedback)
         t0 = time.time()
-        cab = self._run("Cable Layer", self.run_cable_layer,
-                        parameters, context, steps, feedback, results=results)
+        cab = self._guarded_stage(
+            guard, "Cable Layer", self.run_cable_layer,
+            parameters, context, steps, feedback, results,
+            needs=("Trench Layer", "Duct Layer"),
+            preflight=lambda: self._preflight_cable(results, context, feedback),
+        )
         results["cables"] = cab
         elapsed = time.time() - t0
         n_fc = self._fast_count(cab.get(self._CB_OUT_FEEDER), context)
@@ -1985,8 +2034,10 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             steps.setCurrentStep(8)
             feedback.pushInfo(self.tr("[99%] Running Pole Layer"))
             t0 = time.time()
-            poles = self._run("Pole Layer", self.run_pole_layer,
-                              parameters, context, steps, feedback, results=results)
+            poles = self._guarded_stage(
+                guard, "Pole Layer", self.run_pole_layer,
+                parameters, context, steps, feedback, results,
+            )
             results["poles"] = poles.get("OUT_POLES") if poles else None
             elapsed = time.time() - t0
             n_po = self._fast_count(results.get("poles"), context)
@@ -2002,10 +2053,13 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             steps.setCurrentStep(9)
             feedback.pushInfo(self.tr("[99.5%] Running Aerial Drop Layer"))
             t0 = time.time()
-            aerial = self._run("Aerial Drop Layer", self.run_aerial_drop_layer,
-                               parameters, context, steps, feedback, results=results)
-            results["aerial_trench"] = aerial.get("OUT_AERIAL_TRENCH") if aerial else None
-            results["aerial_cable"] = aerial.get("OUT_AERIAL_CABLE") if aerial else None
+            aerial = self._guarded_stage(
+                guard, "Aerial Drop Layer", self.run_aerial_drop_layer,
+                parameters, context, steps, feedback, results,
+                needs=("Pole Layer",),
+            )
+            results["aerial_trench"] = aerial.get("OUT_AERIAL_TRENCH")
+            results["aerial_cable"] = aerial.get("OUT_AERIAL_CABLE")
             elapsed = time.time() - t0
             n_at = self._fast_count(results.get("aerial_trench"), context)
             fc_str = "{} features, ".format(n_at) if n_at is not None else ""
@@ -2025,15 +2079,17 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             "AERIAL_DROPS": results.get("aerial_drops"),
             "OUTPUT": self._dest(parameters, self.OUT_SERVED_PREMISES, context),
         }
-        try:
-            served_result = processing.run(
+        served_result = guard.run(
+            "Served Premises Register",
+            lambda: processing.run(
                 "hldplanning:served_premises", served_params,
-                context=context, feedback=feedback, is_child_algorithm=True)
+                context=context, feedback=feedback, is_child_algorithm=True),
+            feedback=feedback,
+        )
+        if served_result:
             results["served_premises"] = self._save_layer_to_gpkg(
                 served_result.get("OUTPUT"), "Served_Premises.gpkg",
                 out_dir, context, feedback)
-        except Exception as exc:
-            raise PipelineStageError(self._stage_error("Served Premises Register", exc))
 
         # --- HLD_attr catalogue enrichment (in place on the saved GPKGs) ---
         if out_dir:
@@ -2060,6 +2116,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         feedback.pushInfo(self.tr(
             "[timing] Total pipeline: {:.3f}s".format(time.time() - t_pipeline)
         ))
+        self._finish_run(guard, out_dir, feedback, results)
         feedback.pushInfo(self.tr("[100%] Complete"))
 
         return self._collect_outputs(results, parameters, context, feedback)
@@ -2100,6 +2157,76 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
                     self.tr("Pipeline canceled during %s.") % stage_name
                 )
             raise PipelineStageError(self._stage_error(stage_name, exc))
+
+    def _guarded_stage(self, guard, stage_name, runner, parameters, context, steps,
+                       feedback, results=None, needs=(), preflight=None):
+        """Run one cascade stage under ``guard`` and always return a dict.
+
+        A stage that fails is recorded and its dependants skip; the design
+        already built stays publishable.  ``preflight`` runs inside the same
+        guard, so a stage refusing to start because its inputs are missing is
+        contained like any other failure.  The dict is always safe to index, so
+        the driver below reads ``out.get(...)`` without a None check.
+        """
+        def _go():
+            if preflight is not None:
+                preflight()
+            return self._run(stage_name, runner, parameters, context, steps,
+                             feedback, results=results)
+
+        out = guard.run(stage_name, _go, needs=needs, feedback=feedback)
+        return out if isinstance(out, dict) else {}
+
+    def _finish_run(self, guard, out_dir, feedback, results=None):
+        """Publish the stage report and the verdict; never raises.
+
+        ``run_report.json`` is written beside the design so a failed or skipped
+        stage is visible after the fact (and so the slow stage in a real run is
+        a number, not a guess).
+        """
+        summarise(guard, feedback)
+        try:
+            report = guard.report()
+            path = guard.write_report(out_dir, extra={
+                "output_dir": out_dir or "",
+                "feature_counts": self._feature_counts(results or {}, feedback),
+            })
+            if path:
+                feedback.pushInfo(self.tr(
+                    "  [stages] Run report written to {path}"
+                ).format(path=path))
+            # The stage timing belongs in the log too: it is what the next
+            # optimisation decision reads.
+            for entry in report.get("slowest_stages", ()):
+                feedback.pushInfo(self.tr(
+                    "  [timing] {name}: {seconds:.3f}s"
+                ).format(name=entry["name"], seconds=entry["seconds"]))
+        except Exception as exc:
+            feedback.pushWarning(
+                self.tr("  [stages] Run report skipped: %s") % exc
+            )
+
+    def _feature_counts(self, results, feedback):
+        """Per-layer feature counts for the report — cheap, from disk headers."""
+        counts = {}
+        for key in ("objects", "polygons", "pdp", "trenches", "chambers",
+                    "garden", "poles", "aerial_trench", "aerial_cable",
+                    "served_premises"):
+            value = results.get(key)
+            if not value:
+                continue
+            n = self._fast_count(value, None)
+            if n is not None:
+                counts[key] = n
+        for tier, layer in ((results.get("cables") or {}).items()):
+            n = self._fast_count(layer, None)
+            if n is not None:
+                counts["cable:" + str(tier)] = n
+        for tier, layer in ((results.get("ducts") or {}).items()):
+            n = self._fast_count(layer, None)
+            if n is not None:
+                counts["duct:" + str(tier)] = n
+        return counts
 
     def _collect_outputs(self, results, parameters, context, feedback):
         out = {}
