@@ -235,6 +235,8 @@ def test_a_lost_job_fails_the_run_instead_of_polling_forever(tmp_path, monkeypat
     calls = []
 
     def fake_call(path, data=None, method="GET", timeout=120):
+        if path == "/health":
+            return b'{"state": "ok"}'
         calls.append((method, path))
         if method == "PUT" or method == "POST":
             return b"{}"
@@ -324,9 +326,52 @@ def test_an_unreachable_worker_says_so_instead_of_hanging(tmp_path, monkeypatch)
     project.mkdir()
     monkeypatch.setattr(main, "QGIS_WORKER_URL", "http://127.0.0.1:9")
     monkeypatch.setattr(main, "QGIS_WORKER_TOKEN", TOKEN)
+    # The real budget is 180 s (a free instance's cold start); the wait itself is
+    # exercised in the wake test below, so keep this one fast.
+    monkeypatch.setattr(main, "QGIS_WORKER_WAKE_S", 0.2)
 
     with pytest.raises(RuntimeError) as exc:
         main._run_command("proj1", [sys.executable, "-c", "print(1)"], project)
 
     assert "QGIS worker" in str(exc.value)
-    assert "unreachable" in str(exc.value)
+    assert "did not answer within" in str(exc.value)
+
+
+def test_a_sleeping_worker_is_waited_for_instead_of_failing_the_run(tmp_path, monkeypatch):
+    """A free worker answers 502 while it boots; that must not kill the run.
+
+    Measured 2026-10-20 13:20: a run against the sleeping worker was settled as
+    failed in 34 s with "HTTP Error 502: Bad Gateway", and the planner lost the
+    ward it had just started.
+    """
+    project = tmp_path / "proj1"
+    project.mkdir()
+    asleep = {"n": 2}
+    seen = []
+
+    def cold(path, data=None, method="GET", timeout=120):
+        seen.append((method, path))
+        if asleep["n"]:
+            asleep["n"] -= 1
+            raise urllib.error.HTTPError(
+                "http://worker" + path, 502, "Bad Gateway", {}, io.BytesIO(b"")
+            )
+        if path == "/health":
+            return b'{"state": "ok"}'
+        if method in ("PUT", "POST"):
+            return b"{}"
+        return b'{"state": "done", "exit_code": 0, "lines": [], "offset": 0}'
+
+    monkeypatch.setattr(main, "QGIS_WORKER_URL", "http://worker")
+    monkeypatch.setattr(main, "_worker_call", cold)
+    monkeypatch.setattr(main, "_persist_project_state", lambda *a, **k: None)
+    monkeypatch.setattr(main, "_extract_into", lambda body, out: [])
+
+    written = main._run_command_remote(
+        "proj1", ["qgis_process", "run", "x"], project
+    )
+
+    assert written == []
+    # The job was only queued after the worker stopped answering 502.
+    assert ("POST", "/jobs/proj1") in seen
+    assert seen[0][1] == "/health"

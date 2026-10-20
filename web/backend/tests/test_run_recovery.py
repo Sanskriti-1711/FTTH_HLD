@@ -565,13 +565,20 @@ def test_a_run_owned_by_this_engine_is_still_recovered(monkeypatch, tmp_path):
     assert task["stage"] == "Duct Layer" and task["progress"] == 55
 
 
-def test_a_row_from_before_the_column_existed_is_still_recovered(monkeypatch, tmp_path):
-    """Old rows carry no owner; they must not be left running for ever."""
+def test_a_row_with_no_owner_is_left_alone(monkeypatch, tmp_path):
+    """A row that no engine stamped is not proof of anything.
+
+    Measured 2026-10-20, after the first ownership fix shipped: the laptop
+    engine was still running the pre-fix code, so its run had no owner -- and
+    the Render engine settled it as failed within seconds, exactly the bug the
+    stamp was meant to stop. "No owner" therefore cannot mean "mine": leaving
+    a dead row running costs a stale list entry, settling a live run costs the
+    run.
+    """
     monkeypatch.setattr(main.postgis, "ENGINE_INSTANCE", "local")
     monkeypatch.setattr(main, "OUTPUT_DIR", tmp_path)
     monkeypatch.setattr(main, "_persist_project_state", lambda *a, **k: None)
     main.tasks.clear()
 
-    task = main._recover_orphan_from_row({"project_id": "old-run", "status": "running"})
-
-    assert task is not None and task["status"] == "failed"
+    assert main._recover_orphan_from_row({"project_id": "old-run", "status": "running"}) is None
+    assert main.tasks.get("old-run") is None

@@ -184,6 +184,18 @@ QGIS_WORKER_TOKEN = os.environ.get("QGIS_WORKER_TOKEN", "")
 # How often the worker's job log is polled. Two seconds keeps the stage strip
 # live without a request per stdout line.
 QGIS_WORKER_POLL_S = float(os.environ.get("FTTH_QGIS_WORKER_POLL", "2"))
+# A sleeping free-tier worker answers 502 from the platform's edge (measured
+# 2026-10-20: /health waited 45 s on the first request of the day and answered
+# in 0.3 s on the next) until it boots.  Starting a job counts as the worker's
+# traffic, so a run that arrives while it sleeps used to die in 34 s with "HTTP
+# Error 502: Bad Gateway" and lose the planner's ward.  Job start now waits out
+# a boot instead; 180 s covers the ~47 s cold start plus the boot queue.
+QGIS_WORKER_WAKE_S = float(os.environ.get("FTTH_QGIS_WORKER_WAKE", "180"))
+# How long a run survives losing contact with a worker that is mid-pipeline.
+# Five 2-second misses (10 s) was too tight for a platform hiccup on a job that
+# has already burned an hour of a slow instance's CPU; a RESTARTED worker still
+# ends the run immediately, because its job store answers "unknown".
+QGIS_WORKER_MISS_S = float(os.environ.get("FTTH_QGIS_WORKER_MISS", "90"))
 # The worker's manifest of files THIS run wrote.  It travels inside the result
 # zip and is removed after use -- see _extract_into().
 WORKER_MANIFEST = "._written.json"
@@ -417,6 +429,69 @@ def _worker_call(path: str, data: Optional[bytes] = None, method: str = "GET",
     return body
 
 
+def _worker_wake(budget: Optional[float] = None) -> None:
+    """Wait for the worker to answer ``/health``, if it is still booting.
+
+    A free-tier worker sleeps after 15 idle minutes and the platform's edge
+    answers **502** meanwhile. Measured 2026-10-20 13:20: a run started against
+    the sleeping worker was settled as failed in 34 s with "HTTP Error 502: Bad
+    Gateway", which is indistinguishable from an outage in the UI. Waiting here
+    turns that into a delay the run absorbs.
+    """
+    if not QGIS_WORKER_URL:
+        return
+    budget = QGIS_WORKER_WAKE_S if budget is None else budget
+    deadline = time.time() + budget
+    waited_from = time.time()
+    last: Optional[BaseException] = None
+    while True:
+        try:
+            _worker_call("/health", timeout=max(5.0, min(30.0, deadline - time.time())))
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            last = exc
+            if time.time() >= deadline:
+                raise RuntimeError(
+                    f"The QGIS worker at {QGIS_WORKER_URL} did not answer within "
+                    f"{int(budget)} s ({last}). This is what a sleeping free-tier "
+                    "instance looks like while it boots; run the area again when "
+                    "the worker is awake."
+                ) from last
+            time.sleep(min(3.0, max(0.05, deadline - time.time())))
+            continue
+        waited = time.time() - waited_from
+        if waited >= 5:
+            print(f"[worker] woke in {waited:.0f}s", flush=True)
+        return
+
+
+def _start_worker_job(project_id: str, job: str, output_dir: Path,
+                      cmd: List[str]) -> None:
+    """Upload the inputs and queue the job, waiting out a worker that is booting.
+
+    The inputs PUT is idempotent (it replaces the job's directory), so retrying
+    the pair after a cold-start 502 cannot queue the run twice.
+    """
+    payload = _zip_directory(output_dir)
+    body = json.dumps({"args": cmd[1:]}).encode("utf-8")
+    attempts = 2
+    for attempt in range(1, attempts + 1):
+        _worker_wake()
+        try:
+            _worker_call(f"{job}/inputs", data=payload, method="PUT", timeout=900)
+            _worker_call(job, data=body, method="POST", timeout=120)
+            return
+        except (urllib.error.URLError, OSError) as exc:
+            if attempt >= attempts:
+                raise RuntimeError(
+                    f"The QGIS worker at {QGIS_WORKER_URL} is unreachable: {exc}"
+                ) from exc
+            _append(
+                project_id, "info",
+                f"The QGIS worker did not take the job ({exc}); waiting for it and "
+                "trying once more.",
+            )
+
+
 def _run_command_remote(project_id: str, cmd: Union[List[str], str],
                         output_dir: Path) -> List[str]:
     """Run the pipeline on the QGIS worker and collect its outputs.
@@ -431,32 +506,26 @@ def _run_command_remote(project_id: str, cmd: Union[List[str], str],
     timeout = int(os.environ.get("QGIS_PROCESS_TIMEOUT", "10800"))
     started = time.time()
     job = f"/jobs/{project_id}"
-    try:
-        _worker_call(f"{job}/inputs", data=_zip_directory(output_dir),
-                     method="PUT", timeout=900)
-        _worker_call(job, data=json.dumps({"args": cmd[1:]}).encode("utf-8"),
-                     method="POST", timeout=120)
-    except (urllib.error.URLError, OSError) as exc:
-        raise RuntimeError(
-            f"The QGIS worker at {QGIS_WORKER_URL} is unreachable: {exc}"
-        ) from exc
+    _start_worker_job(project_id, job, output_dir, cmd)
     _append(project_id, "info", f"Running on the QGIS worker at {QGIS_WORKER_URL}.")
 
     offset = 0
-    unreachable = 0
+    lost_since = 0.0
     while True:
         if time.time() - started > timeout:
             raise RuntimeError(f"qgis_process timed out after {timeout} seconds")
         try:
             batch = json.loads(_worker_call(f"{job}/log?offset={offset}", timeout=120) or b"{}")
-            unreachable = 0
+            lost_since = 0.0
         except (urllib.error.URLError, OSError, ValueError) as exc:
-            # A worker restart mid-run is a lost job, not a hang: say so after a
-            # few consecutive misses instead of waiting out the 3-hour budget.
-            unreachable += 1
-            if unreachable >= 5:
+            # A worker restart mid-run is a lost job, not a hang, and its job
+            # store says "unknown" on the next successful poll (below).  This
+            # branch is for contact lost for longer than a platform hiccup.
+            lost_since = lost_since or time.time()
+            if time.time() - lost_since >= QGIS_WORKER_MISS_S:
                 raise RuntimeError(
-                    f"The QGIS worker stopped answering during this run: {exc}"
+                    f"The QGIS worker stopped answering during this run for "
+                    f"{int(QGIS_WORKER_MISS_S)} s: {exc}"
                 ) from exc
             time.sleep(QGIS_WORKER_POLL_S)
             continue
@@ -1108,10 +1177,15 @@ def _recover_orphan_from_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     # proof of death -- it is equally proof that ANOTHER engine owns it.  On
     # 2026-10-20 a local run was settled as failed by the 512 MB Render engine
     # because that deployment could not see the laptop's thread.
+    # An UNSTAMPED row is treated the same way: it may be a run this engine
+    # never wrote (an older local engine that predates the column), so "no
+    # owner" cannot mean "mine" either.  Left running, a genuinely dead row
+    # costs one stale list entry; settled wrongly, it costs a live run.
     owner = str(row.get("engine_instance") or "").strip()
-    if owner and owner != postgis.ENGINE_INSTANCE:
+    if owner != postgis.ENGINE_INSTANCE:
         logger_note = (
-            f"project {project_id[:8]} is owned by engine '{owner}', not "
+            f"project {project_id[:8]} is owned by "
+            f"'{owner or 'an engine that did not stamp the row'}', not "
             f"'{postgis.ENGINE_INSTANCE}'; leaving it alone"
         )
         print(f"[ownership] {logger_note}", flush=True)

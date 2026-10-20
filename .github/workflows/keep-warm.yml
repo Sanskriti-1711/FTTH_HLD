@@ -1,4 +1,4 @@
-name: Keep the engine awake
+name: Keep the engine and the QGIS worker awake
 
 # Render's free plan stops a web service after 15 minutes without traffic, and a
 # cold start measured 42s. That was long enough to empty the country dropdown
@@ -44,5 +44,22 @@ jobs:
           head -c 400 /tmp/health.json || true
           if [ "$code" != "200" ]; then
             echo "::warning::engine /health answered $code (a cold boot is expected occasionally; a run of failures is not)"
+            exit 1
+          fi
+
+      # The worker sleeps on the same 15-minute clock, and it is the one that
+      # matters more: a sleeping engine only delays a request, but a sleeping
+      # worker used to fail a run outright (2026-10-20: "HTTP Error 502: Bad
+      # Gateway" 34 s after a run started). The engine now waits out a boot, so
+      # this is the second line of defence rather than the only one.
+      - name: Wake the QGIS worker
+        run: |
+          set -o pipefail
+          code=$(curl -sS -o /tmp/worker.json -w '%{http_code}' -m 120 \
+            https://ftth-qgis-worker.onrender.com/health || echo 000)
+          echo "http_status=$code"
+          head -c 200 /tmp/worker.json || true
+          if [ "$code" != "200" ]; then
+            echo "::warning::worker /health answered $code (a cold boot is expected occasionally; a run of failures is not)"
             exit 1
           fi
