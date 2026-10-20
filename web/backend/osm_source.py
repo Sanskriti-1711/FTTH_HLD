@@ -54,6 +54,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
+import meminfo
 import postgis
 import household_register
 from countries import country_name, country_options, normalize_country_code
@@ -2909,6 +2910,7 @@ def _run_area_fetch(key: str, area: str, bbox: Sequence[float]) -> None:
         _set_fetch_state(key, "queued", groups_done=0, reset=True)
         for group, body in groups:
             _set_fetch_state(key, f"fetching_{group}", groups_done=done)
+            meminfo.trace(f"osm fetch {key[:8]} requesting {group}")
             group_elements, mirror_used = overpass_query(body, bbox)
             done += 1
             # Store each group as it arrives instead of holding every element in
@@ -2917,6 +2919,13 @@ def _run_area_fetch(key: str, area: str, bbox: Sequence[float]) -> None:
             # the point layers available to anything reading the store.
             for table, written in (store_overpass_elements(group_elements) or {}).items():
                 counts[table] = counts.get(table, 0) + int(written or 0)
+            # The parsed group and the row tuples built from it are dead from
+            # here on.  Dropping the reference is not enough under glibc -- the
+            # arena stays -- and this runs in the same 512 MB container QGIS
+            # will need, so hand it back before asking for the next group.
+            del group_elements
+            meminfo.trace(f"osm fetch {key[:8]} stored {group}")
+            meminfo.trim()
             _set_fetch_state(
                 key, f"fetching_{group}", groups_done=done, detail=mirror_used,
                 counts=dict(counts),

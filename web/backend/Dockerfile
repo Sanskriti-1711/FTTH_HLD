@@ -5,6 +5,17 @@ ENV PYTHONUNBUFFERED=1 \
     QGIS_PLUGINPATH=/app \
     QGIS_EXECUTABLE=/usr/bin/qgis_process
 
+# The instance is memory-capped (512 MB on the free plan) and the API process
+# shares it with qgis_process.  glibc gives every thread its own 64 MB arena by
+# default, so a threaded server keeps memory it no longer uses; two arenas is
+# the documented way to stop that without serialising the allocator.  The two
+# GDAL/OGR caches are page caches that default to a share of system RAM -- on a
+# shared 512 MB box they compete with the pipeline itself for no benefit, since
+# the inputs are small GeoPackages read once.
+ENV MALLOC_ARENA_MAX=2 \
+    GDAL_CACHEMAX=64 \
+    OGR_SQLITE_CACHE=16
+
 WORKDIR /app
 
 COPY HLDPlanning /app/HLDPlanning

@@ -29,6 +29,7 @@ from fastapi.responses import FileResponse, Response
 
 import countries
 import design
+import meminfo
 import occupancy
 import osm_source
 import postgis
@@ -161,6 +162,11 @@ ORPHAN_DEAD_SECONDS = int(os.environ.get("HLD_ORPHAN_DEAD_SECONDS", "1800"))
 # integrity check cannot become valid by waiting, and a run whose last write is
 # minutes old is not mid-write on it.
 ORPHAN_BROKEN_SECONDS = int(os.environ.get("HLD_ORPHAN_BROKEN_SECONDS", "300"))
+
+# How often a running pipeline's memory is sampled (engine and qgis_process).
+# Every 20 s is frequent enough to catch the ramp into an OOM kill and rare
+# enough not to flood the platform log for an hour-long run.
+MEMORY_SAMPLE_SECONDS = int(os.environ.get("HLD_MEMORY_SAMPLE_SECONDS", "20"))
 
 # Guards the recovery of one project: two status polls arriving together must
 # not both ingest the outputs.
@@ -324,6 +330,31 @@ def _run_command(project_id: str, cmd: Union[List[str], str], output_dir: Path) 
     env.setdefault("PYTHONUNBUFFERED", "1")
 
     _append(project_id, "info", "$ " + (cmd if isinstance(cmd, str) else " ".join(cmd)))
+    # The container's limit is shared by this process and qgis_process, so a run
+    # that dies is only explainable if both are measured.  Sampled while the
+    # child is alive and written to stdout: a Render OOM kill leaves no
+    # traceback, and "the engine restarted" is the only thing the run says.
+    engine_pid = os.getpid()
+    peaks = {"engine_mb": 0.0, "qgis_mb": 0.0}
+    stop_sampling = threading.Event()
+
+    def _sample_memory() -> None:
+        while not stop_sampling.wait(MEMORY_SAMPLE_SECONDS):
+            if process.poll() is not None:
+                return
+            engine_mb = meminfo.rss_mb(engine_pid) or 0.0
+            qgis_mb = meminfo.rss_mb(process.pid) or 0.0
+            peaks["engine_mb"] = max(peaks["engine_mb"], engine_mb)
+            peaks["qgis_mb"] = max(peaks["qgis_mb"], qgis_mb)
+            meminfo.trace(
+                f"run {project_id[:8]}", engine_mb=engine_mb, qgis_mb=qgis_mb,
+                stage=_task(project_id).get("stage"),
+            )
+
+    sampler = threading.Thread(
+        target=_sample_memory, daemon=True, name=f"mem-{project_id[:8]}",
+    )
+    sampler.start()
     process = subprocess.Popen(
         cmd,
         cwd=str(ROOT_DIR),
@@ -382,6 +413,21 @@ def _run_command(project_id: str, cmd: Union[List[str], str], output_dir: Path) 
         else:
             process.kill()
         raise RuntimeError(f"qgis_process timed out after {timeout} seconds")
+    finally:
+        stop_sampling.set()
+        limit = meminfo.limit_mb()
+        # On the task log, where the planner can see it: the number that decides
+        # whether a bigger area can ever run on this instance.
+        _append(
+            project_id, "info",
+            "Peak memory: engine %.0f MB, qgis_process %.0f MB%s."
+            % (peaks["engine_mb"], peaks["qgis_mb"],
+               f" of {limit:.0f} MB" if limit else ""),
+        )
+        meminfo.trace(
+            f"run {project_id[:8]} ended",
+            engine_peak_mb=peaks["engine_mb"], qgis_peak_mb=peaks["qgis_mb"],
+        )
 
 
 def _convert_gpkg_to_geojson(gpkg_path: Path, geojson_path: Path) -> bool:
@@ -664,10 +710,19 @@ def _recover_orphan_run(
     output_dir = OUTPUT_DIR / project_id
     info = _stage_from_outputs(output_dir)
     if info is None:
-        # Nothing on disk: the run never got as far as writing an output.
+        # Nothing on disk: the run never got as far as writing an output.  On a
+        # memory-capped instance the process being KILLED for exceeding the cap
+        # is by far the most common way in here (the platform logs it as
+        # `oomKilled`, which nothing inside the process can see), so the message
+        # names that instead of blaming a restart the planner cannot act on.
+        limit = meminfo.limit_mb()
         _settle_orphan(
             project_id, task, "failed",
-            "The engine restarted before this run wrote any output. Run it again.",
+            "The engine process was killed or restarted before this run wrote "
+            "any output. "
+            + (f"This instance has {limit:.0f} MB of memory and running out of "
+               "it is the usual cause. " if limit and limit <= 1024 else "")
+            + "Run it again.",
             stage_name="Resolve area", stage_index=0, progress=0,
         )
         return
@@ -1701,6 +1756,16 @@ def _run_pipeline(
         if os.name == "nt" and qgis.lower().endswith((".bat", ".cmd")):
             cmd = " ".join(_quote_cmd_arg(part) for part in cmd)
 
+        # Hand the area build's freed arenas back before QGIS starts: the two
+        # peaks would otherwise be added together in one 512 MB container.
+        meminfo.trim()
+        meminfo.trace(f"run {project_id[:8]} starting qgis_process")
+        _append(
+            project_id, "info",
+            "Engine memory before the pipeline: %.0f MB of %s."
+            % (meminfo.rss_mb() or 0.0,
+               f"{meminfo.limit_mb():.0f} MB" if meminfo.limit_mb() else "the host"),
+        )
         run_started = time.time()
         _run_command(project_id, cmd, output_dir)
         _drop_stale_outputs(project_id, output_dir, run_started)
@@ -1760,6 +1825,10 @@ def health() -> Dict[str, Any]:
         "service": "ftth-engine-api",
         "started_at": APP_STARTED_AT.isoformat(timespec="seconds"),
         "uptime_seconds": int((datetime.now(timezone.utc) - APP_STARTED_AT).total_seconds()),
+        # The container is shared with qgis_process and capped (512 MB on the
+        # free instance), so how much of it this process holds is honest health
+        # information, not diagnostics-only.
+        "memory": meminfo.report(),
         "qgis_process": qgis,
         "postgis": postgis.db_info(),
         "osm": _osm_health(),
@@ -2164,6 +2233,9 @@ def _run_area_pipeline(
         return
 
     households = built["households"]
+    # Peak of the area build, which is a phase of its own: the OSM extract is
+    # parsed, classified and stored here before QGIS is ever started.
+    meminfo.trace(f"run {project_id[:8]} area inputs built")
     extract = built.get("extract") or {}
     _append(project_id, "info", f"Area resolved to {built.get('matched') or area}.")
     _append(
@@ -4008,6 +4080,13 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
                     return f
         return None
 
+    def _serving_part(f: Dict[str, Any], o: Any) -> Any:
+        parts = _line_strings(f.get("geometry"))
+        for ln in parts:
+            if len(ln) >= 2 and (((ln[-1][0] - o[0]) ** 2 + (ln[-1][1] - o[1]) ** 2) ** 0.5 <= DROP_CONNECT_TOL):
+                return ln
+        return parts[0]
+
     def _nearest_pole_id(o: Any) -> Optional[str]:
         poles = by_layer.get("poles") or []
         best_d, best_id = float("inf"), None
@@ -4076,7 +4155,7 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
         path: List[Any] = []
         if not has_drop and has_cable and serving_cable is not None:
             ln = _path_ending_at(
-                _line_strings(serving_cable.get("geometry"))[0], o
+                _serving_part(serving_cable, o), o
             )
             path = ln[-2:] if len(ln) >= 2 else ln
         elif not has_cable and has_drop and serving_duct is not None:
