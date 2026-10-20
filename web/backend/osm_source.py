@@ -128,10 +128,16 @@ def load_env_file(start: Optional[Path] = None) -> Optional[Path]:
 # offline.
 STALE_DAYS = 30
 
-# How long a caller waits for someone else's in-flight download of the same
-# bbox before giving up and reporting progress instead.  A cold city takes
-# 10-16 min, so this is generous on purpose: the alternative is every caller
-# starting its own copy of the same download.
+# How long ONE SLICE of waiting for someone else's in-flight download lasts.
+#
+# It is a slice, not a budget: the waiter re-checks the cache and keeps waiting
+# for as long as the fetch is actually in flight (see ensure_area_data).  It
+# used to be the whole budget, and a cold city takes 10-16 min against a 15 min
+# budget, so a caller that arrived at the start of a download fell out of the
+# wait just before it finished and then started a SECOND download of the same
+# bbox.  Measured on B16 9BH, Birmingham: the page reported "3 of 7 groups" and
+# then "1 of 7" with the counts reset, because the second download had started
+# again from group one.
 FETCH_WAIT_SECONDS = int(os.environ.get("OSM_FETCH_WAIT_SECONDS", "900"))
 
 # The largest area the BOUNDARY call will start downloading on its own.
@@ -2959,12 +2965,31 @@ def start_area_fetch(area: str, bbox: Sequence[float]) -> Dict[str, Any]:
     return area_fetch_state(area, bbox)
 
 
+def _cache_result(cached: Dict[str, Any]) -> Dict[str, Any]:
+    """The `ensure_area_data` answer for an extract already in the store."""
+    return {
+        "source": "cache",
+        "detail": cached.get("detail"),
+        "fetched_at": cached["fetched_at"].isoformat(timespec="seconds")
+        if hasattr(cached.get("fetched_at"), "isoformat") else str(cached.get("fetched_at")),
+        "counts": cached.get("counts") or {},
+    }
+
+
 def ensure_area_data(area: str, bbox: Sequence[float]) -> Dict[str, Any]:
     """Make sure the local store holds OSM data for this bbox, fetching if not.
 
     This is the automat: no operator runs an import.  A fresh overlapping
     extract is reused; otherwise the download runs once and every caller that
     needs the same bbox waits for that one run rather than starting its own.
+
+    The wait REPEATS for as long as the other download is in flight.  It used to
+    be a single FETCH_WAIT_SECONDS budget, which a cold city (10-16 min) outlives
+    -- so a caller that arrived at the start of a download fell out of the wait
+    a little before the download finished and started its own one.  Two threads
+    then fetched the same bbox and wrote the same progress entry: B16 9BH in
+    Birmingham reported "3 of 7 groups", then "1 of 7" with the counts reset,
+    because the second download had begun again at group one.
     """
     if not postgis.is_available():
         raise RuntimeError("postgis_unavailable")
@@ -2972,39 +2997,36 @@ def ensure_area_data(area: str, bbox: Sequence[float]) -> Dict[str, Any]:
 
     cached = covered_by_cache(bbox)
     if cached:
-        return {
-            "source": "cache",
-            "detail": cached.get("detail"),
-            "fetched_at": cached["fetched_at"].isoformat(timespec="seconds")
-            if hasattr(cached.get("fetched_at"), "isoformat") else str(cached.get("fetched_at")),
-            "counts": cached.get("counts") or {},
-        }
+        return _cache_result(cached)
 
     key = _bbox_key(bbox)
-    # Wait for an in-flight download of THIS bbox (started by the boundary
-    # call, or by an earlier preview) instead of starting a second one.
-    if _join_inflight(key):
-        # Re-check the cache: the fetch we waited for wrote it.
-        cached = covered_by_cache(bbox)
-        if cached:
-            return {
-                "source": "cache",
-                "detail": cached.get("detail"),
-                "fetched_at": cached["fetched_at"].isoformat(timespec="seconds")
-                if hasattr(cached.get("fetched_at"), "isoformat") else str(cached.get("fetched_at")),
-                "counts": cached.get("counts") or {},
-            }
-        state = area_fetch_state(area, bbox)
-        if state.get("state") == "failed" and state.get("error"):
-            raise RuntimeError(f"overpass_fetch_failed: {state['error']}")
-    # Nothing in flight and nothing cached: fetch it here, on this thread.
-    # A previous FAILED attempt does not block this one — its entry is cleared
-    # so a retry actually retries.
-    with _FETCH_LOCK:
-        entry = _FETCHES.get(key)
-        if entry is None or entry["state"] in ("ready", "failed"):
+    while True:
+        # Wait for an in-flight download of THIS bbox (started by the boundary
+        # call, or by an earlier preview) instead of starting a second one.
+        if _join_inflight(key):
+            # Re-check the cache: the fetch we waited for wrote it.
+            cached = covered_by_cache(bbox)
+            if cached:
+                return _cache_result(cached)
+            state = area_fetch_state(area, bbox)
+            if state.get("state") == "failed" and state.get("error"):
+                raise RuntimeError(f"overpass_fetch_failed: {state['error']}")
+            # Still downloading, or it finished without writing a cache row:
+            # keep waiting instead of racing it with a second download.
+            continue
+        # Nothing in flight and nothing cached: fetch it here, on this thread.
+        # The bbox is CLAIMED under the lock before it is released, so a caller
+        # arriving while this fetch runs waits for it rather than starting a
+        # twin -- the same-entry, two-writer failure this function had.
+        with _FETCH_LOCK:
+            entry = _FETCHES.get(key)
+            if entry is not None and entry["state"] not in ("ready", "failed"):
+                continue
+            # A previous FAILED attempt does not block this one -- its entry is
+            # cleared so a retry actually retries.
             _FETCHES.pop(key, None)
-    _set_fetch_state(key, "queued", groups_done=0)
+            _set_fetch_state(key, "queued", groups_done=0, reset=True)
+        break
     _run_area_fetch(key, area, list(bbox))
     state = area_fetch_state(area, bbox)
     if state.get("state") == "failed":
