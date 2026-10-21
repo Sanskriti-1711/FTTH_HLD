@@ -63,6 +63,7 @@ jobs:
             latest=auto
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -72,5 +73,69 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope={{ github.ref_name }}
-          cache-to: type=gha,mode=max,scope={{ github.ref_name }}
+          cache-from: type=gha,scope=${{ github.ref_name }}
+          cache-to: type=gha,scope=${{ github.ref_name }}
+
+      # Publishing the image is not the same as deploying it.
+      #
+      # Render cannot be told to watch a Docker Hub tag: `autoDeployTrigger:
+      # checksum` is rejected by the API ("Invalid value for autoDeployTrigger:
+      # checksum") and `commit` watches a git branch that an image-backed
+      # service does not have.  Re-pushing `:1.7.3` was measured on 2026-10-21 --
+      # both services sat on their previous deploy for eight minutes -- and that
+      # morning's release reached production only because the deploy was called
+      # by hand afterwards.  So the deploy is the last step here, where it cannot
+      # be forgotten.
+      #
+      # Needs the repository secret RENDER_API_KEY (Render dashboard -> Account
+      # Settings -> API Keys -> Create API Key).  A tag push without it fails
+      # this step loudly rather than shipping an image nobody deploys.
+      - name: Deploy the published image to Render
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          IMAGE_REF: docker.io/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RENDER_API_KEY:-}" ]; then
+            echo "::error::RENDER_API_KEY is not set for this repository, so the image was built but nothing deploys it." >&2
+            exit 1
+          fi
+          echo "Deploying $IMAGE_REF"
+          for pair in "srv-db36torbc2fs73cqhb40:ftth_planning" \
+                      "srv-dbbkotu7bikc738t70h0:ftth-qgis-worker"; do
+            service_id=${pair%%:*}
+            service_name=${pair##*:}
+            body=$(printf '{"imageUrl":"%s"}' "$IMAGE_REF")
+            code=$(curl -sS -o deploy.json -w '%{http_code}' -X POST \
+              -H "Authorization: Bearer $RENDER_API_KEY" \
+              -H 'Content-Type: application/json' \
+              -H 'Accept: application/json' \
+              -d "$body" \
+              "https://api.render.com/v1/services/$service_id/deploys")
+            if [ "$code" != "201" ]; then
+              echo "::error::$service_name: deploy request returned $code: $(cat deploy.json)" >&2
+              exit 1
+            fi
+            deploy_id=$(python3 -c 'import json; d = json.load(open("deploy.json")); print((d.get("deploy") or d)["id"])')
+            echo "$service_name: deploy $deploy_id"
+            status=""
+            for _ in $(seq 1 60); do
+              status=$(curl -sS \
+                -H "Authorization: Bearer $RENDER_API_KEY" \
+                -H 'Accept: application/json' \
+                "https://api.render.com/v1/services/$service_id/deploys/$deploy_id" \
+                | python3 -c 'import json,sys; d = json.load(sys.stdin); print((d.get("deploy") or d).get("status", ""))')
+              case "$status" in
+                live) echo "$service_name: live"; break ;;
+                build_failed|update_failed|canceled|deactivated)
+                  echo "::error::$service_name: deploy ended $status" >&2
+                  exit 1 ;;
+              esac
+              sleep 15
+            done
+            if [ "$status" != "live" ]; then
+              echo "::error::$service_name: deploy $deploy_id never reached live (last: $status)" >&2
+              exit 1
+            fi
+          done
