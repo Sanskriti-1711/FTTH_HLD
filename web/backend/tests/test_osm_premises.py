@@ -1018,7 +1018,7 @@ def _premise(i, postcode="12107", district="Mariendorf", hh=1):
     }
 
 
-def _stub_area(monkeypatch, premises, roads=({},), resolution=None):
+def _stub_area(monkeypatch, premises, roads=({},), resolution=None, area_state=None):
     """Make preview_area run without a database, the network or the pipeline.
 
     `resolution` overrides the boundary facts a caller wants to exercise -- the
@@ -1057,7 +1057,16 @@ def _stub_area(monkeypatch, premises, roads=({},), resolution=None):
     monkeypatch.setattr(osm_source, "resolve_area", _resolve)
     monkeypatch.setattr(osm_source.postgis, "is_available", lambda: True)
     monkeypatch.setattr(osm_source, "ensure_area_data", lambda *a, **k: {"source": "cache"})
-    monkeypatch.setattr(osm_source, "read_area_rows", lambda poly: ([], [], {}, list(roads)))
+    monkeypatch.setattr(
+        osm_source, "area_inputs_state",
+        lambda area, bbox: dict(
+            area_state or {"ready": True, "partial": False, "state": {}}
+        ),
+    )
+    monkeypatch.setattr(
+        osm_source, "read_area_rows",
+        lambda poly, **kwargs: ([], [], {}, list(roads)),
+    )
     monkeypatch.setattr(
         osm_source, "assemble_premises",
         lambda *a, **k: (list(premises), {"duplicates_merged": 0, "buildings_excluded": 0}),
@@ -2543,7 +2552,7 @@ def _stub_review_rows(monkeypatch, buildings, addresses=(), join=None):
     """Make the review layers run off fixed rows, with no database."""
     monkeypatch.setattr(
         osm_source, "read_area_rows",
-        lambda poly: (list(buildings), list(addresses), dict(join or {}), []),
+        lambda poly, **kwargs: (list(buildings), list(addresses), dict(join or {}), []),
     )
 
 
@@ -2662,12 +2671,18 @@ def test_overpass_retries_the_mirror_list_before_failing(monkeypatch):
     The second round succeeds; the caller gets the elements and the mirror that
     answered.  The pause between rounds is patched out so the test is instant.
     """
-    calls = []
+    probes = []
+    queries = []
     sleeps = []
 
-    def fake_http_json(url, data=None, timeout=None, headers=None):
-        calls.append(url)
-        if len(calls) <= len(osm_source.OVERPASS_URLS):
+    def fake_http_json(url, data=None, timeout=None, headers=None, retries=None):
+        if data == osm_source.OVERPASS_PROBE_BODY:
+            # Every mirror answers the liveness probe here: this test is about
+            # the real query failing once, not about a dead mirror.
+            probes.append(url)
+            return {"elements": []}
+        queries.append(url)
+        if len(queries) <= len(osm_source.OVERPASS_URLS):
             raise RuntimeError("HTTP Error 504: Gateway Time-out")
         return {"elements": [{"type": "node", "id": 1}]}
 
@@ -2678,7 +2693,8 @@ def test_overpass_retries_the_mirror_list_before_failing(monkeypatch):
 
     assert elements == [{"type": "node", "id": 1}]
     assert mirror == osm_source.OVERPASS_URLS[0]
-    assert len(calls) == len(osm_source.OVERPASS_URLS) + 1
+    assert len(queries) == len(osm_source.OVERPASS_URLS) + 1
+    assert len(probes) == len(osm_source.OVERPASS_URLS)
     assert sleeps == [osm_source.OVERPASS_RETRY_DELAY_S]
 
 
@@ -2688,4 +2704,108 @@ def test_overpass_gives_up_after_every_round_with_the_cause(monkeypatch):
     monkeypatch.setattr(osm_source.time, "sleep", lambda s: None)
 
     with pytest.raises(RuntimeError, match=f"after {osm_source.OVERPASS_ROUNDS} rounds.*502"):
-        osm_source.overpass_query("node[building]", (0, 0, 1, 1))
+        osm_source.overpass_query("node[building]", (0, 0, 1,  1))
+
+
+# ---------------------------------------------------------------------------
+# Serving an area while it is still downloading
+# ---------------------------------------------------------------------------
+
+def test_objects_layer_asks_the_store_only_for_what_it_draws(monkeypatch):
+    """The object points are a POINT layer: no polygon, no road.
+
+    Measured on a 15,495-building area, serialising every building polygon was
+    0.46 s and the roads query 0.77 s of a 4.4 s request -- both discarded by
+    this layer.  Pinned here so neither can creep back in silently.
+    """
+    asked = {}
+
+    def fake_rows(poly, **kwargs):
+        asked.update(kwargs)
+        return [_building(1)], [], {}, []
+
+    monkeypatch.setattr(osm_source, "read_area_rows", fake_rows)
+    monkeypatch.setattr(osm_source, "household_register_for", lambda cc, pcs: None)
+
+    osm_source.input_layer_geojson(_review_polygon(), "objects")
+
+    assert asked["include_geometry"] is False
+    assert asked["include_roads"] is False
+
+
+def test_building_layer_still_asks_for_the_polygons(monkeypatch):
+    asked = {}
+
+    def fake_rows(poly, **kwargs):
+        asked.update(kwargs)
+        return [_building(1)], [], {}, []
+
+    monkeypatch.setattr(osm_source, "read_area_rows", fake_rows)
+
+    osm_source.input_layer_geojson(_review_polygon(), "buildings")
+
+    assert asked["include_geometry"] is True
+    # The footprints layer draws no road either.
+    assert asked["include_roads"] is False
+
+
+def test_area_inputs_state_is_partial_when_the_store_has_buildings(monkeypatch):
+    """A running download must not read as a finished one."""
+    monkeypatch.setattr(osm_source.postgis, "is_available", lambda: True)
+    monkeypatch.setattr(osm_source, "covered_by_cache", lambda bbox: None)
+    monkeypatch.setattr(osm_source, "ensure_area_data_background", lambda *a: {"state": "fetching"})
+    monkeypatch.setattr(
+        osm_source, "area_fetch_state",
+        lambda area, bbox: {"state": "fetching_addresses", "fetching": True,
+                            "groups_done": 2, "groups_total": 7,
+                            "counts": {"buildings": 860}},
+    )
+
+    state = osm_source.area_inputs_state("B16 8UU", [0, 0, 1, 1])
+
+    assert state["ready"] is False
+    assert state["partial"] is True
+    assert state["state"]["counts"]["buildings"] == 860
+
+
+def test_area_inputs_state_is_ready_once_the_extract_is_written(monkeypatch):
+    monkeypatch.setattr(osm_source.postgis, "is_available", lambda: True)
+    monkeypatch.setattr(osm_source, "covered_by_cache", lambda bbox: {"detail": "x"})
+    monkeypatch.setattr(
+        osm_source, "area_fetch_state",
+        lambda area, bbox: {"state": "ready", "fetching": False, "counts": {"buildings": 860}},
+    )
+
+    state = osm_source.area_inputs_state("B16 8UU", [0, 0, 1, 1])
+
+    assert state["ready"] is True
+    assert state["partial"] is False
+
+
+def test_a_downloading_area_is_previewed_partially_and_blocks_the_run(monkeypatch):
+    """Counts from a prefix of the area are shown, and a run waits for the rest.
+
+    The page used to hold this call open for the whole seven-group download --
+    27 minutes and counting on B16 8UU.  The counts that arrive meanwhile are
+    real but incomplete, so they are labelled and a run is refused.
+    """
+    _stub_area(
+        monkeypatch,
+        [_premise(1), _premise(2)],
+        area_state={
+            "ready": False,
+            "partial": True,
+            "state": {"state": "fetching_addresses", "fetching": True,
+                      "groups_done": 2, "groups_total": 7,
+                      "counts": {"buildings": 860}},
+        },
+    )
+
+    out = osm_source.preview_area("B16 8UU")
+
+    assert out["partial"] is True
+    assert out["can_run"] is False
+    assert "still running" in out["run_blocked_reason"]
+    assert any("still arriving" in w or "have arrived" in w for w in out["warnings"])
+    # The counts themselves are still reported: a partial answer beats no answer.
+    assert out["premises"]["count"] == 2

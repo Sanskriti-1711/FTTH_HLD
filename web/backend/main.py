@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple, Union
 
 from fastapi import BackgroundTasks, Body, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 
@@ -215,6 +216,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# The layer endpoints answer GeoJSON, and the objects layer is 6.5 MB of it for
+# a 15,495-building area.  Measured: gzip takes that to 0.7 MB (9.7x), and
+# nothing in this stack compressed it -- the engine sent it raw, the Django hop
+# forwarded it raw, and the browser parsed every byte of it.
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 
 def _now() -> str:
@@ -2446,6 +2452,18 @@ def _area_error(exc: Exception) -> HTTPException:
             detail=("PostGIS is unavailable, so OSM data cannot be stored or read. "
                     "Start the database and retry."),
         )
+    if message.startswith("overpass_fetch_failed:"):
+        # Every Overpass mirror did not answer.  That is an OUTAGE UPSTREAM,
+        # not a fault in this area, and the same area normally works on a
+        # retry -- so it is reported as retryable rather than as a broken
+        # request, and the raw cause is kept for the operator.
+        cause = message.split(":", 1)[1].strip() or "no mirror answered"
+        return HTTPException(
+            status_code=503,
+            detail=("The OSM Overpass service did not answer (all mirrors timed out). "
+                    "This is an upstream outage and is usually temporary -- try this "
+                    f"area again in a few minutes. Cause: {cause}"),
+        )
     # Anything else is reported with its CAUSE.  An opaque "could not reach the
     # OSM services" standing in front of a database or geometry error is worse
     # than no message: it sends the reader to check the network for an hour.
@@ -2820,14 +2838,21 @@ def get_input_layer(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     area, country_code, _input_type = _area_request(payload)
     try:
         resolution = osm_source.resolve_area(area, country_code=country_code)
-        osm_source.ensure_area_data(area, resolution["bbox"])
-        return osm_source.input_layer_geojson(
+        # Never wait for the download here.  The object points are in the store
+        # as soon as the buildings group lands, and holding every layer behind
+        # the whole seven-group fetch is what left the review panel empty for
+        # half an hour on a cold area.  `partial` tells the page to say so.
+        area_state = osm_source.area_inputs_state(area, resolution["bbox"])
+        data = osm_source.input_layer_geojson(
             resolution["polygon"],
             layer,
             country=resolution.get("country") or "",
             city=resolution.get("city") or "",
             country_code=resolution.get("country_code") or "",
         )
+        data["partial"] = not area_state["ready"]
+        data["osm_fetch"] = area_state["state"]
+        return data
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001

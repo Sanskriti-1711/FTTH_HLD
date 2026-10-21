@@ -80,12 +80,29 @@ OVERPASS_URLS = (
     "https://z.overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
     "https://overpass.private.coffee/api/interpreter",
+    # The Swiss community mirror.  It carries the full planet and it answers a
+    # trivial query in well under a second even while the German cluster is
+    # timing out -- which is exactly the day it was added (2026-10-21: the
+    # German mirrors and kumi all sat on the connection while osm.ch answered
+    # in 0.4 s).  Order is not what makes it useful; the liveness probe is.
+    "https://overpass.osm.ch/api/interpreter",
 )
 # How many times the whole mirror list is tried, and the base pause between
 # rounds (it grows: 1x, 2x, ...).  Two rounds ride out a brief outage without
 # making a user wait minutes for a dead service.
 OVERPASS_ROUNDS = 2
 OVERPASS_RETRY_DELAY_S = 15.0
+
+# A mirror is ALIVE when it answers a trivial query inside this budget.  The
+# real area query needs minutes, so a DEAD mirror must not be discovered by
+# waiting out that budget: the fetch tried the mirrors in turn and spent the
+# full 210 s per dead one, so an area lookup failed after half an hour even
+# though a healthy mirror was never reached.  Probing costs seconds.
+OVERPASS_PROBE_TIMEOUT_S = 12.0
+OVERPASS_PROBE_BODY = b"[out:json][timeout:10];node(id:1);out;"
+# How long a mirror that answered is trusted without being probed again.  The
+# seven group queries of one fetch share the answer instead of each probing.
+OVERPASS_HEALTH_TTL_S = 120.0
 
 # Nominatim's usage policy requires an identifying User-Agent.
 USER_AGENT = "fiber-ftth-engine/1.0 (FTTH HLD area inputs)"
@@ -661,6 +678,7 @@ def _http_json(
     data: Optional[bytes] = None,
     timeout: float = 180.0,
     headers: Optional[Dict[str, str]] = None,
+    retries: int = 3,
 ) -> Any:
     """GET/POST JSON with a bounded retry.  stdlib only -- no extra dependency.
 
@@ -671,14 +689,20 @@ def _http_json(
     function retried it three times on the SAME mirror (10.5 minutes), then
     ``overpass_query`` moved to the next mirror and did it again -- the page sat
     on "0 of 7 groups" for eight minutes with nothing actually wrong.  A timeout
-    now propagates at once so the next mirror (or a bigger per-group budget) can
-    answer instead.
+    now propagates at once so the next mirror (or a bigger per-group budget)
+    can answer instead.
+
+    ``retries`` is how many times THIS url is tried.  The Overpass caller asks
+    for one: a mirror that answered with a 502/504 has already used up its
+    turn, and the mirror list plus the rounds are the retry -- retrying the
+    same dead mirror three times only multiplied the wait.
     """
     hdrs = {"User-Agent": USER_AGENT}
     if headers:
         hdrs.update(headers)
+    attempts = max(1, int(retries))
     last: Optional[Exception] = None
-    for attempt in range(3):
+    for attempt in range(attempts):
         try:
             req = urllib.request.Request(url, data=data, headers=hdrs)
             with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -687,13 +711,13 @@ def _http_json(
             if isinstance(exc.reason, (TimeoutError, socket.timeout)):
                 raise TimeoutError(f"no answer within {timeout:.0f}s") from exc
             last = exc
-            if attempt < 2:
+            if attempt < attempts - 1:
                 time.sleep(2.0 * (attempt + 1))
         except (TimeoutError, socket.timeout) as exc:
             raise TimeoutError(f"no answer within {timeout:.0f}s") from exc
         except Exception as exc:  # noqa: BLE001 - reported to the caller
             last = exc
-            if attempt < 2:
+            if attempt < attempts - 1:
                 time.sleep(2.0 * (attempt + 1))
     raise RuntimeError(f"HTTP request failed: {last}") from last
 
@@ -2430,6 +2454,72 @@ _OVERPASS_GROUPS: Dict[str, str] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Mirror liveness
+# ---------------------------------------------------------------------------
+
+# The mirrors are PROBED rather than discovered by waiting.  A dead mirror
+# answers nothing for the whole budget it was handed, so a fetch that tried
+# them in turn spent 210 s per dead mirror before it ever reached a healthy
+# one -- and an area lookup then failed with "no answer within 210s" after
+# half an hour.  The probe asks every mirror something trivial with a small
+# budget, all of them at the same time, and the answer arrives in seconds.
+_OVERPASS_HEALTH: Dict[str, float] = {}
+_OVERPASS_PROBE_LOCK = threading.Lock()
+
+
+def _probe_overpass_mirror(url: str) -> bool:
+    """Is this mirror answering right now?  Cheap query, small budget."""
+    try:
+        payload = _http_json(
+            url,
+            data=OVERPASS_PROBE_BODY,
+            timeout=OVERPASS_PROBE_TIMEOUT_S,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            retries=1,
+        )
+        return isinstance(payload, dict)
+    except Exception:  # noqa: BLE001 - a mirror that did not answer is dead
+        return False
+
+
+def _mark_overpass_alive(url: str) -> None:
+    """Remember that this mirror just answered, so it is tried first."""
+    with _OVERPASS_PROBE_LOCK:
+        _OVERPASS_HEALTH[url] = time.monotonic()
+
+
+def ordered_overpass_mirrors() -> List[str]:
+    """The mirror list, the answering mirrors first.
+
+    Every mirror is probed concurrently with a small budget, so a dead one
+    costs seconds instead of the minutes it would spend waiting out a real
+    query.  The answer is cached for a short while, so the seven group
+    queries of one fetch share a single round of probes instead of each
+    probing on its own.
+    """
+    with _OVERPASS_PROBE_LOCK:
+        now = time.monotonic()
+        fresh = {
+            url for url, seen in _OVERPASS_HEALTH.items()
+            if now - seen < OVERPASS_HEALTH_TTL_S
+        }
+        missing = [url for url in OVERPASS_URLS if url not in fresh]
+        if missing:
+            with ThreadPoolExecutor(max_workers=len(missing)) as pool:
+                answers = list(pool.map(_probe_overpass_mirror, missing))
+            for url, alive in zip(missing, answers):
+                if alive:
+                    _OVERPASS_HEALTH[url] = now
+        alive = [
+            url for url in OVERPASS_URLS
+            if url in _OVERPASS_HEALTH
+            and now - _OVERPASS_HEALTH[url] < OVERPASS_HEALTH_TTL_S
+        ]
+        rest = [url for url in OVERPASS_URLS if url not in alive]
+        return alive + rest
+
+
 def overpass_query(body: str, bbox: Sequence[float], timeout: int = 180) -> Tuple[List[Dict[str, Any]], str]:
     """Fetch one group's elements, scoped bbox-first.
 
@@ -2446,16 +2536,25 @@ def overpass_query(body: str, bbox: Sequence[float], timeout: int = 180) -> Tupl
     # Public Overpass mirrors fail transiently (502/504/500, rate limits), often
     # all at once. One pass over the mirrors is not enough, so retry the whole
     # list a bounded number of times with a pause before giving up.
+    #
+    # The list is ordered by LIVENESS: the mirrors are probed first (seconds),
+    # so the first one tried is a mirror that answered a moment ago and a dead
+    # one costs its probe budget rather than the minutes a real query on it
+    # would spend.  One attempt per mirror: the list plus the rounds are the
+    # retry.
     last: Optional[Exception] = None
+    mirrors = ordered_overpass_mirrors()
     for round_no in range(OVERPASS_ROUNDS):
         if round_no:
             time.sleep(OVERPASS_RETRY_DELAY_S * round_no)
-        for url in OVERPASS_URLS:
+        for url in mirrors:
             try:
                 payload = _http_json(
                     url, data=query, timeout=float(timeout) + 30.0,
                     headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    retries=1,
                 )
+                _mark_overpass_alive(url)
                 return list(payload.get("elements") or []), url
             except Exception as exc:  # noqa: BLE001 - try the next mirror
                 last = exc
@@ -3230,6 +3329,41 @@ def ensure_area_data_background(area: str, bbox: Sequence[float]) -> Dict[str, A
     return start_area_fetch(area, bbox)
 
 
+def area_inputs_state(area: str, bbox: Sequence[float]) -> Dict[str, Any]:
+    """Start an area's download if needed, and say what can be read RIGHT NOW.
+
+    The layer and preview paths used to call ``ensure_area_data``, which waits
+    for all seven Overpass groups.  Measured on B16 8UU (Birmingham, 1.5 km²):
+    the building points were stored after 11 minutes, and the page still had
+    nothing to draw 27 minutes later because the address group was outstanding.
+    Nothing in the object layer needs the address group to have finished -- it
+    needs whatever is already stored -- so the page asks this instead and reads
+    the store as it stands.
+
+    Returns ``{"ready", "partial", "state"}``:
+
+      * ``ready``   -- the bbox is covered by a finished extract; read it as a
+        complete answer.
+      * ``partial`` -- no finished extract, so whatever is stored is a prefix of
+        the area's data and the caller must say so.
+
+    Never blocks: ``start_area_fetch`` returns at once, so the caller always has
+    a state to report.
+    """
+    state = area_fetch_state(area, bbox)
+    try:
+        if postgis.is_available() and covered_by_cache(bbox):
+            return {"ready": True, "partial": False, "state": area_fetch_state(area, bbox)}
+    except Exception:  # noqa: BLE001 - a page read must not fail on the cache check
+        pass
+    try:
+        ensure_area_data_background(area, bbox)
+    except Exception:  # noqa: BLE001 - the reported state carries the reason
+        pass
+    state = area_fetch_state(area, bbox)
+    return {"ready": False, "partial": True, "state": state}
+
+
 # ---------------------------------------------------------------------------
 # The household rule -- PURE functions, unit-tested without a database
 # ---------------------------------------------------------------------------
@@ -3911,7 +4045,12 @@ def resolvable_kinds(
     return sub_area_kinds_offered(resolution, verified)
 
 
-def read_area_rows(polygon: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[int, int], List[Dict[str, Any]]]:
+def read_area_rows(
+    polygon: Dict[str, Any],
+    *,
+    include_roads: bool = True,
+    include_geometry: bool = True,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[int, int], List[Dict[str, Any]]]:
     """Buildings, address nodes, the address->building map, and roads, for a polygon.
 
     The address->building map is computed in SQL (ST_Contains) rather than
@@ -3919,21 +4058,38 @@ def read_area_rows(polygon: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[
     containment.  Buildings are selected by their CENTROID being inside the area:
     a building straddling the boundary must count once, in the area that holds
     its centre.
+
+    Two of these columns are OPTIONAL, because most callers never read them:
+
+      * ``include_roads`` -- the objects, premises, buildings and addresses
+        layers use no road at all, and the roads query measured 0.77 s of a
+        4.4 s objects-layer request on a 15,495-building area.  A run still
+        needs them.
+      * ``include_geometry`` -- a point layer is built from the centroid
+        columns, so serialising every building's polygon as GeoJSON only to
+        throw it away cost 0.46 s of that same request.
+
+    ``geom && polygon`` is not a duplicate of the ST_Contains test: it is the
+    only part the GiST index can answer.  Without it the planner scans every
+    building in the store to find the ones inside a small polygon -- measured
+    on an 815-building area at 541 ms and 415 MB of buffers, against 4.9 ms
+    with the index doing the work.
     """
     poly = json.dumps(polygon)
+    geometry_columns = ", ST_AsGeoJSON(geom) AS geom_json" if include_geometry else ""
     buildings = _query(
         f"SELECT osm_id, building, name, addr_street, addr_housenumber, addr_postcode, "
         f"       addr_city, addr_suburb, building_levels, building_flats, tags, "
-        f"       ST_Area(geom::geography) AS footprint_m2, "
-        f"       ST_AsGeoJSON(geom) AS geom_json, "
+        f"       ST_Area(geom::geography) AS footprint_m2{geometry_columns}, "
         f"       ST_X(ST_Centroid(geom)) AS lon, ST_Y(ST_Centroid(geom)) AS lat "
         f"FROM {OSM_SCHEMA}.buildings "
-        f"WHERE ST_Contains({_POLYGON_JSON}, ST_Centroid(geom))",
-        (poly,),
+        f"WHERE geom && {_POLYGON_JSON} "
+        f"  AND ST_Contains({_POLYGON_JSON}, ST_Centroid(geom))",
+        (poly, poly),
     )
     addresses = _query(
         f"SELECT osm_id, addr_street, addr_housenumber, addr_postcode, addr_city, "
-        f"       addr_suburb, addr_flats, ST_AsGeoJSON(geom) AS geom_json, "
+        f"       addr_suburb, addr_flats{geometry_columns}, "
         f"       ST_X(geom) AS lon, ST_Y(geom) AS lat "
         f"FROM {OSM_SCHEMA}.address_nodes WHERE ST_Contains({_POLYGON_JSON}, geom)",
         (poly,),
@@ -3945,12 +4101,14 @@ def read_area_rows(polygon: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[
         f"WHERE ST_Contains({_POLYGON_JSON}, a.geom)",
         (poly,),
     )
-    roads = _query(
-        f"SELECT osm_id, highway, fclass, name, ref, oneway, bridge, tunnel, access, "
-        f"       surface, maxspeed, lanes, ST_AsGeoJSON(geom) AS geom_json "
-        f"FROM {OSM_SCHEMA}.roads WHERE ST_Intersects({_POLYGON_JSON}, geom)",
-        (poly,),
-    )
+    roads: List[Dict[str, Any]] = []
+    if include_roads:
+        roads = _query(
+            f"SELECT osm_id, highway, fclass, name, ref, oneway, bridge, tunnel, access, "
+            f"       surface, maxspeed, lanes, ST_AsGeoJSON(geom) AS geom_json "
+            f"FROM {OSM_SCHEMA}.roads WHERE ST_Intersects({_POLYGON_JSON}, geom)",
+            (poly,),
+        )
     addr_to_building = {int(r["addr_id"]): int(r["building_id"]) for r in join}
     return buildings, addresses, addr_to_building, roads
 
@@ -4170,7 +4328,15 @@ def input_layer_geojson(
         if not features and curated_table:
             features = _reference_features(curated_table, polygon)
     else:
-        buildings, addresses, addr_to_building, roads = read_area_rows(polygon)
+        # A layer asks for the road network only when it IS the roads layer, and
+        # for building polygons only when it draws them: the objects layer is
+        # points, and paying for ST_AsGeoJSON on every polygon there was 0.46 s
+        # of a 4.4 s request that then discarded the text.
+        buildings, addresses, addr_to_building, roads = read_area_rows(
+            polygon,
+            include_roads=(key == "roads"),
+            include_geometry=key in ("buildings", "addresses"),
+        )
         # Only the two layers that show household counts consult the register,
         # and `household_register_for` returns None (so the OSM heuristic is
         # used) whenever the knob is off, no register is loaded, or the country
@@ -4497,8 +4663,23 @@ def preview_area(
             "Choose a country to make the match unambiguous."
         )
 
-    extract = ensure_area_data(area, bbox)
-    buildings, addresses, join, roads = read_area_rows(resolution["polygon"])
+    # The preview is a COUNT: it reads centroids, postcodes and the road
+    # network, and never a building polygon, so the polygons are not serialised.
+    area_state = area_inputs_state(area, bbox)
+    partial = not area_state["ready"]
+    fetch = area_state.get("state") or {}
+    if partial:
+        extract = {
+            "source": "downloading" if fetch.get("fetching") else "not_downloaded",
+            "detail": fetch.get("label") or "OpenStreetMap data is still arriving",
+            "fetched_at": None,
+            "counts": fetch.get("counts") or {},
+        }
+    else:
+        extract = ensure_area_data(area, bbox)
+    buildings, addresses, join, roads = read_area_rows(
+        resolution["polygon"], include_geometry=False
+    )
     register = household_register_for(
         resolution.get("country_code") or "", area_postcodes(buildings, addresses)
     )
@@ -4606,6 +4787,17 @@ def preview_area(
         if not str(p.get("Housenumber") or "").strip()
         and not str(p.get("Address") or "").strip()
     )
+    if partial:
+        # Said FIRST, because every number below it is provisional: the page used
+        # to hold this call open for the whole download (27 minutes and counting
+        # on B16 8UU), and a count that arrives slowly is worse than a count that
+        # says it is still arriving.
+        warnings.insert(
+            0,
+            "Downloading this area's OpenStreetMap data: "
+            f"{fetch.get('groups_done', 0)} of {fetch.get('groups_total', 7)} groups "
+            "have arrived. These counts cover only what is stored so far.",
+        )
     if anonymous:
         warnings.append(
             f"{anonymous} premise(s) have neither a street nor a house number in "
@@ -4669,7 +4861,12 @@ def preview_area(
     # be reviewed, and the page needs the first answer to enable its button
     # honestly rather than letting it start a run the engine will refuse.
     # Mirrors the three refusals in build_inputs().
-    if len(premises) < MIN_PREMISES:
+    if partial:
+        blocked_reason = (
+            "This area's OpenStreetMap download is still running, so the counts "
+            "are incomplete. The run can start once it finishes."
+        )
+    elif len(premises) < MIN_PREMISES:
         blocked_reason = (
             "No premises were found inside this boundary — the area may have "
             "resolved to a building-free area, or the boundary is wrong."
@@ -4691,6 +4888,9 @@ def preview_area(
     return {
         **base,
         "extract": extract,
+        # False once the bbox is covered by a finished download.  The page reads
+        # it to say the numbers are provisional and to keep polling.
+        "partial": partial,
         "household_register": _register_payload(stats.get("household_register"), register),
         "premises": {
             "count": len(premises),
