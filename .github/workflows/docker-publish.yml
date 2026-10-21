@@ -90,6 +90,39 @@ jobs:
       # Needs the repository secret RENDER_API_KEY (Render dashboard -> Account
       # Settings -> API Keys -> Create API Key).  A tag push without it fails
       # this step loudly rather than shipping an image nobody deploys.
+      # A deploy REPLACES the container, and every run in flight goes with it:
+      # the engine restarts, its thread is gone, and the run is reported as
+      # "killed or restarted before this run wrote any output".  On 2026-10-21
+      # that wording was read as an out-of-memory kill, but Render recorded no
+      # oomKilled event -- seven deploys did it.  So wait for the engine to be
+      # idle first, which is cheap when nothing is running (one request).
+      - name: Wait for the engine to be idle
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -uo pipefail
+          unknown=0
+          for attempt in $(seq 1 120); do
+            body=$(curl -s -m 20 https://ftth-planning.onrender.com/health || true)
+            busy=$(printf '%s' "$body" | python3 -c 'import json,sys; d=json.load(sys.stdin); r=d.get("runs") or {}; print(int(r.get("running") or 0)+int(r.get("queued") or 0))' 2>/dev/null) || busy=unknown
+            case "$busy" in
+              0)
+                echo "Engine idle after $((attempt - 1)) checks; deploying."
+                exit 0 ;;
+              unknown)
+                unknown=$((unknown + 1))
+                if [ "$unknown" -ge 3 ]; then
+                  echo "The engine is not answering /health (asleep, or already restarting); deploying."
+                  exit 0
+                fi
+                echo "check $attempt: /health did not answer ($unknown/3)" ;;
+              *)
+                unknown=0
+                echo "check $attempt: running+queued=$busy -- waiting for it to finish" ;;
+            esac
+            sleep 10
+          done
+          echo "::warning::the engine still had runs in flight after 20 minutes; deploying anyway -- those runs will be reported as killed or restarted"
+
       - name: Deploy the published image to Render
         if: startsWith(github.ref, 'refs/tags/v')
         env:

@@ -227,7 +227,57 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+# A finished task stays in memory only so its status page answers without a
+# database round trip, but they used to accumulate for the whole life of the
+# process -- every run since the last deploy, each holding up to MAX_MESSAGES
+# entries.  On a 512 MB instance that is memory nobody is using.
+_TASKS_KEPT = 25
+
+
+def _evict_finished_tasks(keep: int = _TASKS_KEPT,
+                          keep_pid: Optional[str] = None) -> int:
+    """Drop the oldest finished tasks.  A queued or running one is never touched.
+
+    ``keep_pid`` is the task the caller is about to read: evicting it would make
+    the next line re-create it as an empty "queued" stub, which reads as if a
+    finished run had never started.
+    """
+    finished = [
+        pid for pid, task in tasks.items()
+        if task.get("status") not in ("running", "queued") and pid != keep_pid
+    ]
+    if len(finished) <= keep:
+        return 0
+    finished.sort(key=lambda pid: str(tasks[pid].get("updated_at") or ""))
+    dropped = 0
+    for pid in finished[: len(finished) - keep]:
+        tasks.pop(pid, None)
+        dropped += 1
+    return dropped
+
+
+def release_memory(reason: str = "") -> Dict[str, Any]:
+    """Let go of everything that can be rebuilt, and report what is left.
+
+    The order matters: finished tasks and re-askable caches first, then the
+    malloc arenas, because trim() only returns memory that is already free.
+    """
+    evicted = _evict_finished_tasks()
+    osm = osm_source.release_caches()
+    trimmed = meminfo.trim()
+    data = meminfo.report()
+    print(
+        f"[mem] released ({reason or 'on request'}): tasks={evicted} "
+        f"suggestions={osm.get('suggestions')} fetches={osm.get('fetches')} "
+        f"trim={trimmed} rss_mb={data.get('rss_mb')} "
+        f"available_mb={data.get('available_mb')}",
+        flush=True,
+    )
+    return {"tasks_evicted": evicted, **osm, "memory": data}
+
+
 def _task(project_id: str) -> Dict[str, Any]:
+    _evict_finished_tasks(keep_pid=project_id)
     return tasks.setdefault(
         project_id,
         {
@@ -2252,6 +2302,21 @@ def _health_body(*, live: bool) -> Dict[str, Any]:
         # free instance), so how much of it this process holds is honest health
         # information, not diagnostics-only.
         "memory": meminfo.report(),
+        # What is running RIGHT NOW.  A deploy replaces the container and every
+        # in-flight run with it -- today that is what "killed or restarted"
+        # meant, not memory -- so the release step waits for this to be 0.
+        "runs": {
+            "active": sorted(
+                pid for pid, task in tasks.items()
+                if task.get("status") in ("running", "queued")
+            )[:10],
+            "running": sum(
+                1 for task in tasks.values() if task.get("status") == "running"
+            ),
+            "queued": sum(
+                1 for task in tasks.values() if task.get("status") == "queued"
+            ),
+        },
         "qgis_process": _find_qgis_process(),
         "postgis": store.get("postgis", {}),
         "osm": store.get("osm", {}),
@@ -2657,6 +2722,19 @@ def _run_area_pipeline(
         )
 
     try:
+        # The area build is the biggest allocation this process makes, and being
+        # killed by it leaves no trace at all.  Free what can be freed first;
+        # if the container is still close to its cap, say so instead of risking
+        # a kill that the status page can only describe as "restarted".
+        if meminfo.tight():
+            release_memory(f"run {project_id[:8]} before the area build")
+            if meminfo.tight():
+                raise RuntimeError(
+                    "the engine is using %.0f MB of its %.0f MB memory limit, so "
+                    "this area was not started. Nothing was saved; try again in "
+                    "a minute, or narrow the area."
+                    % (meminfo.rss_mb() or 0.0, meminfo.limit_mb() or 0.0)
+                )
         built = osm_source.build_inputs(
             project_id, area, str(output_dir),
             country_code=country_code, input_type=input_type, postcode=postcode,

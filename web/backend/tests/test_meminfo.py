@@ -14,9 +14,35 @@ import meminfo
 def test_report_is_json_safe_and_never_raises():
     data = meminfo.report()
 
-    assert set(data) == {"rss_mb", "peak_rss_mb", "limit_mb"}
-    for value in data.values():
+    # available_mb and tight were added so a caller can decide whether to start
+    # heavy work at all; the contract that matters is the same: JSON-safe
+    # scalars, None where procfs is absent, and never an exception.
+    assert set(data) == {
+        "rss_mb", "peak_rss_mb", "limit_mb", "available_mb", "tight",
+    }
+    for key, value in data.items():
+        if key == "tight":
+            assert isinstance(value, bool)
+            continue
         assert value is None or isinstance(value, float)
+
+
+def test_tight_is_false_when_the_container_has_no_cap(monkeypatch):
+    """An uncapped laptop must never be told it is out of memory."""
+    monkeypatch.setattr(meminfo, "limit_mb", lambda *a, **k: None)
+    monkeypatch.setattr(meminfo, "rss_mb", lambda *a, **k: 900.0)
+
+    assert meminfo.tight() is False
+    assert meminfo.available_mb() is None
+
+
+def test_available_mb_is_the_room_left_before_the_cap(monkeypatch):
+    monkeypatch.setattr(meminfo, "limit_mb", lambda *a, **k: 512.0)
+    monkeypatch.setattr(meminfo, "rss_mb", lambda *a, **k: 400.0)
+
+    assert meminfo.available_mb() == 112.0
+    assert meminfo.tight(0.8) is False        # 400 < 409.6
+    assert meminfo.tight(0.75) is True        # 400 >= 384
 
 
 def test_an_unknown_pid_is_none_not_an_error():

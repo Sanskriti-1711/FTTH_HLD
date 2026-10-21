@@ -1025,6 +1025,61 @@ _SUGGEST_TTL_SECONDS = 600.0
 _SUGGEST_CACHE: Dict[Tuple[str, str], Tuple[float, Dict[str, Any]]] = {}
 _SUGGEST_CACHE_MAX = 500
 
+# Finished fetch entries are a status page, not a cache: the extract itself is
+# in Postgres.  They used to stay in memory for the life of the process -- one
+# per area ever previewed since the last deploy -- so they are evicted both on
+# age and on count, and `release_caches()` drops them when memory is short.
+_FETCHES_KEPT = 40
+_FETCHES_MAX_AGE_S = 3600.0
+
+
+def _evict_fetches(now: Optional[datetime] = None, keep: int = _FETCHES_KEPT,
+                  max_age_s: float = _FETCHES_MAX_AGE_S) -> int:
+    """Drop finished fetch entries that are old or over the cap.
+
+    A running fetch is never evicted: its entry is how the page follows it.
+    Returns the number of entries freed.
+    """
+    now = now or _now()
+    freed = 0
+    with _FETCH_LOCK:
+        finished = [
+            key for key, entry in _FETCHES.items()
+            if entry.get("state") in ("ready", "failed")
+        ]
+        for key in finished:
+            seen = _FETCHES[key].get("updated_at") or _FETCHES[key].get("started_at")
+            try:
+                age = (now - datetime.fromisoformat(str(seen))).total_seconds()
+            except (TypeError, ValueError):
+                age = max_age_s + 1.0
+            if age > max_age_s:
+                _FETCHES.pop(key, None)
+                freed += 1
+        still_finished = [
+            key for key, entry in _FETCHES.items()
+            if entry.get("state") in ("ready", "failed")
+        ]
+        if len(still_finished) > keep:
+            still_finished.sort(key=lambda k: str(_FETCHES[k].get("updated_at") or ""))
+            for key in still_finished[: len(still_finished) - keep]:
+                _FETCHES.pop(key, None)
+                freed += 1
+    return freed
+
+
+def release_caches() -> Dict[str, int]:
+    """Give back what can be rebuilt, and say how much was let go.
+
+    Called when the container is close to its cap before a heavy step: the
+    place-name suggestions are re-askable and the finished fetch entries are a
+    status page over data that already lives in Postgres, so neither is worth
+    being killed for.
+    """
+    suggestions = len(_SUGGEST_CACHE)
+    _SUGGEST_CACHE.clear()
+    return {"suggestions": suggestions, "fetches": _evict_fetches(keep=0)}
+
 
 def suggest_places(text: str, country_code: str = "", limit: int = 8) -> Dict[str, Any]:
     """City/town suggestions for the area input's city combobox.
@@ -2790,10 +2845,20 @@ def fetch_groups_from_map_api(groups, bbox: Sequence[float], on_group=None) -> L
         return []
     elements = map_api_extract(bbox)
     done: List[str] = []
-    for name, body in groups:
-        if on_group is not None:
-            on_group(name, group_elements(body, elements), OSM_MAP_API_URL)
-        done.append(name)
+    try:
+        for name, body in groups:
+            if on_group is not None:
+                # Handed over one group at a time and released immediately: the
+                # extract is the biggest single object in the fetch, and the
+                # caller stores what it needs.
+                picked = group_elements(body, elements)
+                on_group(name, picked, OSM_MAP_API_URL)
+                del picked
+                meminfo.trim()
+            done.append(name)
+    finally:
+        del elements
+        meminfo.trim()
     return done
 
 
@@ -3475,6 +3540,7 @@ def start_area_fetch(area: str, bbox: Sequence[float]) -> Dict[str, Any]:
             return area_fetch_state(area, bbox)
     if not postgis.is_available():
         return {"state": "failed", "error": "postgis_unavailable", "fetching": False}
+    _evict_fetches()
     _set_fetch_state(key, "queued", groups_done=0, reset=True)
     thread = threading.Thread(
         target=_run_area_fetch, args=(key, area, list(bbox)),
@@ -6109,7 +6175,7 @@ def build_inputs(
     )
 
     hh = household_summary(premises)
-    return {
+    result = {
         "excel_path": excel_path,
         "roads_path": roads_path,
         # Not one of the pipeline's two input files: the designer reads this to
@@ -6151,3 +6217,10 @@ def build_inputs(
         "extract": extract,
         "stats": stats,
     }
+    # The area build is the engine's peak: the parsed buildings, the premises and
+    # the road network are all live at once, and both input files are on disk by
+    # now.  Release them before the pipeline starts, so the run is not sharing
+    # the container with memory that is merely idle.
+    del premises, roads, buildings, addresses, kept_roads, pavement
+    meminfo.trim()
+    return result

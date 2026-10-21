@@ -64,12 +64,37 @@ def limit_mb() -> Optional[float]:
     return None
 
 
+def available_mb(pid: Optional[int] = None) -> Optional[float]:
+    """Room left before the container's cap, in MB (None when not capped)."""
+    limit = limit_mb()
+    used = rss_mb(pid)
+    if limit is None or used is None:
+        return None
+    return round(max(0.0, limit - used), 1)
+
+
+def tight(fraction: float = 0.8, pid: Optional[int] = None) -> bool:
+    """Is this process close enough to the cap that a big allocation may kill it?
+
+    Used to decide BEFORE an area build or a run starts, because the kill itself
+    leaves nothing behind: no traceback, no output, and a status page that can
+    only say "killed or restarted".  A refused start is visible and retryable.
+    """
+    limit = limit_mb()
+    used = rss_mb(pid)
+    if not limit or used is None:
+        return False
+    return used >= limit * fraction
+
+
 def report() -> Dict[str, Any]:
     """A JSON-safe snapshot for /health."""
     return {
         "rss_mb": rss_mb(),
         "peak_rss_mb": peak_rss_mb(),
         "limit_mb": limit_mb(),
+        "available_mb": available_mb(),
+        "tight": tight(),
     }
 
 
