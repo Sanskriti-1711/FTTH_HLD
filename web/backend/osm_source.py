@@ -2562,6 +2562,25 @@ def ordered_overpass_mirrors() -> List[str]:
     return carrying + silent + rest
 
 
+def live_overpass_mirrors() -> List[str]:
+    """The mirrors that answered a liveness probe just now -- empty if none did.
+
+    Used to decide whether Overpass is worth a fetch at all: when no mirror
+    answers, trying each one with a real query costs a full timeout per
+    mirror per group (measured 2026-10-21: eight minutes before the fetch
+    admitted there was nothing there), while the map API answers the same
+    area in about two seconds.
+    """
+    ordered_overpass_mirrors()      # fills the probe cache, cheap when fresh
+    with _OVERPASS_PROBE_LOCK:
+        now = time.monotonic()
+        return [
+            url for url in OVERPASS_URLS
+            if url in _OVERPASS_HEALTH
+            and now - _OVERPASS_HEALTH[url] < OVERPASS_HEALTH_TTL_S
+        ]
+
+
 def overpass_query(body: str, bbox: Sequence[float], timeout: int = 180) -> Tuple[List[Dict[str, Any]], str]:
     """Fetch one group's elements, scoped bbox-first.
 
@@ -3366,10 +3385,17 @@ def _run_area_fetch(key: str, area: str, bbox: Sequence[float]) -> None:
         # buildings (minutes on their own) held the six small reference layers
         # back and the page showed "0 of 7 groups" the whole time.  Storing still
         # happens here, one group at a time, as each lands.
-        fetch_groups(groups, bbox, on_group=_store_group, on_start=_starting_group)
-        # The Overpass mirror that answered last is kept here, because the
-        # fallback below overwrites `mirror_used` with the source it turned to.
-        overpass_last = mirror_used
+        # Skip Overpass when no mirror answered a probe: waiting out a real
+        # query on every dead mirror is minutes of the user's time to learn
+        # something the probe already knew.
+        if live_overpass_mirrors():
+            fetch_groups(groups, bbox, on_group=_store_group, on_start=_starting_group)
+            # Kept because the fallback below overwrites `mirror_used` with the
+            # source it turned to.
+            overpass_last = mirror_used
+        else:
+            overpass_last = "no mirror answered the liveness probe"
+            _set_fetch_state(key, "fetching_buildings", groups_done=0, detail=None)
         fallback_error: Optional[str] = None
         if not any(int(v or 0) for v in counts.values()):
             # Every group answered, and every answer was empty.  That is not an

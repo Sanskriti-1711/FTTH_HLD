@@ -27,9 +27,23 @@ _BACKEND_DIR = pathlib.Path(__file__).resolve().parents[1]
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
+import pytest  # noqa: E402
+
 import osm_source  # noqa: E402
 
 BBOX = (-1.9317, 52.4703, -1.9132, 52.4814)
+
+
+@pytest.fixture(autouse=True)
+def _overpass_is_tried(monkeypatch):
+    """Let the fetched path be Overpass, as these tests describe it.
+
+    Without this the mirror probe reaches the real network, and the tests
+    about *an empty Overpass answer* would exercise the map API instead.
+    """
+    monkeypatch.setattr(
+        osm_source, "live_overpass_mirrors", lambda: list(osm_source.OVERPASS_URLS)
+    )
 
 
 def test_the_probe_rejects_a_mirror_that_answers_with_nothing(monkeypatch):

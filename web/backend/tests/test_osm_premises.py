@@ -2159,8 +2159,15 @@ BBOX = [13.31, 52.41, 13.42, 52.47]
 
 
 @pytest.fixture(autouse=True)
-def _clean_fetch_registry():
+def _clean_fetch_registry(monkeypatch):
     """The fetch registry is module state; tests must not leak into each other."""
+    # These tests drive the Overpass path with a stubbed `overpass_query`.  The
+    # liveness probe would otherwise reach the real network, and with no mirror
+    # answering the fetch would go to the map API instead -- a different code
+    # path, and one of these tests would be downloading 6 MB to prove nothing.
+    monkeypatch.setattr(
+        osm_source, "live_overpass_mirrors", lambda: list(osm_source.OVERPASS_URLS)
+    )
     with osm_source._FETCH_LOCK:
         osm_source._FETCHES.clear()
     yield
