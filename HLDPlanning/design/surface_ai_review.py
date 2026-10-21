@@ -48,6 +48,34 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Optional
 
+_REVIEW_OFF = ("0", "false", "no", "off")
+_REVIEW_ON = ("1", "true", "yes", "on")
+
+
+def review_enabled(value: Optional[str] = None) -> bool:
+    """Whether the imagery review runs in this process.
+
+    An explicit ``SURFACE_AI_REVIEW`` always wins, ``0`` included -- that is the
+    kill switch.  Unset now means "on when a provider is configured", because
+    the opt-in had to be re-set on every host that runs the pipeline and a run
+    that lost it silently produced no review at all (the pipeline executes on
+    the QGIS worker, not in the API process that carries the flag).
+    """
+    raw = os.environ.get("SURFACE_AI_REVIEW", "") if value is None else value
+    flag = str(raw).strip().lower()
+    if flag in _REVIEW_OFF:
+        return False
+    if flag in _REVIEW_ON:
+        return True
+    provider = os.environ.get("SURFACE_AI_PROVIDER", "").strip().lower()
+    if provider == "ollama":
+        return True
+    if provider == "gemini":
+        return bool(os.environ.get("GEMINI_API_KEY")
+                    or os.environ.get("GOOGLE_API_KEY"))
+    return False
+
+
 FAMILIES = ("road", "footway", "garden")
 DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
 DEFAULT_OLLAMA_MODEL = "qwen2.5vl:3b"
@@ -1092,8 +1120,7 @@ def review_uncertain_spans(
     paced by ``SURFACE_AI_MIN_INTERVAL_SECONDS`` and, when a provider reports
     exhausted quota, the batch stops and marks the remaining spans deferred.
     """
-    enabled = (os.environ.get("SURFACE_AI_REVIEW", "").strip().lower()
-               in ("1", "true", "yes", "on")) if enabled is None else bool(enabled)
+    enabled = review_enabled() if enabled is None else bool(enabled)
     candidates = list(candidates)
     candidates.sort(key=lambda candidate: (
         _rank_metric(candidate, "known_share"),
@@ -1354,9 +1381,7 @@ def _surface_review(item: dict, candidate: dict, *,
     the item shape. A provider or model failure never raises — it is recorded as
     the item's ``review_status``.
     """
-    enabled = (os.environ.get("SURFACE_AI_REVIEW", "").strip().lower()
-               in ("1", "true", "yes", "on"))
-    if not enabled:
+    if not review_enabled():
         item.update(review_status="disabled",
                     reason="Set SURFACE_AI_REVIEW=1 to enable imagery review.")
         return item
@@ -1520,9 +1545,7 @@ def preview_imagery(coordinates, crs: str = "EPSG:4326", *,
         candidate = {"span_id": item["span_id"], "claimed": None,
                      "coordinates": item["coordinates"], "coordinates_crs": "EPSG:4326"}
 
-    enabled = (os.environ.get("SURFACE_AI_REVIEW", "").strip().lower()
-               in ("1", "true", "yes", "on"))
-    if not enabled:
+    if not review_enabled():
         item.update(review_status="disabled",
                     reason="Set SURFACE_AI_REVIEW=1 to enable imagery review.")
         return item

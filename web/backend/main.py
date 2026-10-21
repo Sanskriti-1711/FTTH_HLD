@@ -185,13 +185,15 @@ QGIS_WORKER_TOKEN = os.environ.get("QGIS_WORKER_TOKEN", "")
 # How often the worker's job log is polled. Two seconds keeps the stage strip
 # live without a request per stdout line.
 QGIS_WORKER_POLL_S = float(os.environ.get("FTTH_QGIS_WORKER_POLL", "2"))
-# A sleeping free-tier worker answers 502 from the platform's edge (measured
-# 2026-10-20: /health waited 45 s on the first request of the day and answered
-# in 0.3 s on the next) until it boots.  Starting a job counts as the worker's
-# traffic, so a run that arrives while it sleeps used to die in 34 s with "HTTP
-# Error 502: Bad Gateway" and lose the planner's ward.  Job start now waits out
-# a boot instead; 180 s covers the ~47 s cold start plus the boot queue.
-QGIS_WORKER_WAKE_S = float(os.environ.get("FTTH_QGIS_WORKER_WAKE", "180"))
+# A sleeping free-tier worker answers 502 from the platform's edge until it
+# boots.  The boot is not the 45 s a small service takes: this image carries
+# QGIS, and a run started after an idle window was settled as failed at 180 s
+# with "HTTP Error 502: Bad Gateway" -- the boot was still under way.  600 s is
+# the platform's own request ceiling, so a run that is going to make it makes it
+# inside one wait instead of asking the planner to press the button again.
+QGIS_WORKER_WAKE_S = float(os.environ.get("FTTH_QGIS_WORKER_WAKE", "600"))
+# How many times a job start waits out the worker before giving up.
+QGIS_WORKER_START_ATTEMPTS = max(1, int(os.environ.get("FTTH_QGIS_WORKER_START_ATTEMPTS", "3")))
 # How long a run survives losing contact with a worker that is mid-pipeline.
 # Five 2-second misses (10 s) was too tight for a platform hiccup on a job that
 # has already burned an hour of a slow instance's CPU; a RESTARTED worker still
@@ -520,6 +522,52 @@ def _worker_wake(budget: Optional[float] = None) -> None:
         return
 
 
+# The pipeline executes on the worker, so the settings that change its output
+# have to travel with the job.  Only this allow-list crosses: everything else a
+# run needs is baked into the image.
+WORKER_ENV_PREFIXES = ("SURFACE_AI_", "GEMINI_", "GOOGLE_API_", "HLD_", "OSM_")
+WORKER_ENV_NAMES = ("GEMINI_API_KEY", "GOOGLE_API_KEY")
+
+
+def _worker_env() -> Dict[str, str]:
+    """The engine's own run settings, for the worker to apply to qgis_process."""
+    env: Dict[str, str] = {}
+    for name, value in os.environ.items():
+        if name in WORKER_ENV_NAMES or name.startswith(WORKER_ENV_PREFIXES):
+            env[name] = value
+    return env
+
+
+def wake_worker(project_id: str = "") -> None:
+    """Start waking the worker now, without making the caller wait.
+
+    Called when a run is accepted, so the boot overlaps the work that precedes
+    the pipeline (resolve, OSM download, input files) instead of being paid at
+    the moment the job is queued.  Failures are the job start's problem, not
+    this thread's: it only warms the instance, and its outcome is logged.
+    """
+    if not QGIS_WORKER_URL:
+        return
+    started = time.time()
+
+    def _run() -> None:
+        try:
+            _worker_wake()
+        except Exception as exc:  # noqa: BLE001 - a warm-up cannot fail a run
+            print(f"[worker] warm-up did not finish: {exc}", flush=True)
+            return
+        waited = time.time() - started
+        if waited >= 5:
+            print(f"[worker] awake after {waited:.0f}s", flush=True)
+        if project_id:
+            _append(project_id, "info",
+                    f"QGIS worker ready ({waited:.0f}s)." if waited >= 5
+                    else "QGIS worker ready.")
+
+    threading.Thread(target=_run, daemon=True,
+                     name=f"wake-{project_id[:8] or 'run'}").start()
+
+
 def _start_worker_job(project_id: str, job: str, output_dir: Path,
                       cmd: List[str]) -> None:
     """Upload the inputs and queue the job, waiting out a worker that is booting.
@@ -528,8 +576,9 @@ def _start_worker_job(project_id: str, job: str, output_dir: Path,
     the pair after a cold-start 502 cannot queue the run twice.
     """
     payload = _zip_directory(output_dir)
-    body = json.dumps({"args": cmd[1:]}).encode("utf-8")
-    attempts = 2
+    env = _worker_env()
+    body = json.dumps({"args": cmd[1:], "env": env}).encode("utf-8")
+    attempts = QGIS_WORKER_START_ATTEMPTS
     for attempt in range(1, attempts + 1):
         _worker_wake()
         try:
@@ -544,7 +593,7 @@ def _start_worker_job(project_id: str, job: str, output_dir: Path,
             _append(
                 project_id, "info",
                 f"The QGIS worker did not take the job ({exc}); waiting for it and "
-                "trying once more.",
+                f"trying again ({attempt + 1} of {attempts}).",
             )
 
 
@@ -564,6 +613,15 @@ def _run_command_remote(project_id: str, cmd: Union[List[str], str],
     job = f"/jobs/{project_id}"
     _start_worker_job(project_id, job, output_dir, cmd)
     _append(project_id, "info", f"Running on the QGIS worker at {QGIS_WORKER_URL}.")
+    forwarded = _worker_env()
+    if forwarded:
+        # Named, because "no AI review report" was a run whose flag never left
+        # this process: the pipeline runs on the worker, which has its own env.
+        _append(
+            project_id, "info",
+            "Sent %d run setting(s) to the worker: %s."
+            % (len(forwarded), ", ".join(sorted(forwarded))),
+        )
 
     offset = 0
     lost_since = 0.0
@@ -2081,6 +2139,7 @@ def _run_pipeline(
         "status": "running", "stage": PIPELINE_STAGES[0], "stage_index": 0,
         "progress": 0, "updated_at": _now(),
     })
+    wake_worker(project_id)
     if postgis.is_available():
         postgis.init_schema()
         postgis.upsert_project(
@@ -2708,6 +2767,10 @@ def _run_area_pipeline(
         "progress": 0,
         "updated_at": _now(),
     })
+    # Warm the worker while the area resolves and its data downloads: those
+    # minutes are free, and paying the boot then is the difference between a run
+    # that reaches the pipeline and one that dies at "HTTP 502" on the start.
+    wake_worker(project_id)
     _append(project_id, "info", f"Resolving area: {area}")
     # Marked running (with its stage) the moment it starts: until now the row
     # said "queued" for the whole resolve, and a restart during it left no trace

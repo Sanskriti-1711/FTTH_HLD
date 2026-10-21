@@ -375,3 +375,116 @@ def test_a_sleeping_worker_is_waited_for_instead_of_failing_the_run(tmp_path, mo
     # The job was only queued after the worker stopped answering 502.
     assert ("POST", "/jobs/proj1") in seen
     assert seen[0][1] == "/health"
+
+
+# ── the run's settings travel with the job ──────────────────────────────────
+
+def _env_script():
+    """A stand-in for qgis_process that prints the settings it was given."""
+    return (
+        "import os\n"
+        "print('SURFACE_AI_REVIEW=' + os.environ.get('SURFACE_AI_REVIEW', 'unset'))\n"
+        "print('GEMINI_API_KEY=' + os.environ.get('GEMINI_API_KEY', 'unset'))\n"
+        "print('PYTHONPATH=' + os.environ.get('PYTHONPATH', 'unset'))\n"
+        "print('Running Object Layer')\n"
+    )
+
+
+def test_the_run_settings_reach_the_qgis_process(tmp_path, monkeypatch):
+    """The pipeline runs on the worker, so the review flag has to travel with it.
+
+    The worker's own environment carries its token and nothing else, which is
+    why a review enabled on the engine produced no report on a worker run.
+    """
+    monkeypatch.setenv("PYTHONPATH", "worker-only")
+    server = _server(tmp_path, monkeypatch)
+    try:
+        _call(server, "/jobs/p1/inputs", data=_zip({"inputs/roads.geojson": b"{}"}),
+              method="PUT")
+        _call(
+            server, "/jobs/p1", method="POST",
+            data=json.dumps({
+                "args": ["-c", _env_script(), str(tmp_path / "p1")],
+                "env": {
+                    "SURFACE_AI_REVIEW": "1",
+                    "SURFACE_AI_PROVIDER": "gemini",
+                    "GEMINI_API_KEY": "test-key",
+                    # Not on the allow-list: a job body comes off the wire.
+                    "PYTHONPATH": "/evil",
+                    "LD_PRELOAD": "/evil.so",
+                },
+            }).encode(),
+        )
+
+        offset, state, lines = 0, "queued", []
+        for _ in range(100):
+            batch = _call(server, f"/jobs/p1/log?offset={offset}")
+            lines.extend(batch["lines"])
+            offset = batch["offset"]
+            state = batch["state"]
+            if state in ("done", "failed"):
+                break
+            time.sleep(0.1)
+
+        assert state == "done"
+        assert "SURFACE_AI_REVIEW=1" in lines
+        assert "GEMINI_API_KEY=test-key" in lines
+        # The worker's own environment is not replaced by the job's.
+        assert "PYTHONPATH=worker-only" in lines
+        assert any("applied 3 run setting(s)" in line for line in lines)
+    finally:
+        server.shutdown()
+
+
+def test_only_the_allow_listed_settings_are_accepted():
+    accepted = worker.job_env({
+        "SURFACE_AI_REVIEW": "1",
+        "HLD_MEMORY_SAMPLE_SECONDS": "5",
+        "OSM_PAVEMENT_ARTERIALS": "x",
+        "GEMINI_API_KEY": "k",
+        "PYTHONPATH": "/evil",
+        "BASH_ENV": "/evil",
+        "BAD=NAME": "x",
+        "IGNORED": None,
+    })
+    assert set(accepted) == {
+        "SURFACE_AI_REVIEW", "HLD_MEMORY_SAMPLE_SECONDS",
+        "OSM_PAVEMENT_ARTERIALS", "GEMINI_API_KEY",
+    }
+    assert worker.job_env(None) == {}
+    assert worker.job_env("SURFACE_AI_REVIEW=1") == {}
+
+
+def test_the_engine_forwards_its_review_settings(monkeypatch):
+    monkeypatch.setenv("SURFACE_AI_REVIEW", "1")
+    monkeypatch.setenv("SURFACE_AI_PROVIDER", "gemini")
+    monkeypatch.setenv("GEMINI_API_KEY", "engine-key")
+
+    env = main._worker_env()
+
+    assert env["SURFACE_AI_REVIEW"] == "1"
+    assert env["SURFACE_AI_PROVIDER"] == "gemini"
+    assert env["GEMINI_API_KEY"] == "engine-key"
+    assert "PATH" not in env
+
+
+def test_a_run_warms_the_worker_before_it_is_needed(monkeypatch):
+    """The boot overlaps the run, instead of being paid when the job is queued."""
+    probed = []
+
+    def fake_wake(budget=None):
+        probed.append(budget)
+
+    task = main._task("proj-warm")
+    task.update({"messages": []})
+    monkeypatch.setattr(main, "QGIS_WORKER_URL", "http://worker")
+    monkeypatch.setattr(main, "_worker_wake", fake_wake)
+
+    main.wake_worker("proj-warm")
+    for _ in range(100):
+        if probed:
+            break
+        time.sleep(0.05)
+
+    assert probed, "the worker was never woken ahead of the pipeline"
+    assert any("QGIS worker ready" in m["text"] for m in task["messages"])

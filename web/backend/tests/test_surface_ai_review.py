@@ -28,6 +28,29 @@ def test_ai_review_is_disabled_by_default(monkeypatch):
     assert result["suggestions"] == []
 
 
+def test_the_review_is_on_when_a_provider_is_configured(monkeypatch):
+    """Unset is no longer "off": a configured provider means every run reviews.
+
+    The opt-in had to be re-set on every host that runs the pipeline, and the
+    run that lacked it produced no review at all.  An explicit 0 still kills it.
+    """
+    monkeypatch.delenv("SURFACE_AI_REVIEW", raising=False)
+    monkeypatch.setenv("SURFACE_AI_PROVIDER", "gemini")
+    monkeypatch.setenv("GEMINI_API_KEY", "key")
+    assert review.review_enabled() is True
+
+    monkeypatch.setenv("SURFACE_AI_REVIEW", "0")
+    assert review.review_enabled() is False
+
+    monkeypatch.delenv("SURFACE_AI_REVIEW")
+    monkeypatch.delenv("GEMINI_API_KEY")
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    assert review.review_enabled() is False
+
+    monkeypatch.setenv("SURFACE_AI_PROVIDER", "ollama")
+    assert review.review_enabled() is True
+
+
 def test_enabled_review_waits_for_an_imagery_source_without_guessing(monkeypatch):
     monkeypatch.delenv("SURFACE_AI_PROVIDER", raising=False)
     result = review.review_uncertain_spans(

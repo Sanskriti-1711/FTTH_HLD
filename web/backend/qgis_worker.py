@@ -67,6 +67,27 @@ MAX_LINES = int(os.environ.get("QGIS_WORKER_MAX_LINES", "20000"))
 # the cap.  Jobs therefore QUEUE -- the API polls a queued job exactly like a
 # running one, so nothing above this changes.
 CONCURRENCY = max(1, int(os.environ.get("QGIS_WORKER_CONCURRENCY", "1")))
+# The pipeline runs HERE, so every switch that changes its output has to arrive
+# with the job: this service's own environment carries only the worker's token,
+# and that is why a review enabled on the engine never reviewed anything on a
+# worker run.  The list is an allow-list, not a passthrough -- a job body comes
+# off the wire and must not be able to set PYTHONPATH or LD_PRELOAD.
+ENV_PASSTHROUGH_PREFIXES = ("SURFACE_AI_", "GEMINI_", "GOOGLE_API_", "HLD_", "OSM_")
+ENV_PASSTHROUGH_NAMES = frozenset(("GEMINI_API_KEY", "GOOGLE_API_KEY"))
+
+
+def job_env(raw: Any) -> Dict[str, str]:
+    """The subset of a job's requested environment this worker will apply."""
+    if not isinstance(raw, dict):
+        return {}
+    allowed: Dict[str, str] = {}
+    for key, value in raw.items():
+        name = str(key)
+        if not name or "=" in name or value is None:
+            continue
+        if name in ENV_PASSTHROUGH_NAMES or name.startswith(ENV_PASSTHROUGH_PREFIXES):
+            allowed[name] = str(value)
+    return allowed
 
 _jobs: Dict[str, Dict[str, Any]] = {}
 _lock = threading.Lock()
@@ -112,8 +133,12 @@ def _job(job_id: str) -> Dict[str, Any]:
         )
 
 
-def start_job(job_id: str, args: List[str]) -> Dict[str, Any]:
-    """Queue ``qgis_process`` with the API's arguments.  Returns immediately."""
+def start_job(job_id: str, args: List[str], env: Any = None) -> Dict[str, Any]:
+    """Queue ``qgis_process`` with the API's arguments.  Returns immediately.
+
+    ``env`` is the API's review/feature configuration for THIS run (see
+    :func:`job_env`), applied on top of the worker's own environment.
+    """
     out_dir = _job_dir(job_id)
     if not out_dir.is_dir():
         raise FileNotFoundError(f"no inputs were uploaded for {job_id}")
@@ -122,7 +147,8 @@ def start_job(job_id: str, args: List[str]) -> Dict[str, Any]:
         if job["state"] in ("queued", "running"):
             return {"state": job["state"], "job_id": job_id}
         job.update(
-            {"state": "queued", "args": list(args), "lines": [], "started_at": None,
+            {"state": "queued", "args": list(args), "env": job_env(env),
+             "lines": [], "started_at": None,
              "finished_at": None, "exit_code": None, "error": None}
         )
     with _sched:
@@ -144,33 +170,39 @@ def _dispatch() -> None:
                 job = _job(job_id)
                 args = job.get("args") or []
                 threading.Thread(
-                    target=_run_job, args=(job_id, args), daemon=True,
-                    name=f"qgis-{job_id[:8]}",
+                    target=_run_job, args=(job_id, args, job.get("env") or {}),
+                    daemon=True, name=f"qgis-{job_id[:8]}",
                 ).start()
             if not _queue and _active["running"] == 0:
                 _active["dispatcher"] = False
                 return
 
 
-def _run_job(job_id: str, args: List[str]) -> None:
+def _run_job(job_id: str, args: List[str], env: Optional[Dict[str, str]] = None) -> None:
     job = _job(job_id)
     out_dir = _job_dir(job_id)
     with _lock:
         job.update({"state": "running", "started_at": time.time()})
     try:
-        _run_qgis(job_id, job, out_dir, args)
+        _run_qgis(job_id, job, out_dir, args, env or {})
     finally:
         with _sched:
             _active["running"] -= 1
 
 
 def _run_qgis(job_id: str, job: Dict[str, Any], out_dir: Path,
-              args: List[str]) -> None:
+              args: List[str], job_environment: Optional[Dict[str, str]] = None) -> None:
     """Run one job to completion, streaming its stdout into the job log."""
     started = time.time()
     env = os.environ.copy()
+    env.update(job_environment or {})
     env.setdefault("QT_QPA_PLATFORM", "offscreen")
     env.setdefault("PYTHONUNBUFFERED", "1")
+    if job_environment:
+        job["lines"].append(
+            "[worker] applied %d run setting(s) from the engine: %s"
+            % (len(job_environment), ", ".join(sorted(job_environment)))
+        )
     before = _snapshot(out_dir)
     try:
         process = subprocess.Popen(
@@ -450,7 +482,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, {"detail": "'args' must be a non-empty list"})
                 return
             try:
-                self._send(202, start_job(parts[1], [str(a) for a in args]))
+                self._send(202, start_job(parts[1], [str(a) for a in args],
+                                          env=payload.get("env")))
             except FileNotFoundError as exc:
                 self._send(409, {"detail": str(exc)})
             except RuntimeError as exc:

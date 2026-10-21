@@ -20,9 +20,11 @@ name: Keep the engine and the fibre backend awake
 #
 # ── The QGIS worker is deliberately NOT warmed ────────────────────────────────
 # It is only needed while a run is in flight, a run is not idle so it does not
-# sleep mid-run, and the engine now waits up to 180 s for it to boot before
-# queueing a job (FTTH_QGIS_WORKER_WAKE). Warming it 24/7 would cost 730 h on
-# its own — the whole budget for a service that needs none of it.
+# sleep mid-run, and the engine starts warming it the moment a run is accepted
+# (so the boot overlaps the resolve and the OSM download) and then waits up to
+# 600 s for it before queueing a job (FTTH_QGIS_WORKER_WAKE). Warming it 24/7
+# would cost 730 h on its own — the whole budget for a service that needs none
+# of it.
 #
 # ── Two limits, both deliberate ───────────────────────────────────────────────
 #   * GitHub does not promise schedule timing -- under load a run can be late by

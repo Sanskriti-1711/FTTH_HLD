@@ -4748,7 +4748,8 @@ def verify_surface_geometry(out_dir, feedback=None, roads_source=None):
     # The optional imagery pass is a separate review artifact. Until an imagery
     # source is configured it records eligible geometry-uncertain spans as
     # awaiting imagery; it never writes to or changes Final_Trenches.gpkg.
-    ai_enabled = os.environ.get("SURFACE_AI_REVIEW", "").strip().lower() in ("1", "true", "yes", "on")
+    from ..design.surface_ai_review import review_enabled as _review_enabled
+    ai_enabled = _review_enabled()
     review_path = os.path.join(out_dir, "surface_ai_review.json")
     if not ai_enabled:
         # A reused output directory must not expose a previous run's review as
