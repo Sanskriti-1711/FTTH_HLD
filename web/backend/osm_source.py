@@ -644,6 +644,112 @@ def bbox_polygon(bbox: Sequence[float]) -> Dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# A section of an area, drawn by the planner
+# ---------------------------------------------------------------------------
+# A postcode is not always the design area.  A planner often needs a share of it
+# -- an estate, one side of a trunk road, the part that fits the run cap or the
+# instance's memory -- and before this the only way to say so was to find a
+# smaller administrative boundary that happened to line up with what they meant.
+# A drawn polygon replaces the resolved one, and everything downstream reads it
+# unchanged: the store query, the premise cap, the input files, the run.
+SELECTION_SOURCE = "selection"
+# 5,000 m^2 is about one large building plot: below that it is a mis-drag, not a
+# design, and a zero-area polygon would silently produce an empty run.
+SELECTION_MIN_KM2 = 0.005
+
+
+def selection_geometry(raw: Any) -> Optional[Dict[str, Any]]:
+    """Validate a drawn GeoJSON polygon; None when none was given.
+
+    Accepts a bare geometry, a Feature, or the JSON text of either, because the
+    three callers (preview, layer review, run) carry it differently.  Raises
+    ValueError with a sentence a planner can act on -- the id of a malformed
+    ring is not one.
+    """
+    if raw is None or raw == "" or raw == {}:
+        return None
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError as exc:
+            raise ValueError("the drawn area could not be read; draw it again") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("the drawn area must be a GeoJSON polygon")
+    if raw.get("type") == "Feature":
+        raw = raw.get("geometry") or {}
+    if raw.get("type") != "Polygon":
+        raise ValueError(
+            "the drawn area must be a single polygon (a closed ring of points)"
+        )
+    rings = raw.get("coordinates") or []
+    if not rings or not isinstance(rings[0], list):
+        raise ValueError("the drawn area has no outline; draw it again")
+
+    ring: List[List[float]] = []
+    for point in rings[0]:
+        try:
+            lon, lat = float(point[0]), float(point[1])
+        except (TypeError, ValueError, IndexError) as exc:
+            raise ValueError("the drawn area has a point that is not a coordinate") from exc
+        if not (math.isfinite(lon) and math.isfinite(lat)):
+            raise ValueError("the drawn area has a point that is not a coordinate")
+        if not (-180.0 <= lon <= 180.0 and -90.0 <= lat <= 90.0):
+            raise ValueError("the drawn area is outside the map")
+        ring.append([lon, lat])
+    if len(ring) < 3:
+        raise ValueError("the drawn area needs at least three corners")
+    if ring[0] != ring[-1]:
+        ring.append(list(ring[0]))
+    if len({(round(p[0], 9), round(p[1], 9)) for p in ring}) < 3:
+        raise ValueError("the drawn area has no surface; draw it again")
+
+    polygon = {"type": "Polygon", "coordinates": [ring]}
+    km2 = polygon_area_km2(polygon)
+    if km2 < SELECTION_MIN_KM2:
+        raise ValueError(
+            "the drawn area is too small to design (%s km²); draw at least %.3f km²"
+            % (round(km2, 4), SELECTION_MIN_KM2)
+        )
+    return polygon
+
+
+def narrow_to_selection(resolution: Dict[str, Any],
+                        raw_selection: Any) -> Dict[str, Any]:
+    """Replace a resolution's boundary with the section the planner drew.
+
+    The parent's name, country, city and codes are kept: the section is still
+    *of* that area, and the run's provenance has to say so.  What changes is the
+    geometry, its bbox (the download and the store query both key on it) and the
+    area the page reports.
+    """
+    polygon = selection_geometry(raw_selection)
+    if polygon is None:
+        return resolution
+    bbox = polygon_bbox(polygon)
+    narrowed = dict(resolution)
+    narrowed.update({
+        "polygon": polygon,
+        "bbox": bbox,
+        "area_km2": round(polygon_area_km2(polygon), 3),
+        "bbox_km2": round(polygon_area_km2(bbox_polygon(bbox)), 3),
+        "polygon_source": SELECTION_SOURCE,
+        "boundary_kind": "selection",
+        "boundary_code": None,
+        "boundary_licence": resolution.get("boundary_licence"),
+        "boundary_note": (
+            "A section drawn inside %s, not a published boundary of its own. "
+            "Its size, premise count and design are the drawn area's."
+            % (resolution.get("matched") or "the area")
+        ),
+        "selection_of": resolution.get("matched"),
+        "selection_km2": round(polygon_area_km2(polygon), 3),
+        "parent_area_km2": resolution.get("area_km2"),
+        "matched": "%s — selected section" % (resolution.get("matched") or "area"),
+    })
+    return narrowed
+
+
 def polygon_bbox(geometry: Dict[str, Any]) -> List[float]:
     """Bounding box of any GeoJSON geometry: [w, s, e, n]."""
     xs: List[float] = []
@@ -4976,6 +5082,7 @@ def preview_area(
     country_code: str = "",
     input_type: str = "",
     postcode: str = "",
+    selection: Any = None,
 ) -> Dict[str, Any]:
     """Area -> boundary, premises and household mix.  Starts nothing.
 
@@ -4994,6 +5101,9 @@ def preview_area(
     resolution = resolve_area(
         area, country_code=country_code, input_type=input_type, postcode=postcode
     )
+    # A drawn section replaces the boundary before anything is counted or shown:
+    # every figure below is about the section, not the area it was cut from.
+    resolution = narrow_to_selection(resolution, selection)
     base = _boundary_payload(area, resolution, boundary_only, country_code, input_type)
     if boundary_only:
         return base
@@ -6110,11 +6220,15 @@ def build_inputs(
     country_code: str = "",
     input_type: str = "",
     postcode: str = "",
+    selection: Any = None,
 ) -> Dict[str, Any]:
     """Write the two pipeline input files for an area.  Returns their paths + provenance."""
     resolution = resolve_area(
         area, country_code=country_code, input_type=input_type, postcode=postcode
     )
+    # The files must be built from the SAME polygon the preview counted, or the
+    # run designs an area the planner never saw.
+    resolution = narrow_to_selection(resolution, selection)
     bbox = resolution["bbox"]
     if not postgis.is_available():
         raise RuntimeError("postgis_unavailable")
@@ -6200,6 +6314,10 @@ def build_inputs(
         "boundary_licence": resolution.get("boundary_licence"),
         "boundary_vintage": resolution.get("boundary_vintage"),
         "boundary_note": resolution.get("boundary_note"),
+        # A drawn section is not a published boundary: record which area it was
+        # cut from and how big it is, so the run's provenance says that.
+        "selection_of": resolution.get("selection_of"),
+        "selection_km2": resolution.get("selection_km2"),
         "area_km2": resolution.get("area_km2"),
         "bbox": resolution.get("bbox"),
         "resolution_key": resolution_key(area, country_code),

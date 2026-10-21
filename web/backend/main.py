@@ -2638,6 +2638,9 @@ def resolve_area_endpoint(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]
             country_code=country_code,
             input_type=input_type,
             postcode=str((payload or {}).get("postcode") or ""),
+            # The section drawn on the map, if any: every count returned is
+            # then about that section rather than the whole area.
+            selection=(payload or {}).get("polygon"),
         )
     except Exception as exc:  # noqa: BLE001 - mapped by _area_error
         raise _area_error(exc) from exc
@@ -2689,6 +2692,7 @@ def _run_area_pipeline(
     input_type: str = "",
     postcode: str = "",
     brownfield_path: Optional[Path] = None,
+    selection: Any = None,
 ) -> None:
     """Generate an area's input files, then run the UNCHANGED pipeline on them.
 
@@ -2738,6 +2742,7 @@ def _run_area_pipeline(
         built = osm_source.build_inputs(
             project_id, area, str(output_dir),
             country_code=country_code, input_type=input_type, postcode=postcode,
+            selection=selection,
         )
     except Exception as exc:  # noqa: BLE001 - reported to the caller
         # A refused area is a decision about the design, not an internal error,
@@ -2766,6 +2771,20 @@ def _run_area_pipeline(
     meminfo.trace(f"run {project_id[:8]} area inputs built")
     extract = built.get("extract") or {}
     _append(project_id, "info", f"Area resolved to {built.get('matched') or area}.")
+    if built.get("selection_of"):
+        # A design on a section has to say so on its own status page: the
+        # premise count, the cable sizing and the BOQ are all about the drawn
+        # area, and a reader who assumes it is the whole postcode will size
+        # the wrong job.
+        _append(
+            project_id, "info",
+            "Designing a section drawn inside %s: %s km² of %s km²."
+            % (
+                built.get("selection_of"),
+                built.get("selection_km2"),
+                built.get("parent_area_km2"),
+            ),
+        )
     _append(
         project_id, "info",
         f"OSM data: {extract.get('source') or 'local store'}"
@@ -2903,6 +2922,9 @@ async def run_from_area(
     background_tasks.add_task(
         _run_area_pipeline, project_id, area, output_dir, poly_method,
         country_code, input_type, postcode, brownfield_path,
+        # The section drawn on the map: the run designs that, not the whole
+        # area, which is also what keeps it inside the instance's memory.
+        (payload or {}).get("polygon"),
     )
     return _public_task(project_id)
 
@@ -2915,7 +2937,10 @@ def get_input_layer(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail="'layer' is required.")
     area, country_code, _input_type = _area_request(payload)
     try:
-        resolution = osm_source.resolve_area(area, country_code=country_code)
+        resolution = osm_source.narrow_to_selection(
+            osm_source.resolve_area(area, country_code=country_code),
+            (payload or {}).get("polygon"),
+        )
         # Never wait for the download here.  The object points are in the store
         # as soon as the buildings group lands, and holding every layer behind
         # the whole seven-group fetch is what left the review panel empty for
