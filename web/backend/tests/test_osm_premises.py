@@ -2817,3 +2817,34 @@ def test_a_downloading_area_is_previewed_partially_and_blocks_the_run(monkeypatc
     assert any("still arriving" in w or "have arrived" in w for w in out["warnings"])
     # The counts themselves are still reported: a partial answer beats no answer.
     assert out["premises"]["count"] == 2
+
+
+def test_a_failed_download_is_not_described_as_still_running(monkeypatch):
+    """A fetch that stopped must not read as one still arriving.
+
+    The preview said "still running" and "still arriving" about a download that
+    had already failed, so a planner waited for something that was never coming.
+    The failure's own reason is carried instead.
+    """
+    _stub_area(
+        monkeypatch,
+        [_premise(1), _premise(2)],
+        area_state={
+            "ready": False,
+            "partial": True,
+            "state": {
+                "state": "failed", "fetching": False, "groups_done": 7, "groups_total": 7,
+                "elapsed_s": 460,
+                "error": "overpass returned no elements for this area on any mirror",
+            },
+        },
+    )
+
+    out = osm_source.preview_area("B16 8UU")
+
+    assert out["partial"] is True
+    assert out["can_run"] is False
+    assert "could not be downloaded" in out["run_blocked_reason"]
+    assert "still running" not in out["run_blocked_reason"]
+    assert any("download failed" in w and "no elements" in w for w in out["warnings"])
+    assert not any("have arrived" in w for w in out["warnings"])

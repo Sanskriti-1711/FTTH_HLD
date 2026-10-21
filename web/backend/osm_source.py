@@ -4811,12 +4811,24 @@ def preview_area(
         # to hold this call open for the whole download (27 minutes and counting
         # on B16 8UU), and a count that arrives slowly is worse than a count that
         # says it is still arriving.
-        warnings.insert(
-            0,
-            "Downloading this area's OpenStreetMap data: "
-            f"{fetch.get('groups_done', 0)} of {fetch.get('groups_total', 7)} groups "
-            "have arrived. These counts cover only what is stored so far.",
-        )
+        # A download that FAILED must not read as one still in progress: the
+        # page would keep saying "still arriving" about a fetch that has already
+        # stopped, and the planner would wait for something that is not coming.
+        if fetch.get("state") == "failed":
+            warnings.insert(
+                0,
+                "This area's OpenStreetMap download failed: "
+                f"{fetch.get('error') or 'no reason was reported'}. "
+                "Nothing further was saved, so these counts are a partial area; "
+                "try again in a few minutes.",
+            )
+        else:
+            warnings.insert(
+                0,
+                "Downloading this area's OpenStreetMap data: "
+                f"{fetch.get('groups_done', 0)} of {fetch.get('groups_total', 7)} groups "
+                "have arrived. These counts cover only what is stored so far.",
+            )
     if anonymous:
         warnings.append(
             f"{anonymous} premise(s) have neither a street nor a house number in "
@@ -4880,7 +4892,12 @@ def preview_area(
     # be reviewed, and the page needs the first answer to enable its button
     # honestly rather than letting it start a run the engine will refuse.
     # Mirrors the three refusals in build_inputs().
-    if partial:
+    if partial and fetch.get("state") == "failed":
+        blocked_reason = (
+            "This area's OpenStreetMap data could not be downloaded, so these "
+            "counts are incomplete. Try again in a few minutes."
+        )
+    elif partial:
         blocked_reason = (
             "This area's OpenStreetMap download is still running, so the counts "
             "are incomplete. The run can start once it finishes."
