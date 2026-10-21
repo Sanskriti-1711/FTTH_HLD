@@ -52,6 +52,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
@@ -2494,6 +2495,35 @@ def _mark_overpass_alive(url: str) -> None:
         _OVERPASS_HEALTH[url] = time.monotonic()
 
 
+# A mirror that answers a probe and then answers a REAL query with nothing is
+# not a mirror without data here -- it is a mirror whose planet is empty or not
+# loaded.  Measured 2026-10-21 10:20Z on the B16 8UU bbox, one query, same body:
+#
+#     overpass-api.de   858 elements
+#     kumi.systems      857 elements
+#     osm.ch              0 elements
+#
+# The probe could not tell them apart (`node(id:1)` came back for osm.ch while
+# its bbox queries were all empty), so liveness alone put the empty one first and
+# the fetch took its silence as the answer.  Demoting a mirror that answered
+# nothing while another answered the same query keeps that from repeating, and
+# it expires on its own so a recovered mirror comes back without a restart.
+_OVERPASS_EMPTY: Dict[str, float] = {}
+OVERPASS_EMPTY_TTL_S = 1800.0
+
+
+def _mark_overpass_empty(url: str) -> None:
+    """Remember that this mirror answered a real query with nothing."""
+    with _OVERPASS_PROBE_LOCK:
+        _OVERPASS_EMPTY[url] = time.monotonic()
+
+
+def _emptied_recently(url: str, now: float) -> bool:
+    with _OVERPASS_PROBE_LOCK:
+        seen = _OVERPASS_EMPTY.get(url)
+    return seen is not None and now - seen < OVERPASS_EMPTY_TTL_S
+
+
 def ordered_overpass_mirrors() -> List[str]:
     """The mirror list, the answering mirrors first.
 
@@ -2502,6 +2532,10 @@ def ordered_overpass_mirrors() -> List[str]:
     query.  The answer is cached for a short while, so the seven group
     queries of one fetch share a single round of probes instead of each
     probing on its own.
+
+    A mirror that recently answered a real query with nothing sorts behind the
+    ones that did not: it is still tried (its answer may be the true one), just
+    not before a mirror that has been known to carry data.
     """
     with _OVERPASS_PROBE_LOCK:
         now = time.monotonic()
@@ -2521,8 +2555,11 @@ def ordered_overpass_mirrors() -> List[str]:
             if url in _OVERPASS_HEALTH
             and now - _OVERPASS_HEALTH[url] < OVERPASS_HEALTH_TTL_S
         ]
-        rest = [url for url in OVERPASS_URLS if url not in alive]
-        return alive + rest
+    rest = [url for url in OVERPASS_URLS if url not in alive]
+    # Stable within each group: the original order still decides ties.
+    carrying = [url for url in alive if not _emptied_recently(url, now)]
+    silent = [url for url in alive if _emptied_recently(url, now)]
+    return carrying + silent + rest
 
 
 def overpass_query(body: str, bbox: Sequence[float], timeout: int = 180) -> Tuple[List[Dict[str, Any]], str]:
@@ -2548,6 +2585,11 @@ def overpass_query(body: str, bbox: Sequence[float], timeout: int = 180) -> Tupl
     # would spend.  One attempt per mirror: the list plus the rounds are the
     # retry.
     last: Optional[Exception] = None
+    # An EMPTY answer is not an answer while another mirror can still speak:
+    # the first mirror to answer used to decide, so one empty-answering mirror
+    # (osm.ch, 2026-10-21) ended every fetch with seven empty groups while two
+    # other mirrors held 858 buildings for the same bbox.
+    silent: Optional[Tuple[List[Dict[str, Any]], str]] = None
     mirrors = ordered_overpass_mirrors()
     for round_no in range(OVERPASS_ROUNDS):
         if round_no:
@@ -2559,11 +2601,181 @@ def overpass_query(body: str, bbox: Sequence[float], timeout: int = 180) -> Tupl
                     headers={"Content-Type": "application/x-www-form-urlencoded"},
                     retries=1,
                 )
-                _mark_overpass_alive(url)
-                return list(payload.get("elements") or []), url
             except Exception as exc:  # noqa: BLE001 - try the next mirror
                 last = exc
+                continue
+            elements = list(payload.get("elements") or [])
+            if elements:
+                _mark_overpass_alive(url)
+                if silent is not None and silent[1] != url:
+                    # That mirror answered nothing for a query this one filled:
+                    # it is not carrying data, so try it last for a while.
+                    _mark_overpass_empty(silent[1])
+                return elements, url
+            if silent is None:
+                silent = ([], url)
+    if silent is not None:
+        # Every mirror that answered said nothing.  Hand the empty answer back
+        # so the caller refuses it (and names the mirror) instead of raising a
+        # transport error that would hide what actually happened.
+        return silent
     raise RuntimeError(f"Overpass request failed on all mirrors after {OVERPASS_ROUNDS} rounds: {last}") from last
+
+
+# ---------------------------------------------------------------------------
+# The OSM map API -- a second, non-Overpass way to get one small area's data
+# ---------------------------------------------------------------------------
+#
+# Overpass is ONE service.  The OSM map API is a different one, on different
+# servers, and it answered while every Overpass mirror we know was refusing.
+# Measured 2026-10-21 10:25Z, same bbox (B16 8UU), same data requested:
+#
+#     overpass-api.de      HTTP 502 Bad Gateway
+#     z.overpass-api.de    HTTP 502
+#     kumi.systems         no answer in 40 s
+#     private.coffee       no answer in 40 s
+#     osm.ch               200 with 0 elements, for every query
+#     api.openstreetmap.org 200, 6.7 MB, 2,390 ways, 2.5 s
+#
+# It is the API the OSM editors use.  One request returns every node and way
+# in a SMALL bbox (the server caps it at 50,000 nodes and refuses bigger areas
+# with HTTP 400 at once), so a postcode-sized area is what it is for and a
+# whole city is refused cheaply.  It is used here only as the fallback for an
+# area Overpass could not answer -- never for bulk -- and a single download
+# feeds all seven groups, because the groups are tag filters over the same
+# extract.
+OSM_MAP_API_URL = os.environ.get(
+    "OSM_MAP_API_URL", "https://api.openstreetmap.org/api/0.6/map"
+)
+OSM_MAP_API_TIMEOUT_S = float(os.environ.get("OSM_MAP_API_TIMEOUT_S", "150"))
+
+
+def _xml_tags(el: Any) -> Dict[str, str]:
+    return {
+        str(t.get("k")): str(t.get("v"))
+        for t in el.findall("tag")
+        if t.get("k") is not None
+    }
+
+
+def map_api_extract(bbox: Sequence[float]) -> List[Dict[str, Any]]:
+    """Every element in a small bbox, in the shape Overpass `out geom` returns.
+
+    Ways carry `geometry`, rebuilt from the node coordinates in the same
+    answer, so `store_overpass_elements` and `_element_geometry` read this
+    exactly as they read an Overpass element: the two sources are
+    interchangeable downstream, which is the whole point of the fallback.
+    """
+    w, s, e, n = (float(v) for v in bbox)
+    # The map API takes lon,lat order (minlon,minlat,maxlon,maxlat).  Swapping
+    # it is not an error there: it returns a well-formed, EMPTY answer for the
+    # bbox that was asked for, so a transposed bbox looks exactly like an area
+    # with nothing in it.  Measured 2026-10-21: swapping the first two numbers
+    # turned 6.7 MB of B16 8UU into a 382-byte <osm> with no elements.
+    url = "%s?bbox=%s" % (
+        OSM_MAP_API_URL,
+        ",".join("%.7f" % v for v in (w, s, e, n)),
+    )
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=OSM_MAP_API_TIMEOUT_S) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code in (400, 413):
+            raise RuntimeError(
+                "the OSM map API refused this area as too large (it serves "
+                "small areas only) -- narrow the area, or retry later"
+            ) from exc
+        raise
+    return _parse_map_api_xml(raw)
+
+
+def _parse_map_api_xml(raw: bytes) -> List[Dict[str, Any]]:
+    """OSM XML -> the element list the Overpass path would have produced."""
+    root = ET.fromstring(raw)
+    nodes: Dict[int, Tuple[float, float]] = {}
+    for el in root.findall("node"):
+        try:
+            nodes[int(el.get("id"))] = (float(el.get("lat")), float(el.get("lon")))
+        except (TypeError, ValueError):
+            continue
+
+    elements: List[Dict[str, Any]] = []
+    for el in root.findall("node"):
+        try:
+            eid = int(el.get("id"))
+            lat, lon = nodes[eid]
+        except (TypeError, ValueError, KeyError):
+            continue
+        elements.append(
+            {"type": "node", "id": eid, "lat": lat, "lon": lon, "tags": _xml_tags(el)}
+        )
+    for el in root.findall("way"):
+        geometry = []
+        for nd in el.findall("nd"):
+            try:
+                lat, lon = nodes[int(nd.get("ref"))]
+            except (TypeError, ValueError, KeyError):
+                continue
+            geometry.append({"lat": lat, "lon": lon})
+        if len(geometry) < 2:
+            continue
+        elements.append(
+            {
+                "type": "way",
+                "id": int(el.get("id", 0)),
+                "geometry": geometry,
+                "tags": _xml_tags(el),
+            }
+        )
+    return elements
+
+
+# One statement of a group body: `way["building"]`, `way["boundary"="protected_area"]`.
+_GROUP_FILTER_RE = re.compile(r'^(node|way|rel)\["([^"]+)"(?:="([^"]*)")?\]$')
+
+
+def group_elements(group_body: str, elements: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The part of an extract that one group's tag filters select."""
+    filters = []
+    for stmt in group_body.split(";"):
+        stmt = stmt.strip()
+        if not stmt:
+            continue
+        match = _GROUP_FILTER_RE.match(stmt)
+        if not match:
+            raise ValueError(f"unsupported group filter: {stmt!r}")
+        filters.append((match.group(1), match.group(2), match.group(3)))
+    picked = []
+    for el in elements:
+        tags = el.get("tags") or {}
+        for kind, key, value in filters:
+            if el.get("type") != kind or key not in tags:
+                continue
+            if value is not None and tags[key] != value:
+                continue
+            picked.append(el)
+            break
+    return picked
+
+
+def fetch_groups_from_map_api(groups, bbox: Sequence[float], on_group=None) -> List[str]:
+    """Fill every group from ONE map-API download of the area.
+
+    Same contract as `fetch_groups`: each group is handed to ``on_group(name,
+    elements, source)`` as it is assembled, so the storing, the progress and
+    the counts stay on one code path whichever source supplied the data.
+    """
+    groups = list(groups)
+    if not groups:
+        return []
+    elements = map_api_extract(bbox)
+    done: List[str] = []
+    for name, body in groups:
+        if on_group is not None:
+            on_group(name, group_elements(body, elements), OSM_MAP_API_URL)
+        done.append(name)
+    return done
 
 
 # A city's buildings are the one query that genuinely needs longer than the
@@ -3155,19 +3367,46 @@ def _run_area_fetch(key: str, area: str, bbox: Sequence[float]) -> None:
         # back and the page showed "0 of 7 groups" the whole time.  Storing still
         # happens here, one group at a time, as each lands.
         fetch_groups(groups, bbox, on_group=_store_group, on_start=_starting_group)
+        # The Overpass mirror that answered last is kept here, because the
+        # fallback below overwrites `mirror_used` with the source it turned to.
+        overpass_last = mirror_used
+        fallback_error: Optional[str] = None
         if not any(int(v or 0) for v in counts.values()):
             # Every group answered, and every answer was empty.  That is not an
-            # area with no buildings -- it is a mirror saying nothing, which is
-            # indistinguishable from a valid empty answer at the HTTP layer.
+            # area with no buildings -- it is a service saying nothing, which
+            # is indistinguishable from a valid empty answer at the HTTP layer.
             # Writing extract_meta here would mark the bbox as downloaded for
             # good, so `covered_by_cache` would report an empty area as ready
             # and every later read would show zero premises.  Measured
             # 2026-10-21 on overpass.osm.ch: seven empty groups, and the area
             # was recorded as cached with counts of zero.
+            #
+            # So before giving up, ask the OTHER OSM service for the same
+            # bbox: the map API is a different service and answered while
+            # every Overpass mirror was refusing (see the note above).  The
+            # groups are reset because its extract feeds all seven from one
+            # download, and a retry must not report "14 of 7 groups"
+            # afterwards.
+            done = 0
+            _set_fetch_state(
+                key, "fetching_buildings", groups_done=0,
+                detail="OpenStreetMap map API", in_flight=list(in_flight),
+            )
+            try:
+                fetch_groups_from_map_api(list(groups), bbox, on_group=_store_group)
+            except Exception as exc:  # noqa: BLE001 - reported with the refusal
+                fallback_error = str(exc)
+        if not any(int(v or 0) for v in counts.values()):
             raise RuntimeError(
                 "overpass returned no elements for this area on any mirror "
-                f"(last tried: {mirror_used}); the area was NOT recorded as "
-                "downloaded. Try again, or narrow the area."
+                f"(last tried: {overpass_last}); the area was NOT recorded as "
+                "downloaded. "
+                + (
+                    f"The OSM map API fallback failed too: {fallback_error}. "
+                    if fallback_error
+                    else "The OSM map API fallback returned nothing either. "
+                )
+                + "Try again, or narrow the area."
             )
         _set_fetch_state(key, "storing", groups_done=len(groups), detail=mirror_used)
         _execute(
