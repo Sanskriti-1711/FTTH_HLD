@@ -317,7 +317,18 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
     # Minimum-cable policy: open one feeder trunk first and add another only
     # when the 70%-usable capacity or the civil length limit requires it.
     FEEDER_TRUNKS_PER_MFG = 1
-    FEEDER_LENGTH_LIMIT_M = 1000.0
+    # …and never more than this in one MFG area. The operator's rule is "not
+    # more than 3-4 feeder cables in 1 MFG area": one cable covers every PDP on
+    # its route until its own threshold, then the next one starts. A 5th trunk
+    # is never opened — the PDP joins the trunk that costs least to extend and
+    # that cable is flagged, because dropping the PDP is worse than a long run.
+    FEEDER_MAX_TRUNKS_PER_MFG = 4
+    # The length threshold. 1,000 m used to split ONE exchange area into 14
+    # cables on project 34b2cfad…: a feeder leaves the MFG and serves every PDP
+    # on its corridor, so the civil length of the run is not what exhausts it —
+    # the fibre capacity is. 5 km still flags a runaway run (LENGTH_CAPPED)
+    # while letting a single cable cover a whole MFG area.
+    FEEDER_LENGTH_LIMIT_M = 5000.0
     # Hard capacity cap per trunk: 70% of the largest ladder cable.
     FEEDER_TRUNK_MAX_DEMAND = int(FEEDER_SPARE_RATIO * 288)
     # Graph/snap parameters for the feeder route tree (mirror duct_layer feeder)
@@ -647,12 +658,32 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
                     _overlap, _length, _demand, _order, t, proj_segs = min(candidates)
                     best = (t, proj_segs, _length)
                 if best is None:
-                    # All three exhausted — open another trunk for the
-                    # remainder rather than dropping the PDP.
-                    nt = {"members": [], "member_pids": [], "member_lengths": [], "demand": 0, "pdp_ids": [],
-                          "segs": set(), "length": 0.0, "hit_length_limit": False}
-                    trunks.append(nt)
-                    best = (nt, q_segs, route_len(q_segs))
+                    if len(trunks) < int(self.FEEDER_MAX_TRUNKS_PER_MFG or 4):
+                        # The trunks were exhausted — open another for the
+                        # remainder rather than dropping the PDP.
+                        nt = {"members": [], "member_pids": [], "member_lengths": [],
+                              "demand": 0, "pdp_ids": [], "segs": set(),
+                              "length": 0.0, "hit_length_limit": False,
+                              "over_limit": False}
+                        trunks.append(nt)
+                        best = (nt, q_segs, route_len(q_segs))
+                    else:
+                        # At the 4-cable cap. Dropping the PDP would break the
+                        # feeder's job (reach every PDP), so it joins the trunk
+                        # that costs least to extend and the cable is flagged.
+                        fallback = None
+                        for order, t in enumerate(trunks):
+                            proj_segs = t["segs"] | q_segs
+                            proj_len = route_len(proj_segs)
+                            overlap = sum(edge_len.get(s, 0.0)
+                                          for s in (t["segs"] & q_segs))
+                            key = (proj_len, -overlap, order)
+                            if fallback is None or key < fallback[0]:
+                                fallback = (key, t, proj_segs, proj_len)
+                        _key, t, proj_segs, proj_len = fallback
+                        t["over_limit"] = True
+                        t["hit_length_limit"] = True
+                        best = (t, proj_segs, proj_len)
                 t, proj_segs, proj_len = best
                 t["members"].append(list(paths[q][0]))
                 t["member_pids"].append(q)
@@ -696,6 +727,7 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
                     "end_node": _end_node,
                     "length": t["length"],
                     "length_capped": 1 if t.get("hit_length_limit") else 0,
+                    "over_trunk_cap": 1 if t.get("over_limit") else 0,
                     "extended_from_pdp": extension_from,
                     "extension_length": extension_length,
                 })
@@ -1033,9 +1065,27 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
         cables = self._group_feeder_cables(
             paths, demands, pid_mfg, edge_geom, edge_len, pdp_label,
             edge_nodes=edge_nodes)
+        per_mfg = defaultdict(int)
+        for c in cables:
+            per_mfg[c.get("mfg_id") or ""] += 1
         feedback.pushInfo(
             f"Feeder corridor grouping: {len(cables)} cable assembly(ies) "
-            "covering shared MFG-to-PDP routes.")
+            "covering shared MFG-to-PDP routes "
+            f"(cap {self.FEEDER_MAX_TRUNKS_PER_MFG} per MFG; "
+            + ", ".join(f"{m}: {n}" for m, n in sorted(per_mfg.items()))
+            + ").")
+        for mfg, n in sorted(per_mfg.items()):
+            if n > int(self.FEEDER_MAX_TRUNKS_PER_MFG or 4):
+                feedback.pushWarning(
+                    f"  Feeder: MFG {mfg} carries {n} cables — over the "
+                    f"{self.FEEDER_MAX_TRUNKS_PER_MFG}-cable cap.")
+        over = [c for c in cables if c.get("over_trunk_cap")]
+        if over:
+            feedback.pushWarning(
+                "  Feeder: %d cable(s) run past the length threshold because "
+                "their MFG already has %d cables — kept and flagged REVIEW "
+                "rather than dropping the PDPs they serve."
+                % (len(over), self.FEEDER_MAX_TRUNKS_PER_MFG))
 
         fields = QgsFields()
         for nm, t in (
@@ -1097,7 +1147,9 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
             nf["RESERVED_SPARE_FIBERS"] = self.RESERVED_SPARE_FIBERS
             nf["AVAILABLE_FIBERS"] = max(0, c["size"] - c["demand"] - self.RESERVED_SPARE_FIBERS)
             nf["CAPACITY_STATUS"] = "OK"
-            nf["CAPACITY_WARNING"] = ""
+            nf["CAPACITY_WARNING"] = ("" if not c.get("over_trunk_cap") else
+                                      "MFG feeder cap reached: this trunk carries "
+                                      "PDPs past its length threshold")
             nf["UTIL_PCT"] = round((c["demand"] / c["size"]) * 100.0, 1) if c["size"] else 0.0
             nf["SPARE_PCT"] = round(max(0.0, 100.0 - nf["UTIL_PCT"]), 1)
             nf["PDP_IDS"] = ",".join(c["pdp_ids"])
@@ -1107,7 +1159,8 @@ class AlgCableBuilderAll(QgsProcessingAlgorithm):
             nf["length_m"] = round(sum(edge_len.get(s, 0.0) for s in segs), 2)
             nf["POLYGON_ID"] = c.get("polygon_id") or ""
             nf["MFG_ID"] = c.get("mfg_id") or ""
-            nf["REVIEW"] = 1 if c["demand"] > self.FEEDER_SPARE_RATIO * self.FEEDER_LADDER[-1] else 0
+            nf["REVIEW"] = 1 if (c["demand"] > self.FEEDER_SPARE_RATIO * self.FEEDER_LADDER[-1]
+                                  or c.get("over_trunk_cap")) else 0
             # Which of the three (or overflow) trunks this cable is, and
             # whether it was closed out by the length cap or by capacity.
             nf["TRUNK_NO"] = int(c.get("trunk_no") or 0)

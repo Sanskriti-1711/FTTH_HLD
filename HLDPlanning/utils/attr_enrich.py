@@ -245,6 +245,10 @@ def _create_fields(lyr, fields):
             if ftype == ogr.OFTString:
                 fld.SetWidth(width)
             lyr.CreateField(fld)
+            # OGR/SQLite names are case-insensitive, so a spec that lists both
+            # spellings (`mfg_id`, `MFG_ID`) must not try to create the second
+            # one: it fails and leaves the layer's definition inconsistent.
+            existing.add(name.lower())
         except Exception:
             pass
 
@@ -4824,6 +4828,489 @@ def verify_surface_geometry(out_dir, feedback=None, roads_source=None):
     return report
 
 
+# ── Every metre of feeder cable rides a feeder duct (rule C2) ────────────────
+# C2 ("feeder cables ride the feeder duct, MFG → PDPs") was recorded as holding
+# because both tiers are planned on the same trench route tree — but they are
+# routed by DIFFERENT producers. The duct stage runs BEFORE the cable stage, so
+# `duct_layer._build_route_ducts` (the one builder that lays duct ON a cable)
+# only sees a cable layer when the duct algorithm is called standalone; in the
+# cascade the embedded feeder builder routes MFG → PDP on the trench network
+# while the cable planner routes its own path afterwards. Measured on the
+# SERVED payload of project 34b2cfad… (2026-10-21, `tmp/live_cable_union.py`):
+#
+#   feeder cable union   8,478 m     feeder duct union   6,894 m
+#   cable inside a duct  6,808 m (80.3 %)
+#   cable with NO duct   1,670 m (19.7 %)  <- the complaint
+#   duct not on a cable     72 m ( 1.0 %)
+#
+# and 7 of that run's 28 PDPs sat 40–258 m off the duct network while the cable
+# reached them. The uncovered geometry is 100 % on `Final_Trenches` (worst
+# 0.1 m), so the DUCT is missing, not misrouted: the fix lays the duct along
+# the cable's own route instead of redrawing the cable (redrawing it would cut
+# those 7 PDPs off, and the cable is the layer that already satisfies C4/D10).
+#
+# Additive and idempotent: existing duct rows keep their geometry and their
+# attributes; only cable geometry with no duct within `_FEEDER_COVER_M` becomes
+# duct rows, cut at the same chambers (`_FEEDER_CUT_M`, rule D3) and carrying
+# the feeder tier's own profile and identities (D1/D11). A second run finds
+# nothing to add. `stamp_duct_occupancy` runs after this and then attributes
+# the cable to the new duct.
+_FEEDER_COVER_M = 0.5        # a cable is "in" a duct within this distance
+_FEEDER_SNAP_M = 0.75        # rejoin the duct at a piece end this close to one
+_FEEDER_CUT_M = 10.0         # the duct tier's chamber cut tolerance (D3)
+_FEEDER_MIN_PIECE_M = 0.2    # the shortest gap worth its own row
+_FEEDER_DUCT_WAYS = 4
+_FEEDER_DUCT_TYPE = "4-Way HDPE"
+_FEEDER_DUCT_DIAMETER_MM = 110
+_FEEDER_DUCT_COLOR = "#d81b60"
+
+
+def _fc_cum(coords):
+    """Cumulative length at every vertex of a coordinate list."""
+    out = [0.0]
+    for a, b in zip(coords, coords[1:]):
+        out.append(out[-1] + ((b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2) ** 0.5)
+    return out
+
+
+def _fc_point_at(coords, cum, measure):
+    """The point ``measure`` metres along the polyline."""
+    if measure <= 0:
+        return coords[0]
+    if measure >= cum[-1]:
+        return coords[-1]
+    for i in range(1, len(cum)):
+        if cum[i] >= measure:
+            span = cum[i] - cum[i - 1]
+            t = 0.0 if span <= 0 else (measure - cum[i - 1]) / span
+            a, b = coords[i - 1], coords[i]
+            return (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
+    return coords[-1]
+
+
+def _fc_measure_of(coords, cum, pt):
+    """(measure, distance) of the closest point of the polyline to ``pt``."""
+    best = (0.0, float("inf"))
+    px, py = pt[0], pt[1]
+    for i in range(1, len(coords)):
+        ax, ay = coords[i - 1]
+        bx, by = coords[i]
+        dx, dy = bx - ax, by - ay
+        seg2 = dx * dx + dy * dy
+        t = 0.0 if seg2 <= 0 else max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / seg2))
+        cx, cy = ax + t * dx, ay + t * dy
+        d = ((px - cx) ** 2 + (py - cy) ** 2) ** 0.5
+        if d < best[1]:
+            best = (cum[i - 1] + t * (cum[i] - cum[i - 1]), d)
+    return best
+
+
+def _fc_substring(coords, cum, m0, m1):
+    """The part of a polyline between two along-measures (as coordinates)."""
+    pts = [_fc_point_at(coords, cum, m0)]
+    for i, m in enumerate(cum):
+        if m0 < m < m1:
+            pts.append(coords[i])
+    pts.append(_fc_point_at(coords, cum, m1))
+    out = []
+    for p in pts:
+        if not out or abs(p[0] - out[-1][0]) + abs(p[1] - out[-1][1]) > 1e-9:
+            out.append(p)
+    return out if len(out) >= 2 else []
+
+
+def _set(lyr, feat, name, value):
+    """Set a field only when the layer has it (schema varies by run age)."""
+    i = lyr.GetLayerDefn().GetFieldIndex(name)
+    if i < 0:
+        return False
+    try:
+        feat.SetField(i, value)
+        return True
+    except Exception:
+        return False
+
+
+class _SegmentGrid:
+    """Point → nearest indexed trench segment, bucketed so a run stays linear.
+
+    `_nearest_trench_id` used to walk every trench segment for every new duct
+    row (168 rows × 4,428 features measured 17 s of a 64 s pass).
+    """
+
+    def __init__(self, cell_m=100.0):
+        self.cell = cell_m
+        self.grid = {}
+
+    def add(self, key, coords):
+        for (x0, y0), (x1, y1) in zip(coords, coords[1:]):
+            for cx in range(int(min(x0, x1) // self.cell), int(max(x0, x1) // self.cell) + 1):
+                for cy in range(int(min(y0, y1) // self.cell), int(max(y0, y1) // self.cell) + 1):
+                    self.grid.setdefault((cx, cy), []).append((key, x0, y0, x1, y1))
+
+    def _nearest(self, pt):
+        px, py = pt[0], pt[1]
+        cell = self.cell
+        best_key, best_d, best_p = "", float("inf"), None
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for key, x0, y0, x1, y1 in self.grid.get(
+                        (int(px // cell) + dx, int(py // cell) + dy), ()):
+                    sx, sy = x1 - x0, y1 - y0
+                    seg2 = sx * sx + sy * sy
+                    t = 0.0 if seg2 <= 0 else max(0.0, min(1.0, ((px - x0) * sx + (py - y0) * sy) / seg2))
+                    qx, qy = x0 + t * sx, y0 + t * sy
+                    d = ((px - qx) ** 2 + (py - qy) ** 2) ** 0.5
+                    if d < best_d:
+                        best_d, best_key, best_p = d, key, (qx, qy)
+        return best_key, best_d, best_p
+
+    def nearest(self, pt, tol_m=2.0):
+        """Key of the nearest indexed segment within ``tol_m`` (else "")."""
+        key, dist, _p = self._nearest(pt)
+        return key if dist <= tol_m else ""
+
+    def distance(self, pt):
+        """Distance to the nearest indexed segment (inf when the grid is empty)."""
+        return self._nearest(pt)[1]
+
+
+def extend_feeder_ducts_along_cables(out_dir, feedback=None):
+    """Lay a feeder duct under every metre of feeder cable that has none.
+
+    Returns the number of duct rows added. Reads the FINAL published cable and
+    duct layers, so it must run after the chamber segmentation and the chamber
+    span fold, and before `stamp_duct_occupancy` (which then attributes the
+    cable to the duct it now lies in) and `verify_duct_continuity` (which then
+    measures the reach this restores).
+    """
+    if not out_dir or not os.path.isdir(out_dir):
+        return 0
+    duct_path = os.path.join(out_dir, "Feeder_Ducts.gpkg")
+    cable_path = os.path.join(out_dir, "Feeder_Cable.gpkg")
+    if not (os.path.isfile(duct_path) and os.path.isfile(cable_path)):
+        return 0
+
+    # ── Read the ducts (their geometry is what the cable has to lie in) ──
+    # Read-only, and closed before anything is written. Iterating a layer and
+    # then creating features in the same handle corrupted the heap under the
+    # QGIS GDAL build, so the two phases never share a datasource.
+    try:
+        rds = ogr.Open(duct_path, 0)
+        rlyr = rds.GetLayer(0) if rds is not None else None
+    except Exception:
+        rlyr = None
+    duct_coords = []
+    profile = {"DUCT_TYPE": _FEEDER_DUCT_TYPE, "WAYS": _FEEDER_DUCT_WAYS,
+               "DIAMETER_MM": _FEEDER_DUCT_DIAMETER_MM, "color": _FEEDER_DUCT_COLOR}
+    # The tier's own catalogue profile, taken from the first published row that
+    # states one — the new rows must read like the rows beside them.
+    profiled = False
+    if rlyr is not None:
+        for f in rlyr:
+            g = f.GetGeometryRef()
+            if g is None or g.IsEmpty():
+                continue
+            duct_coords.extend(_line_parts(g))
+            if not profiled:
+                got = False
+                for key in ("DUCT_TYPE", "WAYS", "DIAMETER_MM", "color"):
+                    v = _get(rlyr, f, key)
+                    if v not in (None, ""):
+                        profile[key] = v
+                        got = True
+                profiled = got
+    rlyr = None
+    rds = None
+    if not duct_coords:
+        return 0
+
+    # ── Read the feeder cables (geometry + the identity the new duct inherits) ──
+    try:
+        cds = ogr.Open(cable_path, 0)
+        clyr = cds.GetLayer(0) if cds is not None else None
+    except Exception:
+        clyr = None
+    cables = []
+    if clyr is not None:
+        fld_ctype = clyr.GetLayerDefn().GetFieldIndex("CABLE_TYPE")
+        for f in clyr:
+            if fld_ctype >= 0:
+                ctype = str(f.GetField(fld_ctype) or "").strip()
+                if ctype and ctype != "Feeder":
+                    continue
+            g = f.GetGeometryRef()
+            if g is None or g.IsEmpty():
+                continue
+            cables.append(({
+                "label": _cable_identity_label(clyr, f, "Feeder"),
+                "pdp": str(_get(clyr, f, "PDP_IDS") or _get(clyr, f, "pdp_ids") or ""),
+                "poly": str(_get(clyr, f, "POLYGON_ID") or _get(clyr, f, "polygon_id") or ""),
+                "mfg": str(_get(clyr, f, "MFG_ID") or _get(clyr, f, "mfg_id") or ""),
+            }, g.Clone()))
+    clyr = None
+    cds = None
+    if not cables:
+        return 0
+
+    # ── Chambers (cuts) and trenches (PARENT_TRENCH) ──
+    chambers = []
+    cpath = os.path.join(out_dir, "Chambers.gpkg")
+    if os.path.isfile(cpath):
+        try:
+            s = ogr.Open(cpath, 0)
+            lyr = s.GetLayer(0) if s is not None else None
+            if lyr is not None:
+                for f in lyr:
+                    g = f.GetGeometryRef()
+                    if g is None or g.IsEmpty():
+                        continue
+                    # The published chamber layer names the structure
+                    # `STRUCT_ID` (`DHH-0011`); older runs carried CHAMBER_ID.
+                    pid = (_get(lyr, f, "STRUCT_ID") or _get(lyr, f, "CHAMBER_ID")
+                           or _get(lyr, f, "chamber_id") or _get(lyr, f, "ID"))
+                    chambers.append(((g.Centroid().GetX(), g.Centroid().GetY()),
+                                     str(pid or "")))
+            # Drop the layer reference BEFORE the datasource: keeping it alive
+            # across the close leaves a dangling C++ layer (heap corruption).
+            lyr = None
+            s = None
+        except Exception:
+            chambers = []
+
+    trench_feats = []
+    tpath = os.path.join(out_dir, "Final_Trenches.gpkg")
+    if os.path.isfile(tpath):
+        try:
+            s = ogr.Open(tpath, 0)
+            lyr = s.GetLayer(0) if s is not None else None
+            if lyr is not None:
+                for f in lyr:
+                    g = f.GetGeometryRef()
+                    if g is None or g.IsEmpty():
+                        continue
+                    tid = str(_get(lyr, f, "TRENCH_ID") or "")
+                    for coords in _line_parts(g):
+                        trench_feats.append((tid, coords))
+            lyr = None
+            s = None
+        except Exception:
+            trench_feats = []
+
+    # ── Find the cable geometry no duct covers ──
+    # Candidates come from an in-memory grid: the layer being written is never
+    # used as a spatial filter here.
+    trench_grid = _SegmentGrid()
+    for tid, coords in trench_feats:
+        if tid:
+            trench_grid.add(tid, coords)
+
+    # Every duct segment in one grid: the gap test is then a point query, not a
+    # polygon buffer. Buffering the nearby multi-line cost 45 s per 59 cables
+    # (measured 2026-10-21) — this whole stage is a few seconds.
+    duct_grid = _SegmentGrid(cell_m=5.0)
+    for coords in duct_coords:
+        duct_grid.add("", coords)
+
+    pieces = []          # (coords, cable_index)
+    uncovered_m = 0.0
+    step = max(_FEEDER_COVER_M, 0.25)
+    for ci, (meta, geom) in enumerate(cables):
+        for coords in _line_parts(geom):
+            if len(coords) < 2:
+                continue
+            cum = _fc_cum(coords)
+            total = cum[-1]
+            if total < _FEEDER_MIN_PIECE_M:
+                continue
+            n = max(2, int(total / step) + 1)
+            # One linear pass: `_fc_point_at` rescans the cumulative list from
+            # the start, which made this loop quadratic on a 1 km cable.
+            off = []
+            seg_i = 1
+            for i in range(n):
+                m = i * total / (n - 1)
+                while seg_i < len(cum) - 1 and cum[seg_i] < m:
+                    seg_i += 1
+                span = cum[seg_i] - cum[seg_i - 1]
+                t = 0.0 if span <= 0 else (m - cum[seg_i - 1]) / span
+                a, b = coords[seg_i - 1], coords[seg_i]
+                off.append(duct_grid.distance(
+                    (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t))
+                    > _FEEDER_COVER_M)
+            if not any(off):
+                continue
+            # Runs of samples with no duct: (start measure, end measure).
+            runs, i = [], 0
+            while i < n:
+                if not off[i]:
+                    i += 1
+                    continue
+                j = i
+                while j + 1 < n and off[j + 1]:
+                    j += 1
+                m0 = max(0.0, i * total / (n - 1) - step)
+                m1 = min(total, j * total / (n - 1) + step)
+                if m1 - m0 >= _FEEDER_MIN_PIECE_M:
+                    runs.append((m0, m1))
+                i = j + 1
+            for m0, m1 in runs:
+                sub = _fc_substring(coords, cum, m0, m1)
+                if len(sub) < 2:
+                    continue
+                # Rejoin the duct by ADDING its nearest point, never by moving
+                # the cable's own vertex: moving an end bends the last segment
+                # off the cable (measured: a 4.93 m fill left the final 1.21 m
+                # of the cable 0.58 m away, and the next run found it again).
+                for end in (0, -1):
+                    _key, dist, near = duct_grid._nearest(sub[end])
+                    if near is None or dist > _FEEDER_SNAP_M or dist < 1e-6:
+                        continue
+                    if end == 0:
+                        sub.insert(0, near)
+                    else:
+                        sub.append(near)
+                pieces.append((sub, ci))
+                uncovered_m += _fc_cum(sub)[-1]
+
+    if not pieces:
+        if feedback:
+            feedback.pushInfo(
+                "  [duct] Feeder ducts: every feeder cable already rides a duct "
+                "(%d cable(s) checked)." % len(cables))
+        return 0
+
+    # ── Cut each gap at the chambers, then write it as duct rows (D3/D11) ──
+    dds, dlyr = _open_lyr(duct_path)
+    if dlyr is None:
+        return 0
+    _create_fields(dlyr, [
+        ("mfg_id", ogr.OFTString, 64),
+        ("pdp_ids", ogr.OFTString, 1024), ("pdp_count", ogr.OFTInteger),
+        ("capacity_total", ogr.OFTInteger), ("capacity_used", ogr.OFTInteger),
+        ("capacity_spare", ogr.OFTInteger), ("part", ogr.OFTString, 48),
+        ("color", ogr.OFTString, 16), ("edge_cnt", ogr.OFTInteger),
+        ("length_m", ogr.OFTReal), ("duct_idx", ogr.OFTInteger),
+        ("POLYGON_ID", ogr.OFTString, 1024), ("START_CHAMBER", ogr.OFTString, 48),
+        ("END_CHAMBER", ogr.OFTString, 48), ("SPAN_INDEX", ogr.OFTInteger),
+        ("SPAN_COUNT", ogr.OFTInteger), ("SPAN_LEN_M", ogr.OFTReal),
+        ("RUN_ID", ogr.OFTString, 48), ("SPAN_KIND", ogr.OFTString, 32),
+        ("DUCT_TYPE", ogr.OFTString, 32), ("WAYS", ogr.OFTInteger),
+        ("DIAMETER_MM", ogr.OFTInteger), ("OCCUPANCY_PCT", ogr.OFTReal),
+        ("SPARE_PCT", ogr.OFTReal), ("PARENT_TRENCH", ogr.OFTString, 48),
+        ("INFRA_STATUS", ogr.OFTString, 32), ("REUSE_LEN_M", ogr.OFTReal),
+        ("REUSE_SOURCE", ogr.OFTString, 64), ("DUCTS_MERGED", ogr.OFTInteger),
+        ("cables_carried", ogr.OFTString, 240), ("ways_used", ogr.OFTInteger),
+        ("WAYS_TOTAL", ogr.OFTInteger),        ("REVIEW", ogr.OFTInteger),
+        ("STUB_ABSORBED", ogr.OFTInteger),
+        ("N_DUCTS", ogr.OFTInteger),
+    ])
+
+    defn = dlyr.GetLayerDefn()
+    added = 0
+    cables_filled = set()
+    dlyr.StartTransaction()
+    for coords, ci in pieces:
+        meta, _geom = cables[ci]
+        cum = _fc_cum(coords)
+        total = cum[-1]
+        # Chamber cuts, measured on THIS piece (D3: a duct breaks at chambers).
+        cuts = []
+        for (cpt, _cid) in chambers:
+            m, d = _fc_measure_of(coords, cum, cpt)
+            if d <= _FEEDER_CUT_M and _FEEDER_MIN_PIECE_M < m < total - _FEEDER_MIN_PIECE_M:
+                cuts.append(m)
+        cuts = sorted(cuts)
+        bounds = [0.0]
+        for m in cuts:
+            if m - bounds[-1] >= _FEEDER_MIN_PIECE_M:
+                bounds.append(m)
+        if total - bounds[-1] < _FEEDER_MIN_PIECE_M and len(bounds) > 1:
+            bounds.pop()
+        bounds.append(total)
+
+        spans = []
+        for m0, m1 in zip(bounds, bounds[1:]):
+            sub = _fc_substring(coords, cum, m0, m1)
+            if len(sub) < 2:
+                continue
+            spans.append(sub)
+
+        for si, sub in enumerate(spans):
+            line = ogr.Geometry(ogr.wkbLineString)
+            for x, y in sub:
+                line.AddPoint_2D(x, y)
+            span_len = line.Length()
+            if span_len < _FEEDER_MIN_PIECE_M:
+                continue
+            start_id = end_id = ""
+            start_pt, end_pt = sub[0], sub[-1]
+            for (cpt, cid) in chambers:
+                if cid and start_id == "" and ((cpt[0] - start_pt[0]) ** 2 + (cpt[1] - start_pt[1]) ** 2) ** 0.5 <= _FEEDER_CUT_M:
+                    start_id = cid
+                if cid and end_id == "" and ((cpt[0] - end_pt[0]) ** 2 + (cpt[1] - end_pt[1]) ** 2) ** 0.5 <= _FEEDER_CUT_M:
+                    end_id = cid
+            feat = ogr.Feature(defn)
+            feat.SetGeometry(line)
+            _set(dlyr, feat, "mfg_id", meta.get("mfg") or "")
+            _set(dlyr, feat, "MFG_ID", meta.get("mfg") or "")
+            _set(dlyr, feat, "pdp_ids", meta.get("pdp") or "")
+            _set(dlyr, feat, "pdp_count", len(_split_list(meta.get("pdp"))))
+            _set(dlyr, feat, "capacity_total", int(profile.get("WAYS") or _FEEDER_DUCT_WAYS))
+            _set(dlyr, feat, "capacity_used", 0)
+            _set(dlyr, feat, "capacity_spare", int(profile.get("WAYS") or _FEEDER_DUCT_WAYS))
+            _set(dlyr, feat, "part", "cable_fill")
+            _set(dlyr, feat, "color", str(profile.get("color") or _FEEDER_DUCT_COLOR))
+            _set(dlyr, feat, "edge_cnt", max(0, len(sub) - 1))
+            _set(dlyr, feat, "length_m", round(float(span_len), 2))
+            _set(dlyr, feat, "duct_idx", 0)
+            _set(dlyr, feat, "POLYGON_ID", meta.get("poly") or "")
+            _set(dlyr, feat, "START_CHAMBER", start_id)
+            _set(dlyr, feat, "END_CHAMBER", end_id)
+            _set(dlyr, feat, "SPAN_INDEX", si + 1)
+            _set(dlyr, feat, "SPAN_COUNT", len(spans))
+            _set(dlyr, feat, "SPAN_LEN_M", round(float(span_len), 2))
+            _set(dlyr, feat, "RUN_ID", "RUN-FILL-%s" % (meta.get("label") or "?"))
+            _set(dlyr, feat, "SPAN_KIND",
+                 "Chamber span" if (start_id and end_id) else "Duct tail")
+            _set(dlyr, feat, "DUCT_TYPE", str(profile.get("DUCT_TYPE") or _FEEDER_DUCT_TYPE))
+            _set(dlyr, feat, "WAYS", int(profile.get("WAYS") or _FEEDER_DUCT_WAYS))
+            _set(dlyr, feat, "DIAMETER_MM", int(profile.get("DIAMETER_MM") or _FEEDER_DUCT_DIAMETER_MM))
+            _set(dlyr, feat, "OCCUPANCY_PCT", 0.0)
+            _set(dlyr, feat, "SPARE_PCT", 100.0)
+            _set(dlyr, feat, "PARENT_TRENCH", trench_grid.nearest(sub[0]))
+            _set(dlyr, feat, "INFRA_STATUS", "Proposed")
+            _set(dlyr, feat, "REUSE_LEN_M", None)
+            _set(dlyr, feat, "REUSE_SOURCE", None)
+            _set(dlyr, feat, "DUCTS_MERGED", 0)
+            _set(dlyr, feat, "cables_carried", meta.get("label") or "")
+            _set(dlyr, feat, "ways_used", 1 if meta.get("label") else 0)
+            _set(dlyr, feat, "WAYS_TOTAL", int(profile.get("WAYS") or _FEEDER_DUCT_WAYS))
+            _set(dlyr, feat, "REVIEW", 0)
+            _set(dlyr, feat, "STUB_ABSORBED", 0)
+            _set(dlyr, feat, "N_DUCTS", 1)
+            if dlyr.CreateFeature(feat) == 0:
+                added += 1
+                cables_filled.add(ci)
+            feat = None
+    try:
+        dlyr.CommitTransaction()
+    except Exception:
+        pass
+    # Release the child objects before their datasources (see above).
+    dlyr = None
+    dds = None
+
+    if feedback:
+        feedback.pushInfo(
+            "  [duct] Feeder ducts: laid %s m of duct under feeder cable that had "
+            "none — %d piece(s) over %d of %d cable(s), 4-Way HDPE, cut at the "
+            "chambers. Every feeder cable now rides a duct."
+            % (format(round(uncovered_m, 1), ","), added, len(cables_filled),
+               len(cables)))
+    return added
+
+
 # ── Cable → duct occupancy ───────────────────────────────────────────────────
 # The duct stage runs BEFORE the cable stage (trench → chambers → ducts →
 # cables), so a duct cannot know which cables will be laid in it: the code that
@@ -5790,6 +6277,17 @@ def enrich_all(out_dir, feedback=None, roads_lyr=None):
     n += absorb_chamber_stubs(p("Distribution_Ducts.gpkg"), feedback,
                               "Distribution ducts", mode="coincident", floor=2)
     n += propagate_duct_pdp_id(p("Distribution_Ducts.gpkg"), feedback)
+    # Rule C2, last on the geometry: the feeder cable is planned AFTER the
+    # duct stage, by its own producer, so it can — and on 34b2cfad… did — run
+    # where no feeder duct was laid. The duct is what goes missing (the cable
+    # is on the trench, the duct is not there at all), so the duct is laid
+    # along the cable. Additive: existing rows keep their geometry.
+    try:
+        n += extend_feeder_ducts_along_cables(out_dir, feedback)
+    except Exception as exc:
+        if feedback:
+            feedback.pushWarning(
+                f"  [duct] Feeder cable coverage skipped: {exc}")
     # Every run states whether the ducts actually flow: one feeder chain from
     # the MFG to every PDP, and couplers sitting on the distribution duct.
     # A verification pass must never fail the run — nor hide the passes after
