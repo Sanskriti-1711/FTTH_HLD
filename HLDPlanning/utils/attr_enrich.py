@@ -4764,11 +4764,32 @@ def verify_surface_geometry(out_dir, feedback=None, roads_source=None):
     if ai_enabled:
         try:
             from ..design import surface_ai_review as ai_review
+            total_uncertain = len(report.get("uncertain_spans", []) or [])
+            if feedback and total_uncertain:
+                # Said BEFORE the batch: it runs after the last pipeline stage,
+                # paced at a few seconds per span, and a run that goes quiet at
+                # 88 % for ten minutes reads as a hang, not as work.
+                feedback.pushInfo(
+                    "  [verify] Surface AI review: reviewing up to %d of %d "
+                    "uncertain span(s) with %s; this takes minutes and does not "
+                    "change the design."
+                    % (min(total_uncertain, ai_review._candidate_limit()),
+                       total_uncertain, ai_review._provider_name()))
+
+            def _review_progress(done: int, total: int, outcome: str) -> None:
+                if not feedback or not total:
+                    return
+                if done in (1, total) or done % 5 == 0:
+                    feedback.pushInfo(
+                        "  [verify] Surface AI review: %d of %d span(s) reviewed."
+                        % (done, total))
+
             review = ai_review.review_uncertain_spans(
                 report.get("uncertain_spans", []),
                 image_provider=ai_review.configured_image_provider(),
                 enabled=True,
-                previous=_previous_surface_review(review_path))
+                previous=_previous_surface_review(review_path),
+                progress=_review_progress)
             ai_review.write_review_report(out_dir, review)
             report["ai_review"] = {
                 "status": review.get("status"),

@@ -1102,6 +1102,24 @@ def test_gemini_reply_with_no_candidate_text_is_recorded():
         raise AssertionError("an empty Gemini payload must be rejected")
 
 
+def test_progress_is_reported_for_every_reviewed_span(monkeypatch):
+    """The batch runs after the last stage, so the run has to say it is moving."""
+    monkeypatch.setenv("SURFACE_AI_PROVIDER", "gemini")
+    monkeypatch.setenv("GEMINI_API_KEY", "key")
+    seen = []
+
+    result = review.review_uncertain_spans(
+        [{"span_id": "T-%d" % index} for index in range(3)],
+        lambda _candidate: {"image_bytes": b"x", "source": "local", "date": None},
+        enabled=True,
+        classifier=lambda *_args: {"ai_surface": "road", "confidence": 0.5, "reason": ""},
+        progress=lambda done, total, outcome: seen.append((done, total, outcome)),
+    )
+
+    assert seen == [(1, 3, "ok"), (2, 3, "ok"), (3, 3, "ok")]
+    assert result["status"] == "ready"
+
+
 def test_review_error_item_keeps_the_rejected_reply(monkeypatch):
     monkeypatch.setenv("SURFACE_AI_PROVIDER", "gemini")
     monkeypatch.setenv("GEMINI_API_KEY", "key")

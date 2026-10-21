@@ -1106,6 +1106,7 @@ def review_uncertain_spans(
     api_key: Optional[str] = None,
     classifier: Optional[Callable[[bytes, str, str, str], dict]] = None,
     previous: Optional[dict] = None,
+    progress: Optional[Callable[[int, int, str], None]] = None,
 ) -> dict:
     """Suggest surfaces for uncertain candidates with separately sourced imagery.
 
@@ -1214,6 +1215,7 @@ def review_uncertain_spans(
                             api_key, model, gate): index
                 for index, candidate in enumerate(selected)
             }
+            done = 0
             for future in as_completed(futures):
                 index = futures[future]
                 try:
@@ -1221,6 +1223,9 @@ def review_uncertain_spans(
                 except Exception as exc:  # a worker fault must not fail the run
                     results[index] = (_queued_item(
                         selected[index], "error", type(exc).__name__), "error")
+                done += 1
+                if progress is not None:
+                    progress(done, len(selected), results[index][1])
         quota_held = 0
         for candidate, result in zip(selected, results):
             item, outcome = result
@@ -1244,6 +1249,10 @@ def review_uncertain_spans(
             item, outcome = _review_one(candidate, image_provider, classify,
                                         api_key, model, pace)
             processed[id(candidate)] = item
+            if progress is not None:
+                # A batch of 50 paced calls runs for several minutes after the
+                # last pipeline stage, which used to look like a hung run.
+                progress(index + 1, len(selected), outcome)
             if outcome == "quota":
                 # The whole model chain is out of quota, so no later candidate
                 # can succeed. Stop spending and leave the remainder for a rerun.
