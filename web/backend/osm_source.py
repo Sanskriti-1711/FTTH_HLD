@@ -3435,10 +3435,16 @@ def _run_area_fetch(key: str, area: str, bbox: Sequence[float]) -> None:
                 + "Try again, or narrow the area."
             )
         _set_fetch_state(key, "storing", groups_done=len(groups), detail=mirror_used)
+        # Provenance is recorded, so it has to be true: an extract filled by the
+        # map API fallback was NOT downloaded from Overpass, and `osm-status`
+        # shows this column to the operator.
+        extract_source = (
+            "osm_map_api" if mirror_used == OSM_MAP_API_URL else EXTRACT_SOURCE
+        )
         _execute(
             f"INSERT INTO {OSM_SCHEMA}.extract_meta (area_key, source, detail, bbox, counts, version) "
             f"VALUES (%s, %s, %s, {_POLYGON_JSON}, %s::jsonb, %s)",
-            (area_key(area), EXTRACT_SOURCE, mirror_used,
+            (area_key(area), extract_source, mirror_used,
              json.dumps(bbox_polygon(bbox)), json.dumps(counts), _EXTRACT_VERSION),
         )
         _set_fetch_state(

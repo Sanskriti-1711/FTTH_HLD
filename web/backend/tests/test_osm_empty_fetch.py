@@ -262,6 +262,10 @@ def test_an_empty_overpass_falls_back_to_the_map_api(monkeypatch):
     assert state["state"] == "ready"
     # One download feeds all seven groups: the count must not double up.
     assert state["groups_done"] == state["groups_total"] == 7
+    # ...and the row says where the data actually came from: `osm-status`
+    # shows this column, and claiming "overpass" would be a lie.
+    params = stored[0][1]
+    assert params[1] == "osm_map_api"
 
 
 def test_both_sources_empty_is_refused_and_names_both(monkeypatch):
@@ -299,4 +303,5 @@ def test_a_fetch_that_stored_rows_is_still_recorded(monkeypatch):
     osm_source._run_area_fetch(osm_source._bbox_key(BBOX), "B16 8UU", BBOX)
 
     assert len(written) == 1
+    assert written[0][1][1] == "overpass"      # the source that supplied it
     assert osm_source.area_fetch_state("B16 8UU", BBOX)["state"] == "ready"
