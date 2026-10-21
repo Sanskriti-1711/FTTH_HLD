@@ -5063,6 +5063,12 @@ def _boundary_payload(
         "boundary_licence": resolution.get("boundary_licence"),
         "boundary_vintage": resolution.get("boundary_vintage"),
         "boundary_note": resolution.get("boundary_note"),
+        # A drawn section: which area it was cut from, how big it is, and how big
+        # that area is.  The page says all three, so a planner reading the
+        # boundary does not mistake a section for the place's own boundary.
+        "selection_of": resolution.get("selection_of"),
+        "selection_km2": resolution.get("selection_km2"),
+        "parent_area_km2": resolution.get("parent_area_km2"),
         # What was matched, and — for a postcode input — whether the postcode
         # actually defined the area or was only the search term.  Reported from
         # the boundary call too, so a client can flag it before paying for the
