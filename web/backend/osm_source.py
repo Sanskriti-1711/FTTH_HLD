@@ -2478,7 +2478,12 @@ def _probe_overpass_mirror(url: str) -> bool:
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             retries=1,
         )
-        return isinstance(payload, dict)
+        # `node(id:1)` always exists, so an EMPTY list is a mirror answering
+        # 200 with nothing -- not a live one.  Measured 2026-10-21:
+        # overpass.osm.ch returned {"elements": []} for the probe and for every
+        # bbox query, so it sorted first, answered all seven groups with
+        # nothing, and the area was written to extract_meta as downloaded.
+        return bool(isinstance(payload, dict) and payload.get("elements"))
     except Exception:  # noqa: BLE001 - a mirror that did not answer is dead
         return False
 
@@ -3150,6 +3155,20 @@ def _run_area_fetch(key: str, area: str, bbox: Sequence[float]) -> None:
         # back and the page showed "0 of 7 groups" the whole time.  Storing still
         # happens here, one group at a time, as each lands.
         fetch_groups(groups, bbox, on_group=_store_group, on_start=_starting_group)
+        if not any(int(v or 0) for v in counts.values()):
+            # Every group answered, and every answer was empty.  That is not an
+            # area with no buildings -- it is a mirror saying nothing, which is
+            # indistinguishable from a valid empty answer at the HTTP layer.
+            # Writing extract_meta here would mark the bbox as downloaded for
+            # good, so `covered_by_cache` would report an empty area as ready
+            # and every later read would show zero premises.  Measured
+            # 2026-10-21 on overpass.osm.ch: seven empty groups, and the area
+            # was recorded as cached with counts of zero.
+            raise RuntimeError(
+                "overpass returned no elements for this area on any mirror "
+                f"(last tried: {mirror_used}); the area was NOT recorded as "
+                "downloaded. Try again, or narrow the area."
+            )
         _set_fetch_state(key, "storing", groups_done=len(groups), detail=mirror_used)
         _execute(
             f"INSERT INTO {OSM_SCHEMA}.extract_meta (area_key, source, detail, bbox, counts, version) "

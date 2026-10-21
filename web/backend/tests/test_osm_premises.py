@@ -2182,7 +2182,9 @@ def test_a_second_caller_joins_the_running_download_instead_of_starting_one(monk
         return [], "https://overpass.example/api/interpreter"
 
     monkeypatch.setattr(osm_source, "overpass_query", fake_query)
-    monkeypatch.setattr(osm_source, "store_overpass_elements", lambda elements: {})
+    # Every group stores a row: a fetch that stores NOTHING is refused outright
+    # now (see test_osm_empty_fetch.py), and these tests are about the wait.
+    monkeypatch.setattr(osm_source, "store_overpass_elements", lambda elements: {"buildings": 1})
     monkeypatch.setattr(osm_source, "_execute", lambda *a, **k: None)
     monkeypatch.setattr(osm_source, "covered_by_cache", lambda bbox: None)
     monkeypatch.setattr(osm_source.postgis, "is_available", lambda: True)
@@ -2222,7 +2224,9 @@ def test_a_waiting_caller_gets_the_result_rather_than_refetching(monkeypatch):
         return [], "https://overpass.example/api/interpreter"
 
     monkeypatch.setattr(osm_source, "overpass_query", fake_query)
-    monkeypatch.setattr(osm_source, "store_overpass_elements", lambda elements: {})
+    # Every group stores a row: a fetch that stores NOTHING is refused outright
+    # now (see test_osm_empty_fetch.py), and these tests are about the wait.
+    monkeypatch.setattr(osm_source, "store_overpass_elements", lambda elements: {"buildings": 1})
     monkeypatch.setattr(osm_source, "_execute", lambda *a, **k: None)
     monkeypatch.setattr(osm_source.postgis, "is_available", lambda: True)
     monkeypatch.setattr(osm_source, "init_schema", lambda: None)
@@ -2271,7 +2275,9 @@ def test_the_fetch_reports_what_it_is_doing(monkeypatch):
         return [], "https://overpass.example/api/interpreter"
 
     monkeypatch.setattr(osm_source, "overpass_query", fake_query)
-    monkeypatch.setattr(osm_source, "store_overpass_elements", lambda elements: {})
+    # Every group stores a row: a fetch that stores NOTHING is refused outright
+    # now (see test_osm_empty_fetch.py), and these tests are about the wait.
+    monkeypatch.setattr(osm_source, "store_overpass_elements", lambda elements: {"buildings": 1})
     monkeypatch.setattr(osm_source, "_execute", lambda *a, **k: None)
     monkeypatch.setattr(osm_source.postgis, "is_available", lambda: True)
     monkeypatch.setattr(osm_source, "init_schema", lambda: None)
@@ -2326,7 +2332,9 @@ def test_a_failed_download_is_reported_and_can_be_retried(monkeypatch):
         return [], "https://overpass.example/api/interpreter"
 
     monkeypatch.setattr(osm_source, "overpass_query", fake_query)
-    monkeypatch.setattr(osm_source, "store_overpass_elements", lambda elements: {})
+    # Every group stores a row: a fetch that stores NOTHING is refused outright
+    # now (see test_osm_empty_fetch.py), and these tests are about the wait.
+    monkeypatch.setattr(osm_source, "store_overpass_elements", lambda elements: {"buildings": 1})
     monkeypatch.setattr(osm_source, "_execute", lambda *a, **k: None)
     monkeypatch.setattr(osm_source.postgis, "is_available", lambda: True)
     monkeypatch.setattr(osm_source, "init_schema", lambda: None)
