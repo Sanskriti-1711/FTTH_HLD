@@ -2986,6 +2986,20 @@ def _area_error(exc: Exception) -> HTTPException:
             detail=("PostGIS is unavailable, so OSM data cannot be stored or read. "
                     "Start the database and retry."),
         )
+    if isinstance(exc, osm_source.RateLimited):
+        # Nominatim limits by IP, and every caller behind this deployment shares
+        # one.  That is an upstream pause, not a fault in the area, so it is a
+        # retryable 503 that names the wait rather than a 502 that reads like a
+        # broken request -- and it only reaches here when there was no cached
+        # boundary to serve instead.
+        wait = getattr(exc, "retry_after", None)
+        hint = f" Try again in about {wait:.0f}s." if wait is not None else " Try again in a minute."
+        return HTTPException(
+            status_code=503,
+            detail=("OpenStreetMap's Nominatim is rate-limiting this server "
+                    f"(HTTP {exc.status}), and there is no cached boundary for "
+                    "this area yet, so it cannot be drawn." + hint),
+        )
     if message.startswith("overpass_fetch_failed:"):
         # Every Overpass mirror did not answer.  That is an OUTAGE UPSTREAM,
         # not a fault in this area, and the same area normally works on a

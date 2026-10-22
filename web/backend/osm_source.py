@@ -39,6 +39,7 @@ Design notes that matter:
 
 from __future__ import annotations
 
+import email.utils
 import hashlib
 import json
 import math
@@ -780,6 +781,58 @@ def area_km2(bbox: Sequence[float]) -> float:
     return abs(width_m * height_m) / 1_000_000.0
 
 
+class RateLimited(RuntimeError):
+    """An upstream asked us to slow down (HTTP 429, or a 503 with a wait).
+
+    A separate type because the answer is not "try the same thing again": the
+    caller either waits the time the server named or serves what it already
+    holds.  Nominatim limits by IP, and every caller behind one host shares
+    that IP, so this is a normal state on a shared deployment -- not a bug.
+    """
+
+    def __init__(self, url: str, status: int, retry_after: Optional[float] = None) -> None:
+        self.url = url
+        self.status = int(status)
+        self.retry_after = retry_after
+        wait = f", retry after {retry_after:.0f}s" if retry_after is not None else ""
+        super().__init__(f"HTTP {status} from {url}{wait}")
+
+
+# A `Retry-After` may ask for an hour.  Holding a request open that long is not
+# a retry, it is a hang -- so the wait is capped, and a server that wants more
+# than the cap is treated as "come back later" rather than waited on.
+RETRY_AFTER_CAP_S = float(os.environ.get("OSM_RETRY_AFTER_CAP_S", "30"))
+
+
+def _retry_after_seconds(exc: BaseException) -> Optional[float]:
+    """Seconds the server asked us to wait, from `Retry-After`, if it sent one.
+
+    Both legal forms are read: a number of seconds, or an HTTP date.  Anything
+    unreadable returns None so the caller falls back to its own backoff instead
+    of sleeping for a nonsense value.
+    """
+    headers = getattr(exc, "headers", None)
+    raw = headers.get("Retry-After") if headers is not None else None
+    if raw is None:
+        return None
+    raw = str(raw).strip()
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+    try:
+        when = email.utils.parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0.0, when.timestamp() - time.time())
+
+
 def _http_json(
     url: str,
     data: Optional[bytes] = None,
@@ -814,6 +867,24 @@ def _http_json(
             req = urllib.request.Request(url, data=data, headers=hdrs)
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            # 429 (and a 503 that names a wait) is the server asking for a
+            # pause, not a flaky connection.  Waiting the time it NAMED is what
+            # makes the retry a retry rather than three requests in six seconds
+            # against a one-per-second limit -- which is how a shared IP turned
+            # a rate limit into "HTTP Error 429" for eight solid seconds.
+            if exc.code not in (429, 503):
+                last = exc
+                if attempt < attempts - 1:
+                    time.sleep(2.0 * (attempt + 1))
+                continue
+            wait = _retry_after_seconds(exc)
+            if attempt >= attempts - 1:
+                # The caller decides what to do with it: Nominatim has a cached
+                # boundary to fall back on, so this is not a dead end.
+                raise RateLimited(url, exc.code, wait) from exc
+            time.sleep(min(wait if wait is not None else 2.0 * (attempt + 1),
+                           RETRY_AFTER_CAP_S))
         except urllib.error.URLError as exc:
             if isinstance(exc.reason, (TimeoutError, socket.timeout)):
                 raise TimeoutError(f"no answer within {timeout:.0f}s") from exc
@@ -2291,6 +2362,40 @@ def _best_point(
     return None, None
 
 
+def _cached_resolution(key: str) -> Optional[Dict[str, Any]]:
+    """The row `osm.area_cache` holds for this key, whatever dataset state it saw."""
+    if not schema_ready():
+        return None
+    rows = _query(
+        f"SELECT area, display_name, osm_type, osm_id, polygon_source, resolution, "
+        f"ST_AsGeoJSON(bbox) AS bbox_json, ST_AsGeoJSON(polygon) AS poly_json "
+        f"FROM {OSM_SCHEMA}.area_cache WHERE area_key = %s",
+        (key,),
+    )
+    return _resolution_from_row(rows[0]) if rows else None
+
+
+def _stale_resolution(cached: Dict[str, Any], exc: RateLimited) -> Dict[str, Any]:
+    """The boundary already held, served because Nominatim will not answer now.
+
+    A 429 is about THIS IP asking too often, and a boundary does not change
+    between two previews of the same area.  Refusing to draw a polygon that is
+    already stored turns a rate limit into "area cannot be loaded"; the answer
+    says `stale` and why, so the planner is told it came from cache rather than
+    being handed a cached polygon as if it were a fresh lookup.
+    """
+    stale = dict(cached)
+    stale["stale"] = True
+    stale["stale_reason"] = (
+        f"OpenStreetMap's Nominatim is rate-limiting this server (HTTP {exc.status}); "
+        f"serving the boundary resolved at {stale.get('resolved_at') or 'an earlier preview'}. "
+        "Try again in a minute for a fresh lookup."
+    )
+    if exc.retry_after is not None:
+        stale["retry_after"] = exc.retry_after
+    return stale
+
+
 def resolve_area(area: str, refresh: bool = False, country_code: str = "",
                  input_type: str = "", postcode: str = "") -> Dict[str, Any]:
     """Area name -> polygon + bbox, cached in `osm.area_cache`.
@@ -2326,15 +2431,9 @@ def resolve_area(area: str, refresh: bool = False, country_code: str = "",
     # Read before the cache: a loaded dataset can change the answer for a country,
     # and a row cached under the previous dataset state must not be served.
     stamp = dataset_stamp(code_in) if schema_ready() else ""
-    if schema_ready() and not refresh:
-        cached = _query(
-            f"SELECT area, display_name, osm_type, osm_id, polygon_source, resolution, "
-            f"ST_AsGeoJSON(bbox) AS bbox_json, ST_AsGeoJSON(polygon) AS poly_json "
-            f"FROM {OSM_SCHEMA}.area_cache WHERE area_key = %s",
-            (key,),
-        )
-        if cached:
-            resolved = _resolution_from_row(cached[0])
+    if not refresh:
+        resolved = _cached_resolution(key)
+        if resolved:
             # An area cached before this country's datasets were loaded carries no
             # stamp, or an older one, and must be re-resolved rather than served:
             # otherwise the ingest appears to do nothing.
@@ -2349,8 +2448,18 @@ def resolve_area(area: str, refresh: bool = False, country_code: str = "",
                 )
                 return resolved
 
-    search_area = nominatim_query(area)
-    results = nominatim_search(search_area, code_in)
+    try:
+        search_area = nominatim_query(area)
+        results = nominatim_search(search_area, code_in)
+    except RateLimited as exc:
+        # The lookup is the only thing Nominatim is needed for here, and the
+        # polygon it produced last time is still in the store.  Falling back to
+        # it keeps the map and the counts working while the limit clears; with
+        # nothing cached the failure is reported as it was before.
+        stale = _cached_resolution(key)
+        if stale and stale.get("polygon"):
+            return _stale_resolution(stale, exc)
+        raise
     best = pick_area_result(results, search_area, code_in)
     props = best.get("properties") or {}
     geometry = best.get("geometry") or {}
