@@ -193,6 +193,35 @@ The `poly_method` parameter controls which algorithm generates service-area poly
 
 ## 3. API Endpoints
 
+### 3.0 Authentication (mutating routes)
+
+The service answers on a public URL, so every route that **changes** something requires a shared key:
+
+```
+POST    /ftth/hld/run
+POST    /ftth/hld/run-from-area
+POST    /ftth/hld/resolve-area
+POST    /ftth/hld/input-layers
+POST    /ftth/hld/design/{project_id}
+POST    /ftth/hld/results/{project_id}/surface-ai-review/{classify,imagery}
+POST    /ftth/hld/projects/{project_id}/stop
+DELETE  /ftth/hld/projects/{project_id}
+POST    /ftth/lld/run, /ftth/lld/replan
+POST    /run-hld
+```
+
+Send it as `X-FTTH-Engine-Key: <key>`. The key is `FTTH_ENGINE_API_KEY` on the engine; the Django backend reads the same variable and adds the header itself.
+
+| Request | Answer |
+|---------|--------|
+| key missing or wrong | `401 {"detail": "Invalid or missing engine API key"}` |
+| engine has no key configured | `503 {"detail": "Engine writes are disabled: FTTH_ENGINE_API_KEY is not set ..."}` |
+| reads (health, results, layers, tiles, downloads) | unchanged — no key needed |
+
+`OPTIONS` preflight is never blocked, and a deployment that forgets the variable fails closed rather than staying open: set it on **both** the engine and the Django service, with the same value, before deploying this change.
+
+---
+
 ### 3.1 Health / Root
 
 ```
@@ -858,6 +887,7 @@ Indexes: `(project_id)`, `GIST (geom)`
 | `PGUSER` | `ftth` | Database user |
 | `PGPASSWORD` | `ftth` | Database password |
 | `PGCONNECT_TIMEOUT` | `2` | Connection timeout |
+| `FTTH_ENGINE_API_KEY` | *(unset)* | Shared key required on every mutating route (`X-FTTH-Engine-Key`). Unset = writes refused with 503. Must match the Django backend's value. |
 
 ---
 

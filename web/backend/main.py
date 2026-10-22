@@ -284,6 +284,10 @@ app = FastAPI(
     version="2.0.0",
     description="FastAPI backend for HLDPlanning one-click FTTH pipeline outputs.",
 )
+# Added before CORS so CORS is the outer layer: a 401 then still carries the
+# Access-Control-Allow-Origin header, and a browser sees the reason instead of
+# a CORS failure. Preflight (OPTIONS) is never treated as a write.
+app.add_middleware(EngineKeyMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -295,9 +299,6 @@ app.add_middleware(
 # nothing in this stack compressed it -- the engine sent it raw, the Django hop
 # forwarded it raw, and the browser parsed every byte of it.
 app.add_middleware(GZipMiddleware, minimum_size=1024)
-# Added last so it is the outermost layer: a request without the key never
-# reaches a route that could start a run.
-app.add_middleware(EngineKeyMiddleware)
 
 
 def _now() -> str:
