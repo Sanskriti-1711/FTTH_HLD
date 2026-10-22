@@ -29,12 +29,14 @@ name: Keep the engine, the backend and the QGIS worker awake
 # suspended) cannot be fixed from inside the workflow that caused it.
 #
 # ── Two limits, both deliberate ───────────────────────────────────────────────
-#   * GitHub does not promise schedule timing -- under load a run can be late by
-#     several minutes. 10 minutes against a 15-minute idle window leaves room
-#     for that, but a long delay plus an outage can still let a service sleep.
-#     The UI is built to survive that (the country list retries once and then
-#     says so; the engine's worker wait covers the QGIS side), and the worker's
-#     own probe below treats "still booting" as expected rather than an error.
+#   * **GitHub does not honour `*/10` on this repository.** The recorded runs
+#     of 2026-10-21/22 are **2-5 hours** apart (10:15, 05:17, 00:35, 22:01,
+#     18:52, 14:36 UTC), so one ping per tick woke a service that had been
+#     asleep for most of the gap -- which is why the worker still had to boot
+#     for 415 s with this workflow "running every ten minutes". A tick now
+#     pings every 5 minutes until the window closes (or 5.5 h, under the 6 h
+#     job limit): a late tick still leaves the services awake for the rest of
+#     the day, and `concurrency` keeps one loop running at a time.
 #   * GitHub disables scheduled workflows in a repository with no activity for
 #     60 days, so this needs a push (or a manual run) now and then. A manual
 #     dispatch warms all three at any hour — that is the "wake it now" button.
@@ -67,7 +69,9 @@ jobs:
       - name: Would this window fit the instance-hour budget?
         id: budget
         run: |
-          hours=$(( WARM_TO_UTC - WARM_FROM_UTC ))
+          # 10# : an env value of '09' would otherwise be read as an invalid
+          # octal literal and abort the step.
+          hours=$(( 10#$WARM_TO_UTC - 10#$WARM_FROM_UTC ))
           if [ "$hours" -le 0 ]; then
             echo "::error::WARM_FROM_UTC ($WARM_FROM_UTC) is not before WARM_TO_UTC ($WARM_TO_UTC)"
             exit 1
@@ -87,7 +91,10 @@ jobs:
       - name: Is it inside the warm window?
         id: window
         run: |
-          hour=$(date -u +%H)
+          # `10#` again: `date +%H` returns 08 and 09, which bash reads as
+          # invalid octal. Zero-padded hours made the 09:00 tick report
+          # "outside the window" -- the first warm hour of the day.
+          hour=$(( 10#$(date -u +%H) ))
           # A manual dispatch always warms, so the workflow can be tested (and a
           # sleeping service woken) at any hour without waiting for the window.
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] ||
@@ -99,13 +106,16 @@ jobs:
             echo "outside the window (utc hour $hour): letting them sleep, this costs nothing"
           fi
 
-      # 120s covers a 42s cold start plus Render's boot queue, and is still short
-      # enough that a run cannot overlap the next schedule tick. The worker gets
+      # 120s covers a 42s cold start plus Render's boot queue. The worker gets
       # 20s instead: its boot is minutes, so holding the request would only make
-      # the job late. The request itself is what wakes it; the next tick finds it
-      # up, and the engine waits for it either way.
-      - name: Wake the engine, the backend and the worker
+      # the round late. The request itself is what wakes it.
+      #
+      # A tick does not ping once and exit -- see the schedule note above. It
+      # loops until the window closes, so the 2-5 hour gaps between scheduled
+      # ticks no longer leave the services asleep.
+      - name: Keep the services awake until the window closes
         if: steps.window.outputs.warm == 'true'
+        timeout-minutes: 350
         run: |
           set -o pipefail
           failed=0
@@ -146,7 +156,26 @@ jobs:
             return 0
           }
 
-          probe engine  https://ftth-planning.onrender.com/health  120 yes || failed=1
-          probe backend https://fibre-backend-wml3.onrender.com/healthz 120 yes || failed=1
-          probe worker  "$WORKER_URL/health" 20 no || failed=1
+          started=$(date -u +%s)
+          while :; do
+            round_failed=0
+            probe engine  https://ftth-planning.onrender.com/health  120 yes || round_failed=1
+            probe backend https://fibre-backend-wml3.onrender.com/healthz 120 yes || round_failed=1
+            probe worker  "$WORKER_URL/health" 20 no || round_failed=1
+            # Only the last round decides the job's status: a service that was
+            # booting on the first round and answered on the next is a success.
+            failed=$round_failed
+            hour=$(( 10#$(date -u +%H) ))
+            if [ "$hour" -ge "$WARM_TO_UTC" ]; then
+              echo "window closed at ${hour}:00Z — stopping."
+              break
+            fi
+            if [ $(( $(date -u +%s) - started )) -ge 19800 ]; then
+              echo "5.5 h served; the next tick carries on until ${WARM_TO_UTC}:00Z."
+              break
+            fi
+            # A third of Render's 15-minute idle window, so one slow round
+            # (three cold services, 120s each) cannot let one fall asleep.
+            sleep 300
+          done
           exit "$failed"
