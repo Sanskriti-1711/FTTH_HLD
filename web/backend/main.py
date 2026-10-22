@@ -352,6 +352,63 @@ def _save_upload(upload: UploadFile, dest_dir: Path, fallback: str) -> Path:
     return path
 
 
+# Files a run cannot be re-planned without. The engine's own disk does not
+# survive a restart, so these are copied into PostGIS when the run starts and
+# restored into outputs/<project>/inputs before an LLD re-plan (Mode B).
+# Without it a re-plan after any redeploy dies on "main inputs missing".
+LLD_INPUT_FILES = (
+    "Main_DataSet.xlsx",
+    "roads.geojson",
+    "area_resolution.json",
+    "brownfield.zip",
+    "osm/landuse/landuse.geojson",
+)
+
+
+def _persist_inputs(project_id: str, inputs_dir: Path) -> None:
+    """Keep the run's pipeline inputs recoverable (best effort)."""
+    if not postgis.is_available():
+        return
+    files: Dict[str, str] = {}
+    for name in LLD_INPUT_FILES:
+        path = inputs_dir / name
+        if path.is_file():
+            files[name] = str(path)
+    # A manual upload saves the workbook under its own file name.
+    for path in inputs_dir.glob("*.xlsx"):
+        files.setdefault(path.name, str(path))
+    if not files:
+        return
+    try:
+        stored = postgis.store_project_inputs(project_id, files)
+    except Exception as exc:  # noqa: BLE001 - never fail a run on the copy
+        _append(project_id, "warning", "Pipeline inputs were not archived: %r" % (exc,))
+        return
+    if stored:
+        _append(
+            project_id, "info",
+            "Archived %d pipeline input(s) for later re-planning (%s)."
+            % (stored, ", ".join(sorted(files))),
+        )
+
+
+def _restore_inputs(project_id: str, inputs_dir: Path) -> None:
+    """Put archived pipeline inputs back on disk (best effort)."""
+    if not postgis.is_available():
+        return
+    try:
+        restored = postgis.restore_project_inputs(project_id, str(inputs_dir))
+    except Exception as exc:  # noqa: BLE001 - the caller reports the real gap
+        _append(project_id, "warning", "Archived inputs could not be restored: %r" % (exc,))
+        return
+    if restored:
+        _append(
+            project_id, "info",
+            "Restored %d archived pipeline input(s) from the database: %s."
+            % (len(restored), ", ".join(sorted(restored))),
+        )
+
+
 def _find_qgis_process() -> Optional[str]:
     override = os.environ.get("QGIS_EXECUTABLE", "").strip()
     if override and os.path.isfile(override):
@@ -2454,7 +2511,11 @@ async def run_hld(
         ("natural", natural),
     ):
         if upload and upload.filename:
-            osm_inputs[key] = _save_upload(upload, upload_dir / "osm" / key, f"{key}.zip")
+            osm_inputs[key] = _save_upload(
+                upload, upload_dir / "osm" / key, f"{key}.zip"
+            )
+
+    _persist_inputs(project_id, upload_dir)
 
     task = _task(project_id)
     task.update(
@@ -2878,6 +2939,10 @@ def _run_area_pipeline(
             json.dump(built, f, indent=2, default=str)
     except Exception:
         pass
+
+    # Keep the two pipeline inputs (and the provenance they were built from)
+    # recoverable: a re-plan after the engine restarts needs them back.
+    _persist_inputs(project_id, output_dir / "inputs")
 
     task["area"] = area
     task["area_meta"] = {
@@ -4644,6 +4709,7 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
         "final_trenches": 0,
         "aerial_spans": 0,
         "aerial_cable": 0,
+        "coupleurs": 0,
     }
     objects = by_layer.get("objects") or []
     if not objects:
@@ -4722,6 +4788,26 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
             max_uid = max(max_uid, int((f.get("properties") or {}).get("DUCT_UID") or 0))
         except (TypeError, ValueError):
             pass
+
+    # Coupler numbering continues the HLD's own series (CPL-0001), so a
+    # field-added joint never collides with a design-time one.
+    max_coupler = 0
+    for f in by_layer.get("coupleurs") or []:
+        m = re.search(r"(\d+)\s*$", str((f.get("properties") or {}).get("coupler_id") or ""))
+        if m:
+            max_coupler = max(max_coupler, int(m.group(1)))
+
+    def _tapped_duct_uid(tap: Any) -> Optional[int]:
+        """DUCT_UID of the distribution duct the drop taps at `tap`."""
+        best_d, best_uid = float("inf"), None
+        for f in by_layer.get("distribution_ducts") or []:
+            for ln in _line_strings(f.get("geometry")):
+                for a, b in zip(ln, ln[1:]):
+                    d = _seg_point_dist(tap, a, b)
+                    if d < best_d:
+                        best_d = d
+                        best_uid = (f.get("properties") or {}).get("DUCT_UID")
+        return best_uid if best_d <= 1e-4 else None
 
     def served_by(ends: List[Any], o: Any) -> bool:
         return any(
@@ -4965,6 +5051,35 @@ def _plan_drop_connections(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[st
                     "OCCUPANCY_PCT": 100.0,
                 },
                 "auto-created drop duct to serve approved new premise %s" % obj_ref,
+            )
+            # 3a2. The joint at the network (footway) end of that drop duct.
+            #      The HLD emits one coupler per drop duct
+            #      (HLDPlanning/algorithms/duct_layer.py, _build_drop_ducts), so
+            #      a field-added premise gets a splitter port too. Without it the
+            #      premise is trenched, ducted and cabled but unserviceable, and
+            #      the LLD coupler count never tracks the drop-duct count.
+            max_coupler += 1
+            tapped = _tapped_duct_uid(path[0])
+            make_feature(
+                "coupleurs",
+                {"type": "Point", "coordinates": list(path[0])},
+                {
+                    "coupler_id": "CPL-%04d" % max_coupler,
+                    "COUPLER_TYPE": "Optical coupler (drop \u2194 distribution)",
+                    "PDP_ID": str(pdp_id or ""),
+                    "ADDR_ID": addr,
+                    "PREMISE_ID": addr,
+                    "HH_ID": hh,
+                    "POLYGON_ID": str(poly_id).upper() if poly_id else "",
+                    "MFG_ID": str(mfg_id or ""),
+                    "DUCT_UID": max_uid,
+                    "DROP_DUCT_UID": max_uid,
+                    "DIST_DUCT_ID": tapped,
+                    "DIST_DUCT_SAME_POLY": 1 if tapped is not None else None,
+                    "SIDE": "Garden",
+                    "INFRA_STATUS": "Proposed",
+                },
+                "auto-created coupler at the drop-duct joint for %s" % obj_ref,
             )
 
         if not has_cable:
@@ -5495,6 +5610,86 @@ def _survey_capacity(props: Dict[str, Any]) -> Tuple[int, int, str]:
     return total, used, verify
 
 
+def _dataset_extent(dataset: Dict[str, Any]) -> Optional[Tuple[Dict[str, Any], List[float]]]:
+    """Bounding polygon + bbox of every coordinate in the approved dataset."""
+    xs: List[float] = []
+    ys: List[float] = []
+
+    def walk(node: Any) -> None:
+        if not node:
+            return
+        if isinstance(node[0], (int, float)):
+            if len(node) >= 2:
+                xs.append(float(node[0]))
+                ys.append(float(node[1]))
+            return
+        for child in node:
+            walk(child)
+
+    for feat in dataset.get("features") or []:
+        walk((feat.get("geometry") or {}).get("coordinates") or [])
+    if not xs or not ys:
+        return None
+    pad = 1e-4  # ~10 m, so every premise sits inside the polygon
+    minx, maxx = min(xs) - pad, max(xs) + pad
+    miny, maxy = min(ys) - pad, max(ys) + pad
+    polygon = {
+        "type": "Polygon",
+        "coordinates": [[[minx, miny], [maxx, miny], [maxx, maxy], [minx, maxy], [minx, miny]]],
+    }
+    return polygon, [minx, miny, maxx, maxy]
+
+
+def _rebuild_replan_inputs(
+    project_id: str,
+    lld_version: str,
+    dataset: Dict[str, Any],
+    inputs_dir: Path,
+) -> Optional[str]:
+    """Re-create a run's pipeline inputs from the extent it already designed.
+
+    The engine's disk does not survive a restart, so a run made before inputs
+    were archived has nothing to re-plan from. Rebuilding them from the
+    surveyed extent (which IS the design) is the only faithful option: the
+    address workbook and the road network come out of the local OSM store for
+    exactly the ground the run drew, and the area is never guessed from a
+    postcode. Returns an error string, or None on success.
+    """
+    import osm_source
+
+    extent = _dataset_extent(dataset)
+    if extent is None:
+        return "the approved dataset has no coordinates to rebuild inputs from"
+    polygon, bbox = extent
+    resolution = {
+        "polygon": polygon,
+        "bbox": bbox,
+        "matched": "surveyed extent of %s" % project_id,
+        "input_type": "survey_extent",
+        "polygon_source": "survey_extent",
+        "country": "",
+        "city": "",
+        "country_code": "",
+    }
+    try:
+        built = osm_source.build_inputs(
+            project_id,
+            "surveyed extent",
+            str(inputs_dir.parent),
+            resolution=resolution,
+        )
+    except Exception as exc:  # noqa: BLE001 - reported to the caller
+        return "rebuilding the inputs from the surveyed extent failed: %r" % (exc,)
+    _lld_append(
+        project_id, lld_version, "info",
+        "Mode B re-plan: rebuilt the run's inputs from the surveyed extent "
+        "(%s premises, %s km of road) because no archived copy existed."
+        % (built.get("premises"), built.get("roads_km")),
+    )
+    _persist_inputs(project_id, inputs_dir)
+    return None
+
+
 def _write_replan_brownfield(bf_dir: Path, dataset: Dict[str, Any]) -> List[str]:
     """Write approved survey segments as brownfield GeoJSON files for the
     oneclick pipeline. Returns the qgis_process ``--`` BF_* args.
@@ -5635,6 +5830,10 @@ def _run_lld_replan(
     try:
         # ── 1. Original HLD inputs (roads + excel) drive the routing graph ──
         inputs_dir = OUTPUT_DIR / project_id / "inputs"
+        # The container's disk is not persistent: after a redeploy the run's
+        # own inputs are gone even though the design is still in PostGIS.
+        # Restore the archived copy before deciding they are missing.
+        _restore_inputs(project_id, inputs_dir)
         excel = inputs_dir / "Main_DataSet.xlsx"
         if not excel.exists():
             xlsx = sorted(inputs_dir.glob("*.xlsx"))
@@ -5643,14 +5842,32 @@ def _run_lld_replan(
         if not roads.exists():
             candidates = sorted(inputs_dir.glob("roads*")) + sorted(inputs_dir.glob("*.gpkg"))
             roads = candidates[0] if candidates else None
-        if not excel or not excel.exists():
-            raise RuntimeError(
-                "Full re-plan needs the original address Excel (inputs/Main_DataSet.xlsx) — missing on disk."
-            )
-        if not roads or not roads.exists():
-            raise RuntimeError(
-                "Full re-plan needs the original roads file (inputs/roads*) — missing on disk."
-            )
+        if not excel or not excel.exists() or not roads or not roads.exists():
+            # Nothing archived (the run predates the archive, or the engine
+            # restarted before it was taken) and the disk is empty: rebuild
+            # both files from the extent the run already designed.
+            task.update({"stage": "Rebuilding missing inputs", "updated_at": _now()})
+            rebuild_error = _rebuild_replan_inputs(project_id, lld_version, dataset, inputs_dir)
+            excel = inputs_dir / "Main_DataSet.xlsx"
+            if not excel.exists():
+                xlsx = sorted(inputs_dir.glob("*.xlsx"))
+                excel = xlsx[0] if xlsx else None
+            roads = inputs_dir / "roads.geojson"
+            if not roads.exists():
+                candidates = sorted(inputs_dir.glob("roads*")) + sorted(inputs_dir.glob("*.gpkg"))
+                roads = candidates[0] if candidates else None
+            if not excel or not excel.exists():
+                raise RuntimeError(
+                    "Full re-plan needs the run's address Excel (inputs/Main_DataSet.xlsx) "
+                    "and none is archived or rebuildable"
+                    + (": %s" % rebuild_error if rebuild_error else ".")
+                )
+            if not roads or not roads.exists():
+                raise RuntimeError(
+                    "Full re-plan needs the run's roads file (inputs/roads*) "
+                    "and none is archived or rebuildable"
+                    + (": %s" % rebuild_error if rebuild_error else ".")
+                )
 
         # ── 2. Brownfield: approved survey segments ONLY ───────────────────
         # The routing graph is the original roads + address Excel (network

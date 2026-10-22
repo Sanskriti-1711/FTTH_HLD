@@ -6227,14 +6227,22 @@ def build_inputs(
     input_type: str = "",
     postcode: str = "",
     selection: Any = None,
+    resolution: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Write the two pipeline input files for an area.  Returns their paths + provenance."""
-    resolution = resolve_area(
-        area, country_code=country_code, input_type=input_type, postcode=postcode
-    )
-    # The files must be built from the SAME polygon the preview counted, or the
-    # run designs an area the planner never saw.
-    resolution = narrow_to_selection(resolution, selection)
+    """Write the two pipeline input files for an area.  Returns their paths + provenance.
+
+    ``resolution`` skips the area lookup: a re-plan whose original inputs were
+    lost rebuilds them from the surveyed extent it already has (the design's
+    own bbox) instead of guessing an area string, so the rebuilt inputs cover
+    the ground the run actually drew.
+    """
+    if resolution is None:
+        resolution = resolve_area(
+            area, country_code=country_code, input_type=input_type, postcode=postcode
+        )
+        # The files must be built from the SAME polygon the preview counted, or
+        # the run designs an area the planner never saw.
+        resolution = narrow_to_selection(resolution, selection)
     bbox = resolution["bbox"]
     if not postgis.is_available():
         raise RuntimeError("postgis_unavailable")

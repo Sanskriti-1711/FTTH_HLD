@@ -473,6 +473,50 @@ def test_path_ending_at_uses_metre_scale_radius():
     assert engine._path_ending_at(line, (0.001, 0.0)) is line
 
 
+def test_drop_planning_gives_every_served_premise_a_coupler():
+    """A premise the engine serves must get a splitter port, not just a duct.
+
+    The HLD emits one coupler per drop duct; the LLD's drop planner created
+    the trench, duct and cable but no coupler, so a field-added premise was
+    trenched and cabled yet unserviceable and missing from the coupler count.
+    """
+    # ~33 m off the distribution duct: unserved, and the tap is not degenerate.
+    premise = (0.0003, 0.0)
+    dist_duct = [[-0.001, 0.0], [0.0, 0.0]]
+    by_layer = {
+        "objects": [{
+            "geometry": {"type": "Point", "coordinates": list(premise)},
+            "properties": {"feature_id": "p1", "ADDR_ID": "A-9", "PDP_ID": "PDP00009"},
+        }],
+        "distribution_ducts": [{
+            "geometry": {"type": "LineString", "coordinates": dist_duct},
+            "properties": {"DUCT_UID": 7},
+        }],
+        "drop_ducts": [],
+        "coupleurs": [{
+            "geometry": {"type": "Point", "coordinates": [-0.002, 0.0]},
+            "properties": {"coupler_id": "CPL-0004", "ADDR_ID": "A-1"},
+        }],
+    }
+    engine._plan_drop_connections(by_layer)
+
+    drop_feature = by_layer["drop_ducts"][-1]
+    drop = drop_feature["properties"]
+    couplers = [f for f in by_layer["coupleurs"] if f["properties"].get("lld_created")]
+    assert len(couplers) == 1, "one coupler per created drop duct"
+    cp = couplers[0]
+    props = cp["properties"]
+    assert props["PREMISE_ID"] == "A-9"
+    assert props["ADDR_ID"] == "A-9"
+    assert props["DROP_DUCT_UID"] == drop["DUCT_UID"]
+    assert props["DUCT_UID"] == drop["DUCT_UID"]
+    # Numbering continues the HLD series instead of restarting at 1.
+    assert props["coupler_id"] == "CPL-0005"
+    # The joint sits at the network (footway) end, not inside the building.
+    assert cp["geometry"]["coordinates"] == drop_feature["geometry"]["coordinates"][0]
+    assert cp["properties"]["DIST_DUCT_ID"] == 7
+
+
 def test_drop_planning_routes_from_cable_part_that_ends_at_premise():
     """A multi-part cable whose first part is far away must still feed the
     drop from the part that actually ends at the premise (regression)."""

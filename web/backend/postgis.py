@@ -21,13 +21,20 @@ from typing import Any, Dict, Iterable, List, Optional
 try:
     import psycopg2
     from psycopg2.extras import Json, RealDictCursor, execute_values
-    from psycopg2 import sql
+    from psycopg2 import Binary, sql
 except ImportError:  # pragma: no cover - handled by API diagnostics
     psycopg2 = None  # type: ignore
     Json = None  # type: ignore
     RealDictCursor = None  # type: ignore
     execute_values = None  # type: ignore
+    Binary = None  # type: ignore
     sql = None  # type: ignore
+
+
+# Upper bound for one persisted pipeline input. The inputs are a recovery
+# copy (see ``store_project_inputs``): a 512 MB engine must not read a huge
+# file into memory to take it, so anything past this is skipped instead.
+MAX_INPUT_BYTES = int(os.environ.get("FTTH_MAX_INPUT_BYTES", 96 * 1024 * 1024))
 
 
 # Schema names shared with Django (settings.py search_path=business,public)
@@ -334,6 +341,29 @@ def init_schema() -> None:
             except Exception:
                 pass  # Race-safe
 
+        # Pipeline inputs (address Excel, roads, area-resolved landuse, the
+        # brownfield archive) live on the container's disk, which does NOT
+        # survive a restart. Storing them here is what makes an LLD re-plan
+        # (Mode B) possible after the engine redeploys: the files are restored
+        # into outputs/<project>/inputs before the pipeline is started.
+        cur.execute(
+            sql.SQL(
+                """
+                CREATE TABLE IF NOT EXISTS {inputs} (
+                    project_id TEXT NOT NULL REFERENCES {projects}(project_id) ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    content BYTEA NOT NULL,
+                    size_bytes BIGINT NOT NULL DEFAULT 0,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (project_id, name)
+                )
+                """
+            ).format(
+                inputs=_biz_ident("ftth_project_inputs"),
+                projects=_biz_ident("ftth_projects"),
+            )
+        )
+
         # GIS schema: spatial layer tables
         for table in _TABLES:
             cur.execute(
@@ -542,6 +572,94 @@ def update_project_downloads(
             ).format(projects=_biz_ident("ftth_projects")),
             (Json(downloads), project_id),
         )
+
+
+def store_project_inputs(project_id: str, files: Dict[str, str]) -> int:
+    """Persist pipeline input files for a project (upsert by file name).
+
+    ``files`` maps the stored name (path relative to ``inputs/``, e.g.
+    ``"Main_DataSet.xlsx"``) to the file on disk. A file that is missing or
+    larger than ``MAX_INPUT_BYTES`` is skipped: the inputs are a recovery copy,
+    and a run must never fail or exhaust this process's memory because of it.
+    Returns the number of files stored.
+    """
+    stored = 0
+    conn = get_conn()
+    for name, path in (files or {}).items():
+        try:
+            if not path or not os.path.isfile(path):
+                continue
+            size = os.path.getsize(path)
+            if size > MAX_INPUT_BYTES:
+                continue
+            with open(path, "rb") as fh:
+                blob = fh.read()
+            with conn.cursor() as cur:
+                cur.execute(
+                    sql.SQL(
+                        """
+                        INSERT INTO {inputs} (project_id, name, content, size_bytes, created_at)
+                        VALUES (%s, %s, %s, %s, now())
+                        ON CONFLICT (project_id, name) DO UPDATE SET
+                            content = EXCLUDED.content,
+                            size_bytes = EXCLUDED.size_bytes,
+                            created_at = now()
+                        """
+                    ).format(inputs=_biz_ident("ftth_project_inputs")),
+                    (project_id, name, Binary(blob), size),
+                )
+            stored += 1
+        except Exception:
+            continue
+    return stored
+
+
+def restore_project_inputs(project_id: str, dest_dir: str) -> List[str]:
+    """Write the persisted input files back into ``dest_dir``.
+
+    Returns the file names restored (empty when nothing was stored for this
+    project). Existing files are never overwritten — a live run owns its own
+    inputs.
+    """
+    restored: List[str] = []
+    conn = get_conn()
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            sql.SQL(
+                "SELECT name, content FROM {inputs} WHERE project_id = %s ORDER BY name"
+            ).format(inputs=_biz_ident("ftth_project_inputs")),
+            (project_id,),
+        )
+        rows = cur.fetchall()
+    for row in rows:
+        name = str(row["name"] or "")
+        if not name or name.startswith("/") or ".." in name:
+            continue
+        target = os.path.join(dest_dir, name)
+        try:
+            if os.path.isfile(target):
+                continue
+            os.makedirs(os.path.dirname(target) or dest_dir, exist_ok=True)
+            with open(target, "wb") as fh:
+                fh.write(bytes(row["content"]))
+            restored.append(name)
+        except Exception:
+            continue
+    return restored
+
+
+def list_project_inputs(project_id: str) -> List[Dict[str, Any]]:
+    """Names + sizes of the persisted input files (never the bytes)."""
+    conn = get_conn()
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            sql.SQL(
+                "SELECT name, size_bytes, created_at FROM {inputs} "
+                "WHERE project_id = %s ORDER BY name"
+            ).format(inputs=_biz_ident("ftth_project_inputs")),
+            (project_id,),
+        )
+        return [dict(r) for r in cur.fetchall()]
 
 
 def get_project(project_id: str) -> Optional[Dict[str, Any]]:
