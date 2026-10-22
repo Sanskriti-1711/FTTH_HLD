@@ -160,6 +160,15 @@ _STAGE_OUTPUT_MARKERS: List[Tuple[str, List[str]]] = [
     ("Aerial Drop Layer", ["Aerial_Drops.gpkg"]),
 ]
 
+# Mode B feeds the HLD design pipeline and then turns its output into the LLD.
+# The pipeline's own stage percentages are real (the plugin prints
+# "[60%] Running Trench Layer"), so the LLD bar is driven from them instead of
+# sitting at 0 % for the whole ~50-minute QGIS phase. The band stops at 78 so
+# the ingest that follows (80 % in _run_lld_replan) never moves backwards, and
+# the run never looks finished while it still has work to do.
+LLD_PIPELINE_PROGRESS = (20, 78)
+_PIPELINE_PERCENT_RE = re.compile(r"^\[\s*(\d{1,3})\s*%\s*\]")
+
 # How long an orphaned run's files must be quiet before it is declared dead.
 # An engine restart does NOT kill the qgis_process child: it kept writing this
 # project's ducts for two hours afterwards, so "the owner is gone" cannot mean
@@ -566,6 +575,37 @@ def _quote_cmd_arg(arg: str) -> str:
     return '"' + arg.replace('"', r'\"') + '"'
 
 
+def _pipeline_task(project_id: str) -> Tuple[Dict[str, Any], bool]:
+    """The task a pipeline line belongs to: the LLD run in scope, else HLD.
+
+    A Mode B re-plan runs this same pipeline on behalf of an LLD run, and
+    ``_lld_log_scope`` already routes its log lines to that run. Its progress
+    has to go there too: driving the project's HLD task left the LLD status
+    page at 0 % for the whole QGIS phase and wrote a phantom "running" HLD run
+    (``_persist_project_state``) that the platform's project list then showed.
+    """
+    sink = getattr(_append_sink, "lld", None)
+    if sink is not None:
+        return _lld_task(sink[0], sink[1]), True
+    return _task(project_id), False
+
+
+def _pipeline_progress(text: str, stage_index: int, in_lld: bool) -> int:
+    """Progress to report for a stage line, in the band that task owns.
+
+    HLD keeps its stage-index ladder. An LLD re-plan maps the pipeline's own
+    announced percentage into ``LLD_PIPELINE_PROGRESS``, so the bar moves with
+    the design (every stage boundary, roughly every 2-12 minutes) instead of
+    stepping 0 → 80 the moment the pipeline ends.
+    """
+    if not in_lld:
+        return int((stage_index / len(PIPELINE_STAGES)) * 100)
+    match = _PIPELINE_PERCENT_RE.match(text)
+    pct = int(match.group(1)) if match else int((stage_index / len(PIPELINE_STAGES)) * 100)
+    low, high = LLD_PIPELINE_PROGRESS
+    return low + round(pct / 100 * (high - low))
+
+
 def _consume_pipeline_line(project_id: str, text: str) -> None:
     """Append one qgis_process line and move the stage it names.
 
@@ -585,17 +625,27 @@ def _consume_pipeline_line(project_id: str, text: str) -> None:
     lowered = text.lower()
     for idx, stage in enumerate(PIPELINE_STAGES):
         if f"running {stage.lower()}" in lowered:
-            task = _task(project_id)
-            if task.get("stage") == stage and task.get("stage_index") == idx:
+            task, in_lld = _pipeline_task(project_id)
+            progress = _pipeline_progress(text, idx, in_lld)
+            if (
+                task.get("stage") == stage
+                and task.get("stage_index") == idx
+                and task.get("progress") == progress
+            ):
                 continue
             task["stage"] = stage
             task["stage_index"] = idx
-            task["progress"] = int((idx / len(PIPELINE_STAGES)) * 100)
+            # Never step backwards: a relayed line is only a sample of where
+            # the pipeline is, and the bar is read by a human.
+            task["progress"] = max(int(task.get("progress") or 0), progress)
             task["updated_at"] = _now()
             # Persisted, not just in memory: this is the only record of
             # where the run was when the engine restarts, and it is what the
-            # platform's project list shows while the run is in flight.
-            _persist_project_state(project_id, task)
+            # platform's project list shows while the run is in flight. An LLD
+            # run has no project-state row of its own — its progress lives on
+            # the LLD task and reaches the planner through the Django run row.
+            if not in_lld:
+                _persist_project_state(project_id, task)
 
 
 def _zip_directory(path: Path) -> bytes:

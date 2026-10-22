@@ -160,6 +160,50 @@ def test_the_pipeline_log_goes_to_the_lld_run_not_a_phantom_hld_run(monkeypatch)
     assert PROJECT in engine.tasks
 
 
+def test_pipeline_stage_lines_move_the_lld_progress_not_the_hld_one(monkeypatch):
+    """The QGIS phase is ~50 minutes on free; the bar must not sit at 0 % for it.
+
+    The pipeline prints its own percentage with each stage ("[60%] Running
+    Trench Layer").  A re-plan used to write those stages to the project's HLD
+    task, so the LLD run reported progress 0 from submit until ingest — and the
+    platform's project list showed a phantom "running" HLD run for the same
+    project, because that task was persisted.
+    """
+    monkeypatch.setattr(engine, "lld_tasks", {})
+    monkeypatch.setattr(engine, "tasks", {})
+    persisted = []
+    monkeypatch.setattr(engine, "_persist_project_state", lambda pid, task: persisted.append(pid))
+
+    task = engine._lld_task(PROJECT, VERSION)
+    with engine._lld_log_scope(PROJECT, VERSION):
+        engine._consume_pipeline_line(PROJECT, "[5%] Running Object Layer")
+        early = task["progress"]
+        engine._consume_pipeline_line(PROJECT, "[60%] Running Trench Layer")
+        middle = task["progress"]
+        engine._consume_pipeline_line(PROJECT, "[95%] Running Cable Layer")
+        latest = task["progress"]
+
+    assert task["stage"] == "Cable Layer"
+    # Inside the re-plan's band, strictly increasing, never "finished".
+    assert 20 <= early < middle < latest <= 78
+    assert early == 23 and middle == 55 and latest == 75
+    assert PROJECT not in engine.tasks, "a phantom HLD run was created"
+    assert persisted == [], "an LLD stage line persisted HLD project state"
+
+
+def test_the_hld_progress_ladder_is_unchanged(monkeypatch):
+    monkeypatch.setattr(engine, "tasks", {})
+    persisted = []
+    monkeypatch.setattr(engine, "_persist_project_state", lambda pid, task: persisted.append(pid))
+
+    engine._consume_pipeline_line(PROJECT, "[60%] Running Trench Layer")
+
+    task = engine.tasks[PROJECT]
+    assert task["stage"] == "Trench Layer"
+    assert task["progress"] == int((3 / len(engine.PIPELINE_STAGES)) * 100)
+    assert persisted == [PROJECT]
+
+
 def test_the_lld_replan_passes_the_project_tree_as_the_transfer_root(outputs, monkeypatch):
     """Mode B hands the engine the tree its command's paths belong to."""
     captured = {}
