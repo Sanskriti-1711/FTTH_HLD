@@ -193,6 +193,58 @@ def test_the_cached_boundary_is_served_when_nominatim_is_limited(monkeypatch):
     assert "2026-10-22T09:00:00" in resolution["stale_reason"]
 
 
+FEATURE = {
+    "type": "Feature",
+    "geometry": {"type": "Point", "coordinates": [-2.98, 53.41]},
+    "properties": {
+        "osm_type": "node", "osm_id": 1,
+        "category": "place", "type": "postcode",
+        "display_name": "L1 8JQ, Liverpool, England, United Kingdom",
+        "address": {"country_code": "gb", "city": "Liverpool"},
+        "lat": 53.41, "lon": -2.98,
+    },
+}
+
+
+def _admin_limited(monkeypatch, cached):
+    """Search succeeds; the administrative-boundary rung behind it gets the 429."""
+    monkeypatch.setattr(osm_source.postgis, "is_available", lambda: False)
+    monkeypatch.setattr(osm_source, "schema_ready", lambda: True)
+    monkeypatch.setattr(osm_source, "dataset_stamp", lambda code: "new-stamp")
+    monkeypatch.setattr(osm_source, "_cached_resolution", lambda key: cached)
+    monkeypatch.setattr(osm_source, "nominatim_search", lambda *a, **k: [FEATURE])
+    monkeypatch.setattr(osm_source, "boundary_dataset_lookup", lambda cc, code: None)
+    monkeypatch.setattr(
+        osm_source, "admin_boundary_for_point",
+        lambda lat, lon: (_ for _ in ()).throw(osm_source.RateLimited(URL, 429, 15)),
+    )
+
+
+def test_a_429_from_the_administrative_rung_serves_the_cached_boundary(monkeypatch):
+    # The live failure: the search answered, the reverse lookup behind it was
+    # limited, and the whole preview 502'd on an area already in the cache.
+    _admin_limited(monkeypatch, dict(CACHED))
+
+    resolution = osm_source.resolve_area("L1 8JQ, Liverpool", country_code="GB")
+
+    assert resolution["polygon"] == SQUARE
+    assert resolution["stale"] is True
+    assert resolution["retry_after"] == 15
+
+
+def test_a_429_from_the_administrative_rung_does_not_invent_a_rectangle(monkeypatch):
+    # With nothing cached the ladder must NOT fall through to the bbox: that
+    # would silently turn a rate limit into a design area nobody chose.
+    _admin_limited(monkeypatch, None)
+
+    try:
+        osm_source.resolve_area("L1 8JQ, Liverpool", country_code="GB")
+    except osm_source.RateLimited as exc:
+        assert exc.status == 429
+    else:  # pragma: no cover - the raise is the point
+        raise AssertionError("an uncached rung must not degrade to a rectangle")
+
+
 def test_an_uncached_area_still_reports_the_rate_limit(monkeypatch):
     # Nothing to serve: the caller must hear the real cause, not a made-up
     # boundary.  A rectangle invented here would silently widen the design.

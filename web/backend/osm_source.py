@@ -2375,6 +2375,19 @@ def _cached_resolution(key: str) -> Optional[Dict[str, Any]]:
     return _resolution_from_row(rows[0]) if rows else None
 
 
+def _stale_boundary(key: str, exc: RateLimited) -> Optional[Dict[str, Any]]:
+    """The cached boundary to serve instead of failing, or None if there is none.
+
+    Used at every Nominatim call site in the resolution, not just the first:
+    the live failure that prompted this was the SEARCH succeeding and the
+    administrative-boundary rung behind it getting the 429.
+    """
+    cached = _cached_resolution(key)
+    if not (cached and cached.get("polygon")):
+        return None
+    return _stale_resolution(cached, exc)
+
+
 def _stale_resolution(cached: Dict[str, Any], exc: RateLimited) -> Dict[str, Any]:
     """The boundary already held, served because Nominatim will not answer now.
 
@@ -2452,13 +2465,12 @@ def resolve_area(area: str, refresh: bool = False, country_code: str = "",
         search_area = nominatim_query(area)
         results = nominatim_search(search_area, code_in)
     except RateLimited as exc:
-        # The lookup is the only thing Nominatim is needed for here, and the
-        # polygon it produced last time is still in the store.  Falling back to
-        # it keeps the map and the counts working while the limit clears; with
-        # nothing cached the failure is reported as it was before.
-        stale = _cached_resolution(key)
-        if stale and stale.get("polygon"):
-            return _stale_resolution(stale, exc)
+        # The polygon Nominatim produced last time is still in the store, so
+        # falling back to it keeps the map and the counts working while the
+        # limit clears; with nothing cached the failure is reported as before.
+        stale = _stale_boundary(key, exc)
+        if stale is not None:
+            return stale
         raise
     best = pick_area_result(results, search_area, code_in)
     props = best.get("properties") or {}
@@ -2507,7 +2519,18 @@ def resolve_area(area: str, refresh: bool = False, country_code: str = "",
         #    exists worldwide, unlike a postcode boundary.  Without this, a US
         #    ZIP or a UK postcode falls straight through to a rectangle.
         lat, lon = _best_point(best, geometry, bbox)
-        admin = admin_boundary_for_point(lat, lon) if lat is not None else None
+        try:
+            admin = admin_boundary_for_point(lat, lon) if lat is not None else None
+        except RateLimited as exc:
+            # Measured live: the search answered, then this reverse lookup got
+            # the 429 and the whole preview 502'd on an area that was already
+            # cached.  A boundary we hold beats a rung we cannot reach.
+            stale = _stale_boundary(key, exc)
+            if stale is not None:
+                return stale
+            # Nothing cached: report the limit rather than falling through to
+            # the rectangle, which would silently widen the design area.
+            raise
         if admin:
             polygon = admin["geometry"]
             source = "administrative"
