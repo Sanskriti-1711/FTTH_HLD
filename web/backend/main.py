@@ -580,6 +580,32 @@ def _zip_directory(path: Path) -> bytes:
     return buffer.getvalue()
 
 
+def _zip_subtree(root: Path, subpaths: Tuple[str, ...]) -> bytes:
+    """A zip of only the named sub-paths of ``root``, members relative to it.
+
+    The worker unpacks a job's archive into ``outputs/<project_id>`` and then
+    runs qgis_process against the absolute paths the engine built, so a run
+    whose inputs live OUTSIDE its output directory (Mode B: ``inputs/`` and
+    ``replan/<version>/brownfield/``) has to ship exactly those paths, under
+    those names.  The worker image has no copy of them: shipping the design
+    directory alone left ``ROADS`` and ``EXCEL`` pointing at files that did not
+    exist there, and qgis_process exited 1 with "Incorrect parameter value for
+    ROADS".  Zipping the whole project directory instead would upload every
+    previous run's outputs.
+    """
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for part in subpaths:
+            base = root / part
+            if base.is_file():
+                archive.write(base, base.relative_to(root).as_posix())
+                continue
+            for item in sorted(base.rglob("*")):
+                if item.is_file():
+                    archive.write(item, item.relative_to(root).as_posix())
+    return buffer.getvalue()
+
+
 def _extract_into(payload: bytes, dest: Path) -> List[str]:
     """Unpack a worker result into ``dest``; returns the files it wrote.
 
@@ -874,13 +900,21 @@ def wake_worker(project_id: str = "") -> None:
 
 
 def _start_worker_job(project_id: str, job: str, output_dir: Path,
-                      cmd: List[str]) -> None:
+                      cmd: List[str],
+                      transfer: Optional[Tuple[Path, Tuple[str, ...]]] = None) -> None:
     """Upload the inputs and queue the job, waiting out a worker that is booting.
 
     The inputs PUT is idempotent (it replaces the job's directory), so retrying
     the pair after a cold-start 502 cannot queue the run twice.
+
+    ``transfer`` names the tree the command's paths are relative to when that
+    is not the output directory itself (Mode B): ``(root, subpaths)``, zipped
+    at those relative names so the absolute arguments resolve on the worker.
     """
-    payload = _zip_directory(output_dir)
+    if transfer is not None:
+        payload = _zip_subtree(transfer[0], transfer[1])
+    else:
+        payload = _zip_directory(output_dir)
     env = _worker_env()
     body = json.dumps({"args": cmd[1:], "env": env}).encode("utf-8")
     attempts = QGIS_WORKER_START_ATTEMPTS
@@ -906,21 +940,50 @@ def _start_worker_job(project_id: str, job: str, output_dir: Path,
                            QGIS_WORKER_RETRY_S * attempt))
 
 
+def _worker_failure_detail(project_id: str, job: str,
+                           status: Dict[str, Any], code: Any) -> str:
+    """The failure message, with the tail of the worker's qgis log on it.
+
+    A parameter error (a path that does not exist on the worker, a bad
+    algorithm id) is printed by qgis_process and then thrown away: the job
+    carries no ``error`` and the run says only "exited with code 1".  Six tail
+    lines fit in a run message and name the offending parameter.
+    """
+    base = status.get("error") or f"qgis_process exited with code {code}"
+    if status.get("error"):
+        return base
+    try:
+        batch = json.loads(_worker_call(f"{job}/log?offset=0", timeout=60) or b"{}")
+    except (urllib.error.URLError, OSError, ValueError):
+        return base
+    lines = [str(line).strip() for line in (batch.get("lines") or []) if str(line).strip()]
+    if not lines:
+        return base
+    return base + "\n" + "\n".join(lines[-6:])
+
+
 def _run_command_remote(project_id: str, cmd: Union[List[str], str],
-                        output_dir: Path) -> List[str]:
+                        output_dir: Path,
+                        transfer: Optional[Tuple[Path, Tuple[str, ...]]] = None) -> List[str]:
     """Run the pipeline on the QGIS worker and collect its outputs.
 
     The arguments are built HERE and shipped as-is: ``BF_DUCTS``,
     ``PERMIT_DELAYS`` and ``POLY_BARRIER_EXTRA`` are absolute paths under
     ``outputs/<project>/``, and the worker unpacks to the same layout, so the
     same strings resolve on both sides.
+
+    ``transfer`` is required whenever those paths are not inside
+    ``output_dir``: it says which tree to upload, and the worker's results are
+    unpacked back into that same tree so the run's files land at their real
+    locations (a design written to ``replan/<version>/design``).
     """
     if not isinstance(cmd, list) or len(cmd) < 2:
         raise RuntimeError("the QGIS worker needs an argument list, not a shell string")
     timeout = int(os.environ.get("QGIS_PROCESS_TIMEOUT", "10800"))
     started = time.time()
     job = f"/jobs/{project_id}"
-    _start_worker_job(project_id, job, output_dir, cmd)
+    restore_root = transfer[0] if transfer is not None else output_dir
+    _start_worker_job(project_id, job, output_dir, cmd, transfer=transfer)
     _append(project_id, "info", f"Running on the QGIS worker at {QGIS_WORKER_URL}.")
     forwarded = _worker_env()
     if forwarded:
@@ -971,8 +1034,8 @@ def _run_command_remote(project_id: str, cmd: Union[List[str], str],
         raise RuntimeError("The run was stopped.")
     code = status.get("exit_code")
     if status.get("state") == "failed" or code not in (0, None):
-        raise RuntimeError(status.get("error") or f"qgis_process exited with code {code}")
-    written = _extract_into(_worker_call(f"{job}/result", timeout=900), output_dir)
+        raise RuntimeError(_worker_failure_detail(project_id, job, status, code))
+    written = _extract_into(_worker_call(f"{job}/result", timeout=900), restore_root)
     _append(
         project_id, "info",
         "qgis_process finished on the worker; %d output file(s) collected." % len(written),
@@ -985,15 +1048,19 @@ def _run_command_remote(project_id: str, cmd: Union[List[str], str],
 
 
 def _run_command(project_id: str, cmd: Union[List[str], str],
-                 output_dir: Path) -> Optional[List[str]]:
+                 output_dir: Path,
+                 transfer: Optional[Tuple[Path, Tuple[str, ...]]] = None) -> Optional[List[str]]:
     """Run qgis_process -- here, or on the worker when one is configured.
 
     Returns the files the run wrote when the worker reports them (the caller
     uses that list instead of mtimes, which two separate clocks cannot be
     compared across); ``None`` on the local path, where mtimes are trustworthy.
+
+    ``transfer`` only matters on the worker (see ``_run_command_remote``); a
+    local qgis_process already sees every path named in the command.
     """
     if QGIS_WORKER_URL:
-        return _run_command_remote(project_id, cmd, output_dir)
+        return _run_command_remote(project_id, cmd, output_dir, transfer=transfer)
     env = os.environ.copy()
     env.setdefault("QT_QPA_PLATFORM", "offscreen")
     env.setdefault("QGIS_PLUGINPATH", str(ROOT_DIR))
@@ -6296,7 +6363,15 @@ def _run_lld_replan(
         cmd.extend(bf_args)
         if os.name == "nt" and qgis.lower().endswith((".bat", ".cmd")):
             cmd = " ".join(_quote_cmd_arg(part) for part in cmd)
-        _run_command(project_id, cmd, design_dir)
+        # The worker runs qgis_process in its own container, so the command's
+        # paths must exist THERE: the address workbook and roads under
+        # inputs/, and the brownfield files this version wrote.  The design
+        # output stays where the pipeline writes it (replan/<version>/design),
+        # and the worker's results are unpacked back into the project tree.
+        _run_command(
+            project_id, cmd, design_dir,
+            transfer=(OUTPUT_DIR / project_id, ("inputs", f"replan/{lld_version}")),
+        )
 
         # ── 4. Map fresh outputs to LLD layers + build the by_layer set ──
         task.update({"stage": "Ingesting fresh design", "progress": 80, "updated_at": _now()})
