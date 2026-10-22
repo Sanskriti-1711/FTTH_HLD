@@ -7,6 +7,7 @@ tiles for MapLibre or any other client.
 
 from __future__ import annotations
 
+import email.utils
 import gc
 import io
 import json
@@ -14,6 +15,7 @@ import math
 import os
 import re
 import shutil
+import socket
 import sqlite3
 import subprocess
 import threading
@@ -194,6 +196,20 @@ QGIS_WORKER_POLL_S = float(os.environ.get("FTTH_QGIS_WORKER_POLL", "2"))
 QGIS_WORKER_WAKE_S = float(os.environ.get("FTTH_QGIS_WORKER_WAKE", "600"))
 # How many times a job start waits out the worker before giving up.
 QGIS_WORKER_START_ATTEMPTS = max(1, int(os.environ.get("FTTH_QGIS_WORKER_START_ATTEMPTS", "3")))
+# A successful /health probe is trusted for this long, so the job start that
+# follows an already-running wake does not probe the worker a second time.
+QGIS_WORKER_READY_S = float(os.environ.get("FTTH_QGIS_WORKER_READY", "60"))
+# First backoff after a failed probe. It doubles to the cap: a boot or an edge
+# rate limit is not helped by a request every three seconds, and that burst is
+# itself a plausible cause of the HTTP 429 that killed run e105cf50.
+QGIS_WORKER_RETRY_S = float(os.environ.get("FTTH_QGIS_WORKER_RETRY", "5"))
+QGIS_WORKER_MAX_RETRY_S = float(os.environ.get("FTTH_QGIS_WORKER_MAX_RETRY", "30"))
+
+# One wake at a time. The run accepted earlier starts the wait and the job start
+# joins its flight; two independent probe loops doubled the request rate.
+_worker_state_lock = threading.Lock()
+_worker_ready_until = 0.0
+_worker_flight: Optional[Dict[str, Any]] = None
 # How long a run survives losing contact with a worker that is mid-pipeline.
 # Five 2-second misses (10 s) was too tight for a platform hiccup on a job that
 # has already burned an hour of a slow instance's CPU; a RESTARTED worker still
@@ -544,39 +560,211 @@ def _worker_call(path: str, data: Optional[bytes] = None, method: str = "GET",
     return body
 
 
-def _worker_wake(budget: Optional[float] = None) -> None:
-    """Wait for the worker to answer ``/health``, if it is still booting.
+def _worker_retry_after(exc: urllib.error.HTTPError) -> Optional[float]:
+    """Seconds the edge asked us to wait, from ``Retry-After``, if present."""
+    headers = getattr(exc, "headers", None)
+    raw = headers.get("Retry-After") if headers is not None else None
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(str(raw).strip()))
+    except (TypeError, ValueError):
+        pass
+    try:
+        when = email.utils.parsedate_to_datetime(str(raw))
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
 
-    A free-tier worker sleeps after 15 idle minutes and the platform's edge
-    answers **502** meanwhile. Measured 2026-10-20 13:20: a run started against
-    the sleeping worker was settled as failed in 34 s with "HTTP Error 502: Bad
-    Gateway", which is indistinguishable from an outage in the UI. Waiting here
-    turns that into a delay the run absorbs.
+
+def _worker_failure(exc: BaseException) -> Tuple[str, Optional[float]]:
+    """Classify one failed probe: boot, rate limit, or a configuration error.
+
+    The distinction is the whole point. ``502``/``503``/timeouts mean the free
+    instance is still coming up, so waiting helps. **429 does not**: it is the
+    edge refusing the request, and retrying it every three seconds is what
+    turned a boot into a ten-minute failure on 2026-10-22. ``401``/``403``/
+    ``404`` cannot be fixed by waiting at all.
     """
-    if not QGIS_WORKER_URL:
-        return
-    budget = QGIS_WORKER_WAKE_S if budget is None else budget
-    deadline = time.time() + budget
-    waited_from = time.time()
+    if isinstance(exc, urllib.error.HTTPError):
+        code = int(exc.code or 0)
+        if code == 429:
+            return "rate-limited", _worker_retry_after(exc)
+        if code in (408, 425, 500, 502, 503, 504):
+            return "booting", None
+        if 400 <= code < 500:
+            return "rejected", None
+        return "booting", None
+    if isinstance(exc, urllib.error.URLError):
+        if isinstance(exc.reason, socket.gaierror):
+            return "unresolvable", None
+        return "booting", None
+    if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
+        return "booting", None
+    return "booting", None
+
+
+def _worker_probe_error(exc: BaseException, kind: str) -> RuntimeError:
+    """The error for a probe that waiting cannot fix."""
+    code = getattr(exc, "code", None)
+    if kind == "unresolvable":
+        return RuntimeError(
+            f"The QGIS worker at {QGIS_WORKER_URL} cannot be resolved "
+            f"({getattr(exc, 'reason', exc)}). Check FTTH_QGIS_WORKER_URL."
+        )
+    if code in (401, 403):
+        return RuntimeError(
+            f"The QGIS worker at {QGIS_WORKER_URL} rejected the probe "
+            f"(HTTP {code}). QGIS_WORKER_TOKEN must match on the engine and "
+            "on the worker."
+        )
+    if code == 404:
+        return RuntimeError(
+            f"The QGIS worker at {QGIS_WORKER_URL} has no /health endpoint "
+            "(HTTP 404). Check that FTTH_QGIS_WORKER_URL points at the worker "
+            "service, not at the engine."
+        )
+    return RuntimeError(
+        f"The QGIS worker at {QGIS_WORKER_URL} refused the probe (HTTP {code})."
+    )
+
+
+def _worker_timeout_error(last: Optional[BaseException], kind: str,
+                          budget: float) -> RuntimeError:
+    if kind == "rate-limited":
+        return RuntimeError(
+            f"The QGIS worker at {QGIS_WORKER_URL} did not answer within "
+            f"{budget:g} s: the platform edge kept returning HTTP 429 "
+            "(Too Many Requests). That is rate limiting, not a boot; wait a "
+            "minute and run again."
+        )
+    detail = f" ({last})" if last else ""
+    return RuntimeError(
+        f"The QGIS worker at {QGIS_WORKER_URL} did not answer within "
+        f"{budget:g} s{detail}. It may still be booting; run the area again "
+        "when the worker is awake."
+    )
+
+
+def _worker_announce(project_id: str, kind: str, exc: BaseException,
+                     retry_after: Optional[float], attempt: int) -> None:
+    """Say once per failure mode what the wait is doing, in the run log too."""
+    if kind == "rate-limited":
+        wait = retry_after
+        if wait is None:
+            wait = min(QGIS_WORKER_MAX_RETRY_S, QGIS_WORKER_RETRY_S * (2 ** attempt))
+        text = (
+            f"The platform edge is rate-limiting the QGIS worker (HTTP 429); "
+            f"backing off {max(0.05, wait):g} s before the next probe."
+        )
+    else:
+        text = f"The QGIS worker is not awake yet ({exc}); waiting for it."
+    print(f"[worker] {text}", flush=True)
+    if project_id:
+        _append(project_id, "info", text)
+
+
+def _probe_worker(deadline: float, budget: float, project_id: str = "") -> None:
+    """Probe /health until it answers, backing off between attempts."""
+    started = time.time()
     last: Optional[BaseException] = None
+    kind = "booting"
+    attempt = 0
+    announced: Set[str] = set()
     while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
         try:
-            _worker_call("/health", timeout=max(5.0, min(30.0, deadline - time.time())))
+            _worker_call("/health", timeout=max(5.0, min(30.0, remaining)))
+            waited = time.time() - started
+            if waited >= 5:
+                print(f"[worker] woke in {waited:.0f}s", flush=True)
+            return
         except (urllib.error.URLError, OSError, ValueError) as exc:
             last = exc
-            if time.time() >= deadline:
-                raise RuntimeError(
-                    f"The QGIS worker at {QGIS_WORKER_URL} did not answer within "
-                    f"{int(budget)} s ({last}). This is what a sleeping free-tier "
-                    "instance looks like while it boots; run the area again when "
-                    "the worker is awake."
-                ) from last
-            time.sleep(min(3.0, max(0.05, deadline - time.time())))
-            continue
-        waited = time.time() - waited_from
-        if waited >= 5:
-            print(f"[worker] woke in {waited:.0f}s", flush=True)
+            kind, retry_after = _worker_failure(exc)
+            if kind in ("rejected", "unresolvable"):
+                raise _worker_probe_error(exc, kind) from exc
+            if kind not in announced:
+                announced.add(kind)
+                _worker_announce(project_id, kind, exc, retry_after, attempt)
+            delay = retry_after if retry_after is not None else (
+                QGIS_WORKER_RETRY_S * (2 ** attempt)
+            )
+            delay = min(max(delay, 0.05), QGIS_WORKER_MAX_RETRY_S)
+            attempt += 1
+            remaining = deadline - time.time()
+            if delay > remaining:
+                break
+            time.sleep(delay)
+    raise _worker_timeout_error(last, kind, budget)
+
+
+def _worker_wake(budget: Optional[float] = None, project_id: str = "") -> None:
+    """Wait for the worker to answer ``/health``, once, for every caller.
+
+    A free-tier worker sleeps after 15 idle minutes and its edge answers 502
+    (or holds the connection) meanwhile. Waiting turns that into a delay the
+    run absorbs instead of a failure at its first QGIS command.
+
+    Two properties are deliberate:
+
+    * **One probe stream.** A run accepted earlier starts the warm wait; the
+      job start joins that flight instead of starting a second loop.
+    * **A 429 is not a boot.** It is retried with ``Retry-After`` and
+      exponential backoff, and reported as rate limiting if the budget runs
+      out. A 401/403/404 fails immediately, because waiting cannot fix a token
+      or a URL.
+    """
+    global _worker_flight, _worker_ready_until
+    if not QGIS_WORKER_URL:
         return
+    if time.time() < _worker_ready_until:
+        return
+    budget = QGIS_WORKER_WAKE_S if budget is None else budget
+    with _worker_state_lock:
+        if time.time() < _worker_ready_until:
+            return
+        flight = _worker_flight
+        owner = flight is None or flight["event"].is_set()
+        if owner:
+            flight = {
+                "event": threading.Event(),
+                "error": None,
+                "deadline": time.time() + budget,
+                "budget": budget,
+            }
+            _worker_flight = flight
+    if not owner:
+        flight["event"].wait(max(0.0, min(budget, flight["deadline"] - time.time() + 1)))
+        if flight["error"] is not None:
+            raise flight["error"]
+        if time.time() >= _worker_ready_until:
+            raise RuntimeError(
+                f"The QGIS worker at {QGIS_WORKER_URL} did not answer within "
+                f"{budget:g} s; its wake-up is still in progress."
+            )
+        return
+    error: Optional[BaseException] = None
+    try:
+        _probe_worker(flight["deadline"], float(flight["budget"]), project_id)
+    except BaseException as exc:
+        error = exc
+        flight["error"] = exc
+        raise
+    finally:
+        if error is None:
+            _worker_ready_until = time.time() + QGIS_WORKER_READY_S
+        flight["event"].set()
+
+
+def _worker_mark_unready() -> None:
+    """A failed job call proves the worker is not usable; probe again next time."""
+    global _worker_ready_until
+    _worker_ready_until = 0.0
 
 
 # The pipeline executes on the worker, so the settings that change its output
@@ -609,7 +797,7 @@ def wake_worker(project_id: str = "") -> None:
 
     def _run() -> None:
         try:
-            _worker_wake()
+            _worker_wake(project_id=project_id)
         except Exception as exc:  # noqa: BLE001 - a warm-up cannot fail a run
             print(f"[worker] warm-up did not finish: {exc}", flush=True)
             return
@@ -637,21 +825,25 @@ def _start_worker_job(project_id: str, job: str, output_dir: Path,
     body = json.dumps({"args": cmd[1:], "env": env}).encode("utf-8")
     attempts = QGIS_WORKER_START_ATTEMPTS
     for attempt in range(1, attempts + 1):
-        _worker_wake()
+        _worker_wake(project_id=project_id)
         try:
             _worker_call(f"{job}/inputs", data=payload, method="PUT", timeout=900)
             _worker_call(job, data=body, method="POST", timeout=120)
             return
         except (urllib.error.URLError, OSError) as exc:
+            _worker_mark_unready()
             if attempt >= attempts:
                 raise RuntimeError(
-                    f"The QGIS worker at {QGIS_WORKER_URL} is unreachable: {exc}"
+                    f"The QGIS worker at {QGIS_WORKER_URL} did not take the "
+                    f"job: {exc}"
                 ) from exc
             _append(
                 project_id, "info",
                 f"The QGIS worker did not take the job ({exc}); waiting for it and "
                 f"trying again ({attempt + 1} of {attempts}).",
             )
+            time.sleep(min(QGIS_WORKER_MAX_RETRY_S,
+                           QGIS_WORKER_RETRY_S * attempt))
 
 
 def _run_command_remote(project_id: str, cmd: Union[List[str], str],
@@ -5816,6 +6008,38 @@ def _drop_generated_corridor_duplicates(
     return removed
 
 
+def _complete_fresh_design(
+    project_id: str,
+    lld_version: str,
+    by_layer: Dict[str, List[Dict[str, Any]]],
+) -> None:
+    """Run the completion passes over a freshly re-planned design.
+
+    Mode B used to stop at the algorithm's own output, so a premise the router
+    skipped stayed unserved (52 of 870 on the first re-plan of 027103bf) and no
+    supporting feature was ever added. The same passes Verify mode relies on
+    are run here so a re-planned design is complete by the same rules:
+    missing trench/duct support, then the serving drop (trench + duct + cable +
+    coupler) for every premise.
+    """
+    created = _propagate_support_layers(by_layer)
+    drops = _plan_drop_connections(by_layer)
+    summary = ", ".join(
+        "%s=%d" % (k, v) for k, v in list(created.items()) + list(drops.items()) if v
+    )
+    if summary:
+        _lld_append(
+            project_id, lld_version, "info",
+            "Fresh design completed by the shared passes: %s." % summary,
+        )
+    else:
+        _lld_append(
+            project_id, lld_version, "info",
+            "Fresh design completion: every cable/duct had its support and every "
+            "premise its drop — nothing to create.",
+        )
+
+
 def _run_lld_replan(
     project_id: str,
     lld_version: str,
@@ -6046,7 +6270,13 @@ def _run_lld_replan(
             duct_props["capacity_spare"] = max(0, LLD_MAX_PDPS_PER_DUCT - len(pdp_ids))
             duct_props["MAX_PDPS_PER_DUCT"] = LLD_MAX_PDPS_PER_DUCT
 
-        # ── 6. Validate + write layers + zip (same contract as _run_lld) ──
+        # ── 6. Completion passes: a re-planned design must satisfy the same
+        #       contract as a verified one (support layers, every premise
+        #       served by a drop duct/cable/coupler). ────────────────────
+        task.update({"stage": "Completing the fresh design", "progress": 88, "updated_at": _now()})
+        _complete_fresh_design(project_id, lld_version, by_layer)
+
+        # ── 7. Validate + write layers + zip (same contract as _run_lld) ──
         normalized = _normalize_trench_construction_class(by_layer)
         if normalized:
             _lld_append(

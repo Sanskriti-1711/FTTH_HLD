@@ -517,6 +517,41 @@ def test_drop_planning_gives_every_served_premise_a_coupler():
     assert cp["properties"]["DIST_DUCT_ID"] == 7
 
 
+def test_fresh_design_completion_serves_every_premise(monkeypatch):
+    """A re-planned design gets the same completion passes as a verified one.
+
+    Mode B used to stop at the algorithm's output: 52 of 870 premises were left
+    with no serving drop. Guard the shared pass that closes that gap.
+    """
+    premise = (0.0003, 0.0)
+    by_layer = {
+        "objects": [{
+            "geometry": {"type": "Point", "coordinates": list(premise)},
+            "properties": {"feature_id": "p1", "ADDR_ID": "A-9", "PDP_ID": "PDP00009"},
+        }],
+        "distribution_ducts": [{
+            "geometry": {"type": "LineString", "coordinates": [[-0.001, 0.0], [0.0, 0.0]]},
+            "properties": {"DUCT_UID": 7},
+        }],
+        "distribution_cable": [],
+        "drop_ducts": [],
+        "trenches": [],
+    }
+    engine._complete_fresh_design("proj", "LLD-V08", by_layer)
+
+    assert len(by_layer["drop_ducts"]) == 1, "the premise must get a drop duct"
+    assert len(by_layer["distribution_cable"]) == 1, "and a serving cable"
+    # One trench under the unsupported distribution duct, one garden trench
+    # for the drop itself (both dig-able support the fresh design lacked).
+    assert len(by_layer["final_trenches"]) == 2
+    assert any(
+        (f["properties"] or {}).get("trench_type") == "Garden"
+        for f in by_layer["final_trenches"]
+    ), "the drop needs a garden trench of its own"
+    assert len(by_layer["coupleurs"]) == 1, "and a splitter port"
+    assert by_layer["coupleurs"][0]["properties"]["PREMISE_ID"] == "A-9"
+
+
 def test_drop_planning_routes_from_cable_part_that_ends_at_premise():
     """A multi-part cable whose first part is far away must still feed the
     drop from the part that actually ends at the premise (regression)."""
