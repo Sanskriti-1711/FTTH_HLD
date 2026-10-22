@@ -30,6 +30,16 @@ import qgis_worker as worker
 TOKEN = "test-token"
 
 
+@pytest.fixture(autouse=True)
+def _fresh_worker_wake_state():
+    """Every test starts with no warm worker and no shared wake flight."""
+    main._worker_ready_until = 0.0
+    main._worker_flight = None
+    yield
+    main._worker_ready_until = 0.0
+    main._worker_flight = None
+
+
 def _script(name="Final_Trenches.gpkg"):
     """A stand-in for qgis_process: prints stage lines and writes a layer.
 
@@ -364,6 +374,8 @@ def test_a_sleeping_worker_is_waited_for_instead_of_failing_the_run(tmp_path, mo
 
     monkeypatch.setattr(main, "QGIS_WORKER_URL", "http://worker")
     monkeypatch.setattr(main, "_worker_call", cold)
+    monkeypatch.setattr(main, "QGIS_WORKER_RETRY_S", 0.01)
+    monkeypatch.setattr(main, "QGIS_WORKER_MAX_RETRY_S", 0.05)
     monkeypatch.setattr(main, "_persist_project_state", lambda *a, **k: None)
     monkeypatch.setattr(main, "_extract_into", lambda body, out: [])
 
@@ -472,8 +484,8 @@ def test_a_run_warms_the_worker_before_it_is_needed(monkeypatch):
     """The boot overlaps the run, instead of being paid when the job is queued."""
     probed = []
 
-    def fake_wake(budget=None):
-        probed.append(budget)
+    def fake_wake(budget=None, project_id=""):
+        probed.append((budget, project_id))
 
     task = main._task("proj-warm")
     task.update({"messages": []})
@@ -488,3 +500,122 @@ def test_a_run_warms_the_worker_before_it_is_needed(monkeypatch):
 
     assert probed, "the worker was never woken ahead of the pipeline"
     assert any("QGIS worker ready" in m["text"] for m in task["messages"])
+
+
+def test_resolving_an_area_warms_the_worker_before_run(monkeypatch):
+    """The preview a planner reads is when the boot should start, not Run.
+
+    Resolving an area is minutes of Nominatim and OSM download, and the worker's
+    cold start is minutes too.  Warming at Run time put both in series: the
+    2026-10-22 run logged ``QGIS worker ready (415s)`` with nothing running.
+    """
+    order = []
+
+    def fake_preview(area, **kwargs):
+        order.append("preview")
+        return {"area": area, "bbox": []}
+
+    monkeypatch.setattr(main.osm_source, "preview_area", fake_preview)
+    monkeypatch.setattr(main.osm_source, "ensure_area_data_background",
+                        lambda area, bbox: {"state": "queued"})
+    monkeypatch.setattr(main, "wake_worker",
+                        lambda project_id="": order.append("wake"))
+
+    main.resolve_area_endpoint({"area": "B16 8UU"})
+
+    assert order[:2] == ["wake", "preview"], (
+        "the worker must start booting before the preview does its work, "
+        f"so the two waits overlap; got {order}"
+    )
+
+
+# ── the wake: one stream, a real backoff, and 429 is not a boot ──────────────
+
+def _http_error(path, code, headers=None):
+    return urllib.error.HTTPError(
+        "http://worker" + path, code, "error", headers or {}, io.BytesIO(b"")
+    )
+
+
+def test_a_rate_limited_worker_backs_off_and_recovers(monkeypatch):
+    """A 429 is retried after Retry-After, not three seconds later."""
+    stamps = []
+
+    def probe(path, data=None, method="GET", timeout=120):
+        stamps.append(time.monotonic())
+        if len(stamps) <= 2:
+            raise _http_error(path, 429, {"Retry-After": "0.05"})
+        return b'{"status": "ok"}'
+
+    monkeypatch.setattr(main, "QGIS_WORKER_URL", "http://worker")
+    monkeypatch.setattr(main, "_worker_call", probe)
+    monkeypatch.setattr(main, "QGIS_WORKER_WAKE_S", 2.0)
+    monkeypatch.setattr(main, "QGIS_WORKER_RETRY_S", 0.05)
+    monkeypatch.setattr(main, "QGIS_WORKER_MAX_RETRY_S", 0.1)
+
+    main._worker_wake()
+
+    assert len(stamps) == 3
+    assert stamps[1] - stamps[0] >= 0.04
+    assert stamps[2] - stamps[1] >= 0.04
+
+
+def test_a_rate_limit_is_reported_as_rate_limiting_not_sleep(monkeypatch):
+    def probe(path, data=None, method="GET", timeout=120):
+        raise _http_error(path, 429, {"Retry-After": "0.02"})
+
+    monkeypatch.setattr(main, "QGIS_WORKER_URL", "http://worker")
+    monkeypatch.setattr(main, "_worker_call", probe)
+    monkeypatch.setattr(main, "QGIS_WORKER_WAKE_S", 0.3)
+    monkeypatch.setattr(main, "QGIS_WORKER_RETRY_S", 0.02)
+    monkeypatch.setattr(main, "QGIS_WORKER_MAX_RETRY_S", 0.02)
+
+    with pytest.raises(RuntimeError) as exc:
+        main._worker_wake()
+
+    text = str(exc.value)
+    assert "HTTP 429" in text
+    assert "rate limiting" in text
+    assert "sleeping" not in text
+
+
+def test_a_rejected_worker_fails_fast_instead_of_waiting(monkeypatch):
+    calls = []
+
+    def probe(path, data=None, method="GET", timeout=120):
+        calls.append(path)
+        raise _http_error(path, 401)
+
+    monkeypatch.setattr(main, "QGIS_WORKER_URL", "http://worker")
+    monkeypatch.setattr(main, "_worker_call", probe)
+    monkeypatch.setattr(main, "QGIS_WORKER_WAKE_S", 60)
+
+    started = time.monotonic()
+    with pytest.raises(RuntimeError) as exc:
+        main._worker_wake()
+
+    assert time.monotonic() - started < 1
+    assert len(calls) == 1
+    assert "QGIS_WORKER_TOKEN" in str(exc.value)
+
+
+def test_two_callers_share_one_probe_stream(monkeypatch):
+    """The accepted run and the job start must not probe twice."""
+    calls = []
+
+    def probe(path, data=None, method="GET", timeout=120):
+        calls.append(time.monotonic())
+        time.sleep(0.05)
+        return b'{"status": "ok"}'
+
+    monkeypatch.setattr(main, "QGIS_WORKER_URL", "http://worker")
+    monkeypatch.setattr(main, "_worker_call", probe)
+
+    callers = [threading.Thread(target=main._worker_wake) for _ in range(2)]
+    for caller in callers:
+        caller.start()
+    for caller in callers:
+        caller.join(2)
+
+    assert len(calls) == 1
+    assert not any(caller.is_alive() for caller in callers)

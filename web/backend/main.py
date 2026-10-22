@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import email.utils
 import gc
+import hmac
 import io
 import json
 import math
@@ -32,7 +33,7 @@ from typing import Any, Deque, Dict, List, Optional, Set, Tuple, Union
 from fastapi import BackgroundTasks, Body, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 import countries
 import design
@@ -223,6 +224,61 @@ WORKER_MANIFEST = "._written.json"
 # not both ingest the outputs.
 _recover_lock = threading.Lock()
 
+# ── Write authentication ────────────────────────────────────────────────────
+# This service answers on a public URL, so every route that starts a run, stops
+# a run or deletes a project is callable by anyone who knows the hostname. Those
+# routes now require a shared key; unchanged reads (health, results, layers,
+# tiles, downloads) stay open because that is what the planner's browser and the
+# Django proxy fetch, and none of them mutates a run.
+#
+# The key lives in FTTH_ENGINE_API_KEY and must be the same value on the engine
+# and on the Django backend (FTTH_ENGINE_API_KEY there, sent as the header
+# below). With no key configured this service refuses writes with 503 instead
+# of quietly staying open: a deployment that forgot the variable can never be
+# mistaken for a protected one.
+ENGINE_API_KEY = os.environ.get("FTTH_ENGINE_API_KEY", "").strip()
+ENGINE_KEY_HEADER = "x-ftth-engine-key"
+_WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+class EngineKeyMiddleware:
+    """Reject mutating requests that do not carry the engine's API key."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope["method"] not in _WRITE_METHODS:
+            return await self.app(scope, receive, send)
+
+        key = ENGINE_API_KEY
+        if not key:
+            response = JSONResponse(
+                {
+                    "detail": (
+                        "Engine writes are disabled: FTTH_ENGINE_API_KEY is not set "
+                        "on this service. Set it here and on the Django backend "
+                        "(same value) to enable runs."
+                    )
+                },
+                status_code=503,
+            )
+            return await response(scope, receive, send)
+
+        supplied = ""
+        for name, value in scope.get("headers") or ():
+            if name.decode("latin-1").lower() == ENGINE_KEY_HEADER:
+                supplied = value.decode("latin-1")
+                break
+        if not hmac.compare_digest(supplied.encode("latin-1"), key.encode("utf-8")):
+            response = JSONResponse(
+                {"detail": "Invalid or missing engine API key"}, status_code=401
+            )
+            return await response(scope, receive, send)
+
+        return await self.app(scope, receive, send)
+
+
 app = FastAPI(
     title="FTTH Engine API",
     version="2.0.0",
@@ -239,6 +295,9 @@ app.add_middleware(
 # nothing in this stack compressed it -- the engine sent it raw, the Django hop
 # forwarded it raw, and the browser parsed every byte of it.
 app.add_middleware(GZipMiddleware, minimum_size=1024)
+# Added last so it is the outermost layer: a request without the key never
+# reaches a route that could start a run.
+app.add_middleware(EngineKeyMiddleware)
 
 
 def _now() -> str:
@@ -2930,6 +2989,13 @@ def resolve_area_endpoint(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]
     design gets built on these numbers.
     """
     area, country_code, input_type = _area_request(payload)
+    # The planner is now one click from Run, so boot the worker while they read
+    # the preview instead of when they press it.  Both halves of this call are
+    # minutes long on a cold day (Nominatim ~9 s, then the OSM fetch), and so is
+    # the worker's cold start -- the run of 2026-10-22 sat on stage 0 for 415 s
+    # because the boot only began once the run was accepted.  It is a background
+    # thread that a real run joins, so the preview never waits for it.
+    wake_worker()
     # No default cap: the preview exists to report the size of any area, and a
     # refusal here used to hide the sub-area breakdown that says where to
     # narrow.  A caller may still impose a cap, and if it is exceeded the error
