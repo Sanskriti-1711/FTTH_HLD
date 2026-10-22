@@ -393,7 +393,35 @@ def _public_task(project_id: str) -> Dict[str, Any]:
     return task
 
 
+# Mode B runs the HLD pipeline on behalf of an LLD run.  Its log lines belong
+# to that LLD run: appending them to the project's HLD task would invent a
+# "queued" HLD run that never starts (and /health counts it as a queued run,
+# which the release step waits on).  A re-plan sets this sink for the duration
+# of the pipeline command.
+_append_sink = threading.local()
+
+
+def _lld_log_scope(project_id: str, lld_version: str):
+    """Context manager: route ``_append`` lines to an LLD run's log."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def _scope():
+        previous = getattr(_append_sink, "lld", None)
+        _append_sink.lld = (project_id, lld_version)
+        try:
+            yield
+        finally:
+            _append_sink.lld = previous
+
+    return _scope()
+
+
 def _append(project_id: str, level: str, text: str) -> None:
+    sink = getattr(_append_sink, "lld", None)
+    if sink is not None:
+        _lld_append(sink[0], sink[1], level, text)
+        return
     task = _task(project_id)
     # Collapse the per-feature ADDR_ID / ogr field-width warnings: they fire
     # once per feature (2-3k times) and push the real error out of the 500-
@@ -1093,7 +1121,9 @@ def _run_command(project_id: str, cmd: Union[List[str], str],
             peaks["qgis_mb"] = max(peaks["qgis_mb"], qgis_mb)
             meminfo.trace(
                 f"run {project_id[:8]}", engine_mb=engine_mb, qgis_mb=qgis_mb,
-                stage=_task(project_id).get("stage"),
+                # ``tasks.get`` not ``_task``: sampling memory must never create
+                # a run entry for a project that has none (Mode B on the worker).
+                stage=(tasks.get(project_id) or {}).get("stage"),
             )
 
     sampler = threading.Thread(
@@ -6368,10 +6398,11 @@ def _run_lld_replan(
         # inputs/, and the brownfield files this version wrote.  The design
         # output stays where the pipeline writes it (replan/<version>/design),
         # and the worker's results are unpacked back into the project tree.
-        _run_command(
-            project_id, cmd, design_dir,
-            transfer=(OUTPUT_DIR / project_id, ("inputs", f"replan/{lld_version}")),
-        )
+        with _lld_log_scope(project_id, lld_version):
+            _run_command(
+                project_id, cmd, design_dir,
+                transfer=(OUTPUT_DIR / project_id, ("inputs", f"replan/{lld_version}")),
+            )
 
         # ── 4. Map fresh outputs to LLD layers + build the by_layer set ──
         task.update({"stage": "Ingesting fresh design", "progress": 80, "updated_at": _now()})

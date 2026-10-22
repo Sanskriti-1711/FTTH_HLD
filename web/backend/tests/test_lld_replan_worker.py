@@ -133,6 +133,33 @@ def test_a_verify_run_still_ships_only_its_output_directory(outputs, monkeypatch
     assert set(uploads[0].namelist()) == expected
 
 
+def test_the_pipeline_log_goes_to_the_lld_run_not_a_phantom_hld_run(monkeypatch):
+    """A re-plan's qgis output belongs to the LLD run, not the project's HLD task.
+
+    Appending to the HLD task invented a "queued" run that never starts, and
+    /health counts that as a queued run — which is the signal the release step
+    waits on before replacing the container.  The qgis lines also used to be
+    invisible in the LLD log, which is why a parameter error showed up only as
+    "qgis_process exited with code 1".
+    """
+    monkeypatch.setattr(engine, "lld_tasks", {})
+    monkeypatch.setattr(engine, "tasks", {})
+
+    with engine._lld_log_scope(PROJECT, VERSION):
+        engine._append(PROJECT, "info", "Running on the QGIS worker at http://worker.")
+        engine._append(PROJECT, "error", "Incorrect parameter value for ROADS")
+
+    task = engine.lld_tasks[engine._lld_key(PROJECT, VERSION)]
+    texts = " | ".join(m["text"] for m in task["messages"])
+    assert "QGIS worker" in texts
+    assert "ROADS" in texts
+    assert PROJECT not in engine.tasks, "a phantom HLD run was created"
+
+    # Outside the scope the HLD task is still the destination, as before.
+    engine._append(PROJECT, "info", "$ qgis_process run …")
+    assert PROJECT in engine.tasks
+
+
 def test_the_lld_replan_passes_the_project_tree_as_the_transfer_root(outputs, monkeypatch):
     """Mode B hands the engine the tree its command's paths belong to."""
     captured = {}
