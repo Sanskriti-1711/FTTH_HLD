@@ -7,6 +7,7 @@ so Verify mode has the same physical representation without importing QGIS.
 
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -158,8 +159,12 @@ def regroup_distribution_cables(
             0, base_props["FIBER_COUNT"] - RESERVED_SPARE_FIBERS - hh_count
         )
         base_props["CONNECTION_TYPE"] = "Shared trunk + branches"
-        base_props["length_m"] = sum(
-            _line_length(line) for line in coordinates
+        # The merged cable is longer than either member, so its length is
+        # recomputed — in METRES. The dataset is WGS84, where the raw planar
+        # sum is in degrees (a 17 m garden leg came out as 0.0005), which would
+        # overwrite the HLD's metre value with a number no BOQ can use.
+        base_props["length_m"] = round(
+            sum(_line_length_m(line) for line in coordinates), 2
         )
         output.append(base)
 
@@ -169,3 +174,26 @@ def regroup_distribution_cables(
 
 def _line_length(line: List[List[float]]) -> float:
     return sum(_point_distance(a, b) for a, b in zip(line, line[1:]))
+
+
+def _line_length_m(line: List[List[float]]) -> float:
+    """Length of one coordinate run in METRES.
+
+    WGS84 degree coordinates (the LLD dataset's CRS) are scaled per segment by
+    latitude; a projected CRS is summed as planar metres. Regrouping merges
+    real cables and writes ``length_m`` back, so this must never emit degrees.
+    """
+    if len(line) < 2:
+        return 0.0
+    geographic = all(
+        -180.0 <= p[0] <= 180.0 and -90.0 <= p[1] <= 90.0 for p in line
+    )
+    if not geographic:
+        return _line_length(line)
+    total = 0.0
+    for a, b in zip(line, line[1:]):
+        mid = math.radians((a[1] + b[1]) / 2.0)
+        dx = (b[0] - a[0]) * 111_320.0 * math.cos(mid)
+        dy = (b[1] - a[1]) * 110_540.0
+        total += math.hypot(dx, dy)
+    return total

@@ -5439,6 +5439,38 @@ def _enrich_lld_distribution_cables(by_layer: Dict[str, List[Dict[str, Any]]]) -
     return updated
 
 
+def _metres_between(a: Any, b: Any) -> float:
+    """Approximate ground distance between two WGS84 points, in metres.
+
+    Latitude scales both axes: a degree of longitude at 52.5 N is ~68 km, not
+    the ~111 km the raw degree delta would suggest, so issue messages quote a
+    distance the planner can act on.
+    """
+    mid = math.radians((a[1] + b[1]) / 2.0)
+    dx = (b[0] - a[0]) * 111_320.0 * math.cos(mid)
+    dy = (b[1] - a[1]) * 110_540.0
+    return math.hypot(dx, dy)
+
+
+def _addr_id_map(props: Dict[str, Any]) -> Dict[str, str]:
+    """The premise ids a feature is attributed to (ADDR_ID / ADDR_IDS).
+
+    Maps a lower-case token to the id as written in the data, so a drop duct
+    stamped from the field app (``osm-w123-c``) matches the object layer's
+    ``OSM-W123-C`` while messages still quote the real id.
+    """
+    ids: Dict[str, str] = {}
+    for key in ("ADDR_ID", "addr_id", "ADDR_IDS", "addr_ids", "OBJ_ID", "obj_id"):
+        value = props.get(key)
+        if value in (None, ""):
+            continue
+        for part in str(value).split(","):
+            part = part.strip()
+            if part:
+                ids.setdefault(part.lower(), part)
+    return ids
+
+
 def _validate_network(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
     """Path-continuity + attribute-consistency validation.
 
@@ -5493,27 +5525,74 @@ def _validate_network(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, An
                 })
                 attr_issues += 1
 
-    # Drop connectivity: every premise must have a drop duct ending at it.
-    drop_ends = []
-    for f in by_layer.get("drop_ducts") or []:
-        for ln in _line_strings(f.get("geometry")):
-            if len(ln) >= 2:
-                drop_ends.append(ln[0])
-                drop_ends.append(ln[-1])
+    # Drop service: every premise must be reached by a drop duct (or the
+    # serving distribution cable) that ends at it. Distance alone is NOT
+    # service: a drop may pass within tolerance of the wrong building, and the
+    # served-premises register reads ADDR_ID, not geometry — so the reaching
+    # feature must also be ATTRIBUTED to the premise. A correctly-attributed
+    # premise and a neighbour's drop sitting on top of it are different
+    # defects and are reported separately.
+    serving: List[Tuple[Dict[str, str], Any, str, Any]] = []  # (addr ids, end point, layer, feature_id)
+    for layer in ("drop_ducts", "distribution_cable"):
+        for f in by_layer.get(layer) or []:
+            props = f.get("properties") or {}
+            ids = _addr_id_map(props)
+            fid = props.get("feature_id")
+            for ln in _line_strings(f.get("geometry")):
+                if len(ln) >= 2:
+                    serving.append((ids, ln[0], layer, fid))
+                    serving.append((ids, ln[-1], layer, fid))
+
     drop_issues = 0
+    attribution_issues = 0
     for f in by_layer.get("objects") or []:
+        props = f.get("properties") or {}
+        fids = props.get("feature_id")
+        premise_ids = _addr_id_map(props)
         for o in _points(f.get("geometry")):
-            if not any(
-                ((o[0] - e[0]) ** 2 + (o[1] - e[1]) ** 2) ** 0.5 <= DROP_CONNECT_TOL
-                for e in drop_ends
-            ):
+            reaching: List[Tuple[Dict[str, str], str, Any, float]] = []
+            for ids, pt, layer, fid in serving:
+                d = ((o[0] - pt[0]) ** 2 + (o[1] - pt[1]) ** 2) ** 0.5
+                if d <= DROP_CONNECT_TOL:
+                    reaching.append((ids, layer, fid, _metres_between(o, pt)))
+            if not reaching:
                 drop_issues += 1
                 issues.append({
                     "type": "drop",
                     "layer": "objects",
-                    "feature_id": (f.get("properties") or {}).get("feature_id"),
+                    "feature_id": fids,
                     "message": "Premise has no serving drop duct",
                 })
+                continue
+            if not premise_ids:
+                # No premise id to attribute against — the distance check is
+                # the only evidence available, so this cannot be judged.
+                continue
+            if any(premise_ids.keys() & ids.keys() for ids, _l, _f, _d in reaching):
+                continue
+            attribution_issues += 1
+            others = sorted(
+                {
+                    display
+                    for ids, _l, _f, _d in reaching
+                    for token, display in ids.items()
+                    if token not in premise_ids
+                }
+            )
+            nearest_m = min(m for _i, _l, _f, m in reaching)
+            issues.append({
+                "type": "drop_attribution",
+                "layer": "objects",
+                "feature_id": fids,
+                "message": (
+                    "Premise %s is reached only by a drop attributed to %s (%.1f m)"
+                    % (
+                        ", ".join(sorted(premise_ids.values())),
+                        ", ".join(others) or "no premise id",
+                        nearest_m,
+                    )
+                ),
+            })
 
     return {
         "issues": issues,
@@ -5523,6 +5602,7 @@ def _validate_network(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, An
             "continuity_issues": sum(1 for i in issues if i["type"] == "continuity"),
             "attribute_issues": attr_issues,
             "drop_issues": drop_issues,
+            "drop_attribution_issues": attribution_issues,
         },
     }
 
@@ -5669,13 +5749,15 @@ def _run_lld(
         validation = _validate_network(by_layer)
         _lld_append(
             project_id, lld_version, "info",
-            "Validation: %d layers, %d features, %d continuity issue(s), %d attribute issue(s), %d drop issue(s)."
+            "Validation: %d layers, %d features, %d continuity issue(s), %d attribute issue(s), "
+            "%d drop issue(s), %d drop-attribution issue(s)."
             % (
                 validation["summary"]["layers"],
                 validation["summary"]["total_features"],
                 validation["summary"]["continuity_issues"],
                 validation["summary"]["attribute_issues"],
                 validation["summary"].get("drop_issues", 0),
+                validation["summary"].get("drop_attribution_issues", 0),
             ),
         )
 
@@ -6356,13 +6438,15 @@ def _run_lld_replan(
         validation = _validate_network(by_layer)
         _lld_append(
             project_id, lld_version, "info",
-            "Validation: %d layers, %d features, %d continuity issue(s), %d attribute issue(s), %d drop issue(s)."
+            "Validation: %d layers, %d features, %d continuity issue(s), %d attribute issue(s), "
+            "%d drop issue(s), %d drop-attribution issue(s)."
             % (
                 validation["summary"]["layers"],
                 validation["summary"]["total_features"],
                 validation["summary"]["continuity_issues"],
                 validation["summary"]["attribute_issues"],
                 validation["summary"].get("drop_issues", 0),
+                validation["summary"].get("drop_attribution_issues", 0),
             ),
         )
 
