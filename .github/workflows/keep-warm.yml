@@ -1,39 +1,43 @@
-name: Keep the engine and the fibre backend awake
+name: Keep the engine, the backend and the QGIS worker awake
 
-# Render's free plan stops a web service after 15 minutes without traffic, and a
-# cold start measured 42s. That was long enough to empty the country dropdown
-# (the gateway gave it 15s back then) and to make every first visit of the day
-# feel broken. This pings /health often enough that the services never idle.
+# Render's free plan stops a web service after 15 minutes without traffic. A
+# cold start measured 42s for the backend; the QGIS worker's measured **415 s**
+# on the 2026-10-22 L1 8JQ run (`QGIS worker ready (415s)`), which is the whole
+# reason it is warmed here too: the engine waits that out instead of failing,
+# but the run still sits on stage 0 doing nothing for seven minutes.
 #
 # ── The hour budget is the constraint, and it is shared ────────────────────────
 # Render grants **750 free instance hours per workspace per calendar month**,
 # shared across every free web service, and a service only spends them while it
-# is RUNNING (a spun-down service is free). Three services awake 24/7 would be
-# ~2,160 h/mo: the workspace would exhaust its budget about ten days into the
-# month and Render SUSPENDS free web services until the next calendar month —
-# every service down at once, which is far worse than a cold start.
+# is RUNNING (a spun-down service is free). The workspace has three free web
+# services: the engine, the backend, and the worker. All three awake 24/7 would
+# be ~2,230 h/mo: the budget would be gone about ten days in and Render
+# SUSPENDS free web services until the next calendar month — every service down
+# at once, which is far worse than a cold start.
 #
-# Hence a window: WARM_FROM_UTC=07 to WARM_TO_UTC=18 is 11 h/day, so
-# engine + backend cost 2 x 11 x 30 = **660 h/mo**, leaving ~90 h of headroom for
-# your own traffic outside the window. Outside it, services are allowed to sleep
-# and the first visit pays the ~45 s boot.
+# Hence a window, and it has to be **7 h/day** now that the worker is in it:
+# 3 services x (7 h + 0.25 h of the 15-minute idle tail after the last ping)
+# x 31 days = **674 h/mo**, leaving ~75 h for traffic outside the window.
+# The engine and the backend used to get 11 h/day (07-18 UTC) at 660 h/mo
+# between them; the worker's wake is minutes, theirs is seconds, so the three
+# hours went to the service whose cold start actually hurts. 09-16 UTC is
+# 10:00-17:00 in the UK, inside the old window.
 #
-# ── The QGIS worker is deliberately NOT warmed ────────────────────────────────
-# It is only needed while a run is in flight, a run is not idle so it does not
-# sleep mid-run, and the engine starts warming it the moment a run is accepted
-# (so the boot overlaps the resolve and the OSM download) and then waits up to
-# 600 s for it before queueing a job (FTTH_QGIS_WORKER_WAKE). Warming it 24/7
-# would cost 730 h on its own — the whole budget for a service that needs none
-# of it.
+# The budget is not eyeballed: the first step recomputes the monthly hours from
+# WARM_FROM_UTC / WARM_TO_UTC / SERVICE_COUNT and refuses to warm anything if
+# the result would not fit — the failure mode it prevents (every service
+# suspended) cannot be fixed from inside the workflow that caused it.
 #
 # ── Two limits, both deliberate ───────────────────────────────────────────────
 #   * GitHub does not promise schedule timing -- under load a run can be late by
 #     several minutes. 10 minutes against a 15-minute idle window leaves room
 #     for that, but a long delay plus an outage can still let a service sleep.
 #     The UI is built to survive that (the country list retries once and then
-#     says so; the engine's worker wait covers the QGIS side).
+#     says so; the engine's worker wait covers the QGIS side), and the worker's
+#     own probe below treats "still booting" as expected rather than an error.
 #   * GitHub disables scheduled workflows in a repository with no activity for
-#     60 days, so this needs a push (or a manual run) now and then.
+#     60 days, so this needs a push (or a manual run) now and then. A manual
+#     dispatch warms all three at any hour — that is the "wake it now" button.
 #
 # The repository is public, so the runs do not draw on the private-repo minute
 # quota.
@@ -48,8 +52,11 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  WARM_FROM_UTC: '7'
-  WARM_TO_UTC: '18'
+  WARM_FROM_UTC: '9'
+  WARM_TO_UTC: '16'
+  MONTHLY_INSTANCE_HOURS: '750'
+  SERVICE_COUNT: '3'
+  WORKER_URL: https://ftth-qgis-worker.onrender.com
 
 jobs:
   ping:
@@ -57,12 +64,32 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      - name: Would this window fit the instance-hour budget?
+        id: budget
+        run: |
+          hours=$(( WARM_TO_UTC - WARM_FROM_UTC ))
+          if [ "$hours" -le 0 ]; then
+            echo "::error::WARM_FROM_UTC ($WARM_FROM_UTC) is not before WARM_TO_UTC ($WARM_TO_UTC)"
+            exit 1
+          fi
+          # 31 days is the longest month, and +0.25 h per service is the 15 idle
+          # minutes each one keeps running after the last ping of the day.
+          monthly=$(awk -v h="$hours" -v n="$SERVICE_COUNT" \
+            'BEGIN { printf "%.1f", n * (h + 0.25) * 31 }')
+          echo "window: ${hours} h/day x ${SERVICE_COUNT} services -> ${monthly} instance-hours in a 31-day month (budget ${MONTHLY_INSTANCE_HOURS})"
+          if awk -v m="$monthly" -v b="$MONTHLY_INSTANCE_HOURS" 'BEGIN { exit !(m <= b) }'; then
+            echo "budget=ok" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::${monthly} instance-hours/mo at this window would exhaust the ${MONTHLY_INSTANCE_HOURS}-hour budget and Render would suspend every free service. Narrow WARM_FROM_UTC/WARM_TO_UTC."
+            exit 1
+          fi
+
       - name: Is it inside the warm window?
         id: window
         run: |
           hour=$(date -u +%H)
-          # A manual dispatch always warms, so the workflow can be tested at any
-          # hour without waiting for the window (and without editing the file).
+          # A manual dispatch always warms, so the workflow can be tested (and a
+          # sleeping service woken) at any hour without waiting for the window.
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] ||
              { [ "$hour" -ge "$WARM_FROM_UTC" ] && [ "$hour" -lt "$WARM_TO_UTC" ]; }; then
             echo "warm=true" >> "$GITHUB_OUTPUT"
@@ -73,23 +100,53 @@ jobs:
           fi
 
       # 120s covers a 42s cold start plus Render's boot queue, and is still short
-      # enough that a run cannot overlap the next schedule tick.
-      - name: Wake the engine and the fibre backend
+      # enough that a run cannot overlap the next schedule tick. The worker gets
+      # 20s instead: its boot is minutes, so holding the request would only make
+      # the job late. The request itself is what wakes it; the next tick finds it
+      # up, and the engine waits for it either way.
+      - name: Wake the engine, the backend and the worker
         if: steps.window.outputs.warm == 'true'
         run: |
           set -o pipefail
           failed=0
+
+          # probe <name> <url> <timeout> <strict>
+          #   strict=yes -> a non-200 is a failure (the service boots in seconds)
+          #   strict=no  -> only a 4xx config error is a failure; "still booting"
+          #                 and 429 are warnings, because both are expected once
           probe() {
-            name=$1; url=$2
-            code=$(curl -sS -o "/tmp/$name.json" -w '%{http_code}' -m 120 "$url" || echo 000)
+            name=$1; url=$2; limit=$3; strict=$4
+            # `|| true`, not `|| echo 000`: curl already writes 000 when the
+            # connection never opened, and appending another made "000000".
+            rm -f "/tmp/$name.json"
+            code=$(curl -sS -o "/tmp/$name.json" -w '%{http_code}' -m "$limit" "$url" || true)
+            code=${code:-000}
             echo "$name http_status=$code"
-            head -c 300 "/tmp/$name.json" || true
+            head -c 300 "/tmp/$name.json" 2>/dev/null || true
             echo
-            if [ "$code" != "200" ]; then
+            case "$code" in
+              200) return 0 ;;
+              429)
+                # The edge is rate-limiting this runner, not refusing the
+                # service: the 2026-10-22 incident was exactly this signal read
+                # as "asleep". Do not fail the workflow for it.
+                echo "::warning::$name /health answered 429 (rate limited); the next tick will retry"
+                return 0
+                ;;
+              401|403|404)
+                echo "::error::$name /health answered $code: the URL is the wrong service or the route moved — waiting will not fix that"
+                return 1
+                ;;
+            esac
+            if [ "$strict" = "yes" ]; then
               echo "::warning::$name /health answered $code (a cold boot is expected occasionally; a run of failures is not)"
-              failed=1
+              return 1
             fi
+            echo "$name did not answer within ${limit}s ($code): it is booting — the next tick will find it awake"
+            return 0
           }
-          probe engine  https://ftth-planning.onrender.com/health
-          probe backend https://fibre-backend-wml3.onrender.com/healthz
+
+          probe engine  https://ftth-planning.onrender.com/health  120 yes || failed=1
+          probe backend https://fibre-backend-wml3.onrender.com/healthz 120 yes || failed=1
+          probe worker  "$WORKER_URL/health" 20 no || failed=1
           exit "$failed"
