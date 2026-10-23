@@ -282,6 +282,38 @@ def test_mode_a_reports_a_created_trench_with_nothing_in_it(mode_a_env):
     assert "full re-plan" in texts
 
 
+def test_a_created_trench_is_forced_into_the_replan_router(tmp_path):
+    """The re-plan is the mode that lays ducts and cables in a new trench.
+
+    The approved trench is written as BF_TRENCHES with ``USE_MODE=survey``, so
+    the router is weight-0 bound to the engineer's path and the design is
+    routed over the new civil work (verify has nothing to relay onto it).
+    """
+    dataset = _asv()
+    dataset["features"].append(
+        _feature(
+            "final_trenches",
+            _line([[13.4005, 52.5000], [13.4005, 52.5002], [13.4005, 52.50035]]),
+            {
+                "feature_id": "TR-NEW",
+                "approved": True,
+                "change_id": "chg-new-trench",
+                "trench_type": "New Trench",
+            },
+        )
+    )
+
+    args = engine._write_replan_brownfield(tmp_path, dataset)
+
+    assert "USE_BROWNFIELD=true" in args
+    trench_arg = next(a for a in args if a.startswith("BF_TRENCHES="))
+    doc = json.loads(pathlib.Path(trench_arg.split("=", 1)[1]).read_text(encoding="utf-8"))
+    created = next(
+        f for f in doc["features"] if f["properties"]["feature_id"] == "TR-NEW"
+    )
+    assert created["properties"]["USE_MODE"] == "survey"
+
+
 def test_mode_a_purges_old_reroute_region(mode_a_env):
     """The old straight path must not survive the purge pass."""
     task = _run(mode_a_env)
