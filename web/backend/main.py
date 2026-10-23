@@ -5830,8 +5830,8 @@ def _validate_network(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, An
                 "layer": layer,
                 "feature_id": props.get("feature_id"),
                 "message": (
-                    "Approved trench carries no duct or cable — verify mode does not "
-                    "design over new civil work"
+                    "Approved trench carries no duct or cable — no duct or cable was "
+                    "routed along it"
                 ),
             })
 
@@ -5987,6 +5987,18 @@ def _run_lld(
                 "(baseline tier kept in TRENCH_TIER)." % normalized,
             )
 
+        # An approved trench nothing rides publishes civil work with no duct in
+        # it (a reroute whose relay found no dependent duct included). The
+        # trench is field truth; create the duct along it before validating.
+        filled = _ensure_approved_trench_support(by_layer)
+        if any(filled.values()):
+            _lld_append(
+                project_id, lld_version, "info",
+                "Trench support: created %d feeder duct(s) and %d distribution duct(s) "
+                "along approved trenches that carried no duct or cable."
+                % (filled.get("feeder_ducts", 0), filled.get("distribution_ducts", 0)),
+            )
+
         task.update({"stage": "Validating network", "progress": 30, "updated_at": _now()})
         validation = _validate_network(by_layer)
         _lld_append(
@@ -6006,9 +6018,10 @@ def _run_lld(
             _lld_append(
                 project_id, lld_version, "warn",
                 "Unused approved trench: %d approved trench feature(s) carry no duct or "
-                "cable. Verify mode never designs over new civil work — run a full "
-                "re-plan (it feeds the approved trench into the router) or draw the "
-                "duct/cable in the survey."
+                "cable. The trench is kept (it is survey field truth) and its duct is "
+                "created along it, so this should now be empty; check the run log's "
+                "\"Trench support\" line — if the count did not drop, the trench's "
+                "interior could not be read or no duct layer was published."
                 % validation["summary"]["unused_trench_issues"],
             )
 
@@ -6408,6 +6421,230 @@ def _drop_generated_corridor_duplicates(
     return removed
 
 
+# ---------------------------------------------------------------------------
+# Approved AREA changes: a surveyed building or zone is design truth too
+# ---------------------------------------------------------------------------
+# The brownfield contract is corridors only (BF_TRENCHES, BF_DUCTS, BF_FIBRE,
+# BF_FEEDER_TRENCH, BF_EXISTING_PDP/MFG, BF_CHAMBERS). An approved survey change
+# to a building (`objects`) or a zone (`polygons`) therefore had no input and no
+# output: a re-surveyed household count never reached the design, the zone the
+# engineer drew was ignored, and the results page counted only the corridor
+# changes (LLD-V02 on 2026-10-23: 3 of 6 approved changes, because the two
+# buildings and the zone were dropped). The same rule the corridors use is
+# applied here instead — field truth wins, the design keeps its own identifiers,
+# and the change is stamped with `change_id` so every approved change is visible
+# and traceable.
+SURVEY_AREA_LAYERS: Tuple[str, ...] = ("objects", "polygons")
+
+# A surveyed building within this distance of a design premise IS that premise
+# (~11 m at UK latitudes): a surveyed building point and its OSM address point
+# routinely differ by several metres, while neighbouring terraced houses stand
+# ~5-8 m apart. Beyond it the surveyed building is a NEW premise and is added.
+LLD_SURVEY_PREMISE_SNAP_DEG = 0.0001
+
+# Fallback for a zone whose identifiers the fresh design did not keep: the
+# zone is matched by the fresh polygon that contains it, then by centroid.
+LLD_SURVEY_ZONE_SNAP_DEG = 0.002
+
+
+def _match_area_target(
+    features: List[Dict[str, Any]],
+    layer: str,
+    props: Dict[str, Any],
+    geometry: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """The fresh-design feature an approved area change replaces, if any.
+
+    Matched by identity first (the change's own ids and the design's
+    feature_id / ADDR_ID / POLYGON_ID / SRC_ID), then by geometry: a building
+    by proximity, a zone by containment. A miss means the engineer surveyed
+    something the design does not have, and the change is added.
+    """
+    refs = {
+        str(v)
+        for v in (
+            props.get("original_hld_feature_id"),
+            props.get("id"),
+            props.get("_id"),
+            props.get("change_id"),
+        )
+        if v
+    }
+    if refs:
+        for f in features:
+            fp = f.get("properties") or {}
+            own = {str(fp.get(k)) for k in (
+                "feature_id", "id", "_id", "SRC_ID", "POLYGON_ID", "ADDR_ID", "change_id",
+            ) if fp.get(k)}
+            if refs & own:
+                return f
+
+    if layer == "objects":
+        pts = _points(geometry)
+        if not pts:
+            return None
+        target = pts[0]
+        best: Optional[Dict[str, Any]] = None
+        best_d = LLD_SURVEY_PREMISE_SNAP_DEG
+        for f in features:
+            for pt in _points(f.get("geometry")):
+                d = ((pt[0] - target[0]) ** 2 + (pt[1] - target[1]) ** 2) ** 0.5
+                if d <= best_d:
+                    best, best_d = f, d
+        return best
+
+    centre = _polygon_centroid(geometry)
+    if centre is None:
+        return None
+    containing = [f for f in features if _point_in_polygon(centre, f.get("geometry"))]
+    if containing:
+        # The zone whose own centre is nearest is the most specific one when the
+        # design's zones nest (a PDP catchment inside the company area).
+        def _centre_gap(f: Dict[str, Any]) -> float:
+            c = _polygon_centroid(f.get("geometry"))
+            if c is None:
+                return float("inf")
+            return ((c[0] - centre[0]) ** 2 + (c[1] - centre[1]) ** 2) ** 0.5
+
+        return min(containing, key=_centre_gap)
+    best, best_d = None, LLD_SURVEY_ZONE_SNAP_DEG
+    for f in features:
+        c = _polygon_centroid(f.get("geometry"))
+        if c is None:
+            continue
+        d = ((c[0] - centre[0]) ** 2 + (c[1] - centre[1]) ** 2) ** 0.5
+        if d <= best_d:
+            best, best_d = f, d
+    return best
+
+
+def _apply_approved_area_changes(
+    by_layer: Dict[str, List[Dict[str, Any]]],
+    dataset: Dict[str, Any],
+) -> Dict[str, int]:
+    """Apply approved building and zone changes to the fresh design.
+
+    Returns how many changes were applied per layer. Idempotent: a change that
+    already matches a feature (same ids) is merged again rather than duplicated,
+    and the feature keeps the design's ``feature_id``/``layer`` so every
+    downstream reference (permits, validation, BOQ) still resolves.
+    """
+    applied: Dict[str, int] = {layer: 0 for layer in SURVEY_AREA_LAYERS}
+    for feat in dataset.get("features") or []:
+        props = dict(feat.get("properties") or {})
+        layer = props.get("layer")
+        if not props.get("approved") or layer not in SURVEY_AREA_LAYERS:
+            continue
+        geometry = feat.get("geometry") or {}
+        if layer == "objects" and geometry.get("type") != "Point":
+            continue
+        if layer == "polygons" and geometry.get("type") not in ("Polygon", "MultiPolygon"):
+            continue
+
+        # The survey records a building's demand as ``household_count``; the
+        # design (and the BOQ's HP line) counts ``households``. Without this the
+        # surveyed 3/5-household building would be applied with its old count.
+        if props.get("household_count") not in (None, "") and not props.get("households"):
+            props["households"] = props["household_count"]
+
+        features = by_layer.setdefault(layer, [])
+        target = _match_area_target(features, layer, props, geometry)
+        if target is None:
+            new_props = dict(props)
+            new_props["layer"] = layer
+            new_props["feature_id"] = "LLD-%s-%s" % (layer, uuid.uuid4().hex[:10])
+            if layer == "objects" and not (new_props.get("ADDR_ID") or new_props.get("addr_id")):
+                # A surveyed building carries no address register id; the drop
+                # planner labels its serving feature by ADDR_ID, so give it one
+                # that names the survey change instead of an empty string.
+                ref = "SURVEY-%s" % str(new_props.get("change_id") or uuid.uuid4().hex)[:12]
+                new_props["ADDR_ID"] = ref
+                new_props["SRC_ID"] = new_props.get("SRC_ID") or ref
+            new_props["survey_authoritative"] = True
+            new_props["lld_created"] = True
+            new_props["lld_reason"] = "approved survey %s" % (
+                "building" if layer == "objects" else "zone"
+            )
+            features.append({"type": "Feature", "geometry": geometry, "properties": new_props})
+            applied[layer] += 1
+            continue
+
+        tprops = target.setdefault("properties", {})
+        # The design's own identifiers survive unless the survey supplies one:
+        # the premises register (ADDR_ID), the polygon numbering (POLYGON_ID /
+        # SRC_ID) and the feature id downstream rows point at.
+        design_ids = {
+            k: tprops.get(k)
+            for k in ("feature_id", "layer", "ADDR_ID", "addr_id", "SRC_ID", "POLYGON_ID", "OSM_ID")
+            if tprops.get(k) not in (None, "")
+        }
+        tprops.update(props)
+        for key, value in design_ids.items():
+            if key in ("feature_id", "layer") or not tprops.get(key):
+                tprops[key] = value
+        tprops["layer"] = layer
+        tprops["survey_authoritative"] = True
+        target["geometry"] = geometry
+        applied[layer] += 1
+    return applied
+
+
+# ---------------------------------------------------------------------------
+# An approved trench with nothing in it is not a design
+# ---------------------------------------------------------------------------
+# The completion passes create support downward (cable -> duct -> trench), never
+# a duct for a trench that has no cable. An approved trench — created or
+# rerouted — that nothing rode therefore stayed published as civil work with no
+# duct in it: on LLD-V02 the rerouted trench 478175b6 came out empty (1
+# unused_trench issue) while the BOQ billed its metres. The trench is field
+# truth and stays; the duct it exists for is created along it.
+
+
+def _ensure_approved_trench_support(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, int]:
+    """Create a duct along every approved trench that carries none.
+
+    Only approved/authoritative trenches are considered, and only their middle
+    (a junction touch is not a duct laid in the trench), which is the same test
+    validation uses. Returns created counts per duct layer.
+    """
+    created: Dict[str, int] = {"feeder_ducts": 0, "distribution_ducts": 0}
+    support: List[Any] = []
+    for layer in (*DUCT_LAYERS, *CABLE_LAYERS):
+        for f in by_layer.get(layer, []):
+            support.extend(ln for ln in _line_strings(f.get("geometry")) if len(ln) >= 2)
+    # An empty index is a design with no ducts or cables at all: every approved
+    # trench is then empty by definition, which is exactly when it needs one.
+    support_index, support_cell = _build_segment_index(support, LLD_RELAY_TOL)
+
+    for f in by_layer.get("final_trenches") or []:
+        props = f.get("properties") or {}
+        if not (props.get("approved") or props.get("survey_authoritative")):
+            continue
+        if not _created_trench_is_empty(f.get("geometry"), support_index, support_cell):
+            continue
+        tier = str(props.get("TRENCH_TIER") or props.get("trench_type") or "").lower()
+        layer = "feeder_ducts" if "feeder" in tier else "distribution_ducts"
+        duct_props: Dict[str, Any] = {
+            "layer": layer,
+            "feature_id": "LLD-%s-%s" % (layer, uuid.uuid4().hex[:10]),
+            "DUCT_TYPE": "1-Way HDPE",
+            "WAYS": 1,
+            "capacity_total": 1,
+            "capacity_used": 0,
+            "capacity_spare": 1,
+            "lld_created": True,
+            "lld_reason": "approved trench carried no duct or cable; its duct was created along it",
+            "survey_authoritative": bool(props.get("survey_authoritative")),
+        }
+        if props.get("change_id"):
+            duct_props["change_id"] = props["change_id"]
+        by_layer.setdefault(layer, []).append(
+            {"type": "Feature", "geometry": f.get("geometry"), "properties": duct_props}
+        )
+        created[layer] += 1
+    return created
+
+
 def _complete_fresh_design(
     project_id: str,
     lld_version: str,
@@ -6666,6 +6903,20 @@ def _run_lld_replan(
             % (authoritative, dropped_summary, relay_summary, purge_summary),
         )
 
+        # ── 5b. Approved AREA changes: surveyed buildings and zones ─────────
+        # The brownfield contract is corridors only, so a building or zone the
+        # engineer edited had no path into a re-plan and vanished from the
+        # design (and from the results page's per-change list). Field truth
+        # replaces the premise/zone it stands for, or becomes one.
+        area_applied = _apply_approved_area_changes(by_layer, dataset)
+        if any(area_applied.values()):
+            _lld_append(
+                project_id, lld_version, "info",
+                "Survey building/zone changes: %d building(s) and %d zone(s) applied "
+                "to the fresh design (survey geometry and attributes are authoritative)."
+                % (area_applied.get("objects", 0), area_applied.get("polygons", 0)),
+            )
+
         # ── 6. Apply the same final cable/duct contract as Verify mode ────
         # Full re-plan has fresh HLD output, but it must still pass through
         # the shared grouped-cable normalization before LLD files are written.
@@ -6684,6 +6935,17 @@ def _run_lld_replan(
         #       served by a drop duct/cable/coupler). ────────────────────
         task.update({"stage": "Completing the fresh design", "progress": 88, "updated_at": _now()})
         _complete_fresh_design(project_id, lld_version, by_layer)
+
+        # An approved trench nobody rode would otherwise be published as civil
+        # work with no duct in it. The trench is field truth; create its duct.
+        filled = _ensure_approved_trench_support(by_layer)
+        if any(filled.values()):
+            _lld_append(
+                project_id, lld_version, "info",
+                "Trench support: created %d feeder duct(s) and %d distribution duct(s) "
+                "along approved trenches that carried no duct or cable."
+                % (filled.get("feeder_ducts", 0), filled.get("distribution_ducts", 0)),
+            )
 
         # ── 7. Validate + write layers + zip (same contract as _run_lld) ──
         normalized = _normalize_trench_construction_class(by_layer)
