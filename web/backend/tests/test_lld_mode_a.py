@@ -244,6 +244,44 @@ def test_mode_a_relay_moves_dependents_onto_reroute(mode_a_env):
     )
 
 
+def test_mode_a_reports_a_created_trench_with_nothing_in_it(mode_a_env):
+    """A trench the survey ADDED is published empty — and now says so.
+
+    Verify relays existing ducts/cables onto a reroute and creates support
+    cable -> duct -> trench, never trench -> duct, so new civil work comes out
+    with no capacity in it (while the BOQ bills its metres). The run reports it
+    instead of finishing as "0 issues"; the mode that fills it is the re-plan,
+    which feeds approved trenches to the router as BF_TRENCHES.
+    """
+    dataset = _asv()
+    dataset["features"].append(
+        _feature(
+            "final_trenches",
+            _line([[13.4005, 52.5000], [13.4005, 52.5002], [13.4005, 52.50035]]),
+            {
+                "feature_id": "TR-NEW",
+                "approved": True,
+                "change_id": "chg-new-trench",
+                "trench_type": "New Trench",
+            },
+        )
+    )
+
+    task = _run(mode_a_env, dataset=dataset)
+
+    summary = task["validation"]["summary"]
+    assert summary["unused_trench_issues"] == 1, task["validation"]["issues"]
+    flagged = [
+        i for i in task["validation"]["issues"] if i["type"] == "unused_trench"
+    ]
+    assert [i["feature_id"] for i in flagged] == ["TR-NEW"]
+    # The rerouted trench keeps its relayed duct and must NOT be accused.
+    assert all(i["feature_id"] != "TR-1" for i in flagged)
+    texts = " | ".join(m.get("text", "") for m in task["messages"])
+    assert "Unused approved trench" in texts
+    assert "full re-plan" in texts
+
+
 def test_mode_a_purges_old_reroute_region(mode_a_env):
     """The old straight path must not survive the purge pass."""
     task = _run(mode_a_env)

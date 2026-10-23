@@ -5632,6 +5632,49 @@ def _addr_id_map(props: Dict[str, Any]) -> Dict[str, str]:
     return ids
 
 
+def _created_trench_is_empty(
+    geometry: Any,
+    support_index: Dict[Tuple[int, int], List[Any]],
+    support_cell: float,
+) -> bool:
+    """True when a survey-created trench carries no duct/cable along its middle.
+
+    The two tolerance-wide ends of the trench are ignored: that is where it
+    meets the network it branches from, and a duct touching the junction says
+    nothing about what was laid in the new civil work.
+    """
+    tol = LLD_RELAY_TOL
+    for ln in _line_strings(geometry):
+        if len(ln) < 2:
+            continue
+        points = list(_sample_polyline(ln, tol * 0.5))
+        a, b = ln[0], ln[-1]
+        interior = [
+            p
+            for p in points
+            if min(
+                ((p[0] - a[0]) ** 2 + (p[1] - a[1]) ** 2) ** 0.5,
+                ((p[0] - b[0]) ** 2 + (p[1] - b[1]) ** 2) ** 0.5,
+            )
+            > tol
+        ]
+        if len(interior) < 2:
+            return False  # too short to judge: do not accuse it
+        covered = 0
+        for p in interior:
+            kx, ky = int(p[0] / support_cell), int(p[1] / support_cell)
+            if any(
+                _seg_point_dist(p, seg_a, seg_b) <= tol
+                for dx in (-1, 0, 1)
+                for dy in (-1, 0, 1)
+                for seg_a, seg_b in support_index.get((kx + dx, ky + dy), [])
+            ):
+                covered += 1
+        if covered * 2 < len(interior):
+            return True
+    return False
+
+
 def _validate_network(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
     """Path-continuity + attribute-consistency validation.
 
@@ -5755,6 +5798,43 @@ def _validate_network(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, An
                 ),
             })
 
+    # Unused CREATED trench: civil work with nothing in it. Verify mode relays an
+    # EXISTING duct/cable onto a reroute and only ever creates support downward
+    # (cable -> duct -> trench), so a trench the survey ADDED comes out published
+    # and empty — while the BOQ bills its metres. Only created trenches are
+    # candidates (no ``original_geometry``; a reroute carries its before-geometry
+    # and its dependents are relayed onto it), and only their interior is judged:
+    # the first/last stretch shares a junction with the network it branches from,
+    # where a coincidental touch is not a duct laid in it. The finding is
+    # advisory — the design decision belongs to the planner (draw the duct/cable
+    # in the survey, or run a full re-plan, which feeds approved trenches into the
+    # router as BF_TRENCHES with USE_MODE=survey).
+    support_lines: List[Any] = []
+    for layer in (*DUCT_LAYERS, *CABLE_LAYERS):
+        for f in by_layer.get(layer, []):
+            for ln in _line_strings(f.get("geometry")):
+                if len(ln) >= 2:
+                    support_lines.append(ln)
+    support_index, support_cell = _build_segment_index(support_lines, LLD_RELAY_TOL)
+    unused_trenches = 0
+    for layer in TRENCH_LAYERS:
+        for f in by_layer.get(layer, []):
+            props = f.get("properties") or {}
+            if not props.get("approved") or props.get("original_geometry"):
+                continue
+            if not _created_trench_is_empty(f.get("geometry"), support_index, support_cell):
+                continue
+            unused_trenches += 1
+            issues.append({
+                "type": "unused_trench",
+                "layer": layer,
+                "feature_id": props.get("feature_id"),
+                "message": (
+                    "Approved trench carries no duct or cable — verify mode does not "
+                    "design over new civil work"
+                ),
+            })
+
     return {
         "issues": issues,
         "summary": {
@@ -5764,6 +5844,7 @@ def _validate_network(by_layer: Dict[str, List[Dict[str, Any]]]) -> Dict[str, An
             "attribute_issues": attr_issues,
             "drop_issues": drop_issues,
             "drop_attribution_issues": attribution_issues,
+            "unused_trench_issues": unused_trenches,
         },
     }
 
@@ -5921,6 +6002,15 @@ def _run_lld(
                 validation["summary"].get("drop_attribution_issues", 0),
             ),
         )
+        if validation["summary"].get("unused_trench_issues"):
+            _lld_append(
+                project_id, lld_version, "warn",
+                "Unused approved trench: %d approved trench feature(s) carry no duct or "
+                "cable. Verify mode never designs over new civil work — run a full "
+                "re-plan (it feeds the approved trench into the router) or draw the "
+                "duct/cable in the survey."
+                % validation["summary"]["unused_trench_issues"],
+            )
 
         # ── 2. Write one GeoJSON file per layer. ────────────────────────────
         task.update({"stage": "Writing layers", "progress": 60, "updated_at": _now()})
