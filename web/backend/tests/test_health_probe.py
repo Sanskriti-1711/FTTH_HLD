@@ -164,3 +164,66 @@ def test_both_routes_are_registered():
 
     assert "/health" in paths
     assert "/health/deep" in paths
+
+
+# ---------------------------------------------------------------------------
+# /health must not report work that does not exist
+# ---------------------------------------------------------------------------
+# `_task()` is a lookup that also creates, and its default status is "queued".
+# A Mode B re-plan line from a thread with no LLD sink used to call it, leaving a
+# placeholder that nothing finishes: /health then reported a completed run as
+# `queued` for the life of the container, and the release workflow's "wait for
+# the engine to be idle" step sat out its 20-minute timeout before deploying
+# (measured 2026-10-23 on the 1.7.22 deploy).
+
+
+def test_a_log_line_does_not_make_the_engine_look_busy(monkeypatch):
+    """The log may create an entry (it has to land somewhere); health must not
+    read that entry as work waiting for a slot."""
+    monkeypatch.setattr(main, "tasks", {})
+    monkeypatch.setattr(main, "_health_snapshot", _good_snapshot())
+    monkeypatch.setattr(main, "_health_snapshot_at", time.time())
+
+    main._append("ghost-project", "info", "a pipeline line with no run in scope")
+
+    body = main.health()
+
+    assert main.tasks["ghost-project"]["status"] == "queued"
+    assert "ghost-project" not in body["runs"]["active"]
+    assert body["runs"]["queued"] == 0
+
+
+def test_a_log_line_still_reaches_a_real_run(monkeypatch):
+    monkeypatch.setattr(main, "tasks", {})
+    task = main._task("real-project")
+    task.update({"status": "running", "stage": "Object Layer"})
+
+    main._append("real-project", "info", "Progress 3/10")
+
+    assert [m["text"] for m in task["messages"]] == ["Progress 3/10"]
+
+
+def test_a_placeholder_is_not_queued_work(monkeypatch):
+    monkeypatch.setattr(main, "tasks", {})
+    main._task("placeholder")  # exactly what `_task()` creates: queued, no stage
+    monkeypatch.setattr(main, "_health_snapshot", _good_snapshot())
+    monkeypatch.setattr(main, "_health_snapshot_at", time.time())
+
+    body = main.health()
+
+    assert "placeholder" not in body["runs"]["active"]
+    assert body["runs"]["queued"] == 0
+
+
+def test_a_submitted_run_is_queued_work(monkeypatch):
+    monkeypatch.setattr(main, "tasks", {})
+    task = main._task("submitted")
+    task.update({"status": "queued", "stage": "Queued", "output_dir": "/tmp/out"})
+    monkeypatch.setattr(main, "_health_snapshot", _good_snapshot())
+    monkeypatch.setattr(main, "_health_snapshot_at", time.time())
+
+    body = main.health()
+
+    assert body["runs"]["active"] == ["submitted"]
+    assert body["runs"]["queued"] == 1
+    assert body["runs"]["running"] == 0

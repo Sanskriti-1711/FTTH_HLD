@@ -431,6 +431,12 @@ def _append(project_id: str, level: str, text: str) -> None:
     if sink is not None:
         _lld_append(sink[0], sink[1], level, text)
         return
+    # `_task()` here is a lookup that also creates (the log has to land
+    # somewhere even if the run's entry appears later). A created entry starts
+    # "queued" with no stage, which is why /health counts queued work through
+    # `_task_is_queued_work` instead of the raw status: Mode B lines from a
+    # thread with no LLD sink left such placeholders behind, and the deploy's
+    # "wait for the engine to be idle" step read a finished run as busy.
     task = _task(project_id)
     # Collapse the per-feature ADDR_ID / ogr field-width warnings: they fire
     # once per feature (2-3k times) and push the real error out of the 500-
@@ -2806,6 +2812,19 @@ def _store_block(*, live: bool) -> Dict[str, Any]:
     return block
 
 
+def _task_is_queued_work(task: Dict[str, Any]) -> bool:
+    """True for a `queued` entry a submission created, false for a placeholder.
+
+    `_task()` is a lookup that also creates, with "queued" as its default
+    status. A submit (``run_hld``, ``run_area``) stamps a stage and an output
+    directory on the entry, so anything without those is a leftover nobody is
+    going to run -- it must not make /health report the engine as busy.
+    """
+    if task.get("status") != "queued":
+        return False
+    return bool(task.get("stage") or task.get("output_dir") or task.get("input_dir"))
+
+
 def _health_body(*, live: bool) -> Dict[str, Any]:
     store = _store_block(live=live)
     return {
@@ -2820,16 +2839,21 @@ def _health_body(*, live: bool) -> Dict[str, Any]:
         # What is running RIGHT NOW.  A deploy replaces the container and every
         # in-flight run with it -- today that is what "killed or restarted"
         # meant, not memory -- so the release step waits for this to be 0.
+        # A queued entry is in flight only if something submitted it: an
+        # entry with no stage and no output directory is a placeholder that a
+        # read or a log line created, not work waiting for a slot. Counting
+        # those made a finished project look busy to the deploy gate.
         "runs": {
             "active": sorted(
-                pid for pid, task in tasks.items()
-                if task.get("status") in ("running", "queued")
+                pid
+                for pid, task in tasks.items()
+                if task.get("status") == "running" or _task_is_queued_work(task)
             )[:10],
             "running": sum(
                 1 for task in tasks.values() if task.get("status") == "running"
             ),
             "queued": sum(
-                1 for task in tasks.values() if task.get("status") == "queued"
+                1 for task in tasks.values() if _task_is_queued_work(task)
             ),
         },
         "qgis_process": _find_qgis_process(),
