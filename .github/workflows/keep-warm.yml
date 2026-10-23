@@ -30,13 +30,27 @@ name: Keep the engine, the backend and the QGIS worker awake
 #
 # ── Two limits, both deliberate ───────────────────────────────────────────────
 #   * **GitHub does not honour `*/10` on this repository.** The recorded runs
-#     of 2026-10-21/22 are **2-5 hours** apart (10:15, 05:17, 00:35, 22:01,
-#     18:52, 14:36 UTC), so one ping per tick woke a service that had been
+#     of 2026-10-21/22/23 are **2-5 hours** apart (10:15, 05:17, 00:35, 22:01,
+#     18:52, 14:36 UTC; 2026-10-23 had ticks at 00:44 and 05:24 and nothing
+#     else before 10:03), so one ping per tick woke a service that had been
 #     asleep for most of the gap -- which is why the worker still had to boot
 #     for 415 s with this workflow "running every ten minutes". A tick now
-#     pings every 5 minutes until the window closes (or 5.5 h, under the 6 h
-#     job limit): a late tick still leaves the services awake for the rest of
-#     the day, and `concurrency` keeps one loop running at a time.
+#     pings every 5 minutes until the window closes: a late tick still leaves
+#     the services awake for the rest of the day, and `concurrency` keeps one
+#     loop running at a time.
+#   * **The job used to be capped at 5 minutes.** `timeout-minutes: 5` was the
+#     JOB's limit, not the step's, so the loop was killed on its first
+#     `sleep 300`: the 2026-10-22 15:18Z run was cancelled at 6.5 min, and
+#     every other tick inside the window exited after three pings. That is why
+#     the engine was asleep at **09:56:59Z on 2026-10-23** when the re-plan was
+#     submitted at 10:03Z (the last tick was 05:24Z, outside the window): the
+#     edge answered 429 and the run failed at 0 %. The job now gets GitHub's
+#     6 h ceiling and the loop stops itself just short of it.
+#   * **A tick before the window holds until it opens.** Ticks are 2-5 h apart,
+#     so the one before 09:00Z is often the only one there is: it waits, then
+#     warms. Waiting costs no Render instance hours (the services are asleep)
+#     and public-repo runner minutes are free; wait + loop is capped at 5 h 45 m
+#     so the job ends cleanly instead of being cancelled mid-ping.
 #   * GitHub disables scheduled workflows in a repository with no activity for
 #     60 days, so this needs a push (or a manual run) now and then. A manual
 #     dispatch warms all three at any hour — that is the "wake it now" button.
@@ -59,12 +73,21 @@ env:
   MONTHLY_INSTANCE_HOURS: '750'
   SERVICE_COUNT: '3'
   WORKER_URL: https://ftth-qgis-worker.onrender.com
+  # How long before the window a tick is allowed to hold and then warm. 4 h
+  # covers the gap seen on this repository (05:24Z -> 09:00Z) without turning a
+  # late-night tick into a wasted 5-hour job that warms nothing.
+  MAX_PRE_WINDOW_WAIT_S: '14400'
+  # Wait + loop must stay under GitHub's 6 h job ceiling (21600 s) with room to
+  # finish the round in flight and print why it stopped.
+  WARM_CEILING_S: '20700'
 
 jobs:
   ping:
     name: Ping the services that sleep
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # GitHub's ceiling for one job. 5 was the old value and it capped the whole
+    # loop, not one step: the in-window loop died on its first sleep.
+    timeout-minutes: 360
     steps:
       - name: Would this window fit the instance-hour budget?
         id: budget
@@ -95,16 +118,44 @@ jobs:
           # invalid octal. Zero-padded hours made the 09:00 tick report
           # "outside the window" -- the first warm hour of the day.
           hour=$(( 10#$(date -u +%H) ))
+          minute=$(( 10#$(date -u +%M) ))
+          now=$(( hour * 60 + minute ))
+          from=$(( 10#"$WARM_FROM_UTC" * 60 ))
+          to=$(( 10#"$WARM_TO_UTC" * 60 ))
           # A manual dispatch always warms, so the workflow can be tested (and a
           # sleeping service woken) at any hour without waiting for the window.
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] ||
-             { [ "$hour" -ge "$WARM_FROM_UTC" ] && [ "$hour" -lt "$WARM_TO_UTC" ]; }; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "warm=true" >> "$GITHUB_OUTPUT"
-            echo "warming (utc hour $hour)"
-          else
-            echo "warm=false" >> "$GITHUB_OUTPUT"
-            echo "outside the window (utc hour $hour): letting them sleep, this costs nothing"
+            echo "wait_s=0" >> "$GITHUB_OUTPUT"
+            echo "warming now (manual dispatch, utc $hour:$minute)"
+            exit 0
           fi
+          if [ "$now" -ge "$from" ] && [ "$now" -lt "$to" ]; then
+            echo "warm=true" >> "$GITHUB_OUTPUT"
+            echo "wait_s=0" >> "$GITHUB_OUTPUT"
+            echo "warming (utc $hour:$minute)"
+            exit 0
+          fi
+          if [ "$now" -lt "$from" ]; then
+            wait_s=$(( (from - now) * 60 ))
+            if [ "$wait_s" -le "$MAX_PRE_WINDOW_WAIT_S" ]; then
+              echo "warm=true" >> "$GITHUB_OUTPUT"
+              echo "wait_s=$wait_s" >> "$GITHUB_OUTPUT"
+              echo "utc $hour:$minute is $(( wait_s / 60 )) min before the window: holding this job, then warming"
+              exit 0
+            fi
+          fi
+          echo "warm=false" >> "$GITHUB_OUTPUT"
+          echo "wait_s=0" >> "$GITHUB_OUTPUT"
+          echo "outside the window (utc $hour:$minute): letting them sleep, this costs nothing"
+
+      - name: Hold until the window opens
+        if: steps.window.outputs.warm == 'true' && steps.window.outputs.wait_s != '0'
+        env:
+          WAIT_S: ${{ steps.window.outputs.wait_s }}
+        run: |
+          echo "holding ${WAIT_S}s until ${WARM_FROM_UTC}:00Z (the services are asleep, so this costs no instance hours)"
+          sleep "$WAIT_S"
 
       # 120s covers a 42s cold start plus Render's boot queue. The worker gets
       # 20s instead: its boot is minutes, so holding the request would only make
@@ -116,6 +167,8 @@ jobs:
       - name: Keep the services awake until the window closes
         if: steps.window.outputs.warm == 'true'
         timeout-minutes: 350
+        env:
+          WAIT_S: ${{ steps.window.outputs.wait_s }}
         run: |
           set -o pipefail
           failed=0
@@ -157,6 +210,9 @@ jobs:
           }
 
           started=$(date -u +%s)
+          # The loop shares the job with any wait above: stop before GitHub's 6 h
+          # ceiling so this ends cleanly (and says why) instead of being killed.
+          max_s=$(( WARM_CEILING_S - ${WAIT_S:-0} ))
           while :; do
             round_failed=0
             probe engine  https://ftth-planning.onrender.com/health  120 yes || round_failed=1
@@ -170,8 +226,8 @@ jobs:
               echo "window closed at ${hour}:00Z — stopping."
               break
             fi
-            if [ $(( $(date -u +%s) - started )) -ge 19800 ]; then
-              echo "5.5 h served; the next tick carries on until ${WARM_TO_UTC}:00Z."
+            if [ $(( $(date -u +%s) - started )) -ge "$max_s" ]; then
+              echo "$(( max_s / 60 )) min served; the next queued tick carries on until ${WARM_TO_UTC}:00Z."
               break
             fi
             # A third of Render's 15-minute idle window, so one slow round
