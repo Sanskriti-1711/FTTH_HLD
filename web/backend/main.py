@@ -2231,12 +2231,35 @@ def _collect_brownfield_candidates(bf_dir: Path) -> Dict[str, List[Path]]:
     return candidates
 
 
+def _as_bool(value: Any, default: bool = True) -> bool:
+    """A form/JSON flag as a bool; absent or unreadable keeps ``default``.
+
+    The flag arrives as a JSON boolean, a form string or nothing at all, and an
+    absent flag must mean the behaviour that was there before it (reuse ON), so
+    a client that never sends it is not silently changed.
+    """
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() not in ("0", "false", "no", "off")
+
+
 def _brownfield_args(brownfield_path: Optional[Path], output_dir: Path,
-                     project_id: Optional[str] = None) -> List[str]:
+                     project_id: Optional[str] = None,
+                     use_brownfield: bool = True) -> List[str]:
     """Unzip an uploaded brownfield archive and build the plugin BF_* params.
 
     Returns qgis_process ``--`` style args (e.g. ``USE_BROWNFIELD=true``,
     ``BF_DUCTS=<path>``) or an empty list when nothing was supplied.
+
+    ``use_brownfield=False`` (the run's own toggle) returns NOTHING: no archive
+    is extracted, no occupancy or trench read-back happens, and the pipeline
+    designs every duct and trench fresh. That is the only way to see a rule
+    change take effect on a project that has been published before — otherwise
+    the run replays its own stored network (the trench stage prices an existing
+    edge at 0.1x a new one, so 92 % of the Leeds re-run's trenches rode the
+    previous design and its ducts followed them).
 
     ``project_id`` enables the occupancy read-back: the last run's duct
     occupancy is the spare capacity this run must consume before laying new
@@ -2254,6 +2277,9 @@ def _brownfield_args(brownfield_path: Optional[Path], output_dir: Path,
     archive does not name, so an archive may legitimately carry only some
     layers.
     """
+    if not use_brownfield:
+        return []
+
     bf_dir = output_dir / "brownfield"
     have_inputs = False
     if brownfield_path and brownfield_path.exists():
@@ -2595,6 +2621,7 @@ def _run_pipeline(
     output_dir: Path,
     poly_method: int = 3,
     brownfield_path: Optional[Path] = None,
+    use_brownfield: bool = True,
 ) -> None:
     task = _task(project_id)
     task.update({
@@ -2631,10 +2658,17 @@ def _run_pipeline(
             f"OUTPUT_DIR={output_dir}",
             f"POLY_METHOD={int(poly_method or 3)}",
         ]
-        bf_args = _brownfield_args(brownfield_path, output_dir, project_id)
+        bf_args = _brownfield_args(brownfield_path, output_dir, project_id,
+                                   use_brownfield=use_brownfield)
         if bf_args:
             cmd.extend(bf_args)
-            _append(project_id, "info", "Brownfield upload detected; enabling reuse.")
+            _append(project_id, "info", "Existing infrastructure loaded; reuse enabled.")
+        elif not use_brownfield:
+            _append(
+                project_id, "info",
+                "Existing infrastructure (brownfield) is OFF for this run: no "
+                "archive is used, no earlier design of this project is fed "
+                "back, and every duct and trench is designed fresh.")
         permit_args, permit_path = _permit_delay_args(output_dir, project_id)
         osm_args = _osm_constraint_args(output_dir, project_id,
                                         permit_path=permit_path)
@@ -2911,7 +2945,12 @@ async def run_hld(
     project_id: Optional[str] = Form(None),
     name: Optional[str] = Form(None),
     poly_method: Optional[int] = Form(3),
+    # Reuse existing infrastructure (an uploaded archive AND this project's own
+    # stored network). OFF designs every duct and trench fresh; an absent flag
+    # keeps the old behaviour.
+    use_brownfield: Optional[str] = Form(None),
 ) -> Dict[str, Any]:
+    brownfield_on = _as_bool(use_brownfield)
     project_id = project_id or uuid.uuid4().hex
     output_dir = OUTPUT_DIR / project_id
     upload_dir = output_dir / "inputs"
@@ -2946,6 +2985,7 @@ async def run_hld(
             "status": "queued",
             "project_name": name or "",
             "poly_method": poly_method,
+            "use_brownfield": brownfield_on,
             "roads_filename": roads_path.name,
             "output_dir": str(output_dir),
             "osm_inputs": {k: str(v) for k, v in osm_inputs.items()},
@@ -2969,6 +3009,7 @@ async def run_hld(
         output_dir,
         poly_method,
         brownfield_path,
+        use_brownfield=brownfield_on,
     )
     return _public_task(project_id)
 
@@ -3257,6 +3298,7 @@ def _run_area_pipeline(
     postcode: str = "",
     brownfield_path: Optional[Path] = None,
     selection: Any = None,
+    use_brownfield: bool = True,
 ) -> None:
     """Generate an area's input files, then run the UNCHANGED pipeline on them.
 
@@ -3421,6 +3463,7 @@ def _run_area_pipeline(
         output_dir,
         poly_method,
         brownfield_path,
+        use_brownfield=use_brownfield,
     )
 
 
@@ -3453,6 +3496,9 @@ async def run_from_area(
 
     area, country_code, input_type = _area_request(payload)
     postcode = str((payload or {}).get("postcode") or "")
+    # Reuse existing infrastructure: an uploaded archive and this project's own
+    # stored network. OFF designs fresh; absent keeps the old behaviour.
+    brownfield_on = _as_bool((payload or {}).get("use_brownfield"))
     project_id = str((payload or {}).get("project_id") or uuid.uuid4().hex)
     name = (payload or {}).get("name")
     try:
@@ -3475,6 +3521,7 @@ async def run_from_area(
         "project_name": name or area,
         "area": area,
         "poly_method": poly_method,
+        "use_brownfield": brownfield_on,
         "output_dir": str(output_dir),
         "updated_at": _now(),
     })
@@ -3493,10 +3540,12 @@ async def run_from_area(
 
     background_tasks.add_task(
         _run_area_pipeline, project_id, area, output_dir, poly_method,
-        country_code, input_type, postcode, brownfield_path,
+        country_code, input_type, postcode,
+        brownfield_path if brownfield_on else None,
         # The section drawn on the map: the run designs that, not the whole
         # area, which is also what keeps it inside the instance's memory.
         (payload or {}).get("polygon"),
+        use_brownfield=brownfield_on,
     )
     return _public_task(project_id)
 
