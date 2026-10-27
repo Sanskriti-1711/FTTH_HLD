@@ -691,8 +691,35 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
     DENSE_M   = "DENSIFY_INTERVAL_M"
     HEAL_M    = "HEALING_THRESHOLD_M"
     SNAP_M    = "MAX_SNAP_DIST_M"
+    LEAD_IN_M = "MAX_LEAD_IN_M"
+    SIDEWALK_COST = "SIDEWALK_COST_FACTOR"
     MAX_HH    = "MAX_HH_PER_DUCT"
     ADD_STYLE = "ADD_CATEGORIZED_STYLE"
+
+    # ── Where a distribution duct is allowed to be ──────────────────────
+    # The trench is the civil route: the duct is what goes IN it. This builder
+    # used to add the trench as a third line network beside Sidewalk L/R and
+    # route an unweighted shortest path, so a duct took the footway whenever the
+    # footway happened to be shorter — measured at 21.1 % of the distribution
+    # layer off the trench, repaired afterwards by `DuctLayer._rebase_*
+    # distribution_output`. Now the trench is the graph and a sidewalk metre
+    # costs ``SIDEWALK_COST_FACTOR`` times a trench metre, so the router only
+    # leaves the trench when the trench cannot carry the route (a gap, or an
+    # endpoint the trench does not reach) — and what it does use is counted in
+    # OFF_TRENCH_LEN_M instead of being hidden.
+    DEFAULT_SIDEWALK_COST_FACTOR = 10.0
+
+    # The most a duct's end may sit off the trench and still snap onto it. An
+    # endpoint further away is reached through the sidewalk graph (following the
+    # footway) rather than by a straight chord across the block.
+    DEFAULT_LEAD_IN_M = 25.0
+
+    # How far round the trench a duct may go before the detour stops being a
+    # design and becomes a loop: a route that would be more than this multiple
+    # of the shortest route loses to the shortest route, and the footway metres
+    # it then uses are reported. Without it, a 20 m gap in the trench would be
+    # bought with a 900 m walk around the block.
+    MAX_TRENCH_DETOUR_FACTOR = 1.5
 
     # Output
     O_DUCTS   = "OUT_DISTRIBUTION_DUCTS"
@@ -716,6 +743,8 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
         self.addParameter(QgsProcessingParameterNumber(self.DENSE_M, "Densify interval (m)", QgsProcessingParameterNumber.Double, defaultValue=2.0, minValue=0.0))
         self.addParameter(QgsProcessingParameterNumber(self.HEAL_M,  "Graph healing threshold (m)", QgsProcessingParameterNumber.Double, defaultValue=3.0, minValue=0.0))
         self.addParameter(QgsProcessingParameterNumber(self.SNAP_M,  "Max snap distance to graph (m)", QgsProcessingParameterNumber.Double, defaultValue=50.0, minValue=0.1))
+        self.addParameter(QgsProcessingParameterNumber(self.LEAD_IN_M, "Max lead-in off the trench (m)", QgsProcessingParameterNumber.Double, defaultValue=self.DEFAULT_LEAD_IN_M, minValue=0.0))
+        self.addParameter(QgsProcessingParameterNumber(self.SIDEWALK_COST, "Sidewalk cost factor (trench = 1)", QgsProcessingParameterNumber.Double, defaultValue=self.DEFAULT_SIDEWALK_COST_FACTOR, minValue=1.0))
         self.addParameter(QgsProcessingParameterNumber(self.MAX_HH,  "Max HH per duct", QgsProcessingParameterNumber.Integer, defaultValue=10, minValue=2, maxValue=100))
         self.addParameter(QgsProcessingParameterBoolean(self.ADD_STYLE,"Add categorized style to project", defaultValue=True))
         self.addParameter(QgsProcessingParameterFeatureSink(self.O_DUCTS, "Distribution_Ducts (per PDP; strict PDP match; ≤HH cap)", QgsProcessing.TypeVectorLine))
@@ -736,7 +765,35 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
                 [ [QgsPointXY(p) for p in geom.asPolyline()] ])
 
     @staticmethod
-    def _add_lines_to_graph(G, layer, step_m):
+    def _add_edge(G, a, b, length, edge_kind, weight_factor=1.0):
+        """Add one graph edge without letting a footway overlay a trench edge.
+
+        `networkx.Graph.add_edge` REPLACES the attributes on an existing pair,
+        so a sidewalk segment that shares both end nodes with a trench segment
+        would rewrite the trench pricing and turn the trench into footway — the
+        router would then avoid it. First writer wins here, and a trench edge
+        is never downgraded.
+        """
+        prev = G.get_edge_data(a, b)
+        if prev is not None:
+            if edge_kind == "trench" and prev.get("kind") != "trench":
+                G[a][b].update(weight=length, length=length, kind="trench")
+                return True
+            return False
+        G.add_edge(a, b, weight=length * weight_factor, length=length,
+                   kind=edge_kind)
+        return True
+
+    @staticmethod
+    def _add_lines_to_graph(G, layer, step_m, edge_kind="sidewalk",
+                            weight_factor=1.0):
+        """Add a line layer to the routing graph, tagged with what it is.
+
+        Every edge carries its true ``length`` and its ``kind`` (``trench`` /
+        ``sidewalk``), so the router can price a metre of footway differently
+        from a metre of trench and the output can report which metres were not
+        in the trench. ``weight`` is the routing cost, not the length.
+        """
         for f in layer.getFeatures():
             g = f.geometry()
             if not g or g.isEmpty(): continue
@@ -747,7 +804,9 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
                     if a == b: continue
                     w = _math.hypot(a.x()-b.x(), a.y()-b.y())
                     if w <= 0: continue
-                    G.add_edge((a.x(), a.y()), (b.x(), b.y()), weight=w)
+                    AlgDistributionDucts._add_edge(
+                        G, (a.x(), a.y()), (b.x(), b.y()), w, edge_kind,
+                        weight_factor)
 
     @staticmethod
     def _pt_seg_dist(px, py, ax, ay, bx, by):
@@ -816,7 +875,7 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
         return best[1]
 
     @staticmethod
-    def _bridge_intersections(G, A, B, step_m):
+    def _bridge_intersections(G, A, B, step_m, edge_kind="link"):
         if A is None or B is None: return 0
         idxB = QgsSpatialIndex(B.getFeatures())
         made = 0
@@ -843,7 +902,13 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
                     px, py = pxy.x(), pxy.y()
                     for ex, ey in (ends_a + ends_b):
                         w = _math.hypot(px-ex, py-ey)
-                        if w > 0: G.add_edge((px,py), (ex,ey), weight=w); made += 1
+                        if w > 0:
+                            # A crossing weld is the same metre of ground on
+                            # both networks, so it costs its length and is not
+                            # charged as a footway metre.
+                            if AlgDistributionDucts._add_edge(
+                                    G, (px, py), (ex, ey), w, edge_kind):
+                                made += 1
         return made
     def _make_sink(self, p, key, context, feedback, fields, wkb, crs):
         """
@@ -924,6 +989,10 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
         dense_m = float(self.parameterAsDouble(p, self.DENSE_M,  context))
         heal_m  = float(self.parameterAsDouble(p, self.HEAL_M,   context))
         snap_m  = float(self.parameterAsDouble(p, self.SNAP_M,   context))
+        lead_in_m = float(self.parameterAsDouble(p, self.LEAD_IN_M, context))
+        sidewalk_cost = float(self.parameterAsDouble(p, self.SIDEWALK_COST,
+                                                     context))
+        sidewalk_cost = max(1.0, sidewalk_cost)
         max_hh  = int(self.parameterAsInt(p, self.MAX_HH, context))
 
         missing_bits = []
@@ -948,20 +1017,43 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
         idx_left = QgsSpatialIndex(left_t.getFeatures()) if left_t else None
         idx_right = QgsSpatialIndex(right_t.getFeatures()) if right_t else None
 
-        # Build graph
-        feedback.pushInfo("🔧 Building sidewalk+tangent graph …")
+        # Build graph — TRENCH FIRST. The duct is what goes into the trench, so
+        # the trench network is the route and the footways are the fallback.
+        trench_present = bool(tang_t is not None and tang_t.featureCount() > 0)
         G = nx.Graph()
-        self._add_lines_to_graph(G, left_t,  dense_m)
-        self._add_lines_to_graph(G, right_t, dense_m)
-        if tang_t:
-            self._add_lines_to_graph(G, tang_t, dense_m)
+        if trench_present:
+            feedback.pushInfo("🔧 Building the trench graph (primary) …")
+            self._add_lines_to_graph(G, tang_t, dense_m,
+                                     edge_kind="trench", weight_factor=1.0)
+        # Every node the trench contributed: an endpoint may snap onto these
+        # within the lead-in cap, and onto nothing else.
+        trench_nodes = set(G.nodes) if trench_present else set()
+        if left_t:
+            self._add_lines_to_graph(G, left_t,  dense_m,
+                                     edge_kind="sidewalk",
+                                     weight_factor=sidewalk_cost)
+        if right_t:
+            self._add_lines_to_graph(G, right_t, dense_m,
+                                     edge_kind="sidewalk",
+                                     weight_factor=sidewalk_cost)
+        if not trench_present:
+            feedback.pushWarning(
+                "Distribution: no tangent trenches supplied — routing on the "
+                "sidewalk graph only (the duct is NOT on a trench here).")
+        else:
+            feedback.pushInfo(
+                f"🧭 Trench is the routing graph; a sidewalk metre costs "
+                f"{sidewalk_cost:g}× a trench metre and an endpoint snaps onto "
+                f"the trench up to {lead_in_m:g} m away.")
 
-        # Bridge at intersections
-        bridges  = self._bridge_intersections(G, left_t,  right_t, dense_m)
+        # Bridge at intersections (each weld keeps its own kind)
+        bridges  = self._bridge_intersections(G, left_t,  right_t, dense_m,
+                                              edge_kind="sidewalk")
         if tang_t:
             bridges += self._bridge_intersections(G, left_t,  tang_t, dense_m)
             bridges += self._bridge_intersections(G, right_t, tang_t, dense_m)
-            bridges += self._bridge_intersections(G, tang_t, tang_t, dense_m)
+            bridges += self._bridge_intersections(G, tang_t, tang_t, dense_m,
+                                                  edge_kind="trench")
         feedback.pushInfo(f"🔗 Bridges added: {bridges}")
 
         # Heal small gaps
@@ -982,7 +1074,7 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
                             if a >= b: continue
                             d = _math.hypot(a[0]-b[0], a[1]-b[1])
                             if 0 < d <= heal_m and not G.has_edge(a, b):
-                                G.add_edge(a, b, weight=d); healed += 1
+                                G.add_edge(a, b, weight=d, length=d, kind="link"); healed += 1
         feedback.pushInfo(f"📈 Graph: {G.number_of_nodes()} nodes / {G.number_of_edges()} edges (healed: {healed})")
 
         # Node index for nearest-node snap (fast)
@@ -998,25 +1090,54 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
             prv.addFeatures(feats); node_layer.updateExtents()
         idx_nodes = QgsSpatialIndex(node_layer.getFeatures())
 
-        def nearest_node(pt_xy: QgsPointXY):
-            for r in [snap_m, snap_m*2, snap_m*5, snap_m*10, None]:
-                cand = []
-                if r is None:
-                    cand = list(G.nodes)
-                else:
-                    rect = QgsGeometry.fromPointXY(pt_xy).buffer(r, 8).boundingBox()
-                    for fid in idx_nodes.intersects(rect):
-                        cand.append(nid2node[node_layer.getFeature(fid)["nid"]])
-                if not cand: continue
-                best, bestd2 = None, float("inf")
-                for n in cand:
-                    dx, dy = pt_xy.x() - n[0], pt_xy.y() - n[1]
-                    d2 = dx*dx + dy*dy
-                    if d2 < bestd2:
-                        best, bestd2 = n, d2
-                if best is not None:
-                    return best
-            return None
+        def nearest_node(pt_xy: QgsPointXY, radius: float, allowed=None):
+            """Nearest graph node within `radius`, optionally restricted.
+
+            The old search widened its box to 10× the snap distance and then to
+            the WHOLE graph, so an endpoint 400 m from any line still snapped
+            onto one. That is how a "lead-in" became an unbounded off-trench
+            leg. The caller now names the radius, so the cap is real.
+            """
+            best, bestd2 = None, radius * radius
+            rect = QgsGeometry.fromPointXY(pt_xy).buffer(radius, 8).boundingBox()
+            for fid in idx_nodes.intersects(rect):
+                n = nid2node[node_layer.getFeature(fid)["nid"]]
+                if allowed is not None and n not in allowed:
+                    continue
+                dx, dy = pt_xy.x() - n[0], pt_xy.y() - n[1]
+                d2 = dx*dx + dy*dy
+                if d2 <= bestd2:
+                    best, bestd2 = n, d2
+            return best
+
+        # Length helpers. `length` is the real metre count; `weight` is the
+        # routing price (a sidewalk metre costs `sidewalk_cost` of them), so it
+        # must never be reported as a duct length.
+        def _edge_len(u, v):
+            e = G[u][v]
+            return float(e.get("length", e.get("weight", 0.0)))
+
+        def _path_len(seq):
+            return float(sum(_edge_len(u, v) for u, v in zip(seq[:-1], seq[1:])))
+
+        def _off_len(seq):
+            return float(sum(
+                _edge_len(u, v) for u, v in zip(seq[:-1], seq[1:])
+                if G[u][v].get("kind") == "sidewalk"))
+
+        def attach_node(pt_xy: QgsPointXY):
+            """Where an endpoint joins the network: the trench if it is close.
+
+            Within the lead-in cap the endpoint is a trench point. Beyond it the
+            endpoint joins whatever is nearest (usually the footway), and the
+            route from there is priced as sidewalk — following the street
+            instead of cutting a chord across the block to reach the trench.
+            """
+            if trench_nodes:
+                n = nearest_node(pt_xy, lead_in_m, trench_nodes)
+                if n is not None:
+                    return n
+            return nearest_node(pt_xy, snap_m)
 
         # Prepare output
         fields = QgsFields()
@@ -1025,6 +1146,10 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
         fields.append(QgsField("hh_ids",    QMetaType.Type.QString))
         fields.append(QgsField("hh_count",  QMetaType.Type.Int))
         fields.append(QgsField("length_m",  QMetaType.Type.Double))
+        # How much of THIS duct had to leave the trench, and why. Reported, not
+        # hidden: a footway metre in a distribution duct is a design finding.
+        fields.append(QgsField("OFF_TRENCH_LEN_M", QMetaType.Type.Double))
+        fields.append(QgsField("TRENCH_STATUS",    QMetaType.Type.QString))
         fields.append(QgsField("side",      QMetaType.Type.QString))
         fields.append(QgsField("duct_uid",  QMetaType.Type.Int))
         fields.append(QgsField("color",     QMetaType.Type.QString))
@@ -1089,10 +1214,10 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
             pid = str(v).strip()
             if not pid or pid in pdp_map: continue
             pt = f.geometry().asPoint()
-            n = nearest_node(QgsPointXY(pt))
+            n = attach_node(QgsPointXY(pt))
             if not n: continue
             # lightweight connection PDP point to nearest node
-            G.add_edge(n, (pt.x(), pt.y()), weight=0.01)
+            G.add_edge(n, (pt.x(), pt.y()), weight=0.01, length=0.0, kind="stub")
             pdp_map[pid] = (pt, n)
 
         if not pdp_map:
@@ -1110,13 +1235,15 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
             g = f.geometry()
             if not g or g.isEmpty(): continue
             pt = g.asMultiPoint()[0] if g.isMultipart() else g.asPoint()
-            n = nearest_node(QgsPointXY(pt))
+            n = attach_node(QgsPointXY(pt))
             if not n: continue
             hh_by_pid[pid].append((f.id(), n, pt))
             hh_feat_cache[f.id()] = f
 
         state_uid = 0
         total = 0
+        off_total = 0.0
+        off_rows = 0
 
         for pid, items in hh_by_pid.items():
             if not items: continue
@@ -1129,7 +1256,7 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
                 # so a single early-stop heap per PDP is the right granularity.
                 endpoint_nodes = {n for (_hid, n, _pt) in items}
                 import heapq as _hq
-                def _multi_target_dijkstra(graph, src, tgts):
+                def _multi_target_dijkstra(graph, src, tgts, cost=None):
                     tgt_set = set(tgts)
                     if not tgt_set:
                         return {}, {}
@@ -1165,7 +1292,8 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
                             if len(found_dist) == len(tgt_set):
                                 break
                         for nb, edata in graph[u].items():
-                            w = float(edata.get("weight", 1.0))
+                            w = float(cost(edata) if cost is not None
+                                      else edata.get("weight", 1.0))
                             nd = d + w
                             if nb not in dist or nd + 1e-9 < dist[nb]:
                                 dist[nb] = nd
@@ -1173,15 +1301,34 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
                                 _hq.heappush(heap, (nd, nb))
                     return found_dist, found_path
                 lengths, paths = _multi_target_dijkstra(G, pdp_node, endpoint_nodes)
+                # The cheapest route can be a long way round when the trench has
+                # a gap. Price the same trip with no penalty so that detour is
+                # judged instead of silently accepted.
+                plain_lengths, plain_paths = _multi_target_dijkstra(
+                    G, pdp_node, endpoint_nodes,
+                    cost=lambda e: float(e.get("length", e.get("weight", 0.0))))
             except Exception:
                 lengths = nx.single_source_shortest_path_length(G, pdp_node)
                 paths   = nx.single_source_shortest_path(G, pdp_node)
+                plain_lengths, plain_paths = lengths, paths
 
-            # Reachable HH, record side by proximity to left/right
+            # Reachable HH, record side by proximity to left/right. Each HH keeps
+            # the trench route unless it walks more than
+            # MAX_TRENCH_DETOUR_FACTOR times the shortest one.
             reachable = []
+            chosen = {}
             for hid, n, pt in items:
-                if n in paths:
-                    reachable.append((hid, n, pt, side_of_point(QgsPointXY(pt))))
+                seq = paths.get(n)
+                if seq is None:
+                    continue
+                plain_seq = plain_paths.get(n)
+                if plain_seq is not None:
+                    pen_len = _path_len(seq)
+                    plain_len = _path_len(plain_seq)
+                    if plain_len > 0 and pen_len > plain_len * self.MAX_TRENCH_DETOUR_FACTOR:
+                        seq = plain_seq
+                chosen[hid] = seq
+                reachable.append((hid, n, pt, side_of_point(QgsPointXY(pt))))
 
             if not reachable:
                 feedback.pushInfo(f"[Warn] PDP_ID={pid}: no reachable HH; skipped.")
@@ -1193,25 +1340,24 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
                 if not cand:
                     continue
 
-                # Build (hid, path, length) list
+                # Build (hid, path, length, off-trench length) list.
                 pl = []
                 for hid, n, pt in cand:
-                    seq = paths[n]
-                    Lm = float(sum(G[u][v]["weight"] for u, v in zip(seq[:-1], seq[1:])))
-                    pl.append((hid, seq, Lm))
+                    seq = chosen[hid]
+                    pl.append((hid, seq, _path_len(seq), _off_len(seq)))
 
                 # Greedy grouping: farthest path + on-way HHs (prefix) up to max_hh
-                remaining = {hid for (hid, _, _) in pl}
-                index_map = {hid: (seq, Lm) for (hid, seq, Lm) in pl}
+                remaining = {hid for (hid, _, _, _) in pl}
+                index_map = {hid: (seq, Lm, off) for (hid, seq, Lm, off) in pl}
                 duct_idx = 0
                 while remaining:
                     # choose farthest
                     far_hid = max(remaining, key=lambda h: index_map[h][1])
-                    far_seq, far_len = index_map[far_hid]
+                    far_seq, far_len, far_off = index_map[far_hid]
                     # collect on-way HHs
                     on_way = []
                     for hid in sorted(list(remaining - {far_hid}), key=lambda h: index_map[h][1]):
-                        seq, Lm = index_map[hid]
+                        seq, Lm, _off = index_map[hid]
                         if is_prefix(seq, far_seq):
                             on_way.append(hid)
                         if len(on_way) >= (max_hh - 1):
@@ -1232,6 +1378,13 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
                     f["hh_ids"]    = ",".join(str(h) for h in group)
                     f["hh_count"]  = len(group)
                     f["length_m"]  = far_len
+                    f["OFF_TRENCH_LEN_M"] = far_off
+                    f["TRENCH_STATUS"] = (
+                        "No trench input" if not trench_present else
+                        "On trench" if far_off <= 0.5 else
+                        f"Lead-in {far_off:.1f} m off trench"
+                        if far_off <= lead_in_m else
+                        f"OFF TRENCH {far_off:.1f} m")
                     f["side"]      = side_name
                     f["duct_uid"]  = state_uid
                     f["color"]     = distribution_color(side_name, duct_idx)
@@ -1247,8 +1400,22 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
                     total += 1
                     state_uid += 1
                     duct_idx += 1
+                    if far_off > 0.5:
+                        off_rows += 1
+                        off_total += far_off
 
         feedback.pushInfo(f"✅ Distribution ducts created: {total}")
+        if total:
+            if trench_present:
+                feedback.pushInfo(
+                    f"🧭 On the trench: {total - off_rows} of {total} duct(s) ride "
+                    f"Final_Trenches end to end; {off_rows} use "
+                    f"{off_total:,.1f} m of footway the trench could not carry.")
+            else:
+                feedback.pushWarning(
+                    "Distribution ducts were routed on the sidewalk graph: no "
+                    "tangent trenches were supplied, so none of them is in a "
+                    "trench.")
 
         if bool(self.parameterAsBool(p, self.ADD_STYLE, context)):
             apply_color_renderer(out_id, "Distribution_Ducts", "color")
@@ -3592,6 +3759,11 @@ class DuctLayer(QgsProcessingAlgorithm):
             distr.F_HH_ID:      hh_fld,
             distr.F_PDP_ON_HH:  pdp_on_h,
             distr.CRS_TGT:      QgsCoordinateReferenceSystem(self.DEFAULT_CRS_AUTHID),
+            # The trench is the design surface for distribution (see
+            # AlgDistributionDucts): the cap and the cost live on the algorithm
+            # so the plugin and the pipeline cannot drift apart.
+            distr.LEAD_IN_M:    distr.DEFAULT_LEAD_IN_M,
+            distr.SIDEWALK_COST: distr.DEFAULT_SIDEWALK_COST_FACTOR,
             distr.ADD_STYLE:    False,
             distr.O_DUCTS:      out_distr_uri,
         }
