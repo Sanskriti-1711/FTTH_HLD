@@ -714,6 +714,27 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
     # footway) rather than by a straight chord across the block.
     DEFAULT_LEAD_IN_M = 25.0
 
+    # ── "Is this duct in the trench?" is a question about the DRAWN LINE ──
+    # The metres of sidewalk EDGE a route walked (PAVEMENT_LEN_M) answer a
+    # different question from the metres of duct that are drawn away from the
+    # trench (OFF_TRENCH_LEN_M). A duct can walk the pavement beside a trench
+    # and still be drawn on it: on the Leeds run every duct labelled
+    # "OFF TRENCH 33 m" by the route measure sat 0.1 m from the trench line,
+    # which read on the map as a duct that had left the street. So the offset
+    # is measured on the geometry, and one metre of sidewalk is reported as
+    # what it is -- a footway metre, not a duct off the trench.
+    #
+    # How far the drawn line may be from the nearest trench and still count as
+    # "on" it: the duct is placed on the trench, but the corridor puts it a
+    # little to one side (the kerb/side offset) and the line is densified, so a
+    # metre or two is a duct IN the trench. Measured: mean 0.06 m, 99 % of the
+    # length within 2 m.
+    TRENCH_PROXIMITY_M = 2.0
+    # Sampling step of the geometric measure: finer than any corridor offset.
+    TRENCH_SAMPLE_M = 1.0
+    # Spatial-grid cell for the trench segments, in metres.
+    TRENCH_GRID_M = 20.0
+
     # How far round the trench a duct may go before the detour stops being a
     # design and becomes a loop: a route that would be more than this multiple
     # of the shortest route loses to the shortest route, and the footway metres
@@ -1046,6 +1067,78 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
                 f"{sidewalk_cost:g}× a trench metre and an endpoint snaps onto "
                 f"the trench up to {lead_in_m:g} m away.")
 
+        # ── Geometric on-trench accounting ──────────────────────────────
+        # Index the trench SEGMENTS once, then ask, per duct, how much of the
+        # drawn line is farther than TRENCH_PROXIMITY_M from all of them. A
+        # spatial grid keeps the query local: a duct sits next to its trench, so
+        # one or two rings of cells settle it.
+        trench_grid = {}
+        trench_grid_m = self.TRENCH_GRID_M
+        if trench_present:
+            for tf in tang_t.getFeatures():
+                tg = tf.geometry()
+                if not tg or tg.isEmpty():
+                    continue
+                for line in self._line_parts(tg):
+                    for i in range(len(line) - 1):
+                        a, b = line[i], line[i + 1]
+                        if a == b:
+                            continue
+                        seg = (a.x(), a.y(), b.x(), b.y())
+                        for gx in range(int(min(seg[0], seg[2]) // trench_grid_m),
+                                        int(max(seg[0], seg[2]) // trench_grid_m) + 1):
+                            for gy in range(int(min(seg[1], seg[3]) // trench_grid_m),
+                                            int(max(seg[1], seg[3]) // trench_grid_m) + 1):
+                                trench_grid.setdefault((gx, gy), []).append(seg)
+
+        def _trench_dist(px, py):
+            """Metres from a point to the nearest trench line.
+
+            `inf` when nothing is within six grid cells: such a point is off the
+            trench by any reading, and its duct is counted as off.
+            """
+            if not trench_grid:
+                return float("inf")
+            cx, cy = int(px // trench_grid_m), int(py // trench_grid_m)
+            best, radius = float("inf"), 1
+            while True:
+                for gx in range(cx - radius, cx + radius + 1):
+                    for gy in range(cy - radius, cy + radius + 1):
+                        for ax, ay, bx, by in trench_grid.get((gx, gy), ()):
+                            d = self._pt_seg_dist(px, py, ax, ay, bx, by)
+                            if d < best:
+                                best = d
+                if best <= (radius - 1) * trench_grid_m or radius >= 6:
+                    return best
+                radius += 1
+
+        def _geom_off_len(geom):
+            """Metres of the DRAWN duct farther than the on-trench band.
+
+            Sampled every `TRENCH_SAMPLE_M` along each part, and each off sample
+            carries its share of the part, so the result is length-weighted the
+            same way `OFF_TRENCH_LEN_M` has always been reported.
+            """
+            if not trench_grid:
+                return 0.0
+            step = self.TRENCH_SAMPLE_M
+            band = self.TRENCH_PROXIMITY_M
+            off = 0.0
+            for line in self._line_parts(geom):
+                for i in range(len(line) - 1):
+                    a, b = line[i], line[i + 1]
+                    seg_len = _math.hypot(b.x() - a.x(), b.y() - a.y())
+                    if seg_len <= 0:
+                        continue
+                    n = max(1, int(seg_len // step))
+                    share = seg_len / n
+                    for k in range(n):
+                        t = (k + 0.5) / n
+                        if _trench_dist(a.x() + (b.x() - a.x()) * t,
+                                        a.y() + (b.y() - a.y()) * t) > band:
+                            off += share
+            return off
+
         # Bridge at intersections (each weld keeps its own kind)
         bridges  = self._bridge_intersections(G, left_t,  right_t, dense_m,
                                               edge_kind="sidewalk")
@@ -1149,6 +1242,7 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
         # How much of THIS duct had to leave the trench, and why. Reported, not
         # hidden: a footway metre in a distribution duct is a design finding.
         fields.append(QgsField("OFF_TRENCH_LEN_M", QMetaType.Type.Double))
+        fields.append(QgsField("PAVEMENT_LEN_M",   QMetaType.Type.Double))
         fields.append(QgsField("TRENCH_STATUS",    QMetaType.Type.QString))
         fields.append(QgsField("side",      QMetaType.Type.QString))
         fields.append(QgsField("duct_uid",  QMetaType.Type.Int))
@@ -1244,6 +1338,8 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
         total = 0
         off_total = 0.0
         off_rows = 0
+        walk_total = 0.0
+        walk_rows = 0
 
         for pid, items in hh_by_pid.items():
             if not items: continue
@@ -1378,13 +1474,18 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
                     f["hh_ids"]    = ",".join(str(h) for h in group)
                     f["hh_count"]  = len(group)
                     f["length_m"]  = far_len
-                    f["OFF_TRENCH_LEN_M"] = far_off
+                    # What the map shows: the metres of this duct that are
+                    # DRAWN away from the trench, not the pavement metres the
+                    # route happened to walk beside it.
+                    geom_off = _geom_off_len(geom) if trench_present else 0.0
+                    f["OFF_TRENCH_LEN_M"] = geom_off
+                    f["PAVEMENT_LEN_M"] = far_off
                     f["TRENCH_STATUS"] = (
                         "No trench input" if not trench_present else
-                        "On trench" if far_off <= 0.5 else
-                        f"Lead-in {far_off:.1f} m off trench"
-                        if far_off <= lead_in_m else
-                        f"OFF TRENCH {far_off:.1f} m")
+                        "On trench" if geom_off <= 0.5 else
+                        f"Lead-in {geom_off:.1f} m off trench"
+                        if geom_off <= lead_in_m else
+                        f"OFF TRENCH {geom_off:.1f} m")
                     f["side"]      = side_name
                     f["duct_uid"]  = state_uid
                     f["color"]     = distribution_color(side_name, duct_idx)
@@ -1400,17 +1501,27 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
                     total += 1
                     state_uid += 1
                     duct_idx += 1
-                    if far_off > 0.5:
+                    if geom_off > 0.5:
                         off_rows += 1
-                        off_total += far_off
+                        off_total += geom_off
+                    if far_off > 0.5:
+                        walk_rows += 1
+                        walk_total += far_off
 
         feedback.pushInfo(f"✅ Distribution ducts created: {total}")
         if total:
             if trench_present:
                 feedback.pushInfo(
-                    f"🧭 On the trench: {total - off_rows} of {total} duct(s) ride "
-                    f"Final_Trenches end to end; {off_rows} use "
-                    f"{off_total:,.1f} m of footway the trench could not carry.")
+                    f"🧭 On the trench: {total - off_rows} of {total} duct(s) are "
+                    f"drawn within {self.TRENCH_PROXIMITY_M:g} m of "
+                    f"Final_Trenches; {off_rows} leave it by {off_total:,.1f} m "
+                    f"in total.")
+                if walk_rows:
+                    feedback.pushInfo(
+                        f"   Route: {walk_rows} duct(s) walked "
+                        f"{walk_total:,.1f} m of pavement beside the trench "
+                        f"(PAVEMENT_LEN_M). That is routing, not the drawn "
+                        f"line's distance -- OFF_TRENCH_LEN_M counts the latter.")
             else:
                 feedback.pushWarning(
                     "Distribution ducts were routed on the sidewalk graph: no "

@@ -10,8 +10,16 @@ the trench was only used when it happened to lie on that path — measured at
 The trench is the civil route: the duct is the conduit INSIDE it. So the trench
 is now the routing graph, a footway metre costs `SIDEWALK_COST_FACTOR` times a
 trench metre, and an endpoint snaps onto the trench only within the lead-in cap
-(`MAX_LEAD_IN_M`). What a duct still has to spend on the footway is reported in
-`OFF_TRENCH_LEN_M` / `TRENCH_STATUS` instead of being hidden.
+(`MAX_LEAD_IN_M`).
+
+Two different facts are reported, and confusing them is what made an on-trench
+design read as off-trench on the map:
+
+* `OFF_TRENCH_LEN_M` / `TRENCH_STATUS` — metres of the DRAWN duct farther than
+  `TRENCH_PROXIMITY_M` from any trench line. This is what the map shows.
+* `PAVEMENT_LEN_M` — metres of the route that walked the pavement beside the
+  trench. A duct laid on the trench but routed along the footway has a large
+  `PAVEMENT_LEN_M` and an `OFF_TRENCH_LEN_M` of zero.
 
 Run under the QGIS interpreter, from the repo root:
 
@@ -117,7 +125,8 @@ def _context():
     return ctx
 
 
-def _run(tmp_path, *, trench, left, right, pdp, hh, name="dist.gpkg"):
+def _run(tmp_path, *, trench, left, right, pdp, hh, name="dist.gpkg",
+         lead_in_m=None):
     algo = AlgDistributionDucts()
     algo.initAlgorithm()
     out = str(tmp_path / name)
@@ -134,6 +143,8 @@ def _run(tmp_path, *, trench, left, right, pdp, hh, name="dist.gpkg"):
     }
     if trench is not None:
         params[algo.L_TAN] = _line_layer(trench, "trench")
+    if lead_in_m is not None:
+        params[algo.LEAD_IN_M] = float(lead_in_m)
     fb = _Fb()
     algo.processAlgorithm(params, _context(), fb)
     return QgsVectorLayer(out, "out", "ogr"), fb
@@ -168,8 +179,10 @@ def test_a_duct_rides_the_trench_even_when_the_footway_is_the_shorter_path(tmp_p
     assert max(abs(x) for x in _xs(out)) <= 1e-6
     for f in feats:
         assert f["OFF_TRENCH_LEN_M"] == pytest.approx(0.0, abs=0.5)
+        assert f["PAVEMENT_LEN_M"] == pytest.approx(0.0, abs=0.5)
         assert f["TRENCH_STATUS"] == "On trench"
-    assert "On the trench: 2 of 2 duct(s) ride Final_Trenches" in fb.text()
+    assert ("On the trench: 2 of 2 duct(s) are drawn within 2 m of "
+            "Final_Trenches") in fb.text()
 
 
 def test_the_footway_is_used_only_where_the_trench_cannot_carry_the_route(tmp_path):
@@ -192,9 +205,12 @@ def test_the_footway_is_used_only_where_the_trench_cannot_carry_the_route(tmp_pa
     xs = _xs(out)
     assert min(xs) == pytest.approx(0.0, abs=1e-6)
     assert max(xs) == pytest.approx(80.0, abs=1e-6)
+    # The drawn line really is off the trench here, and the route really did
+    # walk the footway: the two measures agree because nothing is hidden.
     assert f["OFF_TRENCH_LEN_M"] == pytest.approx(80.0, abs=5.0)
+    assert f["PAVEMENT_LEN_M"] == pytest.approx(80.0, abs=5.0)
     assert f["TRENCH_STATUS"].startswith("OFF TRENCH")
-    assert "footway the trench could not carry" in fb.text()
+    assert "leave it by" in fb.text()
 
 
 def test_a_short_trench_gap_does_not_buy_a_loop_around_the_block(tmp_path):
@@ -218,8 +234,40 @@ def test_a_short_trench_gap_does_not_buy_a_loop_around_the_block(tmp_path):
     assert len(feats) == 1
     f = feats[0]
     assert f["length_m"] == pytest.approx(120.0, abs=5.0)
-    assert f["OFF_TRENCH_LEN_M"] == pytest.approx(120.0, abs=5.0)
+    assert f["PAVEMENT_LEN_M"] == pytest.approx(120.0, abs=5.0)
+    # The route is the 120 m footway L, and the drawn line is that same L, so
+    # here the two measures nearly agree -- which is why the divergence is
+    # pinned by `test_walking_the_pavement_beside_the_trench_is_not_off_it`
+    # below, where the pavement runs beside a trench instead.
+    assert f["OFF_TRENCH_LEN_M"] == pytest.approx(118.0, abs=8.0)
     assert f["TRENCH_STATUS"].startswith("OFF TRENCH")
+
+
+def test_the_pavement_metres_are_reported_beside_the_geometry_measure(tmp_path):
+    """Both numbers reach the stage log, and they are named as what they are.
+
+    `PAVEMENT_LEN_M` (the route's footway metres) and `OFF_TRENCH_LEN_M` (the
+    drawn line's distance from the trench) are different measures: on the Leeds
+    run 915 m of pavement metres came with only ~50 m of drawn offset, which is
+    why an on-trench design read as off-trench. The stage must say both, so a
+    reader can tell a duct that walks the pavement beside a trench from a duct
+    that has left it.
+    """
+    out, fb = _run(
+        tmp_path,
+        trench=[[(0, 0), (0, 100)]],
+        left=[[(0, 100), (80, 100)]],
+        right=[[(-10, 0), (-10, 100)]],
+        pdp=[(0, 90, "PDP1")],
+        hh=[(80, 100, "HH1")],
+    )
+
+    feats = list(out.getFeatures())
+    assert len(feats) == 1
+    assert set(feats[0].fields().names()) >= {
+        "OFF_TRENCH_LEN_M", "PAVEMENT_LEN_M", "TRENCH_STATUS"}
+    assert "are drawn within 2 m of Final_Trenches" in fb.text()
+    assert "walked" in fb.text() and "PAVEMENT_LEN_M" in fb.text()
 
 
 def test_without_a_trench_the_layer_says_so(tmp_path):
@@ -229,4 +277,8 @@ def test_without_a_trench_the_layer_says_so(tmp_path):
     assert feats, "the legacy sidewalk build must still produce ducts"
     for f in feats:
         assert f["TRENCH_STATUS"] == "No trench input"
+        # With no trench there is no trench offset to report -- the status is
+        # what says so, and the pavement metres stay visible.
+        assert f["OFF_TRENCH_LEN_M"] == pytest.approx(0.0, abs=1e-6)
+        assert f["PAVEMENT_LEN_M"] > 0.0
     assert any("no tangent trenches" in w for w in fb.warnings)
