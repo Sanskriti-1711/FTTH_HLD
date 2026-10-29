@@ -435,6 +435,84 @@ def _safe_sink_fields(input_fields):
 # Algorithm
 # ------------------------------------------------------------
 
+# ── ONE trench line per side of the street ─────────────────────────────────
+#
+# A run that lies along an already-kept run of the SAME construction class is
+# a duplicate, not a second dig: the sidewalk offsets are applied more than
+# once, so one street comes out as two parallel lines a metre or two apart.
+#
+# Measured on the 2026-10-29 Mariendorf run (528 published trenches): 28 such
+# pairs sit 0.94-3.11 m apart, and each covers 100 % of its twin's length once
+# the test corridor is wide enough to hold the offset. The old tolerance was
+# 0.75 m — NARROWER THAN THE OFFSET IT IS MEANT TO CATCH — so those pairs
+# scored 0 % overlap and both lines shipped. That is the "two trenches on the
+# same side of the road" report.
+#
+# 2.5 m covers the 1 m and 2 m sidewalk offsets. A crossing, a spur, or a
+# genuinely separate trench cannot put DUP_FRAC of its own length inside the
+# corridor, so it survives: the run itself has to be mostly covered.
+DUP_TOL_M = 2.5     # metres — corridor around a kept run that its twin hides in
+DUP_FRAC = 0.8      # share of the candidate's own length that must lie in it
+
+
+def _is_duplicate_run(rg, tt, kept_runs, tol_m=DUP_TOL_M, frac=DUP_FRAC):
+    """True when ``rg`` (construction class ``tt``) duplicates a kept run.
+
+    ``kept_runs`` is the running ``[(geometry, class)]`` list in emission
+    order. A run is a duplicate when, of it and the kept run it lies along,
+    the SHORTER one is at least ``frac`` covered by the ``tol_m`` corridor
+    around the other — and their lengths are within a factor of two, so a long
+    trench brushing a short fragment is never taken for its twin.
+    """
+    if rg is None or rg.isEmpty():
+        return False
+    try:
+        rlen = float(rg.length())
+    except Exception:
+        return False
+    if rlen <= 0:
+        return True
+    try:
+        bb = rg.buffer(tol_m, 8).boundingBox()
+    except Exception:
+        return False
+    for kg, ktt in kept_runs:
+        if ktt != tt:
+            continue
+        try:
+            if not bb.intersects(kg.boundingBox()):
+                continue
+            klen = float(kg.length())
+        except Exception:
+            continue
+        if klen <= 0:
+            continue
+        if rlen <= klen:
+            # The candidate fits inside a longer kept run: it adds no length
+            # the network does not already have, whatever the proportion.
+            denom = rlen
+        elif rlen <= 2.0 * klen:
+            # Comparable twins, and the short one came first. Only twins of
+            # comparable extent are treated this way: a long run that merely
+            # brushes a short kept fragment is a different trench, and
+            # dropping it would delete real length.
+            denom = klen
+        else:
+            continue
+        try:
+            overlap = float(rg.intersection(kg.buffer(tol_m, 8)).length())
+        except Exception:
+            continue
+        # ``denom`` is the length that has to be covered, not always the
+        # candidate's: comparing against the candidate alone kept the pair
+        # whenever the short twin happened to be emitted first — measured on
+        # the 2026-10-29 run, that left 10 same-tier twins (12-64 m each, 100 %
+        # overlap) in the published layer.
+        if (overlap / denom) >= frac:
+            return True
+    return False
+
+
 class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
     # Inputs
     P_POLY = "INPUT_POLY"
@@ -3343,43 +3421,20 @@ class TrenchLayerAlgorithm(QgsProcessingAlgorithm):
                 # ── Near-duplicate suppression (ONE line per side) ─────────
                 # Left and right sidewalk offsets can produce two nearly
                 # coincident lines on the same side of a street (and slivers
-                # left by successive unions). A run whose geometry lies within
-                # _DUP_TOL of an already-kept run of the SAME construction
-                # class is dropped, so each side of the route carries exactly
-                # ONE trench line instead of parallel duplicates. Genuinely
-                # separate trenches are >1 m apart and stay untouched.
-                _DUP_TOL = 0.75   # metres — co-location tolerance
-                _DUP_FRAC = 0.8   # fraction of the shorter run that must overlap
+                # left by successive unions). A run mostly covered by an
+                # already-kept run of the SAME construction class is dropped,
+                # so each side of the route carries exactly ONE trench line.
+                # The calm is in DUP_TOL_M (2.5 m, the width of the sidewalk
+                # offsets) and the run must be 80 % covered, so a crossing or
+                # a genuinely separate trench is never taken.
+                _DUP_TOL = DUP_TOL_M
+                _DUP_FRAC = DUP_FRAC
                 _kept_runs = []   # [(geom, tt)]
                 _dupes = 0
 
                 def _is_duplicate(rg, tt):
-                    if rg is None or rg.isEmpty():
-                        return False
-                    try:
-                        rlen = float(rg.length())
-                    except Exception:
-                        return False
-                    if rlen <= 0:
-                        return True
-                    try:
-                        bb = rg.buffer(_DUP_TOL, 6).boundingBox()
-                    except Exception:
-                        return False
-                    for kg, ktt in _kept_runs:
-                        if ktt != tt:
-                            continue
-                        try:
-                            if not bb.intersects(kg.boundingBox()):
-                                continue
-                            overlap = float(
-                                rg.intersection(kg.buffer(_DUP_TOL, 6)).length()
-                            )
-                        except Exception:
-                            continue
-                        if rlen and (overlap / rlen) >= _DUP_FRAC:
-                            return True
-                    return False
+                    return _is_duplicate_run(
+                        rg, tt, _kept_runs, _DUP_TOL, _DUP_FRAC)
 
                 grouped_features = []
                 for _tt in sorted(_groups):
