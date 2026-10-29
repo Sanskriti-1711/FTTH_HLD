@@ -77,6 +77,11 @@ PIPELINE_STAGES = [
 ONECLICK_OUTPUTS: List[Tuple[str, str, str]] = [
     ("objects", "Objects.gpkg", "Objects.geojson"),
     ("polygons", "Polygons.gpkg", "Polygons.geojson"),
+    # CBT areas: the 16-home sub-areas carved out of each polygon (Phase 1).
+    ("cbt_areas", "CBT_Areas.gpkg", "CBT_Areas.geojson"),
+    # CBT nodes: one splitter structure per CBT area, placed on the street and
+    # snapped onto the trench exactly as a PDP is (Phase 2).
+    ("cbts", "CBTs.gpkg", "CBTs.geojson"),
     ("pdps", "PDPs.gpkg", "PDPs.geojson"),
     ("mfg", "MFG.gpkg", "MFG.geojson"),
     ("mfg_service_areas", "MFG_Service_Areas.gpkg", "MFG_Service_Areas.geojson"),

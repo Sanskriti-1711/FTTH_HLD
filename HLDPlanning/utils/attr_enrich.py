@@ -36,6 +36,11 @@ except Exception:  # pragma: no cover
     _HAS_OGR = False
 
 try:
+    from HLDPlanning.utils.splitters import plan_two_stage
+except Exception:  # pragma: no cover
+    from .splitters import plan_two_stage
+
+try:
     from HLDPlanning.utils.cable_capacity import (
         DISTRIBUTION_FIBER_LADDER,
         DROP_FIBER_LADDER,
@@ -1453,8 +1458,7 @@ def _segment_layer_at_chambers(path, chambers, feedback=None, label="layer",
     chamber and ends at the next one (or at the run end when the run finishes
     without a structure). All original attributes are carried over unchanged —
     construction class, surface, reinstatement, PDP/polygon ids, brownfield and
-    capacity flags — and the span's own length is written to ``length_m`` /
-    ``SPAN_LEN_M`` (BOQ and permits sum these per feature). Features the
+    capacity flags — and the span's own length is written to ``length_m`` /    ``SPAN_LEN_M`` (BOQ and permits sum these per feature). Features the
     chambers do not touch keep their geometry. Returns the number of spans.
 
     ``span_len_fields`` names extra fields that must also be rewritten with the
@@ -3484,6 +3488,11 @@ def enrich_equipment(pdp_path, mfg_path, feedback=None):
             ("SPLITTER_USED_PORTS", ogr.OFTInteger),
             ("SPLITTER_SPARE_PORTS", ogr.OFTInteger),
             ("SPLITTER_UTILIZATION_PCT", ogr.OFTReal),
+            ("PON_GROUP_COUNT", ogr.OFTInteger),
+            ("CBT_COUNT", ogr.OFTInteger),
+            ("HP_PER_GROUP", ogr.OFTInteger),
+            ("PRIMARY_SPLIT_SIZE", ogr.OFTInteger),
+            ("SECONDARY_SPLIT_SIZE", ogr.OFTInteger),
             ("VENDOR", ogr.OFTString, 32),
             ("POWER_REQ", ogr.OFTString, 8),
             ("MAINT_ZONE", ogr.OFTString, 24),
@@ -3513,7 +3522,13 @@ def enrich_equipment(pdp_path, mfg_path, feedback=None):
             util_pct = round((100.0 * used_ports / total_ports), 1) if total_ports else 0.0
 
             f.SetField("SPLIT_RATIO", split)
-            f.SetField("PRIMARY_SPLIT_RATIO", "1:8")
+            _two = plan_two_stage(int(_num(lyr, f, "households", 0)))
+            f.SetField("PRIMARY_SPLIT_RATIO", f"1:{_two['primary']}" if _two["primary"] else "1:8")
+            f.SetField("PON_GROUP_COUNT", _two["groups"])
+            f.SetField("CBT_COUNT", _two["cbt_count"])
+            f.SetField("HP_PER_GROUP", int(_num(lyr, f, "households", 0)) // max(1, _two["groups"]))
+            f.SetField("PRIMARY_SPLIT_SIZE", _two["primary"])
+            f.SetField("SECONDARY_SPLIT_SIZE", _two["secondary"])
             f.SetField("DISTRIBUTION_SPLIT_RATIO", split)
             f.SetField("SPLITTER_MODULE_COUNT", module_count)
             f.SetField("SPLITTER_TOTAL_PORTS", total_ports)

@@ -137,6 +137,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
     P_POLY_PLAN_FIRST = "POLY_PLANNING_FIRST"
     P_POLY_MIN_HH = "POLY_MIN_HH"
     P_POLY_MAX_HH = "POLY_MAX_HH"
+    P_POLY_MAX_CBT = "POLY_MAX_CBT"
     P_POLY_NEIGH = "POLY_NEIGHBOR_DIST"
     P_POLY_SERVICE = "POLY_SERVICE_RADIUS"
     P_POLY_ACCESS = "POLY_ROAD_ACCESS_DIST"
@@ -172,6 +173,8 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
 
     OUT_OBJECTS = "OUT_OBJECTS"
     OUT_POLYGONS = "OUT_POLYGONS"
+    OUT_CBT_AREAS = "OUT_CBT_AREAS"
+    OUT_CBT_NODES = "OUT_CBT_NODES"
     OUT_PDP = "OUT_PDP"
     OUT_MFG = "OUT_MFG"
     OUT_MFG_AREAS = "OUT_MFG_AREAS"
@@ -207,6 +210,8 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         OUT_BROWNFIELD: "Existing_Infrastructure.gpkg",
         OUT_OBJECTS: "Objects.gpkg",
         OUT_POLYGONS: "Polygons.gpkg",
+        OUT_CBT_AREAS: "CBT_Areas.gpkg",
+        OUT_CBT_NODES: "CBTs.gpkg",
         OUT_PDP: "PDPs.gpkg",
         OUT_MFG: "MFG.gpkg",
         OUT_MFG_AREAS: "MFG_Service_Areas.gpkg",
@@ -238,6 +243,8 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
     _POLY_INPUT, _POLY_OUT = "INPUT", "OUT"
     _POLY_METHOD, _POLY_PLAN = "METHOD", "PLANNING_FIRST"
     _POLY_MIN, _POLY_MAX = "MIN_HH_PER_POLYGON", "MAX_HH_PER_POLYGON"
+    _POLY_MAX_CBT = "MAX_HH_PER_CBT_AREA"
+    _POLY_CBT_OUT = "CBT_OUT"
     _POLY_NEIGH, _POLY_SERVICE, _POLY_ACCESS = (
         "NEIGHBOR_DIST", "SERVICE_RADIUS", "ROAD_ACCESS_DIST",
     )
@@ -247,8 +254,8 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
     _POLY_BAR_ROADS, _POLY_BAR_FIELD = "BARRIER_ROADS", "BARRIER_CLASS_FIELD"
     _POLY_BAR_CLASSES, _POLY_BAR_EXTRA = "BARRIER_MAIN_CLASSES", "BARRIER_EXTRA"
 
-    _NET_POLY, _NET_ROADS, _NET_PBF, _NET_OBJECTS = (
-        "INPUT_POLY", "INPUT_ROADS", "INPUT_OSM_PBF", "INPUT_OBJECTS",
+    _NET_POLY, _NET_ROADS, _NET_PBF, _NET_OBJECTS, _NET_CBT = (
+        "INPUT_POLY", "INPUT_ROADS", "INPUT_OSM_PBF", "INPUT_OBJECTS", "INPUT_CBT_AREAS",
     )
     _NET_EDGES, _NET_CAND, _NET_REMOVED, _NET_CLEAN = (
         "OUT_EDGES", "OUT_CAND", "OUT_REMOVED", "OUT_CLEAN",
@@ -256,6 +263,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
     _NET_ASSIGNED, _NET_MFG, _NET_FINAL_OBJECTS, _NET_MFG_AREAS = (
         "OUT_ASSIGNED", "OUT_MFG_POINT", "OUT_FINAL_OBJECTS", "OUT_MFG_AREAS",
     )
+    _NET_CBT_NODES = "OUT_CBT_NODES"
 
     _TR_POLY, _TR_ROADS_KEY, _TR_PDP = "INPUT_POLY", "INPUT_ROADS", "INPUT_PDP"
     _TR_HH, _TR_BLDG, _TR_MFG_KEY = "INPUT_HOUSEHOLDS", "INPUT_BUILDINGS", "INPUT_MFG"
@@ -479,6 +487,11 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             type=QgsProcessingParameterNumber.Integer, defaultValue=128, minValue=1
         ))
         self.addParameter(QgsProcessingParameterNumber(
+            self.P_POLY_MAX_CBT, self.tr("02 Polygon — Growth: maximum homes per CBT area (0 = off)"),
+            type=QgsProcessingParameterNumber.Integer, defaultValue=16, minValue=0
+        ))
+
+        self.addParameter(QgsProcessingParameterNumber(
             self.P_POLY_NEIGH, self.tr("02 Polygon — Growth: neighbour distance rule [m]"),
             type=QgsProcessingParameterNumber.Double, defaultValue=150.0, minValue=1.0
         ))
@@ -582,6 +595,14 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(QgsProcessingParameterFeatureSink(
             self.OUT_POLYGONS, self.tr("Polygon Layer"),
             QgsProcessing.TypeVectorPolygon, optional=True, createByDefault=True
+        ))
+        self.addParameter(QgsProcessingParameterFeatureSink(
+            self.OUT_CBT_AREAS, self.tr("Polygon Layer — CBT areas"),
+            QgsProcessing.TypeVectorPolygon, optional=True, createByDefault=True
+        ))
+        self.addParameter(QgsProcessingParameterFeatureSink(
+            self.OUT_CBT_NODES, self.tr("Network - CBTs"),
+            QgsProcessing.TypeVectorPoint, optional=True, createByDefault=True
         ))
         self.addParameter(QgsProcessingParameterFeatureSink(
             self.OUT_PDP, self.tr("Network - PDPs"),
@@ -973,6 +994,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             self._POLY_PLAN: self.parameterAsBoolean(parameters, self.P_POLY_PLAN_FIRST, context),
             self._POLY_MIN: self.parameterAsInt(parameters, self.P_POLY_MIN_HH, context),
             self._POLY_MAX: self.parameterAsInt(parameters, self.P_POLY_MAX_HH, context),
+            self._POLY_MAX_CBT: self.parameterAsInt(parameters, self.P_POLY_MAX_CBT, context),
             self._POLY_NEIGH: self.parameterAsDouble(parameters, self.P_POLY_NEIGH, context),
             self._POLY_SERVICE: self.parameterAsDouble(parameters, self.P_POLY_SERVICE, context),
             self._POLY_ACCESS: self.parameterAsDouble(parameters, self.P_POLY_ACCESS, context),
@@ -983,6 +1005,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             ) or "motorway,trunk,primary,secondary",
             self._POLY_THIN: self.parameterAsBoolean(parameters, self.P_POLY_THIN, context),
             self._POLY_OUT: self._dest(parameters, self.OUT_POLYGONS, context),
+            self._POLY_CBT_OUT: self._dest(parameters, self.OUT_CBT_AREAS, context),
         }
         if clip is not None:
             params[self._POLY_CLIP] = clip
@@ -1007,11 +1030,14 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             self._NET_REMOVED: QgsProcessing.TEMPORARY_OUTPUT,
             self._NET_CLEAN: QgsProcessing.TEMPORARY_OUTPUT,
             self._NET_ASSIGNED: self._dest(parameters, self.OUT_PDP, context),
+            self._NET_CBT_NODES: self._dest(parameters, self.OUT_CBT_NODES, context),
             self._NET_MFG: (QgsProcessing.TEMPORARY_OUTPUT if mfg_override is not None
                             else self._dest(parameters, self.OUT_MFG, context)),
             self._NET_MFG_AREAS: self._dest(parameters, self.OUT_MFG_AREAS, context),
             self._NET_FINAL_OBJECTS: self._dest(parameters, self.OUT_OBJECTS, context),
         }
+        if results.get("cbt_areas") is not None:
+            params[self._NET_CBT] = results["cbt_areas"]
         if roads is not None:
             params[self._NET_ROADS] = roads
         if pbf:
@@ -1278,6 +1304,13 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             # No Trench_Nodes layer: chambers come from trench intersections
             # and the duct/PDP rules only.
             "INPUT_TRENCH_NODES": None,
+            # Network CBT nodes (one per CBT area) become chamber structures.
+            # CBT nodes are published as their own layer, but they do NOT
+            # create a chamber: feeding them in changed the chimney count (67
+            # -> 234), re-cut the published trench at every new anchor and
+            # pushed the ducts apart on the street. The trench and chamber
+            # stages stay exactly as they were until that design is approved.
+            "INPUT_CBT_NODES": None,
             "INPUT_AOI": self._fast_resolve(results.get("aoi"), context),
             "INPUT_BUILDINGS": self.parameterAsVectorLayer(parameters, self.P_BUILDINGS, context),
             "OUT_CHAMBERS": self._dest(parameters, self.OUT_CHAMBERS, context),
@@ -1702,6 +1735,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             needs=("Object Layer",),
         )
         results["polygons"] = poly.get(self._POLY_OUT)
+        results["cbt_areas"] = poly.get(self._POLY_CBT_OUT)
         elapsed = time.time() - t0
         n_poly = self._fast_count(results["polygons"], context)
         fc_str = "{} features, ".format(n_poly) if n_poly is not None else ""
@@ -1709,6 +1743,9 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         t_save = time.time()
         results["polygons"] = self._save_layer_to_gpkg(
             results["polygons"], "Polygons.gpkg", out_dir, context, feedback)
+        if results.get("cbt_areas"):
+            results["cbt_areas"] = self._save_layer_to_gpkg(
+                results["cbt_areas"], "CBT_Areas.gpkg", out_dir, context, feedback)
         feedback.pushInfo(self.tr("  [timing] Polygon output save: {:.3f}s".format(time.time() - t_save)))
 
         if feedback.isCanceled():
@@ -1726,6 +1763,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         results["pdp"] = net.get(self._NET_ASSIGNED)
         results["mfg"] = net.get(self._NET_MFG)
         results["mfg_service_areas"] = net.get(self._NET_MFG_AREAS)
+        results["cbt_nodes"] = net.get(self._NET_CBT_NODES)
         elapsed = time.time() - t0
         n_pdp = self._fast_count(results["pdp"], context)
         n_fobj = self._fast_count(net.get(self._NET_FINAL_OBJECTS), context)
@@ -2245,6 +2283,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         put(self.OUT_PDP, results.get("pdp"))
         put(self.OUT_MFG, results.get("mfg"))
         put(self.OUT_MFG_AREAS, results.get("mfg_service_areas"))
+        put(self.OUT_CBT_NODES, results.get("cbt_nodes"))
         put(self.OUT_FEEDER_TRENCH, results.get("feeder"))
         put(self.OUT_DIST_TRENCH, results.get("distribution"))
         put(self.OUT_GARDEN_TRENCH, results.get("garden"))

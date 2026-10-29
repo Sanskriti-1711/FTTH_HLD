@@ -58,6 +58,7 @@ class COMMON_FIELDS:
     CHAMBER_TYPE = "CHAMBER_TYPE"       # Manhole | Chamber | Handhole
     SUBTYPE = "SUBTYPE"                # Bore | Handhole | Manhole (civil sub-category)
     REASON = "REASON"                  # why this structure exists (rule that placed it)
+    CBT_ID = "CBT_ID"                  # CBT-001 (CBT chambers only)
     CONN_DUCTS = "CONN_DUCTS"
     SIZE = "SIZE"
     EQUIPMENT = "EQUIPMENT"             # associated equipment id (PDP/FAT)
@@ -114,6 +115,7 @@ THIN_PROFILES = {
         COMMON_FIELDS.CHAMBER_TYPE,
         COMMON_FIELDS.SUBTYPE,
         COMMON_FIELDS.REASON,
+        COMMON_FIELDS.CBT_ID,
         COMMON_FIELDS.PARENT_TRENCH,
         COMMON_FIELDS.CONN_DUCTS,
         COMMON_FIELDS.SIZE,

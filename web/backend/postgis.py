@@ -50,6 +50,8 @@ LAYER_TABLES: Dict[str, str] = {
     # Canonical names (from ONECLICK_OUTPUTS)
     "objects": "object_layer",
     "polygons": "polygon_layer",
+    "cbt_areas": "cbt_area_layer",
+    "cbts": "cbt_node_layer",
     "pdps": "pdps",
     "mfg": "mfg",
     "mfg_service_areas": "mfg_service_areas",
@@ -116,6 +118,8 @@ LAYER_TABLES: Dict[str, str] = {
 TABLE_TO_PUBLIC_NAME = {
     "object_layer": "objects",
     "polygon_layer": "polygons",
+    "cbt_area_layer": "cbt_areas",
+    "cbt_node_layer": "cbts",
     "pdps": "pdps",
     "mfg": "mfg",
     "mfg_service_areas": "mfg_service_areas",

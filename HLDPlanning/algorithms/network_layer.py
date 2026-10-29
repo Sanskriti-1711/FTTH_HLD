@@ -52,6 +52,16 @@ def _geom_covers(a: QgsGeometry, b: QgsGeometry) -> bool:
     return a.contains(b) or a.touches(b)
 
 
+def _nearest_cbt_node(pt_geom, cbt_nodes):
+    """CBT_ID of the node in ``cbt_nodes`` ([(CBT_ID, point geometry)]) nearest ``pt_geom``."""
+    best_id, best_d = None, None
+    for cbt_id, node in cbt_nodes:
+        d = pt_geom.distance(node)
+        if best_d is None or d < best_d:
+            best_id, best_d = cbt_id, d
+    return best_id
+
+
 def _thin_feature(fields: QgsFields, geom: QgsGeometry, attrs: dict) -> QgsFeature:
     """Create a feature with a strict/thin schema and safe attribute assignment."""
     f = QgsFeature(fields)
@@ -407,6 +417,7 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
     INPUT_ROADS = "INPUT_ROADS"
     INPUT_OSM_PBF = "INPUT_OSM_PBF"
     INPUT_OBJECTS = "INPUT_OBJECTS"
+    INPUT_CBT_AREAS = "INPUT_CBT_AREAS"  # optional CBT areas from the Polygon Layer
 
     DEFAULT_FILTER_CAND = (
         "\"fclass\" IN ('residential','living_street','unclassified',"
@@ -448,6 +459,9 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
     # Final object layer: objects + POLYGON_ID/PDP_ID/MFG_ID from the registry
     OUT_FINAL_OBJECTS = "OUT_FINAL_OBJECTS"
 
+    # CBT nodes: one per CBT area, on the street (optional)
+    OUT_CBT_NODES = "OUT_CBT_NODES"
+
     # -------------- UI / Parameter definitions --------------
     def initAlgorithm(self, config=None):
         # Core inputs
@@ -474,6 +488,12 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
         ))
 
         # Outputs
+        self.addParameter(QgsProcessingParameterVectorLayer(
+            self.INPUT_CBT_AREAS,
+            "CBT areas (optional; enables CBT nodes and per-building CBT_ID)",
+            [QgsProcessing.TypeVectorPolygon],
+            optional=True,
+        ))
         self.addParameter(QgsProcessingParameterFeatureSink(self.OUT_EDGES,   "buffer_edges"))
         self.addParameter(QgsProcessingParameterFeatureSink(self.OUT_CAND,    "candidate_pdps"))
         self.addParameter(QgsProcessingParameterFeatureSink(self.OUT_REMOVED, "pdps_to_remove"))
@@ -486,6 +506,9 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
             clipped_param.flags() | QgsProcessingParameterDefinition.FlagOptional
         )
         self.addParameter(clipped_param)
+        self.addParameter(QgsProcessingParameterFeatureSink(
+            self.OUT_CBT_NODES, "CBTs", QgsProcessing.TypeVectorPoint, optional=True,
+        ))
         self.addParameter(QgsProcessingParameterFeatureSink(self.OUT_MFG, "Final_MFG_Point"))
         self.addParameter(QgsProcessingParameterFeatureSink(
             self.OUT_MFG_AREAS, "MFG serving-area boundaries",
@@ -1834,6 +1857,54 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
             feedback.pushInfo("Placed {} MFG points and matching service-area boundaries.".format(len(mfg_areas)))
 
         # ------------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # CBT nodes: one node per CBT area, placed on the nearest allowed
+        # street exactly as a PDP is. Off when no CBT areas are supplied.
+        # ------------------------------------------------------------------
+        cbt_areas = self.parameterAsVectorLayer(params, self.INPUT_CBT_AREAS, context)
+        cbt_nodes_by_poly = defaultdict(list)   # POLYGON_ID -> [(CBT_ID, node geometry)]
+        id_cbt = None
+        if cbt_areas is not None and cbt_areas.featureCount() > 0:
+            cbt_fields = QgsFields()
+            for _name, _type in (("CBT_ID", QMetaType.Type.QString), ("SERVED_HH", QMetaType.Type.Int),
+                                 ("POLYGON_ID", QMetaType.Type.QString), ("PDP_ID", QMetaType.Type.QString),
+                                 ("SPLIT_SIZE", QMetaType.Type.QString), ("STAGE", QMetaType.Type.QString)):
+                cbt_fields.append(QgsField(_name, _type))
+            sinkCbt, id_cbt = self.parameterAsSink(
+                params, self.OUT_CBT_NODES, context, cbt_fields, QgsWkbTypes.Point, polys_valid.crs())
+            _reg_cbt = manager.get_registry()
+            _pdp_of = {str(_p): _reg_cbt.get_network(_p)["pdp_id"] for _p in _reg_cbt.polygon_ids()}
+            for _cf in cbt_areas.getFeatures():
+                _ag = _cf.geometry()
+                if _ag is None or _ag.isEmpty():
+                    continue
+                _rep = _ag.centroid()
+                if _rep is None or _rep.isEmpty() or not _ag.contains(_rep.asPoint()):
+                    _rep = _ag.pointOnSurface()
+                _street_pt, _ = _nearest_street_point(_rep, filtered)
+                _node = _street_pt if _street_pt is not None else QgsGeometry(_rep)
+                _pid_c = str(_cf["POLYGON_ID"])
+                _cid = str(_cf["CBT_AREA_ID"])
+                _hh = int(_cf["households"] or 0)
+                cbt_nodes_by_poly[_pid_c].append((_cid, _node))
+                if sinkCbt is not None:
+                    _plan = plan_splitters(_hh)
+                    _nf = QgsFeature(cbt_fields)
+                    _nf.setGeometry(_node)
+                    _nf["CBT_ID"] = _cid
+                    _nf["SERVED_HH"] = _hh
+                    _nf["POLYGON_ID"] = _pid_c
+                    _nf["PDP_ID"] = _pdp_of.get(_pid_c)
+                    _nf["SPLIT_SIZE"] = f"1:{_plan['primary']}" if _plan["primary"] else "-"
+                    _nf["STAGE"] = "cbt_nodes"
+                    sinkCbt.addFeature(_nf)
+            feedback.pushInfo(
+                f"CBT nodes placed: {sum(len(v) for v in cbt_nodes_by_poly.values())}")
+
+        def _cbt_for(poly_id, pt_geom):
+            """CBT_ID of the CBT node nearest a building, within its own polygon."""
+            return _nearest_cbt_node(pt_geom, cbt_nodes_by_poly.get(str(poly_id), []))
+
         # Final Object Layer: a NEW layer (input objects are left untouched
         # apart from the legacy in-place sync) carrying every source column
         # plus canonical POLYGON_ID / PDP_ID / MFG_ID from the registry.
@@ -1850,7 +1921,7 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
                 fo_fields = QgsFields()
                 for _fld in src_fields:
                     fo_fields.append(QgsField(_fld.name(), _fld.type(), _fld.typeName(), _fld.length(), _fld.precision()))
-                for _extra in (COMMON_FIELDS.POLYGON_ID, COMMON_FIELDS.PDP_ID, COMMON_FIELDS.MFG_ID):
+                for _extra in (COMMON_FIELDS.POLYGON_ID, COMMON_FIELDS.PDP_ID, COMMON_FIELDS.MFG_ID, "CBT_ID"):
                     if fo_fields.lookupField(_extra) < 0:
                         fo_fields.append(QgsField(_extra, QMetaType.Type.QString))
 
@@ -1885,6 +1956,7 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
                     _poly_i = fo_fields.lookupField(COMMON_FIELDS.POLYGON_ID)
                     _pdp_i = fo_fields.lookupField(COMMON_FIELDS.PDP_ID)
                     _mfg_i = fo_fields.lookupField(COMMON_FIELDS.MFG_ID)
+                    _cbt_i = fo_fields.lookupField("CBT_ID")
                     _linked = _unlinked = 0
                     for _of in objects.getFeatures():
                         _nf = QgsFeature(fo_fields)
@@ -1904,6 +1976,7 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
                             _unlinked += 1
                         if not _match:
                             _nf[_mfg_i] = None
+                        _nf[_cbt_i] = _cbt_for(_match[0], _of.geometry()) if _match else None
                         sinkFO.addFeature(_nf)
                     feedback.pushInfo(
                         f"Final_Object_Layer written: {_linked} objects linked to PDPs/MFGs, "
@@ -1950,4 +2023,6 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
             out[self.OUT_MFG_AREAS] = out_mfg_areas_id
         if id_final_obj is not None:
             out[self.OUT_FINAL_OBJECTS] = id_final_obj
+        if id_cbt is not None:
+            out[self.OUT_CBT_NODES] = id_cbt
         return out

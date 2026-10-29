@@ -162,6 +162,47 @@ def plan_splitters(hh, sizes=SPLITTER_SIZES, util_min=SPLIT_UTIL_MIN, util_max=S
             "util": util, "ok": ok, "primary": primary, "label": label}
 
 
+CBT_HP_TARGET = 16   # homes per CBT (1:16 secondary splitter)
+
+
+def plan_two_stage(hh, primary=(4, 8), secondary=(16, 32), cbt_hp=CBT_HP_TARGET):
+    """
+    Two-stage split for one PDP area: a primary splitter at the PDP feeds
+    the CBTs, and each CBT holds a secondary splitter for its homes.
+
+    The CBT count is ceil(hh / cbt_hp). The primary size is the smallest in
+    `primary` whose ports cover the CBTs, or the largest one when they do
+    not fit in a single device. Returns a dict with:
+      groups        number of primary splitters
+      primary       primary splitter size (ports per splitter)
+      cbt_count     number of CBTs
+      ports         primary ports installed (groups * primary)
+      util          CBTs / primary ports * 100 (one decimal)
+      secondary     secondary size used per CBT (smallest in `secondary`
+                    that covers the homes on that CBT, at most cbt_hp)
+    """
+    empty = {"groups": 0, "primary": 0, "cbt_count": 0, "ports": 0,
+             "util": 0.0, "secondary": 0}
+    try:
+        hh = int(hh)
+    except (TypeError, ValueError):
+        return dict(empty)
+    if hh <= 0:
+        return dict(empty)
+
+    prim = sorted(int(s) for s in primary if int(s) > 0)
+    sec = sorted(int(s) for s in secondary if int(s) > 0)
+    cbt_count = int(math.ceil(hh / float(cbt_hp)))
+    p_size = next((s for s in prim if s >= cbt_count), prim[-1])
+    groups = int(math.ceil(cbt_count / float(p_size)))
+    ports = groups * p_size
+    per_cbt = min(hh, cbt_hp)
+    sec_size = next((s for s in sec if s >= per_cbt), sec[-1])
+    return {"groups": groups, "primary": p_size, "cbt_count": cbt_count,
+            "ports": ports, "util": round(100.0 * cbt_count / ports, 1),
+            "secondary": sec_size}
+
+
 def recommend_splitter(hh):
     """Backward-compatible summary: (primary_size_label, total_splitters, util, ok)."""
     p = plan_splitters(hh)
