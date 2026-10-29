@@ -69,7 +69,6 @@ GROWTH_MEMBER_PROTECT = 10.0
 # full neighbour) may be absorbed into that neighbour up to this multiple of the
 # max-homes cap, to avoid leaving it as a lone satellite square. The absorbing
 # polygon is flagged REVIEW=1. (User choice: presentable > strict cap by a hair.)
-GROWTH_OVERFLOW = 1.10
 
 # Splitter sizing (computed OUTPUT, not a growth constraint): the full mix of
 # splitters used per polygon/PDP lives in utils/splitters.py (shared with stage 03).
@@ -95,6 +94,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
     # Seeded-growth builder
     P_PLAN_FIRST = "PLANNING_FIRST"
     P_MIN_HH = "MIN_HH_PER_POLYGON"; P_MAX_HH = "MAX_HH_PER_POLYGON"
+    P_MAX_HH_CBT = "MAX_HH_PER_CBT_AREA"; P_CBT_OUT = "CBT_OUT"
     P_NEIGH_DIST = "NEIGHBOR_DIST"; P_SERVICE_RADIUS = "SERVICE_RADIUS"
     P_ACCESS_DIST = "ROAD_ACCESS_DIST"
     P_BAR_ROADS = "BARRIER_ROADS"; P_BAR_FIELD = "BARRIER_CLASS_FIELD"
@@ -186,7 +186,14 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
             self.P_MAX_HH,
             self.tr("Growth: maximum homes per polygon"),
             type=QgsProcessingParameterNumber.Integer,
-            defaultValue=128, minValue=1
+            defaultValue=64, minValue=1
+        ))
+
+        self.addParameter(QgsProcessingParameterNumber(
+            self.P_MAX_HH_CBT,
+            self.tr("Growth: maximum homes per CBT area (0 = off)"),
+            type=QgsProcessingParameterNumber.Integer,
+            defaultValue=16, minValue=0
         ))
 
         self.addParameter(QgsProcessingParameterDistance(
@@ -251,6 +258,13 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
             self.P_OUT,
             self.tr("Output polygons"),
             QgsProcessing.TypeVectorPolygon
+        ))
+
+        self.addParameter(QgsProcessingParameterFeatureSink(
+            self.P_CBT_OUT,
+            self.tr("Output CBT areas (optional)"),
+            QgsProcessing.TypeVectorPolygon,
+            optional=True
         ))
 
     # ------------- helpers -------------
@@ -664,9 +678,21 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
             src.sourceCrs()
         )
 
+        # Optional CBT-area output: one sub-area per CBT, written by the growth builder.
+        (cbt_sink, cbt_dest) = self.parameterAsSink(
+            p, self.P_CBT_OUT, context,
+            self._cbt_area_fields(),
+            QgsWkbTypes.MultiPolygon,
+            src.sourceCrs()
+        )
+
         if method == M_GROWTH:
-            self._process_growth(p, context, feedback, src, sink, fields_out, buf_m, clip_lyr)
-            return {self.P_OUT: dest_id}
+            self._process_growth(p, context, feedback, src, sink, fields_out, buf_m, clip_lyr,
+                                 cbt_sink=cbt_sink)
+            outputs = {self.P_OUT: dest_id}
+            if cbt_dest is not None:
+                outputs[self.P_CBT_OUT] = cbt_dest
+            return outputs
 
         # ---- Legacy hull methods (Convex / Concave / Voronoi) ----
         # Build a spatial index of premises so each hull polygon gets correct
@@ -947,6 +973,95 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                 sink.addFeature(out, QgsFeatureSink.FastInsert)
 
         return {self.P_OUT: dest_id}
+
+    def _cbt_area_fields(self) -> QgsFields:
+        """Attributes of the optional CBT-area output."""
+        out = QgsFields()
+        for name, typ in [
+            ("CBT_AREA_ID", QMetaType.Type.QString),
+            ("POLYGON_ID", QMetaType.Type.QString),
+            ("households", QMetaType.Type.Int),
+            ("CBT_ORDER", QMetaType.Type.Int),
+        ]:
+            out.append(QgsField(name, typ))
+        return out
+
+    def _write_cbt_areas(self, sink, fields, poly_id, geom, members, pts, hh_of,
+                         cap, serial):
+        """
+        Split one finished PDP area into CBT sub-areas of at most `cap` homes and
+        write them to `sink`. Premises are grouped by utils.cbt_areas; each group
+        takes the Voronoi cells of its own premises, clipped to the PDP area, so
+        the CBT areas tile the PDP area. Returns the next CBT serial number.
+        """
+        from shapely import voronoi_polygons
+        from shapely.geometry import MultiPoint, Point
+        from ..utils.cbt_areas import split_into_cbt_groups
+
+        rows = [(m, pts[m].x(), pts[m].y(), hh_of.get(m, 1)) for m in members]
+        groups = split_into_cbt_groups(rows, cap)
+        if not groups:
+            return serial
+
+        if len(groups) == 1:
+            area_geoms = [geom]
+        else:
+            coords = [(pts[m].x(), pts[m].y()) for m in members]
+            vor = voronoi_polygons(MultiPoint(coords))
+            group_of = {m: gi for gi, g in enumerate(groups) for m in g}
+            per_group = [[] for _ in groups]
+            # Index the premises once so each Voronoi cell finds its own
+            # premises in O(log n), not by testing every premises.
+            from shapely import STRtree
+            # Query by envelope, then test containment explicitly, so the
+            # result does not depend on the order shapely applies a predicate.
+            pt_geoms = [Point(x, y) for x, y in coords]
+            tree = STRtree(pt_geoms)
+            for cell in vor.geoms:
+                for hit in tree.query(cell):
+                    if cell.contains(pt_geoms[int(hit)]):
+                        m = members[int(hit)]
+                        per_group[group_of[m]].append(QgsGeometry.fromWkt(cell.wkt))
+                        break
+            area_geoms = []
+            for cells in per_group:
+                if not cells:
+                    area_geoms.append(QgsGeometry())
+                    continue
+                area_geoms.append(QgsGeometry.unaryUnion(cells).intersection(geom))
+            # Any sliver no premises' cell covers (e.g. duplicate coordinates) goes
+            # to the group of the nearest premises, so the areas still tile the PDP.
+            covered = QgsGeometry.unaryUnion([g for g in area_geoms if not g.isEmpty()])
+            left = geom.difference(covered) if not covered.isEmpty() else geom
+            if left is not None and not left.isEmpty():
+                cen = left.centroid().asPoint()
+                nearest = min(range(len(members)), key=lambda i: (
+                    (coords[i][0] - cen.x()) ** 2 + (coords[i][1] - cen.y()) ** 2))
+                gi = group_of[members[nearest]]
+                area_geoms[gi] = QgsGeometry.unaryUnion(
+                    [g for g in [area_geoms[gi], left] if not g.isEmpty()])
+
+        for order, (g_members, ag) in enumerate(zip(groups, area_geoms), start=1):
+            if ag is None or ag.isEmpty():
+                continue
+            # Drop zero-area remnants (touching edges or slivers from the clip),
+            # so each CBT area is one polygon of real area.
+            if ag.isMultipart():
+                ag = QgsGeometry.unaryUnion(
+                    [p for p in ag.asGeometryCollection() if p.area() > 0])
+            if ag is None or ag.isEmpty():
+                continue
+            out = QgsFeature(fields)
+            ag.convertToMultiType()
+            out.setGeometry(ag)
+            hh = sum(hh_of.get(m, 1) for m in g_members)
+            for k, v in [("CBT_AREA_ID", f"CBT{serial:05d}"), ("POLYGON_ID", poly_id),
+                         ("households", hh), ("CBT_ORDER", order)]:
+                if k in fields.names():
+                    out[k] = v
+            serial += 1
+            sink.addFeature(out, QgsFeatureSink.FastInsert)
+        return serial
 
     def _write_polygon_metrics(self, feat, geom, names, pt_index, pt_geoms, pt_hh):
         """
@@ -1306,7 +1421,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
             return None
 
     def _process_growth(self, p, context, feedback, src, sink, fields_out,
-                        buf_m, clip_lyr):
+                        buf_m, clip_lyr, cbt_sink=None):
         """
         Constrained agglomerative (Ward-linkage) region building under the polygon
         creation rules: Distance (neighbour ≤ NEIGHBOR_DIST graph), Home Count
@@ -1324,7 +1439,12 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
         neigh_dist = float(self.parameterAsDouble(p, self.P_NEIGH_DIST, context) or 150.0)
         seedbuf = float(self.parameterAsDouble(p, self.P_SEEDBUF, context) or 0.0)
         min_hh = max(1, self.parameterAsInt(p, self.P_MIN_HH, context) or 32)
-        max_hh = self.parameterAsInt(p, self.P_MAX_HH, context) or 128
+        max_hh = self.parameterAsInt(p, self.P_MAX_HH, context) or 64
+        cbt_cap = self.parameterAsInt(p, self.P_MAX_HH_CBT, context)
+        if cbt_cap is None:
+            cbt_cap = 16
+        cbt_fields = self._cbt_area_fields()
+        cbt_serial = 1
         if max_hh < min_hh:
             max_hh = min_hh
         service_radius = float(self.parameterAsDouble(p, self.P_SERVICE_RADIUS, context) or 300.0)
@@ -1715,7 +1835,6 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
         # cap, then within soft-cap overflow, else the nearest neighbour outright
         # (flagged REVIEW). Only a building with NO barrier-free neighbour at all
         # can remain alone — and that is a genuinely isolated premise.
-        singleton_soft = int(round(max_hh * GROWTH_OVERFLOW))
         singleton_merges = 0
         for _sround in range(4):
             singles = [ci for ci in range(len(clusters))
@@ -1743,15 +1862,12 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                 cand.sort(key=lambda t: t[0])
                 # pick best by capacity tier: in-cap → soft-cap → nearest
                 target = None
-                for _tier_cap in (max_hh, singleton_soft, None):
-                    for d, nci in cand:
-                        if _tier_cap is None or clusters[nci]["hh"] + clusters[ci]["hh"] <= _tier_cap:
-                            target = nci
-                            break
-                    if target is not None:
+                for d, nci in cand:
+                    if clusters[nci]["hh"] + clusters[ci]["hh"] <= max_hh:
+                        target = nci
                         break
                 if target is None:
-                    continue
+                    continue                # no neighbour has room under the cap
                 clusters[target]["members"].extend(clusters[ci]["members"])
                 clusters[target]["hh"] += clusters[ci]["hh"]
                 clusters[target]["sx"] += clusters[ci]["sx"]
@@ -1892,13 +2008,10 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
         # / service-radius enforced). Rebuild the partition once afterwards. This
         # targets the few fragmenting buildings without smearing cluster borders.
         if vmap:
-            soft_cap = int(round(max_hh * GROWTH_OVERFLOW))
-            overflow_used = 0
-            # Rounds 0–2: strict cap. Rounds 3–5: allow the surrounding cluster to
-            # go up to soft_cap so a capacity-locked stray never stays a lone
-            # square (the absorbing polygon is flagged REVIEW).
+            # Every round holds the hard cap: a stray that cannot move under it
+            # stays where it is rather than pushing a polygon over MAX_HH.
             for _round in range(6):
-                cap = max_hh if _round < 3 else soft_cap
+                cap = max_hh
                 stranded = []
                 for ci in emit_order:
                     cell = vmap.get(ci)
@@ -1948,9 +2061,6 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                     clusters[nci]["sx"] += pts[m].x()
                     clusters[nci]["sy"] += pts[m].y()
                     assigned[m] = nci
-                    if clusters[nci]["hh"] > max_hh:
-                        clusters[nci]["review"] = True     # over the cap by design → flag
-                        overflow_used += 1
                     moved += 1
                 if not moved:
                     break
@@ -1966,11 +2076,6 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                 vmap = self._voronoi_by_cluster(owner, pts, src.sourceCrs(), feedback)
                 if not vmap:
                     break
-            if overflow_used:
-                feedback.pushInfo(
-                    f"Growth: {overflow_used} stray building(s) absorbed with capacity overflow "
-                    f"(up to {soft_cap} homes) to avoid lone squares — those polygons flagged REVIEW."
-                )
 
         # ---- Phase B.6: DE-ISLAND — force single-part serving areas ----
         # A serving polygon must be ONE contiguous boundary. Any building still
@@ -2013,6 +2118,8 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                         nci = _resolve(na) if na is not None else None
                         if nci is None or nci == ci or not clusters[nci]["members"]:
                             continue
+                        if clusters[nci]["hh"] + hh_of[m] > max_hh:
+                            continue                # would breach the cap
                         votes_any[nci] += 1
                         if not crosses_barrier(pts[m], pts[nid]):
                             votes_free[nci] += 1
@@ -2029,6 +2136,8 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                         for oci in emit_order:
                             if oci == ci or not clusters[oci]["members"]:
                                 continue
+                            if clusters[oci]["hh"] + hh_of[m] > max_hh:
+                                continue            # would breach the cap
                             ocell = vmap.get(oci)
                             if ocell is None or ocell.isEmpty():
                                 continue
@@ -2385,6 +2494,18 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                 if k in names:
                     out[k] = v
             sink.addFeature(out, QgsFeatureSink.FastInsert)
+            if cbt_sink is not None and cbt_cap > 0:
+                # One building cannot be split across CBTs, so a premises over
+                # the cap becomes its own CBT. Flag it so the run log shows it.
+                _over = [m for m in cl["members"] if hh_of.get(m, 1) > cbt_cap]
+                if _over:
+                    feedback.pushWarning(
+                        f"CBT: {len(_over)} premises in polygon {poly_id} hold more "
+                        f"than {cbt_cap} homes (max {max(hh_of.get(m, 1) for m in _over)}); "
+                        "each is its own CBT and needs a larger splitter.")
+                cbt_serial = self._write_cbt_areas(
+                    cbt_sink, cbt_fields, poly_id, geom, cl["members"],
+                    pts, hh_of, cbt_cap, cbt_serial)
 
         hh_total = sum(clusters[ci]["hh"] for ci in emit_order)
         in_band = sum(1 for ci in emit_order
