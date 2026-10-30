@@ -15,9 +15,12 @@ name: Keep the engine, the backend and the QGIS worker awake
 # SUSPENDS free web services until the next calendar month — every service down
 # at once, which is far worse than a cold start.
 #
-# Hence a window, and it has to be **7 h/day** now that the worker is in it:
-# 3 services x (7 h + 0.25 h of the 15-minute idle tail after the last ping)
-# x 31 days = **674 h/mo**, leaving ~75 h for traffic outside the window.
+# Hence a window: **3 h/day**, 09:00Z-12:00Z, narrowed from 7 h on 2026-10-30
+# while the month's spare instance hours were still under review.
+# 3 services x (3 h + 0.25 h of the 15-minute idle tail after the last ping)
+# x 31 days = **302 h/mo**, leaving ~448 h of the 750 for traffic outside it.
+# A run in flight keeps its services awake on its own -- the window only
+# decides when PINGS happen, so narrowing it never cuts a running job.
 # The engine and the backend used to get 11 h/day (07-18 UTC) at 660 h/mo
 # between them; the worker's wake is minutes, theirs is seconds, so the three
 # hours went to the service whose cold start actually hurts. 09-16 UTC is
@@ -69,7 +72,7 @@ concurrency:
 
 env:
   WARM_FROM_UTC: '9'
-  WARM_TO_UTC: '16'
+  WARM_TO_UTC: '12'
   MONTHLY_INSTANCE_HOURS: '750'
   SERVICE_COUNT: '3'
   WORKER_URL: https://ftth-qgis-worker.onrender.com
