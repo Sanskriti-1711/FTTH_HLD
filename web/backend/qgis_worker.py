@@ -62,6 +62,11 @@ EXECUTABLE = os.environ.get("QGIS_WORKER_EXECUTABLE", "")
 # middle of a run must still be able to collect the outputs).
 JOB_RETENTION_S = int(os.environ.get("QGIS_WORKER_JOB_RETENTION_S", "21600"))
 MAX_LINES = int(os.environ.get("QGIS_WORKER_MAX_LINES", "20000"))
+# How many of those lines are written to the recovery file. The live log is
+# served from memory, so the persisted copy only has to be long enough to
+# explain a restart; rewriting all 20,000 every 40 lines was heavy enough to
+# stall the worker's own health endpoint.
+PERSIST_LINES = int(os.environ.get("QGIS_WORKER_PERSIST_LINES", "2000"))
 # One QGIS process at a time.  The whole point of this service is that QGIS gets
 # the instance to itself; two concurrent designs would put it straight back over
 # the cap.  Jobs therefore QUEUE -- the API polls a queued job exactly like a
@@ -175,7 +180,7 @@ def _save_job(job_id: str, job: Dict[str, Any]) -> None:
             "finished_at": job.get("finished_at"),
             "queued_at": job.get("queued_at"),
             "last_line_at": job.get("last_line_at"),
-            "lines": (job.get("lines") or [])[-MAX_LINES:],
+            "lines": (job.get("lines") or [])[-PERSIST_LINES:],
         }
         tmp = _state_file(job_id).with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload), encoding="utf-8")
@@ -401,12 +406,21 @@ def _run_qgis(job_id: str, job: Dict[str, Any], out_dir: Path,
             "[worker] applied %d run setting(s) from the engine: %s"
             % (len(job_environment), ", ".join(sorted(job_environment)))
         )
-    lines_since_save = 0
+    last_save = 0.0
     before = _snapshot(out_dir)
     try:
         process, output = _spawn_qgis(args, env)
         job["pid"] = process.pid
         job["process"] = process
+        # Let the worker's own HTTP thread win the CPU. This service answers
+        # Render's health check from the same small box qgis_process saturates,
+        # and when that check cannot open the port Render restarts the instance
+        # -- taking every run in flight with it. Raising the child's niceness
+        # needs no privilege and costs the pipeline nothing it cannot spare.
+        try:
+            os.setpriority(os.PRIO_PROCESS, process.pid, 19)
+        except (AttributeError, OSError):
+            pass
         meminfo.trace(f"worker job {job_id[:8]} started", pid=process.pid)
         if job.get("canceled"):
             # The stop landed before Popen returned; kill it now rather than
@@ -421,10 +435,14 @@ def _run_qgis(job_id: str, job: Dict[str, Any], out_dir: Path,
                 job["last_line_at"] = time.time()
                 if len(job["lines"]) > MAX_LINES:
                     del job["lines"][: len(job["lines"]) - MAX_LINES]
-            # Every 40 lines, not every line: the save is for recovery, not a journal.
-            lines_since_save += 1
-            if lines_since_save >= 40:
-                lines_since_save = 0
+            # By TIME, not by line count: a burst of output used to rewrite the
+            # whole job file every 40 lines, and on a 0.1-CPU worker that starved
+            # the HTTP thread long enough for the health check to fail ("dial tcp
+            # ...:10000: i/o timeout"), which restarted the instance and killed
+            # the run.
+            now = time.time()
+            if now - last_save >= 5.0:
+                last_save = now
                 _save_job(job_id, job)
         try:
             close = getattr(output, "close", None)
