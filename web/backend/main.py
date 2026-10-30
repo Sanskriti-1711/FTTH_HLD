@@ -629,6 +629,26 @@ def _pipeline_task(project_id: str) -> Tuple[Dict[str, Any], bool]:
     return _task(project_id), False
 
 
+def _is_instage_line(text: str, stage_index: int) -> bool:
+    """Does this line say more than which stage it belongs to?
+
+    "[25%] Running Polygon Layer" is the stage's own entry line: it moves the
+    HLD bar to that stage's ladder rung and nothing else, which is the contract
+    ``test_the_hld_progress_ladder_is_unchanged`` protects. A line that keeps
+    going after the stage name is a sample from INSIDE the stage —
+    "[40%] Running Polygon Layer — compaction pass 3/8" — and those are what
+    let a long growth pass move the bar instead of sitting still at 11 %.
+    """
+    if not (0 <= stage_index < len(PIPELINE_STAGES)):
+        return False
+    stage = f"running {PIPELINE_STAGES[stage_index].lower()}"
+    lowered = text.lower()
+    at = lowered.find(stage)
+    if at < 0:
+        return False
+    return bool(lowered[at + len(stage):].strip(" \t-–—:|,"))
+
+
 def _pipeline_progress(text: str, stage_index: int, in_lld: bool) -> int:
     """Progress to report for a stage line, in the band that task owns.
 
@@ -637,10 +657,23 @@ def _pipeline_progress(text: str, stage_index: int, in_lld: bool) -> int:
     the design (every stage boundary, roughly every 2-12 minutes) instead of
     stepping 0 → 80 the moment the pipeline ends.
     """
-    if not in_lld:
-        return int((stage_index / len(PIPELINE_STAGES)) * 100)
     match = _PIPELINE_PERCENT_RE.match(text)
-    pct = int(match.group(1)) if match else int((stage_index / len(PIPELINE_STAGES)) * 100)
+    ladder = int((stage_index / len(PIPELINE_STAGES)) * 100)
+    if not in_lld:
+        # An in-stage line carries a percentage through its OWN stage, so it
+        # interpolates inside that stage's band. Before this the bar sat at the
+        # stage's ladder value — 11 % for Polygon Layer — for the whole growth
+        # pass: run f094c6c5 read 11 % for 27 minutes while clustering,
+        # compaction and six defragmentation rounds were all working, which is
+        # indistinguishable from a frozen run on the status page. Progress
+        # never steps backwards, so this cannot pull the bar back either.
+        if match and _is_instage_line(text, stage_index):
+            low = int((stage_index / len(PIPELINE_STAGES)) * 100)
+            high = int(((stage_index + 1) / len(PIPELINE_STAGES)) * 100)
+            within = max(0, min(100, int(match.group(1))))
+            return low + int(within / 100 * (high - low))
+        return ladder
+    pct = int(match.group(1)) if match else ladder
     low, high = LLD_PIPELINE_PROGRESS
     return low + round(pct / 100 * (high - low))
 

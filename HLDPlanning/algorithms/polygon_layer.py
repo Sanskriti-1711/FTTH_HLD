@@ -1456,6 +1456,25 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
             f"service radius ≤ {service_radius:.0f} m, road access ≤ {access_dist:.0f} m."
         )
 
+        def _progress(pct: int, label: str) -> None:
+            """Announce where the growth pass is INSIDE the Polygon Layer stage.
+
+            The engine moves the stage bar on "[NN%] Running <Stage>" lines
+            only, so this pass used to report nothing at all: run f094c6c5 sat
+            at "Polygon Layer 11 %" for 27 minutes while clustering,
+            compaction and six defragmentation rounds were all working, which
+            is indistinguishable from a frozen run on the status page.
+
+            ``pct`` is a position WITHIN this stage (0–100), not the pipeline's
+            global percentage: the engine interpolates it across the stage's
+            own band. The trailing label is what marks the line as in-stage —
+            the bare stage entry line must keep moving only the ladder.
+            """
+            try:
+                feedback.pushInfo(f"[{pct}%] Running Polygon Layer — {label}")
+            except Exception:
+                pass
+
         # ---- collect premises (membership units) ----
         hh_name = self._detect_hh_field(src.fields())
         obj_name = self._detect_object_field(src.fields())
@@ -1721,6 +1740,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
         feedback.pushInfo(
             f"Growth: agglomerative (Ward) clustering — {n_merges} merges → {n_clusters} clusters."
         )
+        _progress(15, f"{n_merges} merges → {n_clusters} cluster(s)")
 
         # HOME COUNT (min) + ≥3-buildings: flag survivors that stay undersized
         n_under = 0
@@ -1911,6 +1931,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
 
         compact_moves = 0
         for _it in range(8):
+            _progress(20 + _it * 3, f"compaction pass {_it + 1}/8")
             cents = {ci: _centroid(ci) for ci in range(len(clusters))
                      if ci not in merged_into and clusters[ci]["members"]}
             moved = 0
@@ -2013,6 +2034,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
             # Every round holds the hard cap: a stray that cannot move under it
             # stays where it is rather than pushing a polygon over MAX_HH.
             for _round in range(6):
+                _progress(50 + _round * 5, f"defragmentation round {_round + 1}/6")
                 cap = max_hh
                 stranded = []
                 for ci in emit_order:
@@ -2320,6 +2342,8 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                 feedback.setProgress(60 + int(35 * (n_done + 1) / max(1, len(emit_order))))
             except Exception:
                 pass
+            if (n_done + 1) % 100 == 0:
+                _progress(90, "emitted %d/%d polygon(s)" % (n_done + 1, len(emit_order)))
 
         # ---- Phase D: COVERAGE GUARANTEE — leave no premise outside a polygon ----
         # Every house must sit inside a polygon. After the single-boundary trim,
