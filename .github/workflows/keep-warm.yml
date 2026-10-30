@@ -1,10 +1,23 @@
-name: Keep the engine, the backend and the QGIS worker awake
+name: Keep the engine and the backend awake (the worker wakes on demand)
 
 # Render's free plan stops a web service after 15 minutes without traffic. A
 # cold start measured 42s for the backend; the QGIS worker's measured **415 s**
-# on the 2026-10-22 L1 8JQ run (`QGIS worker ready (415s)`), which is the whole
-# reason it is warmed here too: the engine waits that out instead of failing,
-# but the run still sits on stage 0 doing nothing for seven minutes.
+# on the 2026-10-22 L1 8JQ run (`QGIS worker ready (415s)`).
+#
+# ── Why the worker is no longer on the schedule (2026-10-30) ───────────────────
+# Pinging it bought almost nothing. A run keeps the worker awake by itself: the
+# engine polls `/jobs/{id}/log` every 2 s while a run is in flight, and Render
+# only counts *inbound* traffic. And a run never starts on a sleeping worker
+# unannounced -- `wake_worker()` boots it from three places (run submit, area
+# preview, run start), overlaps the boot with the OSM fetch, and the run log
+# says "The QGIS worker is not awake yet (...); waiting for it". So the schedule
+# was buying 415 s of latency avoided on the first run of the day, at a cost of
+# 3 h/day of the shared instance-hour budget.
+#
+# The trade taken instead: the schedule warms only the engine and the backend,
+# the worker boots on demand, and the engine's wake budget (`FTTH_QGIS_WORKER_WAKE`,
+# 900 s) covers a 415 s boot plus Render's queue. A **manual dispatch still warms
+# the worker** -- that is the "wake it now" button before a demo, at ~0.2 h a click.
 #
 # ── The hour budget is the constraint, and it is shared ────────────────────────
 # Render grants **750 free instance hours per workspace per calendar month**,
@@ -17,8 +30,9 @@ name: Keep the engine, the backend and the QGIS worker awake
 #
 # Hence a window: **3 h/day**, 09:00Z-12:00Z, narrowed from 7 h on 2026-10-30
 # while the month's spare instance hours were still under review.
-# 3 services x (3 h + 0.25 h of the 15-minute idle tail after the last ping)
-# x 31 days = **302 h/mo**, leaving ~448 h of the 750 for traffic outside it.
+# 2 scheduled services x (3 h + 0.25 h of the 15-minute idle tail after the last
+# ping) x 31 days = **201 h/mo** of the 750, leaving ~549 h for runs and traffic
+# outside the window. Taking the worker off the schedule returned 101 h/mo.
 # A run in flight keeps its services awake on its own -- the window only
 # decides when PINGS happen, so narrowing it never cuts a running job.
 # The engine and the backend used to get 11 h/day (07-18 UTC) at 660 h/mo
@@ -56,7 +70,8 @@ name: Keep the engine, the backend and the QGIS worker awake
 #     so the job ends cleanly instead of being cancelled mid-ping.
 #   * GitHub disables scheduled workflows in a repository with no activity for
 #     60 days, so this needs a push (or a manual run) now and then. A manual
-#     dispatch warms all three at any hour — that is the "wake it now" button.
+#     dispatch warms all three at any hour — engine, backend and the worker that
+#     the schedule deliberately leaves alone.
 #
 # The repository is public, so the runs do not draw on the private-repo minute
 # quota.
@@ -74,8 +89,14 @@ env:
   WARM_FROM_UTC: '9'
   WARM_TO_UTC: '12'
   MONTHLY_INSTANCE_HOURS: '750'
-  SERVICE_COUNT: '3'
+  # Services the SCHEDULE keeps awake: engine + backend. The worker boots on
+  # demand (see the header) and is only pinged by a manual dispatch, so it does
+  # not draw on the scheduled budget — hence 2, not 3.
+  SERVICE_COUNT: '2'
   WORKER_URL: https://ftth-qgis-worker.onrender.com
+  # 'true' only for a manual dispatch: the scheduled window leaves the worker to
+  # boot on demand, but the operator keeps a one-click wake for it.
+  WARM_WORKER: ${{ github.event_name == 'workflow_dispatch' }}
   # How long before the window a tick is allowed to hold and then warm. 4 h
   # covers the gap seen on this repository (05:24Z -> 09:00Z) without turning a
   # late-night tick into a wasted 5-hour job that warms nothing.
@@ -160,9 +181,10 @@ jobs:
           echo "holding ${WAIT_S}s until ${WARM_FROM_UTC}:00Z (the services are asleep, so this costs no instance hours)"
           sleep "$WAIT_S"
 
-      # 120s covers a 42s cold start plus Render's boot queue. The worker gets
-      # 20s instead: its boot is minutes, so holding the request would only make
-      # the round late. The request itself is what wakes it.
+      # 120s covers a 42s cold start plus Render's boot queue. The worker, when a
+      # manual dispatch asks for it, gets 20s instead: its boot is minutes, so
+      # holding the request would only make the round late. The request itself is
+      # what wakes it.
       #
       # A tick does not ping once and exit -- see the schedule note above. It
       # loops until the window closes, so the 2-5 hour gaps between scheduled
@@ -220,7 +242,12 @@ jobs:
             round_failed=0
             probe engine  https://ftth-planning.onrender.com/health  120 yes || round_failed=1
             probe backend https://fibre-backend-wml3.onrender.com/healthz 120 yes || round_failed=1
-            probe worker  "$WORKER_URL/health" 20 no || round_failed=1
+            # Off the schedule (WARM_WORKER=false): a run wakes the worker itself
+            # and keeps it awake by polling, so a scheduled ping would only spend
+            # instance hours. A manual dispatch still warms it.
+            if [ "${WARM_WORKER:-false}" = "true" ]; then
+              probe worker  "$WORKER_URL/health" 20 no || round_failed=1
+            fi
             # Only the last round decides the job's status: a service that was
             # booting on the first round and answered on the next is a success.
             failed=$round_failed

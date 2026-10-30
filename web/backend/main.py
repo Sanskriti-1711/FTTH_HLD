@@ -200,10 +200,18 @@ QGIS_WORKER_POLL_S = float(os.environ.get("FTTH_QGIS_WORKER_POLL", "2"))
 # A sleeping free-tier worker answers 502 from the platform's edge until it
 # boots.  The boot is not the 45 s a small service takes: this image carries
 # QGIS, and a run started after an idle window was settled as failed at 180 s
-# with "HTTP Error 502: Bad Gateway" -- the boot was still under way.  600 s is
-# the platform's own request ceiling, so a run that is going to make it makes it
-# inside one wait instead of asking the planner to press the button again.
-QGIS_WORKER_WAKE_S = float(os.environ.get("FTTH_QGIS_WORKER_WAKE", "600"))
+# with "HTTP Error 502: Bad Gateway" -- the boot was still under way.  Measured
+# at **415 s** on the 2026-10-22 L1 8JQ run, so one wait covers a boot and the
+# run never has to ask the planner to press the button again.
+#
+# The worker is NOT in the keep-warm schedule (.github/workflows/keep-warm.yml);
+# it boots on demand.  Every probe attempt is a short request that is retried, so
+# the budget is the wait, not an edge timeout: 900 s covers the 415 s boot plus a
+# cold image pull or Render's boot queue, and costs nothing when the worker is
+# already awake (the first attempt returns).  A budget overrun fails the very run
+# the wait exists to save, which is why it is not the old 600 s -- 185 s of
+# headroom was too little.
+QGIS_WORKER_WAKE_S = float(os.environ.get("FTTH_QGIS_WORKER_WAKE", "900"))
 # How many times a job start waits out the worker before giving up.
 QGIS_WORKER_START_ATTEMPTS = max(1, int(os.environ.get("FTTH_QGIS_WORKER_START_ATTEMPTS", "3")))
 # A successful /health probe is trusted for this long, so the job start that
