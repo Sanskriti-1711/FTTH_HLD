@@ -400,6 +400,12 @@ def test_geometry_checker_preserves_custom_projected_candidate_crs():
 
 def test_point_classify_is_disabled_without_explicit_opt_in(monkeypatch):
     monkeypatch.delenv("SURFACE_AI_REVIEW", raising=False)
+    # Pin the rest of the opt-in as well: with SURFACE_AI_REVIEW unset,
+    # review_enabled() falls through to the configured provider, so an ambient
+    # SURFACE_AI_PROVIDER=gemini plus a key turns this straight back on.
+    monkeypatch.delenv("SURFACE_AI_PROVIDER", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     item = review.classify_point([1.5248, 49.0762])
     assert item["review_status"] == "disabled"
     assert item["AI_SURFACE"] is None
@@ -856,6 +862,9 @@ def test_gemini_does_not_retry_a_non_transient_status(monkeypatch):
 
     monkeypatch.setattr(review.urllib.request, "urlopen", fake_urlopen)
     monkeypatch.setattr(review.time, "sleep", lambda _seconds: None)
+    # An ambient SURFACE_AI_MODEL_FALLBACK chains extra models onto the call,
+    # so "one call, no retry" measures three instead.
+    monkeypatch.delenv("SURFACE_AI_MODEL_FALLBACK", raising=False)
     try:
         review._gemini_classify(b"patch", "image/jpeg", "key", "test-model")
     except RuntimeError:
@@ -874,6 +883,9 @@ def test_gemini_gives_up_after_the_retry_budget(monkeypatch):
 
     monkeypatch.setattr(review.urllib.request, "urlopen", fake_urlopen)
     monkeypatch.setattr(review.time, "sleep", lambda _seconds: None)
+    # An ambient SURFACE_AI_MODEL_FALLBACK multiplies the retry budget by the
+    # number of chained models (12 calls, not GEMINI_RETRY_ATTEMPTS).
+    monkeypatch.delenv("SURFACE_AI_MODEL_FALLBACK", raising=False)
     try:
         review._gemini_classify(b"patch", "image/jpeg", "key", "test-model")
     except RuntimeError:
@@ -1249,6 +1261,11 @@ def test_point_classify_can_return_the_patch_the_model_saw(monkeypatch):
 
 def test_span_classify_is_disabled_without_opt_in(monkeypatch):
     monkeypatch.delenv("SURFACE_AI_REVIEW", raising=False)
+    # Same pin as the point test: the configured provider alone enables the
+    # review once SURFACE_AI_REVIEW is unset.
+    monkeypatch.delenv("SURFACE_AI_PROVIDER", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     called = []
     item = review.classify_span(
         "TR-1", _SPAN, image_provider=lambda _c: called.append(True))
@@ -1347,6 +1364,11 @@ def test_preview_imagery_reports_a_provider_failure(monkeypatch):
 
 def test_preview_imagery_is_disabled_without_opt_in(monkeypatch):
     monkeypatch.delenv("SURFACE_AI_REVIEW", raising=False)
+    # Same pin as the point test: the configured provider alone enables the
+    # review once SURFACE_AI_REVIEW is unset.
+    monkeypatch.delenv("SURFACE_AI_PROVIDER", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     called = []
     item = review.preview_imagery([1.5249, 49.0762],
                                   image_provider=lambda _c: called.append(True))
