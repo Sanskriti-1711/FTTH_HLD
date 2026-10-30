@@ -1734,6 +1734,17 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                     feedback.setProgress(int(50 * n_merges / max(1, total_pts)))
                 except Exception:
                     pass
+                # setProgress only moves QGIS's own bar; the engine reads
+                # STDOUT, so this loop was silent from its first merge to its
+                # last. On 8,100 buildings / 29,700 homes that is minutes of
+                # real work with nothing to show for it, and runs c5570808 and
+                # 20d1273d were failed mid-clustering by the 900 s stall guard
+                # while this was the phase actually running.
+                if n_merges % 250 == 0:
+                    _progress(
+                        5 + int(10 * n_merges / max(1, total_pts)),
+                        "clustering: %d/%d merges" % (n_merges, total_pts),
+                    )
 
         n_clusters = sum(1 for ci in range(len(clusters))
                          if ci not in merged_into and clusters[ci]["members"])
