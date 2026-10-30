@@ -886,10 +886,146 @@ def test_pavement_carriers_rebuilds_the_mapped_footways():
     assert result["mapped_km"] > 0
 
 
+# ── one pavement, one carrier ────────────────────────────────────────────────
+
+def _kerb_row(osm_id, metres_off_centre, x0=13.3800, x1=13.3860, lat0=52.4400):
+    """A footway running parallel to the street, ``metres_off_centre`` north of it."""
+    lat = lat0 + metres_off_centre / 110540.0
+    return _road_row(osm_id, "footway", [[x0, lat], [(x0 + x1) / 2.0, lat], [x1, lat]])
+
+
+def test_a_derived_ribbon_on_a_mapped_footway_is_not_shipped_twice():
+    # Measured on the Mariendorf run: 736 of 6,316 derived ribbons lay on a
+    # mapped footway (71 km of 406 km).  The designer digs a trench per carrier,
+    # so each of those was a second trench 1-6 m from the first on the same side
+    # of the street -- 28 of the 30 observed twin pairs followed a different
+    # carrier.  OSM's line is the one that stays.
+    band = osm_source.pavement_offset_for("residential")
+    street = _road_row(1, "residential",
+                       [[13.3800, 52.4400], [13.3830, 52.4400], [13.3860, 52.4400]])
+    result = osm_source.pavement_carriers(
+        [street, _kerb_row(2, band)])
+    assert result["dropped_on_footway"] == 1
+    assert result["merged_parallel"] == 0
+    # the far kerb survives, the near one is the mapped footway's job
+    derived = [r for r in result["rows"]
+               if r["carrier_source"] == osm_source.PAVEMENT_SOURCE]
+    assert len(derived) == 1
+    assert result["replaced_osm_ids"] == [2]
+
+
+def test_a_pavement_beside_the_mapped_footway_is_not_swallowed():
+    # The rule is a duplicate test, not "any footway within sight": a mapped
+    # footway 3 m beyond the kerb band is a different strip of ground.
+    band = osm_source.pavement_offset_for("residential")
+    street = _road_row(1, "residential",
+                       [[13.3800, 52.4400], [13.3830, 52.4400], [13.3860, 52.4400]])
+    result = osm_source.pavement_carriers([street, _kerb_row(2, band + 3.0)])
+    assert result["dropped_on_footway"] == 0
+    assert len(result["rows"]) == 3          # both kerbs, plus the mapped footway
+
+
+def test_parallel_derived_ribbons_merge_into_one_carrier():
+    # Two rows describing the same street (a re-ingest or a split OSM way) each
+    # produce both kerbs, so four lines land on two strips of pavement.  The
+    # longest of each pair survives; the fragment does not win.
+    line = [[13.3800, 52.4400], [13.3830, 52.4400], [13.3860, 52.4400]]
+    result = osm_source.pavement_carriers(
+        [_road_row(1, "residential", line), _road_row(2, "residential", line)])
+    assert result["merged_parallel"] == 2
+    assert len(result["rows"]) == 2          # one line per kerb
+    assert result["pieces"] >= 1
+
+
+def test_the_duplicate_test_keeps_mapped_footways():
+    # Two OSM ways 1.5 m apart are OSM's data, not ours to delete: only the
+    # derived ribbons are deduped.
+    street = _road_row(1, "residential",
+                       [[13.3800, 52.4400], [13.3830, 52.4400], [13.3860, 52.4400]])
+    result = osm_source.pavement_carriers(
+        [street, _kerb_row(2, 20.0), _kerb_row(3, 21.2)])
+    assert result["dropped_on_footway"] == 0
+    mapped = [r for r in result["rows"]
+              if r["carrier_source"] == "osm-footway"]
+    assert len(mapped) == 2
+
+
+# ── the sidewalk tag decides the sides ───────────────────────────────────────
+
+def test_sidewalk_no_gets_no_derived_pavement():
+    # OSM says this street has no pavement, so there is nothing to run a trench
+    # along; deriving one anyway put a trench on a street that has none.
+    street = _road_row(1, "residential", [[13.3800, 52.4400], [13.3860, 52.4400]])
+    street["sidewalk"] = "no"
+    result = osm_source.pavement_carriers([street])
+    assert result["rows"] == []
+    assert result["derived_km"] == 0.0
+
+
+def test_sidewalk_separate_defers_to_the_mapped_footway():
+    # `sidewalk=separate` means the pavement IS the mapped footway, so deriving
+    # another would be the same duplicate the dedupe exists to prevent.
+    street = _road_row(1, "residential", [[13.3800, 52.4400], [13.3860, 52.4400]])
+    street["sidewalk"] = "separate"
+    result = osm_source.pavement_carriers([street, _kerb_row(2, 4.5)])
+    assert result["dropped_on_footway"] == 0     # nothing derived, nothing dropped
+    assert result["rows"] and all(
+        r["carrier_source"] == "osm-footway" for r in result["rows"])
+
+
+def test_sidewalk_left_gets_one_kerb_and_right_gets_the_other():
+    # Positive distance is the LEFT kerb (the side _offset_polyline offsets to),
+    # and OSM left/right are way-relative too, so on an eastbound street the
+    # left pavement is the north one.
+    line = [[13.3800, 52.4400], [13.3860, 52.4400]]
+    left = _road_row(1, "residential", line)
+    left["sidewalk"] = "left"
+    right = _road_row(2, "residential", line)
+    right["sidewalk"] = "right"
+
+    only_left = osm_source.pavement_carriers([left])
+    assert len(only_left["rows"]) == 1
+    assert only_left["rows"][0]["sidewalk"] == "left"
+    assert json.loads(
+        only_left["rows"][0]["geom_json"])["coordinates"][0][1] > 52.4400
+
+    only_right = osm_source.pavement_carriers([right])
+    assert len(only_right["rows"]) == 1
+    assert only_right["rows"][0]["sidewalk"] == "right"
+    assert json.loads(
+        only_right["rows"][0]["geom_json"])["coordinates"][0][1] < 52.4400
+
+
+def test_an_untagged_street_still_gets_both_kerbs():
+    # The common case, and what keeps a splitter cabinet reachable on either side
+    # of a street OSM does not tag.  The tag now names the side of each ribbon.
+    street = _road_row(1, "residential", [[13.3800, 52.4400], [13.3860, 52.4400]])
+    result = osm_source.pavement_carriers([street])
+    assert len(result["rows"]) == 2
+    assert {r["sidewalk"] for r in result["rows"]} == {"left", "right"}
+
+
+def test_the_sidewalk_tag_reaches_the_written_roads_layer(tmp_path):
+    # The cross-section reads this tag off the roads layer, so it has to survive
+    # the writer: a tag fetched but not written is the same as not fetched.
+    roads = [_road_row(1, "residential", [[13.3800, 52.4400], [13.3860, 52.4400]])]
+    roads[0]["sidewalk"] = "both"
+    path = osm_source.write_roads_geojson(str(tmp_path / "roads.geojson"), roads)
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    assert payload["features"][0]["properties"]["sidewalk"] == "both"
+
+
 def test_arterials_are_not_paved_by_default(monkeypatch):
     # The class ladder exists so a trench does not run down an arterial; a
     # derived pavement there would be the cheapest carrier in that ladder.
+    #
+    # Both states are pinned explicitly. PAVEMENT_ARTERIALS is read from the
+    # environment at import, so an operator's shell exporting
+    # OSM_PAVEMENT_ARTERIALS=1 made this test fail for a reason that had
+    # nothing to do with the code under test -- the default was never under
+    # test, only whatever happened to be running the suite.
     roads = [_road_row(1, "primary", [[13.3800, 52.4400], [13.3850, 52.4400]])]
+    monkeypatch.setattr(osm_source, "PAVEMENT_ARTERIALS", False)
     assert osm_source.pavement_carriers(roads)["rows"] == []
     monkeypatch.setattr(osm_source, "PAVEMENT_ARTERIALS", True)
     paved = osm_source.pavement_carriers(roads)

@@ -968,7 +968,11 @@ CREATE TABLE IF NOT EXISTS {schema}.roads (
     access   TEXT,
     surface  TEXT,
     maxspeed TEXT,
-    lanes    TEXT
+    lanes    TEXT,
+    -- OSM's statement about the pavement: both / left / right / no / separate.
+    -- The trench cross-section reads it, and the carrier build uses it to decide
+    -- which kerbs get a derived pavement.
+    sidewalk TEXT
 );
 
 CREATE TABLE IF NOT EXISTS {schema}.landuse (
@@ -1042,6 +1046,9 @@ CREATE TABLE IF NOT EXISTS {schema}.protected_areas (
 ALTER TABLE {schema}.buildings     ADD COLUMN IF NOT EXISTS tags JSONB NOT NULL DEFAULT '{{}}'::jsonb;
 ALTER TABLE {schema}.address_nodes ADD COLUMN IF NOT EXISTS tags JSONB NOT NULL DEFAULT '{{}}'::jsonb;
 ALTER TABLE {schema}.roads         ADD COLUMN IF NOT EXISTS tags JSONB NOT NULL DEFAULT '{{}}'::jsonb;
+-- Added after the fact like `tags`: an existing store keeps its rows, and the
+-- column arrives empty until the area is re-fetched.
+ALTER TABLE {schema}.roads         ADD COLUMN IF NOT EXISTS sidewalk TEXT;
 ALTER TABLE {schema}.landuse       ADD COLUMN IF NOT EXISTS tags JSONB NOT NULL DEFAULT '{{}}'::jsonb;
 ALTER TABLE {schema}.extract_meta  ADD COLUMN IF NOT EXISTS version INTEGER;
 
@@ -3191,7 +3198,7 @@ _TABLE_COLUMNS: Dict[str, Tuple[str, ...]] = {
     "address_nodes": ("osm_id", "geom", "addr_street", "addr_housenumber", "addr_postcode",
                       "addr_city", "addr_suburb", "addr_flats", "tags"),
     "roads": ("osm_id", "geom", "highway", "fclass", "name", "ref", "oneway", "bridge",
-              "tunnel", "access", "surface", "maxspeed", "lanes", "tags"),
+              "tunnel", "access", "surface", "maxspeed", "lanes", "sidewalk", "tags"),
     "landuse": ("osm_id", "geom", "landuse", '"natural"', "leisure", "boundary", "tags"),
     "railways": ("osm_id", "geom", "railway", "name", "ref", "service", "usage",
                  "bridge", "tunnel", "tags"),
@@ -3268,7 +3275,8 @@ def classify_elements(elements: Iterable[Dict[str, Any]]) -> Dict[str, List[Tupl
                     osm_id, gj, tags.get("highway"), tags.get("highway"),
                     tags.get("name"), tags.get("ref"), tags.get("oneway"),
                     tags.get("bridge"), tags.get("tunnel"), tags.get("access"),
-                    tags.get("surface"), tags.get("maxspeed"), tags.get("lanes"), ts,
+                    tags.get("surface"), tags.get("maxspeed"), tags.get("lanes"),
+                    tags.get("sidewalk"), ts,
                 ))
             continue
 
@@ -4699,7 +4707,7 @@ def read_area_rows(
     if include_roads:
         roads = _query(
             f"SELECT osm_id, highway, fclass, name, ref, oneway, bridge, tunnel, access, "
-            f"       surface, maxspeed, lanes, ST_AsGeoJSON(geom) AS geom_json "
+            f"       surface, maxspeed, lanes, sidewalk, ST_AsGeoJSON(geom) AS geom_json "
             f"FROM {OSM_SCHEMA}.roads WHERE ST_Intersects({_POLYGON_JSON}, geom)",
             (poly,),
         )
@@ -5597,9 +5605,14 @@ EXCEL_HEADERS = (
     "District", "households", "household_method", "LATITUDE", "LONGITUDE", "OSM_ID",
 )
 
+# `sidewalk` is carried because the trench cross-section reads it: it is the only
+# tag that says whether a street has pavement on BOTH sides, ONE side, or none.
+# Without it every kerb-class span took the "untagged" branch -- and the carrier
+# build derived both kerbs regardless, so a street OSM maps one pavement for got
+# a second trench on a side with no pavement at all.
 ROADS_PROPERTIES = ("fclass", "highway", "name", "ref", "oneway", "bridge",
                     "tunnel", "access", "surface", "maxspeed", "lanes", "osm_id",
-                    "carrier_source")
+                    "carrier_source", "sidewalk")
 
 
 def write_address_workbook(path: str, premises: Sequence[Dict[str, Any]]) -> str:
@@ -5723,6 +5736,21 @@ PAVEMENT_WELD_M = 0.75       # two vertices this close are one pavement node
 PAVEMENT_LINK_M = 3.0        # a loose end is tied to the nearest line within this
 PAVEMENT_EXTEND_M = 4.2      # end extension that closes a junction corner
 PAVEMENT_SOURCE = "derived-pavement"
+# One pavement, one carrier.
+#
+# A derived ribbon laid along a footway OSM already maps is the same strip of
+# ground exported twice, and the designer digs one trench per carrier -- so it
+# ships as two trenches 1-6 m apart on one side of the street, which is the
+# "two trenches on the same side" defect.  Measured on the Mariendorf run
+# (2026-10-30): 736 of 6,316 derived ribbons lay on a mapped footway (71 km of
+# 406 km), 2,957 of 9,282 carriers had a parallel companion within 1.5 m, and
+# 28 of the 30 same-side trench twin pairs each followed a DIFFERENT carrier.
+# The trench stage's own 0.75 m suppression cannot fix it: the twins are
+# 1.1-6.0 m apart, and the thing to remove is the duplicate CARRIER, before a
+# trench is routed on it.
+PAVEMENT_DUPLICATE_TOL_M = 1.5    # two carriers this close are one pavement
+PAVEMENT_DUPLICATE_FRAC = 0.8     # share of a ribbon that must lie in that band
+
 # Pavement ends that face each other across one of these are joined by a
 # crossing. The arterials are the classes deliberately left WITHOUT a derived
 # pavement (see PAVEMENT_CLASSES), so they are exactly what cuts the carrier
@@ -5760,6 +5788,32 @@ def pavement_classes() -> Tuple[str, ...]:
     if PAVEMENT_ARTERIALS:
         return PAVEMENT_CLASSES + ARTERIAL_CLASSES
     return PAVEMENT_CLASSES
+
+
+def _pavement_sides(sidewalk_value: Any, band: float
+                    ) -> List[Tuple[float, str]]:
+    """Which kerbs a street gets a derived pavement on, from its `sidewalk` tag.
+
+    The tag is a statement about the STREET: ``no``/``none`` means there is no
+    pavement to run a trench along, ``left``/``right`` names one side, and
+    ``both``/``yes`` -- or nothing tagged, the common case -- gets both.
+    ``separate`` means the pavement is mapped as its own way, so the mapped
+    footway already carries it and deriving another would be the duplicate.
+
+    Applying both kerbs regardless is what put a second trench on the same side
+    of a street that OSM maps one pavement for, and a trench along a street
+    explicitly tagged ``sidewalk=no``.  Positive distance is the LEFT kerb: that
+    is the side ``_offset_polyline`` offsets to, and OSM's left/right are also
+    way-relative.
+    """
+    value = str(sidewalk_value or "").strip().lower()
+    if value in ("no", "none", "false", "separate"):
+        return []
+    if value == "left":
+        return [(band, "left")]
+    if value == "right":
+        return [(-band, "right")]
+    return [(band, "left"), (-band, "right")]
 
 
 def _polyline_parts(row: Dict[str, Any]) -> List[List[List[float]]]:
@@ -6183,7 +6237,9 @@ def pavement_carriers(roads: Sequence[Dict[str, Any]],
 
     The band follows the class width (``pavement_offset_for``) unless
     ``offset_m`` forces one flat distance. Returns ``{"rows", "derived_km",
-    "mapped_km", "total_km", "pieces", "tied"}``. Only the DERIVED lines are
+    "mapped_km", "total_km", "pieces", "tied", "dropped_on_footway",
+    "merged_parallel"}``, the last two counting the carriers removed as
+    duplicates of pavement that already exists. Only the DERIVED lines are
     returned as rows -- the mapped footways are already in ``roads`` and stay
     exactly as OSM drew them; they are fed into the welding pass so the derived
     pavement joins onto them.
@@ -6194,19 +6250,29 @@ def pavement_carriers(roads: Sequence[Dict[str, Any]],
         fclass = str(row.get("fclass") or "")
         if fclass in pavement_classes():
             band = offset_m if offset_m is not None else pavement_offset_for(fclass)
+            # The tag decides the sides; untagged (the common case) still gets
+            # both kerbs, because the engine places its cabinets on either side
+            # of the street and a one-sided network leaves the far side's
+            # cabinets unreachable.  The side is stamped onto a COPY of the row,
+            # so the derived ribbon says which kerb it is while the street keeps
+            # its own tag.
+            sides = _pavement_sides(row.get("sidewalk"), band)
             for coords in _polyline_parts(row):
                 if len(coords) >= 2:
-                    # BOTH kerbs: the engine places its splitter cabinets on the
-                    # sidewalk of either side, so a one-sided network leaves the
-                    # far side's cabinets unreachable again.
-                    for dist in (band, -band):
-                        derived.append((coords, row, dist))
+                    for dist, side in sides:
+                        derived.append((coords, dict(row, sidewalk=side), dist))
         elif fclass in PAVEMENT_MAPPED_CLASSES:
             mapped.extend((coords, row) for coords in _polyline_parts(row))
-    if not derived:
+    # No network at all only when there is nothing to derive AND nothing mapped.
+    # A street tagged `sidewalk=no`/`separate` contributes no derived ribbon, but
+    # the mapped footways beside it must still go out rebuilt: an area where
+    # EVERY carrier street is tagged that way used to return no rows, so the run
+    # reported 0 km of pavement while OSM's own footways sat unused.
+    if not derived and not mapped:
         return {"rows": [], "replaced_osm_ids": [], "derived_km": 0.0,
                 "mapped_km": 0.0, "total_km": 0.0, "pieces": 0, "tied": 0,
-                "nodings": 0, "crossings": 0, "arterials": False}
+                "nodings": 0, "crossings": 0, "arterials": False,
+                "dropped_on_footway": 0, "merged_parallel": 0}
 
     # All geometry in a local metre plane, so an offset is an offset everywhere
     # in the area and not a different distance north to south.
@@ -6235,6 +6301,13 @@ def pavement_carriers(roads: Sequence[Dict[str, Any]],
         lines.append([to_xy(c) for c in coords])
         sources.append(row)
         kinds.append("mapped")
+
+    # ---- One pavement, one carrier ---------------------------------------
+    # Removed here, where a carrier is still only a line: once the designer has
+    # routed on it, the duplicate is a trench with attributes, and the trench
+    # stage can no longer tell a second line from a genuinely separate trench.
+    lines, sources, kinds, dropped_on_footway, merged_parallel = _dedupe_carriers(
+        lines, sources, kinds)
 
     lines = _weld_vertices(lines, PAVEMENT_WELD_M)
     crossed = _split_at_crossings(lines)
@@ -6290,6 +6363,8 @@ def pavement_carriers(roads: Sequence[Dict[str, Any]],
                 "highway": "footway",
                 "name": row.get("name"),
                 "surface": row.get("surface"),
+                # "left" or "right": which kerb of the street this ribbon is.
+                "sidewalk": row.get("sidewalk"),
                 "carrier_source": PAVEMENT_SOURCE,
                 "geom_json": geom_json,
             })
@@ -6313,7 +6388,144 @@ def pavement_carriers(roads: Sequence[Dict[str, Any]],
         "nodings": crossed,
         "crossings": crossings,
         "arterials": bool(PAVEMENT_ARTERIALS),
+        # How much of the network was the same pavement twice, reported with the
+        # build so a regression that starts doubling pavements again is visible
+        # without a design run.
+        "dropped_on_footway": dropped_on_footway,
+        "merged_parallel": merged_parallel,
     }
+
+
+def _polyline_length(pts: Sequence[Sequence[float]]) -> float:
+    return sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(pts, pts[1:]))
+
+
+def _sample_polyline(pts: Sequence[Sequence[float]], step_m: float = 5.0,
+                     max_points: int = 40) -> List[Tuple[float, float]]:
+    """Points along a polyline about ``step_m`` apart, endpoints included."""
+    total = _polyline_length(pts)
+    if total <= 0.0:
+        return []
+    n = max(5, min(max_points, int(total / max(step_m, 0.1)) + 1))
+    out: List[Tuple[float, float]] = []
+    for k in range(n):
+        target = total * k / (n - 1)
+        walked = 0.0
+        point = (float(pts[-1][0]), float(pts[-1][1]))
+        for a, b in zip(pts, pts[1:]):
+            seg = math.hypot(b[0] - a[0], b[1] - a[1])
+            if seg > 0.0 and walked + seg >= target:
+                t = (target - walked) / seg
+                point = (a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]))
+                break
+            walked += seg
+        out.append(point)
+    return out
+
+
+def _segment_distance(p: Sequence[float],
+                      seg: Tuple[float, float, float, float]) -> float:
+    ax, ay, bx, by = seg
+    vx, vy = bx - ax, by - ay
+    l2 = vx * vx + vy * vy
+    t = 0.0 if l2 <= 0.0 else max(
+        0.0, min(1.0, ((p[0] - ax) * vx + (p[1] - ay) * vy) / l2))
+    return math.hypot(p[0] - (ax + t * vx), p[1] - (ay + t * vy))
+
+
+def _grid_add(grid: Dict[Tuple[int, int], List[Tuple[float, float, float, float]]],
+              pts: Sequence[Sequence[float]], cell_m: float) -> None:
+    """Index a polyline's segments by every cell their box touches."""
+    for a, b in zip(pts, pts[1:]):
+        x0, x1 = (a[0], b[0]) if a[0] <= b[0] else (b[0], a[0])
+        y0, y1 = (a[1], b[1]) if a[1] <= b[1] else (b[1], a[1])
+        seg = (a[0], a[1], b[0], b[1])
+        for cx in range(int(math.floor(x0 / cell_m)),
+                        int(math.floor(x1 / cell_m)) + 1):
+            for cy in range(int(math.floor(y0 / cell_m)),
+                            int(math.floor(y1 / cell_m)) + 1):
+                grid.setdefault((cx, cy), []).append(seg)
+
+
+def _within_carriers(pts: Sequence[Sequence[float]],
+                     grid: Dict[Tuple[int, int],
+                                List[Tuple[float, float, float, float]]],
+                     cell_m: float) -> float:
+    """Share of ``pts`` within PAVEMENT_DUPLICATE_TOL_M of a gridded carrier."""
+    samples = _sample_polyline(pts)
+    if not samples or not grid:
+        return 0.0
+    hit = 0
+    for p in samples:
+        cx = int(math.floor(p[0] / cell_m))
+        cy = int(math.floor(p[1] / cell_m))
+        found = False
+        for dx in (-1, 0, 1):
+            if found:
+                break
+            for dy in (-1, 0, 1):
+                for seg in grid.get((cx + dx, cy + dy), ()):
+                    if _segment_distance(p, seg) <= PAVEMENT_DUPLICATE_TOL_M:
+                        found = True
+                        break
+                if found:
+                    break
+        if found:
+            hit += 1
+    return hit / float(len(samples))
+
+
+def _dedupe_carriers(lines: List[List[Tuple[float, float]]],
+                     sources: List[Dict[str, Any]],
+                     kinds: List[str]
+                     ) -> Tuple[List[List[Tuple[float, float]]],
+                                List[Dict[str, Any]], List[str], int, int]:
+    """Keep one carrier per strip of pavement; returns the survivors + counts.
+
+    Two rules, in this order:
+
+    * a DERIVED ribbon that lies along a mapped footway is dropped -- OSM's line
+      stays, ours is the duplicate;
+    * a DERIVED ribbon that lies along another derived ribbon is merged, keeping
+      the longest of the pair so a fragment never wins over the full length.
+
+    Mapped footways are never dropped: two OSM ways 1.5 m apart are OSM's data,
+    not ours to delete, and removing one could remove pavement the design needs.
+    Those are left to the trench stage's own same-side corridor.
+    """
+    cell = max(PAVEMENT_DUPLICATE_TOL_M * 8.0, 10.0)
+    keep = [True] * len(lines)
+    dropped_on_footway = 0
+    merged_parallel = 0
+
+    mapped_grid: Dict[Tuple[int, int], List[Tuple[float, float, float, float]]] = {}
+    for i, kind in enumerate(kinds):
+        if kind == "mapped":
+            _grid_add(mapped_grid, lines[i], cell)
+    if mapped_grid:
+        for i, kind in enumerate(kinds):
+            if kind != "derived":
+                continue
+            if _within_carriers(lines[i], mapped_grid, cell) \
+                    >= PAVEMENT_DUPLICATE_FRAC:
+                keep[i] = False
+                dropped_on_footway += 1
+
+    order = sorted((i for i, k in enumerate(kinds) if k == "derived" and keep[i]),
+                   key=lambda i: -_polyline_length(lines[i]))
+    kept_grid: Dict[Tuple[int, int], List[Tuple[float, float, float, float]]] = {}
+    for i in order:
+        if _within_carriers(lines[i], kept_grid, cell) \
+                >= PAVEMENT_DUPLICATE_FRAC:
+            keep[i] = False
+            merged_parallel += 1
+            continue
+        _grid_add(kept_grid, lines[i], cell)
+
+    return ([ln for i, ln in enumerate(lines) if keep[i]],
+            [src for i, src in enumerate(sources) if keep[i]],
+            [kd for i, kd in enumerate(kinds) if keep[i]],
+            dropped_on_footway, merged_parallel)
 
 
 def _thin_vertices(pts: List[Tuple[float, float]], min_gap_m: float = 1.0
