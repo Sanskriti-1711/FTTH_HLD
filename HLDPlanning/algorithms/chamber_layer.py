@@ -47,6 +47,7 @@ Separation rules (HLD review):
 """
 import math
 import os
+import time
 
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
@@ -280,7 +281,7 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
             for x, y in self._geom_vertices(f.geometry()):
                 yield x, y
 
-    def _junction_points(self, lyr, radius):
+    def _junction_points(self, lyr, radius, feedback=None, label="", tick=1000):
         """Points where >= 2 DISTINCT ducts pass within `radius`.
 
         Every duct vertex is a seed.  A seed is a junction only when at least
@@ -308,7 +309,18 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
         r2 = radius * radius
         out = []
         seen = set()
-        for x, y, fid in verts:
+        # The expensive scan: one seed per VERTEX of every feature, each with a
+        # spatial-index query and a closest-segment test per hit. On the
+        # 2748-feature trench layer of run a7499f9d that is tens of thousands of
+        # seeds, which is why this reports its position instead of going silent
+        # until it is done.
+        t_scan = time.time()
+        for _i, (x, y, fid) in enumerate(verts, 1):
+            if feedback is not None and _i % tick == 0:
+                feedback.pushInfo(
+                    "  [chamber] %s: %d/%d seed(s) scanned, %d junction(s), "
+                    "%.1fs." % (label or "junction scan", _i, len(verts),
+                                len(out), time.time() - t_scan))
             rect = QgsRectangle(x - radius, y - radius, x + radius, y + radius)
             hits = index.intersects(rect)
             distinct = set()
@@ -759,6 +771,29 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
             raise QgsProcessingException(
                 self.tr("At least one input layer is required."))
 
+        # ── progress reporting ───────────────────────────────────────────
+        # Every rule below is a geometric scan over the whole AOI, and the
+        # junction scans in particular are heavy on a dense area. Until this
+        # was added the stage printed ONE line ("Running Chamber Layer") and
+        # then nothing until the whole thing finished, so a slow stage and a
+        # wedged one looked identical from outside: run a7499f9d sat at
+        # "Chamber Layer 44 %" for 50 minutes with a healthy process underneath
+        # and nothing in the log to tell the two apart. Each rule now says what
+        # it added and how long it took, so the log proves the stage is moving --
+        # and, when it stops, names the rule that stopped.
+        t_stage = time.time()
+        _last = {"t": t_stage, "n": 0}
+
+        def _say(msg):
+            feedback.pushInfo("  [chamber] " + msg)
+
+        def _lap(label):
+            now = time.time()
+            added = len(candidates) - _last["n"]
+            _say(f"{label}: +{added} candidate(s) in {now - _last['t']:.1f}s "
+                 f"(total {len(candidates)}, {now - t_stage:.1f}s)")
+            _last["t"], _last["n"] = now, len(candidates)
+
         # ── gather raw candidates ────────────────────────────────────────
         candidates = []
         # Tuples: (x, y, priority, type, equipment, weight, min_spacing_m, reason)
@@ -793,6 +828,7 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
                 if lyr is feeder:
                     feeder_index.addFeature(feat)
                     feeder_geoms[next_uid] = g
+        _lap("duct indexes")
 
         # Rule 0 — the designer's structural nodes (primary source). Every
         # node the designer placed is a candidate: HDD drill openings, tier
@@ -850,6 +886,7 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
                 else:
                     continue
                 node_count += 1
+        _lap("designer nodes (rule 0)")
 
         # Rule 1 + 3 — Chamber at every PDP (splitter location; feeder and
         # distribution meet there, so it doubles as the F2D transition point).
@@ -867,6 +904,7 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
                     pid = str(f["PDP_ID"] or "")
                 candidates.append((pt.x(), pt.y(), 3, "Chamber", pid, 999,
                                    self.MIN_STRUCTURE_SEPARATION_M, "Splitter/F2D (PDP)"))
+        _lap("splitter locations (rule 1)")
 
         # Rule 7 — HDD entry/exit pits at used drill crossings.
         # A drill (HDD) trench needs a chamber at BOTH ends so the cable can
@@ -924,6 +962,7 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
                 candidates.append((x, y, 3, "Chamber", "", 1000,
                                    self.HDD_PIT_SPACING_M, "HDD pit"))
                 seen_drill.append((x, y))
+        _lap(f"HDD pits (rule 7): {len(hdd_occ)} drill endpoint(s) offered")
 
         # (b) Fallback: tangent-crossing midpoints, only when the trench
         # layer carried no HDD legs at all (drills available solely as
@@ -954,14 +993,19 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
 
         # Rule 2 — Branching points: Manhole at feeder junctions, Handhole at
         # distribution junctions (>= JUNCTION_MIN_DUCTS distinct ducts).
-        for x, y, w in self._junction_points(feeder, self.JUNCTION_RADIUS_M):
+        for x, y, w in self._junction_points(
+                feeder, self.JUNCTION_RADIUS_M,
+                feedback=feedback, label="feeder junction"):
             if w >= self.JUNCTION_MIN_DUCTS:
                 candidates.append((x, y, 2, "Manhole", "", w,
                                    self.JUNCTION_SPACING_M, "Branching junction"))
-        for x, y, w in self._junction_points(dist, self.JUNCTION_RADIUS_M):
+        for x, y, w in self._junction_points(
+                dist, self.JUNCTION_RADIUS_M,
+                feedback=feedback, label="distribution junction"):
             if w >= self.JUNCTION_MIN_DUCTS:
                 candidates.append((x, y, 1, "Handhole", "", w,
                                    self.HANDHOLE_SPACING_M, "Branching junction"))
+        _lap("branching junctions (rule 2)")
 
         # Rule 9 — Trench intersections ("chambers at the intersections").
         # Rule 2 above only counts DUCTS, so a point where the trench network
@@ -972,12 +1016,19 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
         # meeting the mains, a distribution spine leaving the backbone.
         # The structure is snapped onto the trench path in the constraint pass,
         # so it lands exactly on the intersection.
-        for x, y, w in self._junction_points(trenches, self.JUNCTION_RADIUS_M):
+        # Computed ONCE and reused by the constraint pass below. It used to be
+        # scanned twice -- here, and again to build `trench_junctions` -- which
+        # doubled the most expensive geometric pass in the stage for no reason.
+        trench_junction_points = self._junction_points(
+            trenches, self.JUNCTION_RADIUS_M,
+            feedback=feedback, label="trench junction")
+        for x, y, w in trench_junction_points:
             if w >= self.TRENCH_JUNCTION_MIN:
                 ctype = "Manhole" if w >= self.TRENCH_JUNCTION_MIN + 1 else "Handhole"
                 candidates.append((x, y, 2, ctype, "", w,
                                    self.JUNCTION_SPACING_M,
                                    "Trench intersection"))
+        _lap("trench intersections (rule 9)")
 
         # Rule 4 — Distribution→Drop transition: Handhole only where a
         # cluster of drop ducts taps off (>= DROP_TRANSITION_MIN_DROPS within
@@ -987,6 +1038,7 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
             if ndrops >= self.DROP_TRANSITION_MIN_DROPS:
                 candidates.append((x, y, 1, "Handhole", "", ndrops,
                                    self.DROP_TRANSITION_SPACING_M, "Drop transition"))
+        _lap("drop transitions (rule 4)")
 
         # Rule 6 — Direction changes > 45°: Manhole on feeder bends,
         # Handhole on distribution bends.
@@ -996,6 +1048,7 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
         for x, y, deg in self._bend_points(dist, self.BEND_ANGLE_DEG):
             candidates.append((x, y, 1, "Handhole", "", int(deg),
                                self.BEND_SPACING_M, "Direction change"))
+        _lap("direction changes (rule 6)")
 
         # Rule 8 — Long straight routes: intermediate pull Manholes on feeder
         # runs, Handholes on distribution runs, every ~250 m.
@@ -1007,6 +1060,7 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
                 dist, self.PULL_SPACING_M, self.PULL_MIN_RUN_M, self.PULL_END_SKIP_M):
             candidates.append((x, y, 1, "Handhole", "", 1,
                                self.PULL_SPACING_M, "Pull point"))
+        _lap("pull points (rule 8)")
 
         # ── boundary + building constraints (HLD review) ─────────────────
         # Chambers must be inside the design boundary and out of buildings,
@@ -1023,9 +1077,8 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
                     trench_lines.append(g)
         # Where trench runs meet: the only places an angle chamber may sit.
         trench_junctions = [
-            (jx, jy) for jx, jy, jw in self._junction_points(
-                trenches, self.JUNCTION_RADIUS_M)
-            if jw >= self.TRENCH_JUNCTION_MIN] if trenches is not None else []
+            (jx, jy) for jx, jy, jw in trench_junction_points
+            if jw >= self.TRENCH_JUNCTION_MIN]
         bend_dropped = 0
         bend_moved = 0
 
@@ -1051,7 +1104,19 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
         # (chambers are the openings of the UG trench), while the boundary and
         # building rules apply only when those layers are supplied.
         constrained = []
-        for cand in candidates:
+        # Each candidate is snapped against EVERY trench line (twice: once onto
+        # the path, once again after the building snap-out), so this loop is
+        # candidates x trenches. It reports its position for the same reason the
+        # junction scans do.
+        _say(f"constraints: snapping {len(candidates)} candidate(s) onto "
+             f"{len(trench_lines)} trench line(s) / {len(trench_junctions)} "
+             f"junction(s)")
+        for _i, cand in enumerate(candidates, 1):
+            if _i % 250 == 0:
+                feedback.setProgress(int(90 * _i / max(1, len(candidates))))
+                if _i % 2500 == 0:
+                    _say(f"constraints: {_i}/{len(candidates)} candidate(s), "
+                         f"{time.time() - t_stage:.1f}s")
             x, y = cand[0], cand[1]
             # HDD pits are placed at the midpoint of the road-crossing tangent
             # line, which sits mid-road while the trench follows the footway —
@@ -1112,6 +1177,7 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
 
         # ── collapse duplicates (highest priority, densest first) ────────
         kept = self._place_structures(candidates)
+        _lap(f"placement (kept {len(kept)} of {len(candidates)})")
 
         # NOTE: the duct spatial indexes (feeder + distribution, plus the
         # feeder-only one) were built while gathering candidates above.
@@ -1168,7 +1234,15 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
         counters = {"HH": 0, "DHH": 0, "MH": 0}
         reason_counts = {}
         written = 0
-        for cand in kept:
+        _say(f"output: writing {len(kept)} structure(s)")
+        for _i, cand in enumerate(kept, 1):
+            if _i % 250 == 0:
+                feedback.setProgress(90 + int(10 * _i / max(1, len(kept))))
+                if _i % 1000 == 0:
+                    # Picks up the nearest trench AND, when reuse is on, the
+                    # brownfield registry -- both are scans per chamber.
+                    _say(f"output: {_i}/{len(kept)} written, "
+                         f"{time.time() - t_stage:.1f}s")
             x, y, prio, ctype, equip, weight = cand[:6]
             reason = cand[7] if len(cand) > 7 else ""
             # ── Standard catalogue: HH / DHH / MH (fixed sizes) ──
@@ -1241,6 +1315,8 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
                 sink.addFeature(feat, QgsFeatureSink.FastInsert)
                 written += 1
 
+        _lap("output")
+        _say(f"stage complete in {time.time() - t_stage:.1f}s")
         rc = ", ".join(f"{k}: {v}" for k, v in sorted(reason_counts.items()))
         stats = getattr(self, "_place_stats", {}) or {}
         feedback.pushInfo(self.tr(
