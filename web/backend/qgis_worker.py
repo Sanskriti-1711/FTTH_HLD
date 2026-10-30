@@ -286,14 +286,106 @@ def _run_job(job_id: str, args: List[str], env: Optional[Dict[str, str]] = None)
     job = _job(job_id)
     out_dir = _job_dir(job_id)
     with _lock:
-        job.update({"state": "running", "started_at": time.time(),
-                    "last_line_at": time.time()})
+        # A cancel can land in the moment between leaving the queue and this
+        # thread starting, and setting state="running" unconditionally used to
+        # overwrite it: the job then ran for its full duration after DELETE had
+        # already answered 200 (seen on a job that started 1 s after the
+        # cancel). A canceled job must never start qgis_process.
+        canceled_early = (
+            job.get("canceled") is True or job.get("state") == "canceled"
+        )
+        if canceled_early:
+            job.update({
+                "state": "canceled",
+                "finished_at": time.time(),
+                "error": job.get("error") or "canceled before it started",
+            })
+        else:
+            job.update({"state": "running", "started_at": time.time(),
+                        "last_line_at": time.time()})
     _save_job(job_id, job)
     try:
+        if canceled_early:
+            return
         _run_qgis(job_id, job, out_dir, args, env or {})
     finally:
         with _sched:
             _active["running"] -= 1
+
+
+def _open_pty():
+    """(master, slave) file descriptors for a pty, or (None, None).
+
+    ``pty`` is POSIX only; a Windows dev box falls back to a plain pipe.
+    """
+    try:
+        import pty
+
+        return pty.openpty()
+    except Exception:  # noqa: BLE001 - absence is a supported case
+        return None, None
+
+
+def _pty_lines(master_fd: int):
+    """Yield the child's lines as it writes them, ending at EOF.
+
+    A pty reports the closed slave as ``OSError: [Errno 5] Input/output error``
+    rather than as a clean end of file, which is why this is a generator and
+    not a plain ``readline`` loop.
+    """
+    with os.fdopen(master_fd, "r", encoding="utf-8", errors="replace", newline="") as stream:
+        while True:
+            try:
+                line = stream.readline()
+            except OSError:
+                return
+            if not line:
+                return
+            yield line
+
+
+def _spawn_qgis(args: List[str], env: Dict[str, str]):
+    """Start qgis_process and return ``(process, line iterator)``.
+
+    stdout goes through a pty where one exists (the Linux worker): a PIPE makes
+    the child's stdio BLOCK buffered, so qgis_process holds up to 4 KB of stage
+    output before the job log sees one line. That is indistinguishable from a
+    hang -- run 88b7b097 sat at "Duct Layer 55 %" with its last line the stage
+    banner while qgis_process was still working, and the engine's stall guard
+    failed it as hung. A pty is a terminal, so the child line-buffers and every
+    stage line reaches the log as it is written, whatever the stage is doing.
+    """
+    argv = [_qgis(), *args]
+    master_fd, slave_fd = _open_pty()
+    if master_fd is not None:
+        try:
+            process = subprocess.Popen(
+                argv,
+                cwd=str(BACKEND_DIR),
+                stdin=subprocess.DEVNULL,
+                stdout=slave_fd,
+                stderr=subprocess.STDOUT,
+                env=env,
+                # Its own session, so cancel_job() can signal the whole tree.
+                start_new_session=True,
+            )
+        finally:
+            os.close(slave_fd)
+        return process, _pty_lines(master_fd)
+    process = subprocess.Popen(
+        argv,
+        cwd=str(BACKEND_DIR),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+        env=env,
+        # Its own session, so cancel_job() can signal the whole tree.
+        start_new_session=True,
+    )
+    return process, iter(process.stdout.readline, "")
 
 
 def _run_qgis(job_id: str, job: Dict[str, Any], out_dir: Path,
@@ -312,24 +404,16 @@ def _run_qgis(job_id: str, job: Dict[str, Any], out_dir: Path,
     lines_since_save = 0
     before = _snapshot(out_dir)
     try:
-        process = subprocess.Popen(
-            [_qgis(), *args],
-            cwd=str(BACKEND_DIR),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            env=env,
-            # Its own session, so cancel_job() can signal the whole tree.
-            start_new_session=True,
-        )
+        process, output = _spawn_qgis(args, env)
         job["pid"] = process.pid
         job["process"] = process
         meminfo.trace(f"worker job {job_id[:8]} started", pid=process.pid)
-        for line in iter(process.stdout.readline, ""):
-            text = line.rstrip("\n")
+        if job.get("canceled"):
+            # The stop landed before Popen returned; kill it now rather than
+            # let a canceled run keep the only slot.
+            cancel_job(job_id)
+        for line in output:
+            text = line.rstrip("\r\n")
             if not text.strip():
                 continue
             with _lock:
@@ -342,7 +426,12 @@ def _run_qgis(job_id: str, job: Dict[str, Any], out_dir: Path,
             if lines_since_save >= 40:
                 lines_since_save = 0
                 _save_job(job_id, job)
-        process.stdout.close()
+        try:
+            close = getattr(output, "close", None)
+            if close is not None:
+                close()
+        except Exception:  # noqa: BLE001 - the child already ended
+            pass
         code = process.wait()
         with _lock:
             job["exit_code"] = code
@@ -454,6 +543,15 @@ def cancel_job(job_id: str) -> Dict[str, Any]:
         _save_job(job_id, job)
         return {"state": "canceled", "job_id": job_id}
     process = job.get("process")
+    if job["state"] == "running" and process is None:
+        # Between "running" and Popen returning there is a window where a cancel
+        # used to be dropped on the floor: the DELETE answered 200 and the run
+        # carried on for its whole duration. The flag is read the moment the
+        # process exists (see _run_qgis), so setting it here is enough.
+        with _lock:
+            job["canceled"] = True
+        _save_job(job_id, job)
+        return {"state": "canceling", "job_id": job_id}
     if job["state"] == "running" and process is not None:
         with _lock:
             job["canceled"] = True
