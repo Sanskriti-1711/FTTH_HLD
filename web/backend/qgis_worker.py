@@ -67,6 +67,10 @@ MAX_LINES = int(os.environ.get("QGIS_WORKER_MAX_LINES", "20000"))
 # the cap.  Jobs therefore QUEUE -- the API polls a queued job exactly like a
 # running one, so nothing above this changes.
 CONCURRENCY = max(1, int(os.environ.get("QGIS_WORKER_CONCURRENCY", "1")))
+# How long a queued or running job may say nothing before `DELETE /jobs?stale=`
+# cancels it. One slot means one dead job starves every later run, and the run
+# it starves is the one the planner is watching.
+STALE_JOB_IDLE_S = int(os.environ.get("QGIS_WORKER_STALE_IDLE_S", "600"))
 # The pipeline runs HERE, so every switch that changes its output has to arrive
 # with the job: this service's own environment carries only the worker's token,
 # and that is why a review enabled on the engine never reviewed anything on a
@@ -149,7 +153,8 @@ def start_job(job_id: str, args: List[str], env: Any = None) -> Dict[str, Any]:
         job.update(
             {"state": "queued", "args": list(args), "env": job_env(env),
              "lines": [], "started_at": None,
-             "finished_at": None, "exit_code": None, "error": None}
+             "finished_at": None, "exit_code": None, "error": None,
+             "queued_at": time.time(), "last_line_at": None}
         )
     with _sched:
         if job_id not in _queue:
@@ -182,7 +187,8 @@ def _run_job(job_id: str, args: List[str], env: Optional[Dict[str, str]] = None)
     job = _job(job_id)
     out_dir = _job_dir(job_id)
     with _lock:
-        job.update({"state": "running", "started_at": time.time()})
+        job.update({"state": "running", "started_at": time.time(),
+                    "last_line_at": time.time()})
     try:
         _run_qgis(job_id, job, out_dir, args, env or {})
     finally:
@@ -227,6 +233,7 @@ def _run_qgis(job_id: str, job: Dict[str, Any], out_dir: Path,
                 continue
             with _lock:
                 job["lines"].append(text)
+                job["last_line_at"] = time.time()
                 if len(job["lines"]) > MAX_LINES:
                     del job["lines"][: len(job["lines"]) - MAX_LINES]
         process.stdout.close()
@@ -252,6 +259,71 @@ def _run_qgis(job_id: str, job: Dict[str, Any], out_dir: Path,
             job["error"] = str(exc)
             job["finished_at"] = time.time()
         meminfo.trace(f"worker job {job_id[:8]} failed", error=str(exc)[:120])
+
+
+def _idle_seconds(job: Dict[str, Any]) -> float:
+    """Seconds since this job last produced a line (or entered its state).
+
+    ``last_line_at`` is the honest clock: a job that is still running but has
+    written nothing for twenty minutes is wedged, and one that never started has
+    only its queue time to measure. -1 means "no clock at all", which is never
+    treated as stale -- an unknown age must not delete work.
+    """
+    anchor = job.get("last_line_at") or job.get("started_at") or job.get("queued_at")
+    if anchor is None:
+        return -1.0
+    return max(0.0, time.time() - anchor)
+
+
+def job_list() -> Dict[str, Any]:
+    """Every job this worker holds, oldest silence first.
+
+    ``/health`` reports a count, and a count cannot tell a deadlocked slot from
+    finished history: on 2026-10-30 the worker said ``jobs: 2`` while one run sat
+    at 0 % for sixteen minutes. This answers which job is which, how long it has
+    been silent, and whether it is queued or running.
+    """
+    with _lock:
+        rows = [
+            {
+                "job_id": job_id,
+                "state": job["state"],
+                "exit_code": job.get("exit_code"),
+                "error": job.get("error"),
+                "started_at": job.get("started_at"),
+                "finished_at": job.get("finished_at"),
+                "lines": len(job.get("lines") or []),
+                "idle_s": round(_idle_seconds(job), 1),
+            }
+            for job_id, job in _jobs.items()
+        ]
+        queued = list(_queue)
+    rows.sort(key=lambda row: row["idle_s"], reverse=True)
+    return {"jobs": rows, "queue": queued, "running": _active["running"],
+            "concurrency": CONCURRENCY, "stale_idle_s": STALE_JOB_IDLE_S}
+
+
+def cancel_stale_jobs(max_idle_s: float) -> Dict[str, Any]:
+    """Cancel queued/running jobs that have been silent past ``max_idle_s``.
+
+    The alternative -- and what was done on 2026-10-30 -- is restarting the
+    worker, which throws away every other job's state with it. Cancelling is
+    surgical: a job that is making progress keeps its slot, and one that is not
+    stops holding everyone else's.
+    """
+    canceled: List[Dict[str, Any]] = []
+    with _lock:
+        candidates = [(job_id, job) for job_id, job in _jobs.items()
+                      if job["state"] in ("queued", "running")]
+        stale = [(job_id, _idle_seconds(job)) for job_id, job in candidates
+                 if _idle_seconds(job) > max_idle_s]
+    for job_id, idle in stale:
+        try:
+            answer = cancel_job(job_id)
+        except Exception as exc:  # noqa: BLE001 - report, never abort the sweep
+            answer = {"state": "failed", "error": str(exc)}
+        canceled.append({"job_id": job_id, "idle_s": round(idle, 1), **answer})
+    return {"max_idle_s": max_idle_s, "canceled": canceled}
 
 
 def cancel_job(job_id: str) -> Dict[str, Any]:
@@ -413,6 +485,11 @@ class Handler(BaseHTTPRequestHandler):
                 "executable": EXECUTABLE or shutil.which("qgis_process") or None,
             })
             return
+        if parts == ["jobs"]:
+            if not self._authorised():
+                return
+            self._send(200, job_list())
+            return
         if len(parts) >= 2 and parts[0] == "jobs":
             if not self._authorised():
                 return
@@ -457,6 +534,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:  # noqa: N802
         parts = [p for p in urlparse(self.path).path.split("/") if p]
+        if parts == ["jobs"]:
+            if not self._authorised():
+                return
+            query = parse_qs(urlparse(self.path).query)
+            raw = (query.get("stale") or query.get("older_than")
+                   or [str(STALE_JOB_IDLE_S)])[0]
+            try:
+                max_idle = float(raw)
+            except (TypeError, ValueError):
+                self._send(400, {"detail": "stale must be a number of seconds"})
+                return
+            self._send(200, cancel_stale_jobs(max_idle))
+            return
         if len(parts) == 2 and parts[0] == "jobs":
             if not self._authorised():
                 return

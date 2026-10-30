@@ -263,6 +263,192 @@ def test_a_lost_job_fails_the_run_instead_of_polling_forever(tmp_path, monkeypat
     assert len([c for c in calls if c[0] == "GET"]) == 1
 
 
+def test_a_job_that_stops_logging_fails_the_run_instead_of_hanging(
+        tmp_path, monkeypatch):
+    """A wedged qgis_process keeps its job "running" for ever.
+
+    Run a7499f9d (2026-10-30) sat at "Chamber Layer 44 %" for 50 minutes with a
+    healthy engine, a healthy worker and one registered job: no terminal state,
+    no exception, nothing in the log to poll. The only exit was
+    QGIS_PROCESS_TIMEOUT (10800 s), so the planner would have waited three
+    hours to learn the run had wedged. Silence past QGIS_STALL is now a failure
+    that names the stage it died in.
+    """
+    project = tmp_path / "proj1"
+    project.mkdir()
+    polls = {"n": 0}
+
+    def fake_call(path, data=None, method="GET", timeout=120):
+        if path == "/health":
+            return b'{"state": "ok"}'
+        if method in ("PUT", "POST"):
+            return b"{}"
+        polls["n"] += 1
+        if polls["n"] == 1:
+            # One stage line, then the wedge: the job never says another word.
+            return (b'{"state": "running", "offset": 40, '
+                    b'"lines": ["[75%] Running Chamber Layer"]}')
+        return b'{"state": "running", "lines": [], "offset": 40}'
+
+    monkeypatch.setattr(main, "QGIS_WORKER_URL", "http://worker")
+    monkeypatch.setattr(main, "_worker_call", fake_call)
+    monkeypatch.setattr(main, "QGIS_WORKER_POLL_S", 0.02)
+    monkeypatch.setattr(main, "QGIS_STALL_S", 0.2)
+    monkeypatch.setattr(main, "_persist_project_state", lambda *a, **k: None)
+
+    started = time.monotonic()
+    with pytest.raises(RuntimeError) as exc:
+        main._run_command_remote("proj1", ["qgis_process", "run", "x"], project)
+
+    text = str(exc.value)
+    assert "stopped reporting progress" in text
+    # The stage it died in is named, so the log says WHERE it hung.
+    assert "Chamber Layer" in text
+    # It fails on silence, not by waiting out the three-hour ceiling.
+    assert time.monotonic() - started < 30
+
+
+def test_a_job_that_never_starts_fails_fast_instead_of_sitting_at_zero(
+        tmp_path, monkeypatch):
+    """A run queued behind a wedged job never reaches qgis_process at all.
+
+    Run ca6c9752 (2026-10-30) sat at "Object Layer 0 %" for 16 minutes while the
+    worker held two jobs and one slot. The job was accepted -- so the engine
+    logged "Running on the QGIS worker" -- and then not one line was written,
+    not even the worker's own first "[worker] applied N run setting(s)" line.
+    The stall guard above cannot see that: it measures silence from a RUNNING
+    job, so a job that never starts had no exit short of the three-hour ceiling.
+    """
+    project = tmp_path / "proj1"
+    project.mkdir()
+
+    def fake_call(path, data=None, method="GET", timeout=120):
+        if path == "/health":
+            return b'{"state": "ok"}'
+        if method in ("PUT", "POST"):
+            return b"{}"
+        return b'{"state": "queued", "lines": [], "offset": 0}'
+
+    monkeypatch.setattr(main, "QGIS_WORKER_URL", "http://worker")
+    monkeypatch.setattr(main, "_worker_call", fake_call)
+    monkeypatch.setattr(main, "QGIS_WORKER_POLL_S", 0.02)
+    monkeypatch.setattr(main, "QGIS_WORKER_START_S", 0.2)
+    monkeypatch.setattr(main, "_persist_project_state", lambda *a, **k: None)
+
+    started = time.monotonic()
+    with pytest.raises(RuntimeError) as exc:
+        main._run_command_remote("proj1", ["qgis_process", "run", "x"], project)
+
+    text = str(exc.value)
+    # It names the failure and the state the job was stuck in.
+    assert "never started qgis_process" in text
+    assert "queued" in text
+    # Fast, not the three-hour ceiling.
+    assert time.monotonic() - started < 30
+
+
+def test_a_job_that_keeps_logging_is_not_treated_as_hung(tmp_path, monkeypatch):
+    """Any new line resets the detector: a slow stage that reports is not hung."""
+    project = tmp_path / "proj1"
+    project.mkdir()
+    polls = {"n": 0}
+
+    def fake_call(path, data=None, method="GET", timeout=120):
+        if path == "/health":
+            return b'{"state": "ok"}'
+        if method in ("PUT", "POST"):
+            return b"{}"
+        if path.endswith("/result"):
+            return b""
+        polls["n"] += 1
+        if polls["n"] >= 12:
+            return b'{"state": "done", "exit_code": 0, "lines": [], "offset": 400}'
+        return json.dumps({
+            "state": "running",
+            "lines": ["  [chamber] rule %d working" % polls["n"]],
+            "offset": 40 + polls["n"] * 10,
+        }).encode()
+
+    monkeypatch.setattr(main, "QGIS_WORKER_URL", "http://worker")
+    monkeypatch.setattr(main, "_worker_call", fake_call)
+    monkeypatch.setattr(main, "QGIS_WORKER_POLL_S", 0.02)
+    # Shorter than the whole run takes, longer than a single poll's gap.
+    monkeypatch.setattr(main, "QGIS_STALL_S", 0.2)
+    monkeypatch.setattr(main, "_persist_project_state", lambda *a, **k: None)
+    monkeypatch.setattr(main, "_extract_into", lambda body, out: [])
+
+    written = main._run_command_remote("proj1", ["qgis_process", "run", "x"], project)
+
+    assert written == []
+    assert polls["n"] >= 12
+
+
+def _seed(job_id, state, *, idle_s, lines=()):
+    """A job entry as the worker would hold it, ``idle_s`` seconds quiet."""
+    now = time.time()
+    worker._jobs[job_id] = {
+        "state": state,
+        "lines": list(lines),
+        "started_at": now - idle_s if state == "running" else None,
+        "finished_at": None,
+        "exit_code": None,
+        "error": None,
+        "pid": 1 if state == "running" else None,
+        "queued_at": now - idle_s,
+        "last_line_at": now - idle_s if state == "running" else None,
+    }
+
+
+def test_the_worker_lists_its_jobs_so_a_held_slot_is_visible(tmp_path, monkeypatch):
+    """A count cannot tell a deadlocked slot from finished history.
+
+    While run ca6c9752 (2026-10-30) sat at 0 % for sixteen minutes, /health said
+    only ``jobs: 2``. Clearing it meant guessing which job to blame. The list
+    names the job, its state and how long it has been silent.
+    """
+    server = _server(tmp_path, monkeypatch)
+    _seed("wedged", "running", idle_s=1200, lines=["[75%] Running Chamber Layer"])
+    _seed("fresh", "queued", idle_s=5)
+
+    listing = _call(server, "/jobs")
+
+    assert listing["concurrency"] == 1
+    assert listing["queue"] == []
+    rows = {row["job_id"]: row for row in listing["jobs"]}
+    assert rows["wedged"]["state"] == "running"
+    assert rows["wedged"]["idle_s"] > 1000
+    assert rows["fresh"]["state"] == "queued"
+    # Oldest silence first: the wedged job is the one to look at.
+    assert listing["jobs"][0]["job_id"] == "wedged"
+
+
+def test_stale_jobs_are_canceled_without_restarting_the_worker(tmp_path, monkeypatch):
+    """The held slot is cleared in place, so other jobs keep their state."""
+    server = _server(tmp_path, monkeypatch)
+    _seed("old", "queued", idle_s=3600)
+    _seed("new", "queued", idle_s=5)
+    worker._queue.extend(["old", "new"])
+
+    answer = _call(server, "/jobs?stale=600", method="DELETE")
+
+    assert [row["job_id"] for row in answer["canceled"]] == ["old"]
+    assert worker._jobs["old"]["state"] == "canceled"
+    assert worker._jobs["new"]["state"] == "queued"
+    assert list(worker._queue) == ["new"]
+
+
+def test_a_job_that_is_still_logging_is_never_canceled(tmp_path, monkeypatch):
+    """A slow stage that reports is working, not stale -- the sweep must say so."""
+    server = _server(tmp_path, monkeypatch)
+    _seed("busy", "running", idle_s=5, lines=["[design] backbone: 33/33 PDP(s)"])
+    worker._queue.clear()
+
+    answer = _call(server, "/jobs?stale=600", method="DELETE")
+
+    assert answer["canceled"] == []
+    assert worker._jobs["busy"]["state"] == "running"
+
+
 def test_the_stop_endpoint_kills_the_worker_job(monkeypatch):
     killed = []
 

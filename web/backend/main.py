@@ -225,6 +225,39 @@ _worker_flight: Optional[Dict[str, Any]] = None
 # has already burned an hour of a slow instance's CPU; a RESTARTED worker still
 # ends the run immediately, because its job store answers "unknown".
 QGIS_WORKER_MISS_S = float(os.environ.get("FTTH_QGIS_WORKER_MISS", "90"))
+# How long a RUNNING job may go without one new log line before the run is
+# declared hung.
+#
+# Losing contact with the worker is a DIFFERENT failure (above): the loop below
+# already ends a run whose worker stopped answering, and one whose job store
+# answered "unknown" (a restart). The case that had no exit at all is the
+# worker answering normally, the job reporting "running", and the pipeline
+# inside it producing no output. Then `state` is never terminal, no exception
+# is ever raised, and the ONLY thing that ended the run was QGIS_PROCESS_TIMEOUT
+# (10800 s, three hours).
+#
+# Measured on run a7499f9d (2026-10-30): frozen at "Chamber Layer 44 %" from
+# 09:39:52 with a healthy engine (uptime continuous, 371 MB free), a healthy
+# worker, one registered job and zero new lines for 50 minutes. Nothing in the
+# stack could say the run was wedged, and the earliest anything would have said
+# so was 12:10.
+#
+# 900 s is longer than any silent stretch a working pipeline produces (the
+# pipeline reports per stage, and the chamber stage now reports per rule), so it
+# ends a wedged run without touching a merely slow one. 0 disables it.
+QGIS_STALL_S = float(os.environ.get("FTTH_QGIS_STALL", "900"))
+# How long a scheduled job may produce NOTHING before the run is failed.
+#
+# The stall guard above measures silence from a job that is RUNNING, and its
+# clock starts at dispatch: on run ca6c9752 (2026-10-30) the job was accepted and
+# the engine logged "Running on the QGIS worker", then the worker wrote not one
+# line for 16 minutes -- not even its own "[worker] applied N run setting(s)"
+# line, which it appends the instant qgis_process is spawned. The job was queued
+# behind another job on the worker's single slot (QGIS_WORKER_CONCURRENCY = 1),
+# so qgis_process had never started and the run sat at "Object Layer 0 %" with
+# nothing to explain it. 180 s is far longer than a healthy job waits for the
+# slot and far shorter than the 10800 s ceiling.
+QGIS_WORKER_START_S = float(os.environ.get("FTTH_QGIS_WORKER_START", "180"))
 # The worker's manifest of files THIS run wrote.  It travels inside the result
 # zip and is removed after use -- see _extract_into().
 WORKER_MANIFEST = "._written.json"
@@ -1081,6 +1114,14 @@ def _run_command_remote(project_id: str, cmd: Union[List[str], str],
 
     offset = 0
     lost_since = 0.0
+    # When the job last PRODUCED anything. A wedged qgis_process keeps its job
+    # in "running" for ever, so this -- not the job state -- is the only
+    # evidence that the run is still doing work.
+    last_output = time.time()
+    # Whether the job has said ANYTHING yet: a job queued behind another one
+    # never starts qgis_process and writes no line at all, which is a different
+    # failure from a running job falling silent (see QGIS_WORKER_START_S).
+    started_output = False
     while True:
         if time.time() - started > timeout:
             raise RuntimeError(f"qgis_process timed out after {timeout} seconds")
@@ -1099,10 +1140,26 @@ def _run_command_remote(project_id: str, cmd: Union[List[str], str],
                 ) from exc
             time.sleep(QGIS_WORKER_POLL_S)
             continue
-        for line in batch.get("lines") or []:
+        lines = batch.get("lines") or []
+        for line in lines:
             _consume_pipeline_line(project_id, line)
-        offset = int(batch.get("offset") or offset)
+        new_offset = int(batch.get("offset") or offset)
+        if lines or new_offset != offset:
+            last_output = time.time()
+            started_output = True
+        offset = new_offset
         state = batch.get("state")
+        if not started_output and QGIS_WORKER_START_S > 0:
+            waited = time.time() - started
+            if waited > QGIS_WORKER_START_S:
+                raise RuntimeError(
+                    f"The QGIS worker accepted this run but never started "
+                    f"qgis_process: no output for {int(waited)} s "
+                    f"(limit {int(QGIS_WORKER_START_S)} s) while its job stayed "
+                    f"'{state}'. The worker runs one job at a time, so another "
+                    f"job is holding the slot -- stop it or restart the worker, "
+                    f"then run this area again."
+                )
         if state == "unknown":
             # The worker restarted and lost the job; its store starts empty, so
             # polling would never end.  Say it and stop instead of hanging.
@@ -1111,6 +1168,20 @@ def _run_command_remote(project_id: str, cmd: Union[List[str], str],
             )
         if state in ("done", "failed", "canceled"):
             break
+        # A job that is still "running" but has said nothing for longer than any
+        # stage can legitimately stay quiet is wedged, not slow. Failing it here
+        # names the stage it died in and leaves the outputs it already wrote, so
+        # the results page shows the design as far as it got -- instead of the
+        # planner waiting out the three-hour ceiling to learn the same thing.
+        silent_for = time.time() - last_output
+        if QGIS_STALL_S > 0 and silent_for > QGIS_STALL_S:
+            stage_now = str((tasks.get(project_id) or {}).get("stage") or "unknown")
+            raise RuntimeError(
+                f"qgis_process stopped reporting progress during the "
+                f"{stage_now} stage: no output for {int(silent_for)} s "
+                f"(limit {int(QGIS_STALL_S)} s). The run was stopped as hung "
+                f"rather than left to sit until the {int(timeout)} s ceiling."
+            )
         time.sleep(QGIS_WORKER_POLL_S)
 
     status = json.loads(_worker_call(job, timeout=120) or b"{}")
