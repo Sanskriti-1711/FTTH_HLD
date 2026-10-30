@@ -712,7 +712,7 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
                     return (qx, qy)
         return pt  # keep original when no nearby exit (better than teleporting)
 
-    def _snap_onto_trenches(self, pt, trench_lines, max_m=None):
+    def _snap_onto_trenches(self, pt, trench_lines, max_m=None, index=None):
         """Snap a chamber ONTO the nearest trench path (chambers are the
         openings of the UG trench — they must lie on it).
 
@@ -726,7 +726,16 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
         cap = self.TRENCH_SNAP_M if max_m is None else max_m
         g = QgsGeometry.fromPointXY(QgsPointXY(pt[0], pt[1]))
         best_d, best_xy = None, None
-        for tg in trench_lines:
+        # Prefiltered when an index is supplied: the nearest trench within
+        # `cap` always lies inside the box around the point, so the candidate
+        # set is identical and the scan is no longer the whole layer.
+        if index is not None:
+            box = QgsRectangle(pt[0] - cap, pt[1] - cap,
+                               pt[0] + cap, pt[1] + cap)
+            candidates = [trench_lines[pos] for pos in index.intersects(box)]
+        else:
+            candidates = trench_lines
+        for tg in candidates:
             try:
                 d = tg.distance(g)
             except Exception:
@@ -750,6 +759,55 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
         return best_xy
 
     # ── main ─────────────────────────────────────────────────────────────
+
+    def _build_trench_index(self, trench_lines):
+        """Spatial index over the trench geometries, keyed by list position.
+
+        Built ONCE per stage.  Every chamber lookup (snap onto the path,
+        nearest parent trench) is a point-to-line query, and running it against
+        the whole layer per chamber is what made this stage look wedged: on run
+        c7939fcf the output loop printed nothing for fifteen minutes and the
+        stall guard killed the run at 44 %.
+        """
+        index = QgsSpatialIndex()
+        for pos, g in enumerate(trench_lines):
+            feat = QgsFeature()
+            feat.setGeometry(g)
+            # The list position, not the layer's fid: `trench_lines` and
+            # `trench_feats` are indexed by it, so an answer maps straight
+            # back to the feature that produced it.
+            feat.setId(pos)
+            index.addFeature(feat)
+        return index
+
+    def _nearest_trench_indexed(self, index, trench_lines, trench_feats,
+                                x, y, tol):
+        """``_nearest_trench`` answered from the index instead of the layer.
+
+        Same result: the nearest feature within ``tol`` and its id field, or an
+        empty string when nothing that close carries one.
+        """
+        if index is None or not trench_lines:
+            return ""
+        pt = QgsGeometry.fromPointXY(QgsPointXY(x, y))
+        best, best_d = "", tol
+        box = QgsRectangle(x - tol, y - tol, x + tol, y + tol)
+        for pos in index.intersects(box):
+            try:
+                g = trench_lines[pos]
+                d = g.distance(pt)
+            except (IndexError, TypeError):
+                continue
+            if d > best_d:
+                continue  # inside the box, outside the real tolerance
+            f = trench_feats[pos]
+            for cand in ("id", "SRC_ID", "POLYGON_ID"):
+                if f.fields().indexOf(cand) >= 0:
+                    v = f[cand]
+                    if v not in (None, ""):
+                        best, best_d = str(v), d
+                        break
+        return best
 
     def processAlgorithm(self, params, context, feedback):
         feeder = self._layer(params, self.P_FEEDER_DUCTS, context)
@@ -1069,12 +1127,23 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
         bldg_union = self._dissolve_union(bldg_lyr)
 
         # ── trench-path snapping (chambers ARE the trench openings) ──────
+        # The lookups below ask "nearest trench" and "snap onto the trench
+        # path" for EVERY planned chamber.  Scanning all 1402 trench features
+        # per chamber is chambers x trench-features distance tests -- on run
+        # c7939fcf (2026-10-30) this loop printed the direction-change summary
+        # and then said nothing for fifteen minutes, which the stall guard
+        # correctly killed as hung.  One index, built once, answers the same
+        # question from a handful of candidates, and it is exact: anything
+        # outside the search box is farther than the tolerance we accept.
         trench_lines = []
+        trench_feats = []
         if trenches is not None and trenches.isValid():
             for f in trenches.getFeatures():
                 g = f.geometry()
                 if g and not g.isEmpty() and g.type() == QgsWkbTypes.LineGeometry:
                     trench_lines.append(g)
+                    trench_feats.append(f)
+        trench_index = self._build_trench_index(trench_lines)
         # Where trench runs meet: the only places an angle chamber may sit.
         trench_junctions = [
             (jx, jy) for jx, jy, jw in trench_junction_points
@@ -1143,7 +1212,7 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
             # Rule: snap ONTO the trench path first — the chamber is the
             # opening of the UG trench and must lie on it.
             if trench_lines:
-                nx, ny = self._snap_onto_trenches((x, y), trench_lines, max_m=cap)
+                nx, ny = self._snap_onto_trenches((x, y), trench_lines, max_m=cap, index=trench_index)
                 if (nx, ny) != (x, y):
                     snapped_trench += 1
                     x, y = nx, ny
@@ -1166,7 +1235,7 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
             # Final re-snap: a building snap-out may have pulled the
             # chamber off the trench — chambers must LIE on the path.
             if trench_lines:
-                x, y = self._snap_onto_trenches((x, y), trench_lines, max_m=cap)
+                x, y = self._snap_onto_trenches((x, y), trench_lines, max_m=cap, index=trench_index)
             cand = (x, y) + tuple(cand[2:])
             constrained.append(cand)
         candidates = constrained
@@ -1238,11 +1307,11 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
         for _i, cand in enumerate(kept, 1):
             if _i % 250 == 0:
                 feedback.setProgress(90 + int(10 * _i / max(1, len(kept))))
-                if _i % 1000 == 0:
-                    # Picks up the nearest trench AND, when reuse is on, the
-                    # brownfield registry -- both are scans per chamber.
-                    _say(f"output: {_i}/{len(kept)} written, "
-                         f"{time.time() - t_stage:.1f}s")
+                # Say it every 250, not every 1000: the engine fails a stage
+                # after 900 s of silence, so the log has to prove movement
+                # inside that window rather than at the end.
+                _say(f"output: {_i}/{len(kept)} written, "
+                     f"{time.time() - t_stage:.1f}s")
             x, y, prio, ctype, equip, weight = cand[:6]
             reason = cand[7] if len(cand) > 7 else ""
             # ── Standard catalogue: HH / DHH / MH (fixed sizes) ──
@@ -1265,8 +1334,12 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
             feat[COMMON_FIELDS.CHAMBER_TYPE] = code  # HH | DHH | MH
             feat[COMMON_FIELDS.SUBTYPE] = subtype    # Bore | Handhole | Manhole
             feat[COMMON_FIELDS.REASON] = reason
-            feat[COMMON_FIELDS.PARENT_TRENCH] = self._nearest_trench(
-                trenches, x, y, self.TRENCH_JOIN_M)
+            # Indexed (see `_build_trench_index`): `_nearest_trench` reads the
+            # whole trench layer per chamber, which is the scan that stalled
+            # this stage at exactly this loop.
+            feat[COMMON_FIELDS.PARENT_TRENCH] = self._nearest_trench_indexed(
+                trench_index, trench_lines, trench_feats, x, y,
+                self.TRENCH_JOIN_M)
             feat[COMMON_FIELDS.CONN_DUCTS] = conn
             feat[COMMON_FIELDS.SIZE] = size
             feat[COMMON_FIELDS.EQUIPMENT] = (equip or "") + (("; " + reason) if reason else "")
