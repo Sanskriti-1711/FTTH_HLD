@@ -1368,7 +1368,9 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
             maxy = max(c[1] for c in coords)
             envelope = shapely_box(minx - 100.0, miny - 100.0,
                                    maxx + 100.0, maxy + 100.0)
-            vor = voronoi_polygons(mp, envelope=envelope)
+            # Shapely's keyword is extend_to (not envelope): the wrong name
+            # raised TypeError on every call and silently fell back to QGIS.
+            vor = voronoi_polygons(mp, extend_to=envelope)
 
             cluster_cells = {}
             for i, fid in enumerate(ordered_fids):
