@@ -5624,9 +5624,14 @@ def write_address_workbook(path: str, premises: Sequence[Dict[str, Any]]) -> str
             "openpyxl is required to write the address workbook (pip install openpyxl)"
         ) from exc
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Addresses"
+    # write_only streams each row straight into the archive instead of keeping
+    # the whole sheet in memory.  A default Workbook holds every cell of every
+    # row: 9k premises x 12 columns is one of the largest allocations in the
+    # engine, made while it also holds the fetched buildings and roads, in the
+    # same 512 MB container -- run ad856c1a was oomKilled in this resolve step.
+    # The file it produces is identical; only the peak changes.
+    wb = Workbook(write_only=True)
+    ws = wb.create_sheet("Addresses")
     ws.append(list(EXCEL_HEADERS))
     for p in premises:
         ws.append([p.get(h) for h in EXCEL_HEADERS])
@@ -5636,25 +5641,37 @@ def write_address_workbook(path: str, premises: Sequence[Dict[str, Any]]) -> str
 
 
 def write_roads_geojson(path: str, roads: Sequence[Dict[str, Any]]) -> str:
-    features: List[Dict[str, Any]] = []
-    for r in roads:
-        geom = r.get("geom_json")
-        if isinstance(geom, str):
-            try:
-                geom = json.loads(geom)
-            except (TypeError, ValueError):
-                continue
-        if not geom:
-            continue
-        features.append({
-            "type": "Feature",
-            "geometry": geom,
-            "properties": {k: r.get(k) for k in ROADS_PROPERTIES if r.get(k) is not None},
-        })
-    payload = {"type": "FeatureCollection", "features": features}
+    """Write the roads layer, one feature at a time.
+
+    Collecting the FeatureCollection first and json.dump-ing it doubled the
+    peak: the feature list and its serialised string were both live for a layer
+    that is 11k rows on a full ward.  Streaming keeps only one feature at a
+    time; the bytes are the same file, so nothing downstream can tell.
+    """
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f)
+        f.write('{"type": "FeatureCollection", "features": [')
+        first = True
+        for r in roads:
+            geom = r.get("geom_json")
+            if isinstance(geom, str):
+                try:
+                    geom = json.loads(geom)
+                except (TypeError, ValueError):
+                    continue
+            if not geom:
+                continue
+            feature = {
+                "type": "Feature",
+                "geometry": geom,
+                "properties": {k: r.get(k) for k in ROADS_PROPERTIES
+                               if r.get(k) is not None},
+            }
+            if not first:
+                f.write(", ")
+            f.write(json.dumps(feature))
+            first = False
+        f.write("]}")
     return path
 
 
@@ -6301,6 +6318,13 @@ def pavement_carriers(roads: Sequence[Dict[str, Any]],
         lines.append([to_xy(c) for c in coords])
         sources.append(row)
         kinds.append("mapped")
+    # The source rows and their projected copies are dead here: every pass below
+    # works on `lines`/`sources`/`kinds` only.  Keeping both meant every street's
+    # coordinates were held twice through the weld, crossing and tying passes --
+    # the heaviest part of building an area's inputs in a 512 MB container.
+    derived.clear()
+    mapped.clear()
+    meminfo.trim()
 
     # ---- One pavement, one carrier ---------------------------------------
     # Removed here, where a carrier is still only a line: once the designer has
@@ -6601,6 +6625,15 @@ def build_inputs(
         city=resolution.get("city") or "",
         register=register,
     )
+    # `buildings`, `addresses` and `join` are read by assemble_premises and by
+    # nothing after it.  On a full ward that is every building row, every address
+    # row and the address->building map, all as dicts, held in the same 512 MB
+    # container the design then needs: run ad856c1a was oomKilled while this
+    # function was still resolving the area, before QGIS had started at all.
+    del buildings, addresses, join
+    meminfo.trace(f"area inputs {project_id[:8]}",
+                  step="premises", premises=len(premises))
+    meminfo.trim()
     if len(premises) < MIN_PREMISES:
         raise ValueError("no_premises")
     if not roads:
@@ -6636,6 +6669,17 @@ def build_inputs(
         os.path.join(inputs_dir, "roads.geojson"),
         kept_roads + list(pavement["rows"]),
     )
+    # The street network, its derived pavement and the filtered copy were the
+    # largest single allocation here (11k road rows on a full ward, plus two
+    # derived ribbons each).  The file is written, so release before the landuse
+    # query and the workbook writer allocate their own.
+    del roads, kept_roads
+    # The summary below keeps the counts and drops these two keys anyway, so the
+    # geometry can go now: it is the part worth releasing.
+    pavement.pop("rows", None)
+    pavement.pop("replaced_osm_ids", None)
+    meminfo.trace(f"area inputs {project_id[:8]}", step="roads")
+    meminfo.trim()
     # The landuse the aerial-zones derivation needs.  Written from the store we
     # already fetched, so an area run produces the same constraint inputs a
     # manual multi-layer upload does; without it the designer falls back to
@@ -6645,6 +6689,8 @@ def build_inputs(
         os.path.join(inputs_dir, "osm", "landuse", "landuse.geojson"),
         resolution["polygon"],
     )
+    meminfo.trace(f"area inputs {project_id[:8]}", step="landuse written")
+    meminfo.trim()
 
     hh = household_summary(premises)
     result = {
@@ -6693,10 +6739,12 @@ def build_inputs(
         "extract": extract,
         "stats": stats,
     }
-    # The area build is the engine's peak: the parsed buildings, the premises and
-    # the road network are all live at once, and both input files are on disk by
-    # now.  Release them before the pipeline starts, so the run is not sharing
-    # the container with memory that is merely idle.
-    del premises, roads, buildings, addresses, kept_roads, pavement
+    # The area build is the engine's peak.  `buildings`, `addresses`, `join`,
+    # `roads` and `kept_roads` were already released the moment their last reader
+    # was done (above), so they are no longer bound here; what is left is the
+    # premise list and the pavement summary the result still needs.  Releasing
+    # them there rather than here is the point: the run then never holds the
+    # fetched buildings, the premises AND the full road network at the same time.
+    del premises, pavement
     meminfo.trim()
     return result
