@@ -1197,6 +1197,11 @@ def _run_command_remote_job(project_id: str, cmd: Union[List[str], str],
     # once before believing it: the inputs are already uploaded and nothing has
     # been produced, so a second POST is free.
     resubmitted = False
+    # Memory is sampled DURING the run, not just at its end. The local path does
+    # this in _run_command; every production run is a worker run, so until now
+    # nothing recorded the ramp until the run had already failed.
+    mem_sampled_at = 0.0
+    mem_rounds = 0
     while True:
         if time.time() - started > timeout:
             raise RuntimeError(f"qgis_process timed out after {timeout} seconds")
@@ -1224,6 +1229,28 @@ def _run_command_remote_job(project_id: str, cmd: Union[List[str], str],
             started_output = True
         offset = new_offset
         state = batch.get("state")
+        if MEMORY_SAMPLE_SECONDS > 0:
+            mem_now = time.time()
+            if mem_now - mem_sampled_at >= MEMORY_SAMPLE_SECONDS:
+                mem_sampled_at = mem_now
+                mem_rounds += 1
+                worker_mem = batch.get("memory") or {}
+                child_mem = batch.get("child") or {}
+                meminfo.trace(
+                    f"run {project_id[:8]} worker",
+                    engine_mb=meminfo.rss_mb(),
+                    worker_mb=worker_mem.get("rss_mb"),
+                    child_mb=child_mem.get("rss_mb"),
+                    child_peak_mb=child_mem.get("peak_rss_mb"),
+                    stage=(tasks.get(project_id) or {}).get("stage"),
+                )
+                # glibc keeps freed arenas as its own, so the engine's peak is the
+                # SUM of that peak and QGIS's. Hand back what is already free every
+                # couple of minutes -- never a cache, only memory that cannot be
+                # used again by this run.
+                if mem_rounds % 6 == 0:
+                    gc.collect()
+                    meminfo.trim()
         if not started_output and QGIS_WORKER_START_S > 0:
             waited = time.time() - started
             if waited > QGIS_WORKER_START_S:

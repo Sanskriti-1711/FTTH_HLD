@@ -668,6 +668,31 @@ def _sweep_old_jobs() -> None:
 
 # ── HTTP ──────────────────────────────────────────────────────────────────
 
+def _child_memory() -> Any:
+    """The running qgis_process's memory, or None when no job is running.
+
+    The worker's own RSS is a rounding error beside the child's: /health used to
+    report 25 MB while the design was actually filling the container, so the one
+    number readable during a run was the wrong one. The child's arenas cannot be
+    released from out here -- this reports it so the ramp is visible before the
+    kernel decides what to do about it.
+    """
+    with _lock:
+        pid = next(
+            (job.get("pid") for job in _jobs.values()
+             if job.get("state") == "running" and job.get("pid")),
+            None,
+        )
+    if not pid:
+        return None
+    return {
+        "pid": pid,
+        "rss_mb": meminfo.rss_mb(pid),
+        "peak_rss_mb": meminfo.peak_rss_mb(pid),
+        "limit_mb": meminfo.limit_mb(),
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "ftth-qgis-worker/1.0"
 
@@ -707,6 +732,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {
                 "status": "ok",
                 "memory": meminfo.report(),
+                "child": _child_memory(),
                 "jobs": len(_jobs),
                 "executable": EXECUTABLE or shutil.which("qgis_process") or None,
             })
@@ -727,7 +753,10 @@ class Handler(BaseHTTPRequestHandler):
                     lines = job["lines"][offset:]
                     offset = offset + len(lines)
                     state = job["state"]
-                self._send(200, {"lines": lines, "offset": offset, "state": state})
+                # The memory rides along so the engine can log the ramp without a
+                # second request every poll -- it already asks for this line.
+                self._send(200, {"lines": lines, "offset": offset, "state": state,
+                                 "memory": meminfo.report(), "child": _child_memory()})
                 return
             if len(parts) == 3 and parts[2] == "result":
                 try:
