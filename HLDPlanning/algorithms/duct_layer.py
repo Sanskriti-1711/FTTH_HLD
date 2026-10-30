@@ -271,6 +271,12 @@ class AlgFeederDuctsNoSplit(QgsProcessingAlgorithm):
             return None
         
         net = _resolve(net); mfg = _resolve(mfg); pdp = _resolve(pdp)
+        feedback.pushInfo(
+            "Feeder: inputs resolved — network "
+            f"{net.featureCount() if net is not None else 'None'}, "
+            f"mfg {mfg.featureCount() if mfg is not None else 'None'}, "
+            f"pdp {pdp.featureCount() if pdp is not None else 'None'}"
+        )
         missing = [n for n, x in (("network", net), ("mfg", mfg), ("pdp", pdp)) if x is None]
         if missing:
             raise QgsProcessingException(f"Missing required layers: {', '.join(missing)}.")
@@ -299,17 +305,20 @@ class AlgFeederDuctsNoSplit(QgsProcessingAlgorithm):
         crs = net.crs()
 
         t0 = _time.time()
+        feedback.pushInfo(f"Feeder: fixing geometries on {net.featureCount()} span(s) …")
         net_fix = processing.run("native:fixgeometries",
                                  {"INPUT": net, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
                                  context=context, feedback=feedback)["OUTPUT"]
         feedback.pushInfo(f"  [timing] Duct geometry fix: {_time.time() - t0:.3f}s")
         t0 = _time.time()
+        feedback.pushInfo("Feeder: splitting multipart spans …")
         net_single = processing.run("native:multiparttosingleparts",
                                     {"INPUT": net_fix, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
                                     context=context, feedback=feedback)["OUTPUT"]
 
         feedback.pushInfo(f"  [timing] Duct multipart split: {_time.time() - t0:.3f}s")
         t0 = _time.time()
+        feedback.pushInfo(f"Feeder: line intersections on {net_single.featureCount()} span(s) …")
         try:
             inter_pts = processing.run("native:lineintersections",
                 {"INPUT": net_single, "INTERSECT": net_single, "INPUT_FIELDS": [], "INTERSECT_FIELDS": [], "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
@@ -389,7 +398,10 @@ class AlgFeederDuctsNoSplit(QgsProcessingAlgorithm):
                 mfg_label[fm.id()] = str(lab)
 
         pdp_nodes, pdp_label = {}, {}
-        for fp in pdp.getFeatures():
+        _pdp_feats = list(pdp.getFeatures())
+        for _pi, fp in enumerate(_pdp_feats, 1):
+            if _pi % 50 == 0:
+                feedback.pushInfo(f"Feeder: snapped {_pi}/{len(_pdp_feats)} PDP(s) …")
             nk, fid = snap_point_create_virtual(
                 fp.geometry(), seg_index, fid_to_geom, fid_to_len,
                 fid_breaks, fid_break_xy, snap_tol, node_tol, end_eps
@@ -529,7 +541,8 @@ class AlgFeederDuctsNoSplit(QgsProcessingAlgorithm):
 
         made = 0
         # Build ducts per MFG
-        for mfg_fid, (mnode, _) in mfg_nodes.items():
+        for _mi, (mfg_fid, (mnode, _)) in enumerate(mfg_nodes.items(), 1):
+            feedback.pushInfo(f"Feeder: routing MFG {_mi}/{len(mfg_nodes)} …")
             if mnode not in adj:
                 continue
             assigned_pids = [pid for pid, lab in pdp_to_mfg.items() if lab == mfg_fid]
@@ -3705,9 +3718,30 @@ class DuctLayer(QgsProcessingAlgorithm):
         feeder = AlgFeederDuctsNoSplit()
         feeder.initAlgorithm()  # <<< IMPORTANT: restore this
 
-        net_lyr = _as_layer_any(self.P_NETWORK, fallback_names=["Feeder_Trench_Final","Final_Trenches","Feeder_Trench"])
-        mfg_lyr = _as_layer_any(self.P_MFG,     fallback_names=["MFG_Point","MFG","mfg_point"])
-        pdp_lyr = _as_layer_any(self.P_PDP,     fallback_names=["PDP","PDPs","clean_pdps","assigned_pdps"])
+        # Each resolution is announced BEFORE it runs: the engine fails a run
+        # that goes silent, and a slow resolve used to look identical to a hang
+        # because the first message came after all three had finished.
+        import time as _t_res
+        _resolved = []
+        for _label, _key, _names in (
+            ("network", self.P_NETWORK, ["Feeder_Trench_Final", "Final_Trenches", "Feeder_Trench"]),
+            ("mfg",     self.P_MFG,     ["MFG_Point", "MFG", "mfg_point"]),
+            ("pdp",     self.P_PDP,     ["PDP", "PDPs", "clean_pdps", "assigned_pdps"]),
+        ):
+            feedback.pushInfo(f"Feeder input resolve → {_label} …")
+            _t_res0 = _t_res.time()
+            _lyr = _as_layer_any(_key, fallback_names=_names)
+            try:
+                _cnt = _lyr.featureCount() if _lyr is not None else -1
+            except Exception:
+                _cnt = -1
+            feedback.pushInfo(
+                f"Feeder input resolve → {_label}: "
+                f"{_lyr.name() if _lyr is not None else 'None'} ({_cnt} feature(s)) "
+                f"in {_t_res.time() - _t_res0:.2f}s"
+            )
+            _resolved.append(_lyr)
+        net_lyr, mfg_lyr, pdp_lyr = _resolved
 
 
         def _lname(L): return (L.name() if L else "None")
