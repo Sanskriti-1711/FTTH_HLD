@@ -1275,18 +1275,43 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
             polygon_fids[polygon_feature.id()] = polygon_id
         # Roads are expanded to the full service radius before graph building:
         # the original 100 m polygon clip cannot answer a 3 km cabinet reach.
+        feedback.pushInfo(
+            "MFG road reach: buffering {} service polygon(s) by 3,000 m.".format(
+                polys_valid.featureCount()
+            )
+        )
         mfg_service_buffer = as_layer(processing.run(
             "native:buffer",
             {"INPUT": polys_valid, "DISTANCE": 3000.0, "SEGMENTS": 8,
              "DISSOLVE": True, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
             is_child_algorithm=True, context=context, feedback=feedback
         )["OUTPUT"], context)
+        # A clip with an UNINDEXED input scans every feature of it, and says so:
+        # on run ed0687a5 the whole roads layer went in without an index, QGIS
+        # printed "No spatial index exists for input layer, performance will be
+        # severely degraded", and the stage then produced nothing for 901 s until
+        # the engine's stall guard failed the run. Every other clip in this file
+        # indexes its input first; this one now does too.
+        feedback.pushInfo(
+            "MFG road reach: indexing {} road feature(s) for the 3,000 m clip.".format(
+                roads_aligned.featureCount()
+            )
+        )
+        processing.run("native:createspatialindex",
+            {"INPUT": roads_aligned}, is_child_algorithm=True, context=context, feedback=feedback
+        )
+        feedback.pushInfo("MFG road reach: clipping roads to the 3,000 m service envelope.")
         mfg_route_source = as_layer(processing.run(
             "native:clip",
             {"INPUT": roads_aligned, "OVERLAY": mfg_service_buffer,
              "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
             is_child_algorithm=True, context=context, feedback=feedback
         )["OUTPUT"], context)
+        feedback.pushInfo(
+            "MFG road reach: {} road feature(s) inside the service envelope.".format(
+                mfg_route_source.featureCount()
+            )
+        )
         mfg_route_fields = {name.lower() for name in mfg_route_source.fields().names()}
         mfg_class_field = "fclass" if "fclass" in mfg_route_fields else (
             "highway" if "highway" in mfg_route_fields else None
@@ -1340,6 +1365,12 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
         manager = NetworkManager(polys_valid.crs(), feedback)
 
         clean_feats = list(clean.getFeatures())
+        # A clean PDP with no geometry can never be chosen, so drop those ONCE.
+        # The per-polygon scan below used to re-test every clean feature's
+        # geometry, which made this stage quadratic in points x polygons.
+        clean_usable = [
+            f for f in clean_feats if f.geometry() and not f.geometry().isEmpty()
+        ]
         used = set()
         placed = 0
 
@@ -1424,7 +1455,7 @@ class NetworkLayerAlgorithm(QgsProcessingAlgorithm):
 
             # Build a candidate pool: prefer points inside/touching the polygon,
             # fall back to a centroid-radius search, then to all unused points.
-            avail = [f for f in clean_feats if f.id() not in used and f.geometry() and not f.geometry().isEmpty()]
+            avail = [f for f in clean_usable if f.id() not in used]
             inside = [f for f in avail if _geom_covers(inner, f.geometry())]
 
             poly_candidates = inside
