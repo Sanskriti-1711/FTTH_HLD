@@ -57,6 +57,95 @@ from ..utils.geom_utils import geom_str_from_wkb
 # -------------------------------
 # Helpers for the wrapper
 # -------------------------------
+def _intersection_points(geom):
+    """The point(s) an intersection geometry carries (point, multipoint or line)."""
+    try:
+        if geom.type() == QgsWkbTypes.PointGeometry:
+            if geom.isMultipart():
+                return [(p.x(), p.y()) for p in geom.asMultiPoint()]
+            p = geom.asPoint()
+            return [(p.x(), p.y())]
+    except Exception:
+        pass
+    pts = []
+    try:
+        for v in geom.vertices():
+            pts.append((v.x(), v.y()))
+    except Exception:
+        pass
+    return pts
+
+
+def _indexed_line_intersections(layer, feedback=None, eps=1e-6):
+    """Crossings between spans, found per PAIR through a spatial index.
+
+    ``native:lineintersections`` compares every span with every span. On the
+    Mariendorf trench that is 3904 spans (~10 130 split segments), and the pass
+    ran longer than the engine's 900 s stall limit without printing one line --
+    so a working run was failed as hung. Asking each span only about the spans
+    whose bounding box touches it returns the same crossings for a fraction of
+    the work, and says how far it has got.
+
+    Returns a temporary POINT layer holding one feature per crossing.
+    """
+    geom_by_fid = {}
+    index = QgsSpatialIndex()
+    for f in layer.getFeatures():
+        g = f.geometry()
+        if g is None or g.isEmpty():
+            continue
+        geom_by_fid[f.id()] = g
+        index.addFeature(f)
+
+    out = QgsVectorLayer(f"Point?crs={layer.crs().authid()}", "intersections", "memory")
+    if not out.isValid() or not geom_by_fid:
+        return out
+
+    seen = set()
+    pending = []
+    total = len(geom_by_fid)
+    for n, (fid, geom) in enumerate(geom_by_fid.items(), 1):
+        rect = geom.boundingBox()
+        for other in index.intersects(rect):
+            if other <= fid:
+                continue                      # each pair once: (a,b), never (b,a)
+            og = geom_by_fid.get(other)
+            if og is None or not rect.intersects(og.boundingBox()):
+                continue
+            if not geom.intersects(og):
+                continue
+            crossing = geom.intersection(og)
+            if crossing is None or crossing.isEmpty():
+                # A near miss inside the intersection tolerance: register the
+                # closest point, which is what the old buffered lookup did.
+                try:
+                    if geom.distance(og) > eps:
+                        continue
+                    crossing = geom.nearestPoint(og)
+                except Exception:
+                    continue
+            for x, y in _intersection_points(crossing):
+                key = (round(x, 6), round(y, 6))
+                if key in seen:
+                    continue
+                seen.add(key)
+                pending.append((x, y))
+        if feedback is not None and n % 250 == 0:
+            feedback.pushInfo(
+                f"Feeder: intersections {n}/{total} span(s) scanned, {len(pending)} crossing(s) …"
+            )
+
+    if pending:
+        objs = []
+        for x, y in pending:
+            f = QgsFeature()
+            f.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(x, y)))
+            objs.append(f)
+        out.dataProvider().addFeatures(objs)
+    out.updateExtents()
+    return out
+
+
 def _tr(s: str) -> str:
     return QCoreApplication.translate("duct_layer", s)
 
@@ -318,22 +407,19 @@ class AlgFeederDuctsNoSplit(QgsProcessingAlgorithm):
 
         feedback.pushInfo(f"  [timing] Duct multipart split: {_time.time() - t0:.3f}s")
         t0 = _time.time()
-        feedback.pushInfo(f"Feeder: line intersections on {net_single.featureCount()} span(s) …")
-        try:
-            inter_pts = processing.run("native:lineintersections",
-                {"INPUT": net_single, "INTERSECT": net_single, "INPUT_FIELDS": [], "INTERSECT_FIELDS": [], "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
-                context=context, feedback=feedback)["OUTPUT"]
-        except Exception:
-            inter_pts = processing.run("qgis:lineintersections",
-                {"INPUT": net_single, "INTERSECT": net_single, "INPUT_FIELDS": [], "INTERSECT_FIELDS": [], "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
-                context=context, feedback=feedback)["OUTPUT"]
-
-        feedback.pushInfo(f"  [timing] Duct line intersections: {_time.time() - t0:.3f}s")
+        feedback.pushInfo(
+            f"Feeder: line intersections on {net_single.featureCount()} span(s) "
+            f"(spatial index, verified per pair) …"
+        )
+        inter_pts = _indexed_line_intersections(net_single, feedback, int_eps)
+        # Duplicate crossings are already collapsed on the coordinate key, so the
+        # separate native:deleteduplicategeometries pass (a full read and write of
+        # the point layer) is no longer needed.
+        feedback.pushInfo(
+            f"  [timing] Duct line intersections: {_time.time() - t0:.3f}s "
+            f"({inter_pts.featureCount()} crossing(s))"
+        )
         t0 = _time.time()
-        inter_pts = processing.run("native:deleteduplicategeometries",
-                                   {"INPUT": inter_pts, "OUTPUT": QgsProcessing.TEMPORARY_OUTPUT},
-                                   context=context, feedback=feedback)["OUTPUT"]
-        feedback.pushInfo(f"  [timing] Duct duplicate intersections: {_time.time() - t0:.3f}s")
         feedback.pushInfo("  [timing] Feeder duct graph preparation complete")
 
         seg_index = QgsSpatialIndex(net_single.getFeatures())

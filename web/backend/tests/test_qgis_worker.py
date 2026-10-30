@@ -312,6 +312,39 @@ def test_a_job_that_stops_logging_fails_the_run_instead_of_hanging(
     assert time.monotonic() - started < 30
 
 
+def test_a_failed_run_cancels_the_worker_job(tmp_path, monkeypatch):
+    """A run the engine gives up on must not keep holding the worker's slot.
+
+    Run 0a27dc4d was failed by the stall guard at 14:27 on 2026-10-30 and its
+    job was still "running" on the worker 975 s later, so the next submission
+    sat at 0 % behind it. The slot is freed now, without a restart.
+    """
+    project = tmp_path / "proj1"
+    project.mkdir()
+    calls = []
+
+    def fake_call(path, data=None, method="GET", timeout=120):
+        calls.append((method, path))
+        if path == "/health":
+            return b'{"state": "ok"}'
+        if method in ("PUT", "POST"):
+            return b"{}"
+        if method == "DELETE":
+            return b'{"state": "canceling"}'
+        return b'{"state": "running", "lines": [], "offset": 40}'
+
+    monkeypatch.setattr(main, "QGIS_WORKER_URL", "http://worker")
+    monkeypatch.setattr(main, "_worker_call", fake_call)
+    monkeypatch.setattr(main, "QGIS_WORKER_POLL_S", 0.02)
+    monkeypatch.setattr(main, "QGIS_STALL_S", 0.2)
+    monkeypatch.setattr(main, "_persist_project_state", lambda *a, **k: None)
+
+    with pytest.raises(RuntimeError):
+        main._run_command_remote("proj1", ["qgis_process", "run", "x"], project)
+
+    assert ("DELETE", "/jobs/proj1") in calls, calls
+
+
 def test_a_job_that_never_starts_fails_fast_instead_of_sitting_at_zero(
         tmp_path, monkeypatch):
     """A run queued behind a wedged job never reaches qgis_process at all.

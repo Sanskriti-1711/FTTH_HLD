@@ -1079,9 +1079,43 @@ def _worker_failure_detail(project_id: str, job: str,
     return base + "\n" + "\n".join(lines[-6:])
 
 
+def _cancel_worker_job(project_id: str) -> None:
+    """Best-effort DELETE of this run's worker job.
+
+    The worker runs one job at a time. When the engine gave up on a run -- stall
+    guard, lost contact, timeout, cancellation -- it left the job alive on the
+    worker: run 0a27dc4d was still "running", with 1608 log lines and 975 s idle,
+    *after* the engine had already failed it, and the next submission queued
+    behind that ghost at 0 % until the job was cancelled by hand. Freeing the
+    slot here is what stops a dead run from blocking the next one.
+    """
+    if not QGIS_WORKER_URL or not project_id:
+        return
+    try:
+        _worker_call(f"/jobs/{project_id}", method="DELETE", timeout=60)
+    except Exception as exc:  # noqa: BLE001 - never mask the failure being raised
+        print(f"[worker] could not cancel job {project_id[:8]}: {exc}", flush=True)
+        return
+    _append(
+        project_id, "warning",
+        "Cancelled the QGIS worker job so the slot is free for the next run.",
+    )
+
+
 def _run_command_remote(project_id: str, cmd: Union[List[str], str],
                         output_dir: Path,
                         transfer: Optional[Tuple[Path, Tuple[str, ...]]] = None) -> List[str]:
+    """Run the pipeline on the worker, and never leave it holding the slot."""
+    try:
+        return _run_command_remote_job(project_id, cmd, output_dir, transfer=transfer)
+    except Exception:
+        _cancel_worker_job(project_id)
+        raise
+
+
+def _run_command_remote_job(project_id: str, cmd: Union[List[str], str],
+                            output_dir: Path,
+                            transfer: Optional[Tuple[Path, Tuple[str, ...]]] = None) -> List[str]:
     """Run the pipeline on the QGIS worker and collect its outputs.
 
     The arguments are built HERE and shipped as-is: ``BF_DUCTS``,
