@@ -1122,6 +1122,14 @@ def _run_command_remote(project_id: str, cmd: Union[List[str], str],
     # never starts qgis_process and writes no line at all, which is a different
     # failure from a running job falling silent (see QGIS_WORKER_START_S).
     started_output = False
+    # An "unknown" job is NOT proof of a restart. The worker answers "unknown"
+    # for any id it has not seen -- including one whose POST never landed (a
+    # wake, an edge retry, an instance replaced in the moment between the POST
+    # and the first poll). Run a7499f9d failed at 12:34 on 2026-10-30 with zero
+    # lines that way, while Render recorded no worker restart at all. Re-submit
+    # once before believing it: the inputs are already uploaded and nothing has
+    # been produced, so a second POST is free.
+    resubmitted = False
     while True:
         if time.time() - started > timeout:
             raise RuntimeError(f"qgis_process timed out after {timeout} seconds")
@@ -1161,6 +1169,20 @@ def _run_command_remote(project_id: str, cmd: Union[List[str], str],
                     f"then run this area again."
                 )
         if state == "unknown":
+            if not started_output and not resubmitted:
+                # It never ran: hand it back to the worker instead of failing.
+                resubmitted = True
+                _append(
+                    project_id, "warning",
+                    "The QGIS worker did not know this job on its first poll; "
+                    "submitting it again (the inputs are already uploaded).",
+                )
+                _start_worker_job(project_id, job, output_dir, cmd,
+                                  transfer=transfer)
+                offset = 0
+                last_output = time.time()
+                time.sleep(QGIS_WORKER_POLL_S)
+                continue
             # The worker restarted and lost the job; its store starts empty, so
             # polling would never end.  Say it and stop instead of hanging.
             raise RuntimeError(

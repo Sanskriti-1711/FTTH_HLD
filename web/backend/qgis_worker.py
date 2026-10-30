@@ -121,20 +121,118 @@ def _job_dir(job_id: str) -> Path:
     return OUTPUT_DIR / safe
 
 
-def _job(job_id: str) -> Dict[str, Any]:
+def _blank_job() -> Dict[str, Any]:
+    return {"state": "unknown", "lines": [], "started_at": None,
+            "finished_at": None, "exit_code": None, "error": None,
+            "pid": None}
+
+
+def _job(job_id: str, create: bool = True) -> Dict[str, Any]:
+    """This job's entry.
+
+    ``create=False`` is for READS. A poll for a job the worker has never seen
+    used to ``setdefault`` an "unknown" entry into the store, so every poll for
+    a run the worker did not know left a phantom job behind: /health then
+    reported ``jobs: 1`` with nothing running (seen 2026-10-30 12:34), and the
+    stale sweep would have had to reason about entries that never existed.
+    """
     with _lock:
-        return _jobs.setdefault(
-            job_id,
-            {
-                "state": "unknown",
-                "lines": [],
-                "started_at": None,
-                "finished_at": None,
-                "exit_code": None,
-                "error": None,
-                "pid": None,
-            },
-        )
+        if job_id in _jobs:
+            return _jobs[job_id]
+        if not create:
+            return _blank_job()
+        job = _blank_job()
+        _jobs[job_id] = job
+        return job
+
+
+def _state_dir() -> Path:
+    return OUTPUT_DIR / ".jobs"
+
+
+def _state_file(job_id: str) -> Path:
+    return _state_dir() / f"{job_id}.json"
+
+
+def _save_job(job_id: str, job: Dict[str, Any]) -> None:
+    """Persist this job, so a replaced instance is not instant amnesia.
+
+    The job store was RAM-only while the INPUTS were already on disk, so when
+    Render replaced the instance the next poll answered "unknown" and the run
+    died as "the worker restarted and lost this run" -- including jobs that had
+    not started yet and could simply have been run.
+    """
+    try:
+        directory = _state_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "job_id": job_id,
+            "state": job.get("state"),
+            "args": job.get("args") or [],
+            "exit_code": job.get("exit_code"),
+            "error": job.get("error"),
+            "started_at": job.get("started_at"),
+            "finished_at": job.get("finished_at"),
+            "queued_at": job.get("queued_at"),
+            "last_line_at": job.get("last_line_at"),
+            "lines": (job.get("lines") or [])[-MAX_LINES:],
+        }
+        tmp = _state_file(job_id).with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, _state_file(job_id))
+    except OSError:
+        # Recovery is a nicety; losing it must never fail a job that runs.
+        pass
+
+
+def _load_state() -> int:
+    """Reload persisted jobs at boot. Returns how many were restored.
+
+    A job that was RUNNING cannot be resumed -- qgis_process died with the old
+    instance -- so it is marked failed with that reason instead of answering
+    "unknown", which the engine could only report as a restart. A job that was
+    still QUEUED never started, so it is queued again: its inputs are on disk
+    and nothing has to be rebuilt.
+    """
+    directory = _state_dir()
+    if not directory.is_dir():
+        return 0
+    restored = 0
+    for path in sorted(directory.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        job_id = str(payload.get("job_id") or path.stem)
+        if not job_id or "".join(ch for ch in job_id
+                                 if ch.isalnum() or ch in "-_") != job_id:
+            continue
+        job = _blank_job()
+        job.update({key: payload.get(key) for key in
+                    ("state", "exit_code", "error", "started_at",
+                     "finished_at", "queued_at", "last_line_at")})
+        job["lines"] = [str(line) for line in payload.get("lines") or []]
+        job["args"] = [str(arg) for arg in payload.get("args") or []]
+        if job["state"] == "running":
+            job.update({
+                "state": "failed",
+                "finished_at": time.time(),
+                "error": ("The worker instance was replaced while this job was "
+                          "running, so qgis_process was lost. Run it again."),
+            })
+        with _lock:
+            _jobs[job_id] = job
+        restored += 1
+        if (job["state"] == "queued" and job["args"]
+                and _job_dir(job_id).is_dir()):
+            with _sched:
+                if job_id not in _queue:
+                    _queue.append(job_id)
+                if not _active["dispatcher"]:
+                    _active["dispatcher"] = True
+                    threading.Thread(target=_dispatch, name="qgis-dispatch",
+                                     daemon=True).start()
+    return restored
 
 
 def start_job(job_id: str, args: List[str], env: Any = None) -> Dict[str, Any]:
@@ -156,6 +254,7 @@ def start_job(job_id: str, args: List[str], env: Any = None) -> Dict[str, Any]:
              "finished_at": None, "exit_code": None, "error": None,
              "queued_at": time.time(), "last_line_at": None}
         )
+    _save_job(job_id, job)
     with _sched:
         if job_id not in _queue:
             _queue.append(job_id)
@@ -189,6 +288,7 @@ def _run_job(job_id: str, args: List[str], env: Optional[Dict[str, str]] = None)
     with _lock:
         job.update({"state": "running", "started_at": time.time(),
                     "last_line_at": time.time()})
+    _save_job(job_id, job)
     try:
         _run_qgis(job_id, job, out_dir, args, env or {})
     finally:
@@ -209,6 +309,7 @@ def _run_qgis(job_id: str, job: Dict[str, Any], out_dir: Path,
             "[worker] applied %d run setting(s) from the engine: %s"
             % (len(job_environment), ", ".join(sorted(job_environment)))
         )
+    lines_since_save = 0
     before = _snapshot(out_dir)
     try:
         process = subprocess.Popen(
@@ -236,6 +337,11 @@ def _run_qgis(job_id: str, job: Dict[str, Any], out_dir: Path,
                 job["last_line_at"] = time.time()
                 if len(job["lines"]) > MAX_LINES:
                     del job["lines"][: len(job["lines"]) - MAX_LINES]
+            # Every 40 lines, not every line: the save is for recovery, not a journal.
+            lines_since_save += 1
+            if lines_since_save >= 40:
+                lines_since_save = 0
+                _save_job(job_id, job)
         process.stdout.close()
         code = process.wait()
         with _lock:
@@ -249,6 +355,7 @@ def _run_qgis(job_id: str, job: Dict[str, Any], out_dir: Path,
             # The manifest is written HERE, not by the API: only the worker
             # knows which files this run touched.
             job["written"] = _written_between(before, _snapshot(out_dir))
+        _save_job(job_id, job)
         meminfo.trace(
             f"worker job {job_id[:8]} ended", exit_code=code,
             seconds=round(time.time() - started, 1),
@@ -258,6 +365,7 @@ def _run_qgis(job_id: str, job: Dict[str, Any], out_dir: Path,
             job["state"] = "failed"
             job["error"] = str(exc)
             job["finished_at"] = time.time()
+        _save_job(job_id, job)
         meminfo.trace(f"worker job {job_id[:8]} failed", error=str(exc)[:120])
 
 
@@ -343,11 +451,13 @@ def cancel_job(job_id: str) -> Dict[str, Any]:
         with _lock:
             job.update({"state": "canceled", "finished_at": time.time(),
                         "error": "canceled before it started"})
+        _save_job(job_id, job)
         return {"state": "canceled", "job_id": job_id}
     process = job.get("process")
     if job["state"] == "running" and process is not None:
         with _lock:
             job["canceled"] = True
+        _save_job(job_id, job)
         try:
             if os.name == "nt":
                 process.terminate()
@@ -496,7 +606,7 @@ class Handler(BaseHTTPRequestHandler):
             job_id = parts[1]
             if len(parts) == 3 and parts[2] == "log":
                 offset = int((parse_qs(parsed.query).get("offset") or ["0"])[0] or 0)
-                job = _job(job_id)
+                job = _job(job_id, create=False)
                 with _lock:
                     lines = job["lines"][offset:]
                     offset = offset + len(lines)
@@ -509,7 +619,7 @@ class Handler(BaseHTTPRequestHandler):
                 except (RuntimeError, FileNotFoundError) as exc:
                     self._send(409, {"detail": str(exc)})
                 return
-            job = _job(job_id)
+            job = _job(job_id, create=False)
             self._send(200, {
                 "job_id": job_id, "state": job["state"],
                 "exit_code": job["exit_code"], "error": job["error"],
@@ -585,6 +695,9 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    restored = _load_state()
+    if restored:
+        print(f"qgis worker restored {restored} job(s) from disk", flush=True)
     port = int(os.environ.get("PORT") or os.environ.get("QGIS_WORKER_PORT") or "8000")
     meminfo.trace("worker starting", port=port)
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)

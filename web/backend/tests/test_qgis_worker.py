@@ -254,13 +254,17 @@ def test_a_lost_job_fails_the_run_instead_of_polling_forever(tmp_path, monkeypat
 
     monkeypatch.setattr(main, "QGIS_WORKER_URL", "http://worker")
     monkeypatch.setattr(main, "_worker_call", fake_call)
+    monkeypatch.setattr(main, "QGIS_WORKER_POLL_S", 0.02)
     monkeypatch.setattr(main, "_persist_project_state", lambda *a, **k: None)
 
     with pytest.raises(RuntimeError) as exc:
         main._run_command_remote("proj1", ["qgis_process", "run", "x"], project)
 
+    # A job the worker never learned is re-submitted ONCE (a POST that never
+    # landed looks identical to a lost job), and then the run fails instead of
+    # polling for ever.
     assert "lost this run" in str(exc.value)
-    assert len([c for c in calls if c[0] == "GET"]) == 1
+    assert len([c for c in calls if c[0] == "POST"]) >= 2
 
 
 def test_a_job_that_stops_logging_fails_the_run_instead_of_hanging(
@@ -447,6 +451,107 @@ def test_a_job_that_is_still_logging_is_never_canceled(tmp_path, monkeypatch):
 
     assert answer["canceled"] == []
     assert worker._jobs["busy"]["state"] == "running"
+
+
+def test_polling_an_unknown_job_does_not_invent_it(tmp_path, monkeypatch):
+    """A read must not create a job.
+
+    The worker answered ``jobs: 1`` on 2026-10-30 with nothing running, because
+    every poll for an id it had not seen wrote an "unknown" entry into the store.
+    """
+    server = _server(tmp_path, monkeypatch)
+
+    answer = _call(server, "/jobs/never-seen")
+
+    assert answer["state"] == "unknown"
+    assert _call(server, "/health")["jobs"] == 0
+
+
+def test_a_queued_job_survives_an_instance_replacement(tmp_path, monkeypatch):
+    """The inputs are on disk, so a queued job should not die with the process."""
+    server = _server(tmp_path, monkeypatch)
+    job = "p-restore"
+    (tmp_path / job / "inputs").mkdir(parents=True)
+    worker._jobs[job] = worker._blank_job()
+    worker._jobs[job].update({
+        "state": "queued",
+        "args": ["-c", _script(), str(tmp_path / job)],
+        "queued_at": time.time(),
+    })
+    worker._save_job(job, worker._jobs[job])
+
+    # The replacement: the store is empty, because it lived in RAM.
+    worker._jobs.clear()
+    worker._queue.clear()
+    worker._active.update({"running": 0, "dispatcher": False})
+
+    assert worker._load_state() == 1
+
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        if _call(server, f"/jobs/{job}")["state"] in ("done", "failed"):
+            break
+        time.sleep(0.05)
+    assert _call(server, f"/jobs/{job}")["state"] == "done"
+
+
+def test_a_job_that_was_running_says_the_instance_was_replaced(tmp_path, monkeypatch):
+    """It cannot be resumed -- qgis_process died with the old instance -- but it
+    must NOT answer "unknown", which the engine reports as a bare restart."""
+    _server(tmp_path, monkeypatch)
+    job = "p-lost"
+    (tmp_path / job / "inputs").mkdir(parents=True)
+    worker._jobs[job] = worker._blank_job()
+    worker._jobs[job].update({"state": "running", "args": ["-c", "pass"],
+                              "started_at": time.time() - 60,
+                              "last_line_at": time.time() - 60})
+    worker._save_job(job, worker._jobs[job])
+    worker._jobs.clear()
+
+    worker._load_state()
+
+    restored = worker._jobs[job]
+    assert restored["state"] == "failed"
+    assert "replaced" in restored["error"]
+
+
+def test_an_unseen_job_is_submitted_again_instead_of_failing(tmp_path, monkeypatch):
+    """Run a7499f9d failed at 0 % with "the worker restarted" and no restart.
+
+    The worker answers "unknown" for an id whose POST never landed, so the
+    engine must re-submit once before believing the run is lost.
+    """
+    project = tmp_path / "proj1"
+    project.mkdir()
+    posts = {"n": 0}
+    polls = {"n": 0}
+
+    def fake_call(path, data=None, method="GET", timeout=120):
+        if path == "/health":
+            return b'{"state": "ok"}'
+        if method in ("PUT", "POST"):
+            if method == "POST":
+                posts["n"] += 1
+            return b"{}"
+        if path.endswith("/result"):
+            return b""
+        polls["n"] += 1
+        if polls["n"] == 1:
+            return b'{"state": "unknown", "lines": [], "offset": 0}'
+        if polls["n"] < 4:
+            return b'{"state": "running", "lines": ["[design] working"], "offset": 10}'
+        return b'{"state": "done", "exit_code": 0, "lines": [], "offset": 20}'
+
+    monkeypatch.setattr(main, "QGIS_WORKER_URL", "http://worker")
+    monkeypatch.setattr(main, "_worker_call", fake_call)
+    monkeypatch.setattr(main, "QGIS_WORKER_POLL_S", 0.02)
+    monkeypatch.setattr(main, "_persist_project_state", lambda *a, **k: None)
+    monkeypatch.setattr(main, "_extract_into", lambda body, out: [])
+
+    written = main._run_command_remote("proj1", ["qgis_process", "run", "x"], project)
+
+    assert written == []
+    assert posts["n"] >= 2
 
 
 def test_the_stop_endpoint_kills_the_worker_job(monkeypatch):
