@@ -5,7 +5,7 @@ import math
 from collections import Counter, defaultdict
 from statistics import median
 
-from qgis.PyQt.QtCore import QByteArray, QCoreApplication, QMetaType
+from qgis.PyQt.QtCore import QCoreApplication, QMetaType
 from qgis.core import (
     QgsFeature, QgsFields, QgsField, QgsWkbTypes, QgsGeometry, QgsGeometryCollection,
     QgsProcessing, QgsProcessingAlgorithm,
@@ -17,32 +17,6 @@ from qgis.core import (
 )
 from qgis import processing
 from ..utils.fields import COMMON_FIELDS
-from ..utils.mem import release_memory
-
-
-def _qgs_from_shapely(geom):
-    """A shapely geometry as QgsGeometry, through WKB rather than WKT.
-
-    The WKT round trip was half of the growth stage's peak: a dissolved Voronoi
-    cell is thousands of vertices, each spelled out as ~20 characters of text,
-    built as one Python string and then re-parsed by QGIS.  WKB carries the same
-    coordinates in binary at a fraction of the size and builds no string at all.
-    WKT stays as the fallback so a build without WKB support behaves as before.
-    """
-    try:
-        from shapely import to_wkb
-
-        wkb = to_wkb(geom)
-        for payload in (QByteArray(wkb), wkb):
-            try:
-                candidate = QgsGeometry.fromWkb(payload)
-            except TypeError:
-                continue
-            if candidate is not None and not candidate.isNull() and not candidate.isEmpty():
-                return candidate
-    except Exception:  # noqa: BLE001 - fall through to the WKT path
-        pass
-    return QgsGeometry.fromWkt(geom.wkt)
 
 
 def _normalize_method_value(val, options, alt_options=None):
@@ -82,16 +56,6 @@ M_CONVEX, M_CONCAVE, M_VORONOI, M_GROWTH = range(4)
 
 # Canonical machine keys in the SAME order and length as METHOD_LABELS
 METHOD_KEYS = ["convex_hull", "concave_hull", "voronoi", "seeded_growth"]
-
-# Upper bound on the prepared barrier engines the growth pass keeps.
-#
-# Testing a building pair against a barrier is fastest with a prepared GEOS
-# engine, so one is cached per barrier feature touched.  That cache was never
-# bounded: a full ward prepared every restriction its merge and compaction
-# passes reached and held them until the stage ended, which is memory the
-# Voronoi partition then could not have.  Cleared wholesale when it fills — a
-# re-prepared engine costs one call, an exhausted container costs the run.
-BARRIER_ENGINE_CACHE = 1024
 
 # Half-width of the corridor cut out of built polygons along barriers [m].
 GROWTH_ROAD_HALF_WIDTH = 4.0
@@ -161,10 +125,8 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
             "road-access validation, no overlaps.\n"
             "Per polygon: exact homes/building counts, coverage area, demand density, and a recommended "
             "splitter (1:8…1:64) targeting 60–90 % utilization.\n"
-            "Backup methods: Convex Hull, Concave Hull and Voronoi remain selectable. They draw geometric "
-            "envelopes — every building inside a smooth boundary and no risk of a malformed polygon — but "
-            "they do NOT enforce the 32–128 home band and do not split a large group into serving areas.\n"
-            "Premises need only geometry + an HH (households) column; PDP/MFG IDs are assigned later in stage 03."
+            "Premises need only geometry + an HH (households) column; PDP/MFG IDs are assigned later in stage 03.\n"
+            "Legacy Convex/Concave/Voronoi envelopes remain selectable and run with fixed defaults."
         )
 
     def createInstance(self):
@@ -182,11 +144,6 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
             self.P_METHOD,
             self.tr("Generation method"),
             options=METHOD_LABELS,
-            # Seeded Growth is the default again (2026-10-31).  It is the only
-            # method that enforces the 32–128 home band and splits a large group
-            # into serving areas; the three hull methods stay selectable as
-            # backups (0 Convex, 1 Concave, 2 Voronoi) and are what growth falls
-            # back to internally when a geometry step cannot be satisfied.
             defaultValue=M_GROWTH
         ))
 
@@ -1391,73 +1348,42 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
         if not owner or len(owner) < 2:
             return None
 
-        # This method rebuilds the WHOLE partition, and growth calls it up to
-        # eleven times in one stage (the first pass, six defragmentation rounds
-        # and four de-island rounds).  Release what the previous round still
-        # holds before allocating the next one.
-        try:
-            stats = release_memory("the Voronoi partition")
-            feedback.pushInfo(
-                f"Growth: Voronoi partition of {len(owner)} building(s) — "
-                f"rss={stats.get('rss_mb')} MB (trimmed={stats.get('trimmed')})"
-            )
-        except Exception:  # noqa: BLE001 - housekeeping never fails a run
-            pass
-
         # Primary: Shapely-based Voronoi (avoids QGIS 3.44 SIGSEGV)
         try:
             from shapely import voronoi_polygons
             from shapely.geometry import MultiPoint
-            from shapely.geometry import box as shapely_box
             from shapely.ops import unary_union
 
             ordered_fids = list(pts.keys())
+            cids = [owner[fid] for fid in ordered_fids]
             coords = [(pts[fid].x(), pts[fid].y()) for fid in ordered_fids]
-            minx = min(c[0] for c in coords)
-            miny = min(c[1] for c in coords)
-            maxx = max(c[0] for c in coords)
-            maxy = max(c[1] for c in coords)
             mp = MultiPoint(coords)
 
             # Build an explicit envelope matching QGIS's BUFFER=100.0 behavior
             # so edge cells extend 100 m beyond the points' bounding box.
+            from shapely.geometry import box as shapely_box
+            minx = min(c[0] for c in coords)
+            miny = min(c[1] for c in coords)
+            maxx = max(c[0] for c in coords)
+            maxy = max(c[1] for c in coords)
             envelope = shapely_box(minx - 100.0, miny - 100.0,
                                    maxx + 100.0, maxy + 100.0)
-            # Shapely's keyword is extend_to (not envelope): the wrong name
-            # raised TypeError on every call and silently fell back to QGIS.
-            vor = voronoi_polygons(mp, extend_to=envelope)
-            del mp, envelope, coords
+            vor = voronoi_polygons(mp, envelope=envelope)
 
-            # Group the cells per cluster, then drop the collection: `vor` is a
-            # single GEOS geometry holding every cell at once, so keeping it
-            # alive through the per-cluster unions holds the partition twice.
             cluster_cells = {}
-            n_cells = len(vor.geoms)
             for i, fid in enumerate(ordered_fids):
-                if i >= n_cells:
+                if i >= len(vor.geoms):
                     break
+                cid = cids[i]
                 cell = vor.geoms[i]
                 if cell is None or cell.is_empty:
                     continue
-                cluster_cells.setdefault(owner[fid], []).append(cell)
-            del vor
+                cluster_cells.setdefault(cid, []).append(cell)
 
-            # Dissolve one cluster at a time and free its cells immediately. The
-            # union of a few thousand cells is the largest single allocation in
-            # the stage and it is needed for one cluster only, so holding the
-            # whole partition until every union is done doubles the peak for
-            # nothing.
             out = {}
-            for done, (cid, cells) in enumerate(cluster_cells.items(), 1):
+            for cid, cells in cluster_cells.items():
                 dissolved = unary_union(cells)
-                cells.clear()
-                geom = _qgs_from_shapely(dissolved)
-                del dissolved
-                if geom is not None and not geom.isEmpty():
-                    out[cid] = geom
-                if done % 64 == 0:
-                    release_memory("the Voronoi dissolve")
-            cluster_cells.clear()
+                out[cid] = QgsGeometry.fromWkt(dissolved.wkt)
 
             if out:
                 return out
@@ -1527,47 +1453,6 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
             f"Growth rules: {min_hh}–{max_hh} homes/polygon, neighbour ≤ {neigh_dist:.0f} m, "
             f"service radius ≤ {service_radius:.0f} m, road access ≤ {access_dist:.0f} m."
         )
-
-        def _progress(pct: int, label: str) -> None:
-            """Announce where the growth pass is INSIDE the Polygon Layer stage.
-
-            The engine moves the stage bar on "[NN%] Running <Stage>" lines
-            only, so this pass used to report nothing at all: run f094c6c5 sat
-            at "Polygon Layer 11 %" for 27 minutes while clustering,
-            compaction and six defragmentation rounds were all working, which
-            is indistinguishable from a frozen run on the status page.
-
-            ``pct`` is a position WITHIN this stage (0–100), not the pipeline's
-            global percentage: the engine interpolates it across the stage's
-            own band. The trailing label is what marks the line as in-stage —
-            the bare stage entry line must keep moving only the ladder.
-            """
-            try:
-                feedback.pushInfo(f"[{pct}%] Running Polygon Layer — {label}")
-            except Exception:
-                pass
-
-        def _release(where: str) -> None:
-            """Hand this phase's freed arenas back before the next one allocates.
-
-            Growth's peak is not one big object, it is a succession of them: the
-            premise geometries, the neighbour graph, then the Voronoi partition
-            rebuilt for every defragmentation round.  Python frees each as the
-            reference goes, but glibc keeps the arenas, so RSS only climbed —
-            run e394dd0c stalled at 501 of 512 MB instead of finishing.
-
-            The line is also the trace that was missing before: an RSS that
-            stays flat across phases means the stage is holding memory on
-            purpose, one that climbs means something is not being freed.
-            """
-            try:
-                stats = release_memory(where)
-                feedback.pushInfo(
-                    f"Growth: memory before {where} — rss={stats.get('rss_mb')} MB "
-                    f"(gc={stats.get('objects')}, trimmed={stats.get('trimmed')})"
-                )
-            except Exception:  # noqa: BLE001 - housekeeping never fails a run
-                pass
 
         # ---- collect premises (membership units) ----
         hh_name = self._detect_hh_field(src.fields())
@@ -1684,8 +1569,6 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
             for xid in barrier_index.intersects(seg.boundingBox()):
                 eng = barrier_engines.get(xid)
                 if eng is None:
-                    if len(barrier_engines) >= BARRIER_ENGINE_CACHE:
-                        barrier_engines.clear()
                     eng = QgsGeometry.createGeometryEngine(barrier_geoms[xid].constGet())
                     eng.prepareGeometry()
                     barrier_engines[xid] = eng
@@ -1713,19 +1596,6 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                     f"Growth: {n_no} building(s) have no road within {access_dist:.0f} m "
                     "(Road Connectivity Rule) — counted per polygon in NO_ACCESS."
                 )
-
-        # The full road network was only ever needed by the access test above,
-        # and it is the largest input geometry set growth holds — every street
-        # of the ward, geometry and prepared spatial index.  Released here rather
-        # than carried, unused, through the whole clustering and Voronoi pass.
-        if road_geoms:
-            n_roads = len(road_geoms)
-            road_geoms.clear()
-            road_index = None
-            feedback.pushInfo(
-                f"Growth: released {n_roads} road feature(s) after the access check."
-            )
-        _release("clustering")
 
         # ---- Phase A/B: CONSTRAINED AGGLOMERATIVE CLUSTERING (Ward linkage) ----
         # Bottom-up region building: every building starts as its own cluster and
@@ -1843,25 +1713,12 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                     feedback.setProgress(int(50 * n_merges / max(1, total_pts)))
                 except Exception:
                     pass
-                # setProgress only moves QGIS's own bar; the engine reads
-                # STDOUT, so this loop was silent from its first merge to its
-                # last. On 8,100 buildings / 29,700 homes that is minutes of
-                # real work with nothing to show for it, and runs c5570808 and
-                # 20d1273d were failed mid-clustering by the 900 s stall guard
-                # while this was the phase actually running.
-                if n_merges % 250 == 0:
-                    _progress(
-                        5 + int(10 * n_merges / max(1, total_pts)),
-                        "clustering: %d/%d merges" % (n_merges, total_pts),
-                    )
 
         n_clusters = sum(1 for ci in range(len(clusters))
                          if ci not in merged_into and clusters[ci]["members"])
         feedback.pushInfo(
             f"Growth: agglomerative (Ward) clustering — {n_merges} merges → {n_clusters} clusters."
         )
-        _progress(15, f"{n_merges} merges → {n_clusters} cluster(s)")
-        _release("the undersized-cluster pass")
 
         # HOME COUNT (min) + ≥3-buildings: flag survivors that stay undersized
         n_under = 0
@@ -2052,7 +1909,6 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
 
         compact_moves = 0
         for _it in range(8):
-            _progress(20 + _it * 3, f"compaction pass {_it + 1}/8")
             cents = {ci: _centroid(ci) for ci in range(len(clusters))
                      if ci not in merged_into and clusters[ci]["members"]}
             moved = 0
@@ -2101,7 +1957,6 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                 break
         if compact_moves:
             feedback.pushInfo(f"Growth: compaction relocated {compact_moves} building(s) to rounder clusters.")
-        _release("the Voronoi partition")
 
         clip_union = None
         if clip_lyr is not None:
@@ -2119,7 +1974,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
         emit_order = [ci for ci in range(len(clusters))
                       if ci not in merged_into and clusters[ci]["members"]]
         # Emit larger clusters first so they claim territory before smaller neighbours
-        # when convex caps overlap and get trimmed by the overlap guard.
+        # when convex caps overlap and get trimmed by the emitted_geom guard.
         emit_order.sort(key=lambda ci: clusters[ci]["hh"], reverse=True)
         owner = {}
         for _fid, _ci in assigned.items():
@@ -2156,7 +2011,6 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
             # Every round holds the hard cap: a stray that cannot move under it
             # stays where it is rather than pushing a polygon over MAX_HH.
             for _round in range(6):
-                _progress(50 + _round * 5, f"defragmentation round {_round + 1}/6")
                 cap = max_hh
                 stranded = []
                 for ci in emit_order:
@@ -2327,29 +2181,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
         poly_id_of_cluster = {}
         geom_of_cluster = {}                  # ci -> emitted polygon (for the ADDR_ID containment check)
         serial = 1
-        # Overlap guard: the polygons emitted so far, kept individually behind a
-        # spatial index instead of as one cumulative union.  The union was
-        # rebuilt with every combine() and every cluster was differed against it
-        # in full — quadratic work, and a multipolygon that grew to the whole
-        # ward and was held until the stage ended.
-        emitted_geoms = {}                    # ci -> QgsGeometry emitted so far
-        emitted_index = QgsSpatialIndex()
-
-        def _emitted_overlap(geom):
-            """Union of the emitted polygons this geometry can actually touch.
-
-            Differing against only the intersecting polygons gives the same
-            answer as differing against all of them: a polygon that does not
-            meet this one's bounding box cannot remove anything from it.
-            """
-            if geom is None or geom.isEmpty() or not emitted_geoms:
-                return None
-            near = [i for i in emitted_index.intersects(geom.boundingBox())
-                    if i in emitted_geoms]
-            if not near:
-                return None
-            parts = [emitted_geoms[i] for i in near]
-            return parts[0] if len(parts) == 1 else QgsGeometry.unaryUnion(parts)
+        emitted_geom = QgsGeometry()          # cumulative union of all polygons emitted so far
 
         # Small per-building footprint radius, used by the fallback / gap-patch
         # to guarantee a member is never left outside its own polygon.
@@ -2396,9 +2228,8 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
             # ---- strict non-overlap safety net: subtract all previously emitted
             # geometry (Voronoi cells are already disjoint, so this is a no-op
             # unless a cell was unavailable / a buffer pushed past the cell). ----
-            _overlap = _emitted_overlap(geom)
-            if _overlap is not None and not geom.isEmpty():
-                geom = geom.difference(_overlap)
+            if not emitted_geom.isEmpty() and not geom.isEmpty():
+                geom = geom.difference(emitted_geom)
 
             geom = self._parts_containing_members(geom, member_pts)
             if geom is None or geom.isEmpty():
@@ -2407,9 +2238,8 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                     "falling back to member footprints (REVIEW=1)."
                 )
                 geom = QgsGeometry.unaryUnion([self._square(q, ownsq_r) for q in member_pts])
-                _overlap = _emitted_overlap(geom)
-                if _overlap is not None and geom is not None and not geom.isEmpty():
-                    geom = geom.difference(_overlap)
+                if not emitted_geom.isEmpty() and geom is not None and not geom.isEmpty():
+                    geom = geom.difference(emitted_geom)
                 review = True
 
             # Tiny inward buffer so adjacent polygons read as separate at map
@@ -2427,9 +2257,8 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                         patch = QgsGeometry.unaryUnion(
                             [self._square(q, ownsq_r) for q in lost]
                         ).intersection(pre_gap)
-                        _overlap = _emitted_overlap(patch)
-                        if _overlap is not None and patch is not None and not patch.isEmpty():
-                            patch = patch.difference(_overlap)
+                        if not emitted_geom.isEmpty() and patch is not None and not patch.isEmpty():
+                            patch = patch.difference(emitted_geom)
                         if patch is not None and not patch.isEmpty():
                             geom = geom.combine(patch)
 
@@ -2455,8 +2284,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                 simp = geom.simplify(max(3.0, margin * 0.5))
                 if (simp is not None and not simp.isEmpty()
                         and all(simp.intersects(QgsGeometry.fromPointXY(q)) for q in member_pts)):
-                    _overlap = _emitted_overlap(simp)
-                    simp = simp.difference(_overlap) if _overlap is not None else simp
+                    simp = simp.difference(emitted_geom) if not emitted_geom.isEmpty() else simp
                     if simp is not None and not simp.isEmpty() and \
                             all(simp.intersects(QgsGeometry.fromPointXY(q)) for q in member_pts):
                         geom = simp
@@ -2481,22 +2309,15 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
             geom_of_cluster[ci] = geom
             review_of[ci] = review
             try:
-                emitted_geoms[ci] = QgsGeometry(geom)
-                _ef = QgsFeature(ci)
-                _ef.setGeometry(geom)
-                emitted_index.addFeature(_ef)
+                emitted_geom = emitted_geom.combine(geom)
             except Exception as exc:
                 feedback.pushWarning(
-                    f"Growth: could not index polygon for cluster {ci} in the overlap guard ({exc})."
+                    f"Growth: could not union polygon for cluster {ci} into overlap guard ({exc})."
                 )
             try:
                 feedback.setProgress(60 + int(35 * (n_done + 1) / max(1, len(emit_order))))
             except Exception:
                 pass
-            if (n_done + 1) % 100 == 0:
-                _progress(90, "emitted %d/%d polygon(s)" % (n_done + 1, len(emit_order)))
-            if (n_done + 1) % 200 == 0:
-                _release("the next batch of polygons")
 
         # ---- Phase D: COVERAGE GUARANTEE — leave no premise outside a polygon ----
         # Every house must sit inside a polygon. After the single-boundary trim,
