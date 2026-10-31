@@ -2814,7 +2814,8 @@ def _run_pipeline(
     excel_path: Path,
     roads_path: Path,
     output_dir: Path,
-    poly_method: int = 3,
+    # 0 = Convex Hull, the pipeline's default since 2026-10-31; 3 = seeded growth.
+    poly_method: int = 0,
     brownfield_path: Optional[Path] = None,
     use_brownfield: bool = True,
 ) -> None:
@@ -2851,7 +2852,9 @@ def _run_pipeline(
             f"EXCEL={excel_path}",
             f"ROADS={roads_path}",
             f"OUTPUT_DIR={output_dir}",
-            f"POLY_METHOD={int(poly_method or 3)}",
+            # `or 0` would be a trap: 0 is a real method (Convex Hull) and is
+            # falsy, so an unset value is mapped explicitly instead of by truth.
+            f"POLY_METHOD={0 if poly_method is None else int(poly_method)}",
         ]
         bf_args = _brownfield_args(brownfield_path, output_dir, project_id,
                                    use_brownfield=use_brownfield)
@@ -3139,7 +3142,7 @@ async def run_hld(
     natural: Optional[UploadFile] = File(None),
     project_id: Optional[str] = Form(None),
     name: Optional[str] = Form(None),
-    poly_method: Optional[int] = Form(3),
+    poly_method: Optional[int] = Form(0),
     # Reuse existing infrastructure (an uploaded archive AND this project's own
     # stored network). OFF designs every duct and trench fresh; an absent flag
     # keeps the old behaviour.
@@ -3487,7 +3490,7 @@ def _run_area_pipeline(
     project_id: str,
     area: str,
     output_dir: Path,
-    poly_method: int = 3,
+    poly_method: int = 0,
     country_code: str = "",
     input_type: str = "",
     postcode: str = "",
@@ -3697,9 +3700,12 @@ async def run_from_area(
     project_id = str((payload or {}).get("project_id") or uuid.uuid4().hex)
     name = (payload or {}).get("name")
     try:
-        poly_method = int((payload or {}).get("poly_method") or 3)
+        # 0 (Convex Hull) is a valid, falsy method, so absence is tested
+        # explicitly rather than with `or`.
+        _pm = (payload or {}).get("poly_method")
+        poly_method = int(_pm) if _pm not in (None, "") else 0
     except (TypeError, ValueError):
-        poly_method = 3
+        poly_method = 0
 
     output_dir = OUTPUT_DIR / project_id
     output_dir.mkdir(parents=True, exist_ok=True)

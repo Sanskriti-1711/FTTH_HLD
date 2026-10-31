@@ -154,15 +154,20 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
     def shortHelpString(self):
         return self.tr(
             "Generate FDP/PDP serving-area polygons directly from the premises (Object) layer.\n"
-            "Default method: Seeded Growth — a constrained agglomerative (Ward-linkage) clusterer groups "
-            "nearby buildings into compact service clusters under the rules: "
-            "neighbour distance (150 m), 32–128 homes per polygon (nearest rule-compliant pair merged first), "
-            "barriers (restricted roads / railway / river / airport zones), 300 m service radius, "
-            "road-access validation, no overlaps.\n"
+            "Default method: Convex Hull — one smooth polygon around the group's buildings, unioned from "
+            "them (so every building is inside it) and optionally inset/buffered. It is the method Concave "
+            "and Voronoi fall back to, and the one that never fails on real data.\n"
+            "NOTE: a hull is a geometric envelope, not a capacity-sized service area — it does NOT enforce the "
+            "32–128 home band and does not split a large group into several serving areas. Seeded Growth below "
+            "is the only method that does, and remains selectable.\n"
             "Per polygon: exact homes/building counts, coverage area, demand density, and a recommended "
-            "splitter (1:8…1:64) targeting 60–90 % utilization.\n"
-            "Premises need only geometry + an HH (households) column; PDP/MFG IDs are assigned later in stage 03.\n"
-            "Legacy Convex/Concave/Voronoi envelopes remain selectable and run with fixed defaults."
+            "splitter (1:8…1:64) targeting 60–90 % utilization — for a hull this describes whatever the "
+            "envelope covers.\n"
+            "Seeded Growth: a constrained agglomerative (Ward-linkage) clusterer groups nearby buildings "
+            "under the full rules — neighbour distance (150 m), 32–128 homes per polygon, barriers "
+            "(restricted roads / railway / river / airport zones), 300 m service radius, road-access "
+            "validation, no overlaps.\n"
+            "Premises need only geometry + an HH (households) column; PDP/MFG IDs are assigned later in stage 03."
         )
 
     def createInstance(self):
@@ -180,7 +185,14 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
             self.P_METHOD,
             self.tr("Generation method"),
             options=METHOD_LABELS,
-            defaultValue=M_GROWTH
+            # Convex Hull by default (2026-10-31): the seeded-growth builder's
+            # Voronoi-trimmed boundaries were not reading as proper serving areas
+            # on real wards.  A hull is the fallback every other method already
+            # drops to, so the default is now the one that cannot produce a
+            # malformed polygon.  Growth stays selectable (value 3) and is still
+            # forced by PLANNING_FIRST — it is the only method with the 32–128
+            # cap and the split-into-serving-areas rule.
+            defaultValue=M_CONVEX
         ))
 
         self.addParameter(QgsProcessingParameterDistance(

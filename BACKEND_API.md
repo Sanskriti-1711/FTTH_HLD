@@ -184,10 +184,12 @@ The `poly_method` parameter controls which algorithm generates service-area poly
 
 | Value | Method | Description |
 |-------|--------|-------------|
-| `0` | Convex Hull | Simple convex hull per cluster |
-| `1` | Concave Hull | Alpha-shape hull |
-| `2` | Voronoi | Voronoi partition → dissolve by group |
-| **`3` (default)** | **Seeded Growth** | Constrained agglomerative clustering with road barriers, capacity caps (32–128 homes), service radius (300 m), and road-access validation |
+| **`0` (default)** | **Convex Hull** | One smooth polygon around the group's buildings, unioned from them so every building is inside it. The hull Concave and Voronoi fall back to, so it cannot produce a malformed polygon — but it is an envelope, not a capacity-sized serving area (no 32–128 cap) |
+| `1` | Concave Hull | Alpha-shape hull; falls back to convex hull on any failure |
+| `2` | Voronoi | Voronoi partition → dissolve by group; falls back to convex hull on any failure |
+| `3` | Seeded Growth | Constrained agglomerative clustering with road barriers, capacity caps (32–128 homes), service radius (300 m), and road-access validation — the only method that enforces the band and splits a group into serving areas |
+
+All four populate the same attribute schema, including the splitter plan (`SPLIT_SIZE`, `SPLIT_CNT`, `SPL_PORTS`, `SPL_4/8/16/32/64`, `SPL_PLAN`), computed from the polygon's own home count — for a hull that describes whatever the envelope covers. `PLANNING_FIRST` overrides `poly_method` and forces `3`.
 
 ---
 
