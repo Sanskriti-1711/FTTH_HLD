@@ -463,9 +463,9 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
 
         self.addParameter(QgsProcessingParameterEnum(
             self.P_POLY_METHOD, self.tr("02 Polygon — Generation method"),
-            # 0 (Convex Hull) is the default since 2026-10-31, matching the
-            # polygon algorithm's own default; 3 is the seeded-growth builder.
-            options=self._METHOD_OPTIONS, defaultValue=0
+            # 3 (Seeded Growth) is the default, matching the polygon algorithm's
+            # own default; 0/1/2 are the hull envelopes kept as backups.
+            options=self._METHOD_OPTIONS, defaultValue=3
         ))
         self.addParameter(QgsProcessingParameterBoolean(
             self.P_POLY_PLAN_FIRST,

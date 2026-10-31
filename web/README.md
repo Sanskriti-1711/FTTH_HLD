@@ -96,7 +96,7 @@ Fields:
 | `excel` | file | yes | Address list `.xlsx` |
 | `roads` | file | yes | Roads layer, usually `.gpkg` |
 | `project_id` | form string | no | If omitted, the API creates one |
-| `poly_method` | form integer | no | Defaults to `0` convex hull. `3` is the seeded-growth builder — the only method that enforces the 32–128 home band and splits a group into serving areas. |
+| `poly_method` | form integer | no | Defaults to `3` seeded growth — the only method that enforces the 32–128 home band and splits a group into serving areas. `0` convex, `1` concave and `2` voronoi are backup envelopes. |
 
 Response is `202 Accepted`:
 
