@@ -1,44 +1,39 @@
-name: Keep the engine and the backend awake (the worker wakes on demand)
+name: Keep the engine, the backend and the QGIS worker awake
 
 # Render's free plan stops a web service after 15 minutes without traffic. A
 # cold start measured 42s for the backend; the QGIS worker's measured **415 s**
-# on the 2026-10-22 L1 8JQ run (`QGIS worker ready (415s)`).
+# on the 2026-10-22 L1 8JQ run (`QGIS worker ready (415s)`), and it was seen
+# again on 2026-10-31 at 01:53Z: `The QGIS worker is not awake yet (HTTP Error
+# 502: Bad Gateway); waiting for it.` -- the run went on to finish, but only
+# after the engine sat on the boot.
 #
-# ── Why the worker is no longer on the schedule (2026-10-30) ───────────────────
-# Pinging it bought almost nothing. A run keeps the worker awake by itself: the
-# engine polls `/jobs/{id}/log` every 2 s while a run is in flight, and Render
-# only counts *inbound* traffic. And a run never starts on a sleeping worker
-# unannounced -- `wake_worker()` boots it from three places (run submit, area
-# preview, run start), overlaps the boot with the OSM fetch, and the run log
-# says "The QGIS worker is not awake yet (...); waiting for it". So the schedule
-# was buying 415 s of latency avoided on the first run of the day, at a cost of
-# 3 h/day of the shared instance-hour budget.
-#
-# The trade taken instead: the schedule warms only the engine and the backend,
-# the worker boots on demand, and the engine's wake budget (`FTTH_QGIS_WORKER_WAKE`,
-# 900 s) covers a 415 s boot plus Render's queue. A **manual dispatch still warms
-# the worker** -- that is the "wake it now" button before a demo, at ~0.2 h a click.
+# ── The worker is warmed here (restored 2026-10-31) ─────────────────────────────
+# It was taken off the schedule for a few hours to save instance hours, on the
+# reasoning that a run keeps it awake by itself (the engine polls
+# `/jobs/{id}/log` every 2 s) and that `wake_worker()` boots it from submit,
+# preview and job start. Both are true, and neither removes the 502: a run that
+# starts on a sleeping worker still pays the boot, and the boot probe can meet
+# the platform edge rate-limiting it (`HTTP 429; backing off 30 s`). Warming it
+# here is what prevents that, so it is back in the loop.
 #
 # ── The hour budget is the constraint, and it is shared ────────────────────────
 # Render grants **750 free instance hours per workspace per calendar month**,
 # shared across every free web service, and a service only spends them while it
-# is RUNNING (a spun-down service is free). The workspace has three free web
-# services: the engine, the backend, and the worker. All three awake 24/7 would
+# is RUNNING (a spun-down service is free). All three awake 24/7 would
 # be ~2,230 h/mo: the budget would be gone about ten days in and Render
 # SUSPENDS free web services until the next calendar month — every service down
 # at once, which is far worse than a cold start.
 #
-# Hence a window: **3 h/day**, 09:00Z-12:00Z, narrowed from 7 h on 2026-10-30
-# while the month's spare instance hours were still under review.
-# 2 scheduled services x (3 h + 0.25 h of the 15-minute idle tail after the last
-# ping) x 31 days = **201 h/mo** of the 750, leaving ~549 h for runs and traffic
-# outside the window. Taking the worker off the schedule returned 101 h/mo.
+# Hence a window: **3 h/day**, 09:00Z-12:00Z.
+# 3 services x (3 h + 0.25 h of the 15-minute idle tail after the last ping)
+# x 31 days = **302 h/mo** of the 750, leaving ~448 h for runs and traffic
+# outside the window.
 # A run in flight keeps its services awake on its own -- the window only
 # decides when PINGS happen, so narrowing it never cuts a running job.
-# The engine and the backend used to get 11 h/day (07-18 UTC) at 660 h/mo
-# between them; the worker's wake is minutes, theirs is seconds, so the three
-# hours went to the service whose cold start actually hurts. 09-16 UTC is
-# 10:00-17:00 in the UK, inside the old window.
+# NOTE the window is UTC: 09-12Z is 10:00-15:00 in Berlin in winter and
+# 11:00-16:00 in summer, so a run started outside it still pays the worker's
+# boot. That is what happened at 01:53Z on 2026-10-31 -- warming cannot help
+# outside the window without spending hours the budget does not have.
 #
 # The budget is not eyeballed: the first step recomputes the monthly hours from
 # WARM_FROM_UTC / WARM_TO_UTC / SERVICE_COUNT and refuses to warm anything if
@@ -89,14 +84,9 @@ env:
   WARM_FROM_UTC: '9'
   WARM_TO_UTC: '12'
   MONTHLY_INSTANCE_HOURS: '750'
-  # Services the SCHEDULE keeps awake: engine + backend. The worker boots on
-  # demand (see the header) and is only pinged by a manual dispatch, so it does
-  # not draw on the scheduled budget — hence 2, not 3.
-  SERVICE_COUNT: '2'
+  # Services the SCHEDULE keeps awake: engine + backend + worker.
+  SERVICE_COUNT: '3'
   WORKER_URL: https://ftth-qgis-worker.onrender.com
-  # 'true' only for a manual dispatch: the scheduled window leaves the worker to
-  # boot on demand, but the operator keeps a one-click wake for it.
-  WARM_WORKER: ${{ github.event_name == 'workflow_dispatch' }}
   # How long before the window a tick is allowed to hold and then warm. 4 h
   # covers the gap seen on this repository (05:24Z -> 09:00Z) without turning a
   # late-night tick into a wasted 5-hour job that warms nothing.
@@ -181,10 +171,9 @@ jobs:
           echo "holding ${WAIT_S}s until ${WARM_FROM_UTC}:00Z (the services are asleep, so this costs no instance hours)"
           sleep "$WAIT_S"
 
-      # 120s covers a 42s cold start plus Render's boot queue. The worker, when a
-      # manual dispatch asks for it, gets 20s instead: its boot is minutes, so
-      # holding the request would only make the round late. The request itself is
-      # what wakes it.
+      # 120s covers a 42s cold start plus Render's boot queue. The worker gets
+      # 20s instead: its boot is minutes, so holding the request would only make
+      # the round late. The request itself is what wakes it.
       #
       # A tick does not ping once and exit -- see the schedule note above. It
       # loops until the window closes, so the 2-5 hour gaps between scheduled
@@ -242,12 +231,10 @@ jobs:
             round_failed=0
             probe engine  https://ftth-planning.onrender.com/health  120 yes || round_failed=1
             probe backend https://fibre-backend-wml3.onrender.com/healthz 120 yes || round_failed=1
-            # Off the schedule (WARM_WORKER=false): a run wakes the worker itself
-            # and keeps it awake by polling, so a scheduled ping would only spend
-            # instance hours. A manual dispatch still warms it.
-            if [ "${WARM_WORKER:-false}" = "true" ]; then
-              probe worker  "$WORKER_URL/health" 20 no || round_failed=1
-            fi
+            # 20s, not 120s: the worker's boot is minutes, so holding the request
+            # would only make the round late. The request itself is what wakes it,
+            # and the ping that follows is what proves it came up.
+            probe worker  "$WORKER_URL/health" 20 no || round_failed=1
             # Only the last round decides the job's status: a service that was
             # booting on the first round and answered on the next is a success.
             failed=$round_failed
