@@ -1426,53 +1426,21 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
             # Shapely's keyword is extend_to (not envelope): the wrong name
             # raised TypeError on every call and silently fell back to QGIS.
             vor = voronoi_polygons(mp, extend_to=envelope)
-            del mp, envelope
+            del mp, envelope, coords
 
             # Group the cells per cluster, then drop the collection: `vor` is a
             # single GEOS geometry holding every cell at once, so keeping it
             # alive through the per-cluster unions holds the partition twice.
-            #
-            # A cell belongs to the SEED IT CONTAINS, never to its position in
-            # the input list.  Shapely returns the cells in its own order, so
-            # `vor.geoms[i]` is only occasionally the cell of `ordered_fids[i]`
-            # -- measured on a 529-building section, 1 cell in 529 was paired
-            # right.  Pairing by position trimmed each cluster with a stranger's
-            # cell, so its own members fell outside, the cap "lost its
-            # member-bearing parts" and growth emitted bare building footprints:
-            # slivers that overlap the neighbours they were cut from.  Looking
-            # the owner up by containment is the same grouping `native:dissolve`
-            # does by the `cid` attribute in the QGIS path below, and it is what
-            # the clean reference runs (d788ef7b) were built with.
-            from shapely.geometry import Point
-            from shapely.strtree import STRtree
-
-            seeds = [Point(c) for c in coords]
-            seed_tree = STRtree(seeds)
             cluster_cells = {}
-            unowned = 0
-            for cell in vor.geoms:
+            n_cells = len(vor.geoms)
+            for i, fid in enumerate(ordered_fids):
+                if i >= n_cells:
+                    break
+                cell = vor.geoms[i]
                 if cell is None or cell.is_empty:
                     continue
-                inside = [i for i in seed_tree.query(cell) if cell.covers(seeds[i])]
-                if not inside:
-                    # A cell clipped by the envelope edge can miss every seed
-                    # centre by a rounding step; the nearest seed is still the
-                    # one whose cell this is.
-                    nearest = seed_tree.nearest(cell)
-                    inside = [int(nearest)] if nearest is not None else []
-                if not inside:
-                    unowned += 1
-                    continue
-                cluster_cells.setdefault(
-                    owner[ordered_fids[inside[0]]], []
-                ).append(cell)
-            del vor, seeds, seed_tree, coords
-            if unowned:
-                # Reported, not raised: one unowned edge cell must not fail a
-                # stage that has a QGIS fallback and a cap fallback behind it.
-                feedback.pushInfo(
-                    f"Growth: {unowned} Voronoi cell(s) matched no building; ignored."
-                )
+                cluster_cells.setdefault(owner[fid], []).append(cell)
+            del vor
 
             # Dissolve one cluster at a time and free its cells immediately. The
             # union of a few thousand cells is the largest single allocation in
@@ -1675,30 +1643,6 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
             for fid in pts:
                 hh_of[fid] = by_building[building_of.get(fid, f"__row_{fid}")]
 
-            # ...but the write-back repeats the BUILDING total on each of its
-            # premise rows, so adding the rows of a cluster up counts a 53-home
-            # block once per address.  A 529-row section with 452 buildings grew
-            # from 7,507 homes to 11,569 that way, and since the band is 32-128
-            # homes the inflated total forces more, smaller polygons (ceil(11569
-            # /128) = 91 instead of 59).  Cluster arithmetic therefore charges a
-            # building's homes to one row -- its first -- and nothing to the
-            # rest; hh_of stays per-row for the splitter plan and the CBT pass.
-            hh_charge = {}
-            _primary_row = {}
-            for fid in pts:
-                _bld = building_of.get(fid, f"__row_{fid}")
-                if _bld in _primary_row:
-                    hh_charge[fid] = 0
-                else:
-                    _primary_row[_bld] = fid
-                    hh_charge[fid] = hh_of[fid]
-            del _primary_row
-
-        if not hh_charge:
-            # No household column at all: one home per premise row, and rows are
-            # the only unit there is, so every row carries its own home.
-            hh_charge = {fid: hh_of[fid] for fid in hh_of}
-
         if not pts:
             raise QgsProcessingException("Growth: INPUT contains no usable premise geometries.")
 
@@ -1798,7 +1742,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
         assigned = {}                                  # fid -> cluster index
         for fid in pts:
             ci = len(clusters)
-            clusters.append({"members": [fid], "hh": hh_charge[fid], "review": False,
+            clusters.append({"members": [fid], "hh": hh_of[fid], "review": False,
                              "sx": pts[fid].x(), "sy": pts[fid].y()})
             assigned[fid] = ci
 
@@ -2116,7 +2060,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                 ci = _resolve(assigned[fid])
                 if ci not in cents or len(clusters[ci]["members"]) <= 3:
                     continue
-                if clusters[ci]["hh"] - hh_charge[fid] < min_hh:
+                if clusters[ci]["hh"] - hh_of[fid] < min_hh:
                     continue                                   # keep donor in-band
                 cx, cy = cents[ci]
                 d_own = math.hypot(pts[fid].x() - cx, pts[fid].y() - cy)
@@ -2132,7 +2076,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                     d_new = math.hypot(pts[fid].x() - ncx, pts[fid].y() - ncy)
                     if d_new >= d_own:
                         continue                               # only moves that increase compactness
-                    if clusters[nci]["hh"] + hh_charge[fid] > max_hh:
+                    if clusters[nci]["hh"] + hh_of[fid] > max_hh:
                         continue                               # Home Count Rule
                     if d_new > service_radius:
                         continue                               # Service Radius Rule
@@ -2143,11 +2087,11 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                 if best is not None:
                     nci = best[0]
                     clusters[ci]["members"].remove(fid)
-                    clusters[ci]["hh"] -= hh_charge[fid]
+                    clusters[ci]["hh"] -= hh_of[fid]
                     clusters[ci]["sx"] -= pts[fid].x()
                     clusters[ci]["sy"] -= pts[fid].y()
                     clusters[nci]["members"].append(fid)
-                    clusters[nci]["hh"] += hh_charge[fid]
+                    clusters[nci]["hh"] += hh_of[fid]
                     clusters[nci]["sx"] += pts[fid].x()
                     clusters[nci]["sy"] += pts[fid].y()
                     assigned[fid] = nci
@@ -2242,7 +2186,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                         nci = _resolve(na) if na is not None else None
                         if nci is None or nci == ci or not clusters[nci]["members"]:
                             continue
-                        if clusters[nci]["hh"] + hh_charge[m] > cap:
+                        if clusters[nci]["hh"] + hh_of[m] > cap:
                             continue
                         if crosses_barrier(pts[m], pts[nid]):
                             continue
@@ -2255,11 +2199,11 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                         continue
                     nci = votes.most_common(1)[0][0]
                     clusters[ci]["members"].remove(m)
-                    clusters[ci]["hh"] -= hh_charge[m]
+                    clusters[ci]["hh"] -= hh_of[m]
                     clusters[ci]["sx"] -= pts[m].x()
                     clusters[ci]["sy"] -= pts[m].y()
                     clusters[nci]["members"].append(m)
-                    clusters[nci]["hh"] += hh_charge[m]
+                    clusters[nci]["hh"] += hh_of[m]
                     clusters[nci]["sx"] += pts[m].x()
                     clusters[nci]["sy"] += pts[m].y()
                     assigned[m] = nci
@@ -2320,7 +2264,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                         nci = _resolve(na) if na is not None else None
                         if nci is None or nci == ci or not clusters[nci]["members"]:
                             continue
-                        if clusters[nci]["hh"] + hh_charge[m] > max_hh:
+                        if clusters[nci]["hh"] + hh_of[m] > max_hh:
                             continue                # would breach the cap
                         votes_any[nci] += 1
                         if not crosses_barrier(pts[m], pts[nid]):
@@ -2338,7 +2282,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                         for oci in emit_order:
                             if oci == ci or not clusters[oci]["members"]:
                                 continue
-                            if clusters[oci]["hh"] + hh_charge[m] > max_hh:
+                            if clusters[oci]["hh"] + hh_of[m] > max_hh:
                                 continue            # would breach the cap
                             ocell = vmap.get(oci)
                             if ocell is None or ocell.isEmpty():
@@ -2349,11 +2293,11 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                         if nci is None:
                             continue                    # truly nothing to absorb into
                     clusters[ci]["members"].remove(m)
-                    clusters[ci]["hh"] -= hh_charge[m]
+                    clusters[ci]["hh"] -= hh_of[m]
                     clusters[ci]["sx"] -= pts[m].x()
                     clusters[ci]["sy"] -= pts[m].y()
                     clusters[nci]["members"].append(m)
-                    clusters[nci]["hh"] += hh_charge[m]
+                    clusters[nci]["hh"] += hh_of[m]
                     clusters[nci]["sx"] += pts[m].x()
                     clusters[nci]["sy"] += pts[m].y()
                     assigned[m] = nci
@@ -2565,7 +2509,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
         #       own cluster as a fresh serving area (flagged REVIEW).
         # A neighbour taken over its cap purely to guarantee coverage is REVIEW-flagged.
         def _availability(oci, fid):
-            if clusters[oci]["hh"] + hh_charge[fid] > max_hh:
+            if clusters[oci]["hh"] + hh_of[fid] > max_hh:
                 return False
             n = max(1, len(clusters[oci]["members"]))
             ncx, ncy = clusters[oci]["sx"] / n, clusters[oci]["sy"] / n
@@ -2655,11 +2599,11 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                 if target != ci:
                     if fid in clusters[ci]["members"]:
                         clusters[ci]["members"].remove(fid)
-                        clusters[ci]["hh"] -= hh_charge[fid]
+                        clusters[ci]["hh"] -= hh_of[fid]
                         clusters[ci]["sx"] -= pts[fid].x()
                         clusters[ci]["sy"] -= pts[fid].y()
                     clusters[target]["members"].append(fid)
-                    clusters[target]["hh"] += hh_charge[fid]
+                    clusters[target]["hh"] += hh_of[fid]
                     clusters[target]["sx"] += pts[fid].x()
                     clusters[target]["sy"] += pts[fid].y()
                     assigned[fid] = target
