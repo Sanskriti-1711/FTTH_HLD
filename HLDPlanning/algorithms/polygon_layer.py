@@ -1426,21 +1426,53 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
             # Shapely's keyword is extend_to (not envelope): the wrong name
             # raised TypeError on every call and silently fell back to QGIS.
             vor = voronoi_polygons(mp, extend_to=envelope)
-            del mp, envelope, coords
+            del mp, envelope
 
             # Group the cells per cluster, then drop the collection: `vor` is a
             # single GEOS geometry holding every cell at once, so keeping it
             # alive through the per-cluster unions holds the partition twice.
+            #
+            # A cell belongs to the SEED IT CONTAINS, never to its position in
+            # the input list.  Shapely returns the cells in its own order, so
+            # `vor.geoms[i]` is only occasionally the cell of `ordered_fids[i]`
+            # -- measured on a 529-building section, 1 cell in 529 was paired
+            # right.  Pairing by position trimmed each cluster with a stranger's
+            # cell, so its own members fell outside, the cap "lost its
+            # member-bearing parts" and growth emitted bare building footprints:
+            # slivers that overlap the neighbours they were cut from.  Looking
+            # the owner up by containment is the same grouping `native:dissolve`
+            # does by the `cid` attribute in the QGIS path below, and it is what
+            # the clean reference runs (d788ef7b) were built with.
+            from shapely.geometry import Point
+            from shapely.strtree import STRtree
+
+            seeds = [Point(c) for c in coords]
+            seed_tree = STRtree(seeds)
             cluster_cells = {}
-            n_cells = len(vor.geoms)
-            for i, fid in enumerate(ordered_fids):
-                if i >= n_cells:
-                    break
-                cell = vor.geoms[i]
+            unowned = 0
+            for cell in vor.geoms:
                 if cell is None or cell.is_empty:
                     continue
-                cluster_cells.setdefault(owner[fid], []).append(cell)
-            del vor
+                inside = [i for i in seed_tree.query(cell) if cell.covers(seeds[i])]
+                if not inside:
+                    # A cell clipped by the envelope edge can miss every seed
+                    # centre by a rounding step; the nearest seed is still the
+                    # one whose cell this is.
+                    nearest = seed_tree.nearest(cell)
+                    inside = [int(nearest)] if nearest is not None else []
+                if not inside:
+                    unowned += 1
+                    continue
+                cluster_cells.setdefault(
+                    owner[ordered_fids[inside[0]]], []
+                ).append(cell)
+            del vor, seeds, seed_tree, coords
+            if unowned:
+                # Reported, not raised: one unowned edge cell must not fail a
+                # stage that has a QGIS fallback and a cap fallback behind it.
+                feedback.pushInfo(
+                    f"Growth: {unowned} Voronoi cell(s) matched no building; ignored."
+                )
 
             # Dissolve one cluster at a time and free its cells immediately. The
             # union of a few thousand cells is the largest single allocation in
