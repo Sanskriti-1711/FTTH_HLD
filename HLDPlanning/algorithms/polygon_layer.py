@@ -1572,6 +1572,10 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                 )
             for fid in pts:
                 hh_of[fid] = by_building[building_of.get(fid, f"__row_{fid}")]
+            # Building identities were only needed for this sum; the addresses
+            # themselves are what the ADDR_ID check uses further down.
+            building_of.clear()
+            by_building.clear()
 
         if not pts:
             raise QgsProcessingException("Growth: INPUT contains no usable premise geometries.")
@@ -1599,6 +1603,15 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                     lst.append((d, nid))
             lst.sort()
             neighbors[fid] = lst
+
+        # The graph is complete, and every consumer below only asks whether one
+        # premise is a neighbour of another, so the ids carry it: 8k lists of
+        # (distance, id) tuples was tens of MB for a sort nobody reads again.
+        # The singleton pass is the one place needing a distance; it recomputes
+        # it from the same coordinates, which yields the same number.
+        pt_index = None
+        for _fid, _lst in neighbors.items():
+            neighbors[_fid] = [nid for _d, nid in _lst]
 
         # ---- barriers (Barrier Rule) + roads of any class (Road Connectivity) ----
         barrier_geoms, barrier_index, road_geoms, road_index = self._load_barriers(
@@ -1707,7 +1720,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
         cl_adj = defaultdict(set)
         for fid, nb in neighbors.items():
             a = assigned[fid]
-            for _d, nid in nb:
+            for nid in nb:
                 if crosses_barrier(pts[fid], pts[nid]):
                     continue
                 b = assigned[nid]
@@ -1717,7 +1730,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
 
         def _barrier_free_link(a, b):
             for m in clusters[a]["members"]:
-                for _d, nid in neighbors.get(m, ()):
+                for nid in neighbors.get(m, ()):
                     if _resolve(assigned.get(nid, -1)) == b and not crosses_barrier(pts[m], pts[nid]):
                         return True
             return False
@@ -1756,6 +1769,9 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
             for mm in clusters[b]["members"]:
                 assigned[mm] = a
             merged_into[b] = a
+            # b's member list is now a duplicate of a's; dropping it marks b
+            # dead for the "has members" checks the passes already make.
+            clusters[b]["members"] = []
             # a inherits b's (barrier-free) adjacency
             for nb in list(cl_adj[b]):
                 rnb = _resolve(nb)
@@ -1872,6 +1888,9 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
             for mm in clusters[b]["members"]:
                 assigned[mm] = a
             merged_into[b] = a
+            # b's member list is now a duplicate of a's; dropping it marks b
+            # dead for the "has members" checks the passes already make.
+            clusters[b]["members"] = []
             clusters[a]["review"] = _undersized(a)
             n = len(clusters[a]["members"])
             ccx[a], ccy[a] = clusters[a]["sx"] / n, clusters[a]["sy"] / n
@@ -1910,14 +1929,15 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                 m = clusters[ci]["members"][0]
                 # candidate neighbour clusters via the graph, nearest edge first
                 cand = []
-                for d, nid in neighbors.get(m, ()):
+                _mx, _my = pts[m].x(), pts[m].y()
+                for nid in neighbors.get(m, ()):
                     na = assigned.get(nid)
                     nci = _resolve(na) if na is not None else None
                     if nci is None or nci == ci or not clusters[nci]["members"]:
                         continue
                     if crosses_barrier(pts[m], pts[nid]):
                         continue
-                    cand.append((d, nci))
+                    cand.append((math.hypot(pts[nid].x() - _mx, pts[nid].y() - _my), nci))
                 if not cand:
                     continue                                   # genuinely isolated
                 cand.sort(key=lambda t: t[0])
@@ -1983,7 +2003,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                 d_own = math.hypot(pts[fid].x() - cx, pts[fid].y() - cy)
                 best = None
                 seen = set()
-                for _d, nid in neighbors.get(fid, ()):
+                for nid in neighbors.get(fid, ()):
                     na = assigned.get(nid)
                     nci = _resolve(na) if na is not None else None
                     if nci is None or nci == ci or nci in seen or nci not in cents:
@@ -2097,7 +2117,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                     if m not in clusters[ci]["members"] or len(clusters[ci]["members"]) <= 3:
                         continue
                     votes = Counter()
-                    for _d, nid in neighbors.get(m, ()):
+                    for nid in neighbors.get(m, ()):
                         na = assigned.get(nid)
                         nci = _resolve(na) if na is not None else None
                         if nci is None or nci == ci or not clusters[nci]["members"]:
@@ -2175,7 +2195,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                     if m not in clusters[ci]["members"] or len(clusters[ci]["members"]) <= 3:
                         continue                       # keep the donor a valid (≥3) cluster
                     votes_free, votes_any = Counter(), Counter()
-                    for _d, nid in neighbors.get(m, ()):
+                    for nid in neighbors.get(m, ()):
                         na = assigned.get(nid)
                         nci = _resolve(na) if na is not None else None
                         if nci is None or nci == ci or not clusters[nci]["members"]:
