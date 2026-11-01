@@ -17,6 +17,7 @@ from qgis.core import (
 )
 from qgis import processing
 from ..utils.fields import COMMON_FIELDS
+from ..utils.mem import release_memory
 
 
 def _normalize_method_value(val, options, alt_options=None):
@@ -56,6 +57,41 @@ M_CONVEX, M_CONCAVE, M_VORONOI, M_GROWTH = range(4)
 
 # Canonical machine keys in the SAME order and length as METHOD_LABELS
 METHOD_KEYS = ["convex_hull", "concave_hull", "voronoi", "seeded_growth"]
+
+# Upper bound on the prepared barrier engines the growth pass keeps.
+#
+# Testing a building pair against a barrier is fastest with a prepared GEOS
+# engine, so one is cached per barrier feature touched.  That cache was never
+# bounded, and a ward prepares every restriction its merge and compaction
+# passes reach.  Cleared wholesale when it fills — a re-prepared engine costs
+# one call, an exhausted container costs the run.
+BARRIER_ENGINE_CACHE = 1024
+
+
+def _release_memory(reason, feedback=None):
+    """Hand freed arenas back to the OS between growth phases.
+
+    Purely housekeeping: growth rebuilds the Voronoi partition for every
+    defragmentation and de-island round (up to eleven times per stage), and
+    glibc keeps each round's arenas after Python drops the objects, so RSS only
+    climbed — runs died at the 512 MB container cap instead of finishing.  The
+    returned RSS is logged so the next run shows which phase holds the peak.
+
+    Nothing here can fail a run: every failure is swallowed.
+    """
+    try:
+        stats = release_memory(reason)
+    except Exception:  # noqa: BLE001 - housekeeping never fails a run
+        return None
+    if feedback is not None:
+        try:
+            feedback.pushInfo(
+                f"Growth: memory before {reason} — rss={stats.get('rss_mb')} MB "
+                f"(gc={stats.get('objects')}, trimmed={stats.get('trimmed')})"
+            )
+        except Exception:  # noqa: BLE001 - housekeeping never fails a run
+            pass
+    return stats
 
 # Half-width of the corridor cut out of built polygons along barriers [m].
 GROWTH_ROAD_HALF_WIDTH = 4.0
@@ -1348,6 +1384,11 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
         if not owner or len(owner) < 2:
             return None
 
+        # The whole partition is rebuilt for every defragmentation and de-island
+        # round, so free what the previous round still holds before allocating
+        # the next one.
+        _release_memory("the Voronoi partition", feedback)
+
         # Primary: Shapely-based Voronoi (avoids QGIS 3.44 SIGSEGV)
         try:
             from shapely import voronoi_polygons
@@ -1403,6 +1444,9 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                 f.setGeometry(QgsGeometry.fromPointXY(pts[fid]))
                 feats.append(f)
             pr.addFeatures(feats)
+            # 8,000 QgsFeature wrappers are pure overhead once the provider has
+            # them, and this runs again for every defragmentation round.
+            feats.clear()
             vlyr.updateExtents()
 
             vor = processing.run("qgis:voronoipolygons",
@@ -1415,6 +1459,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                 if cid is None:
                     continue
                 out[int(cid)] = QgsGeometry(f.geometry())
+            _release_memory("the QGIS Voronoi dissolve", feedback)
             return out or None
         except Exception as exc:
             feedback.pushWarning(f"Growth: Voronoi tiling unavailable ({exc}); using convex caps only.")
@@ -1569,6 +1614,8 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
             for xid in barrier_index.intersects(seg.boundingBox()):
                 eng = barrier_engines.get(xid)
                 if eng is None:
+                    if len(barrier_engines) >= BARRIER_ENGINE_CACHE:
+                        barrier_engines.clear()
                     eng = QgsGeometry.createGeometryEngine(barrier_geoms[xid].constGet())
                     eng.prepareGeometry()
                     barrier_engines[xid] = eng
@@ -1596,6 +1643,19 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                     f"Growth: {n_no} building(s) have no road within {access_dist:.0f} m "
                     "(Road Connectivity Rule) — counted per polygon in NO_ACCESS."
                 )
+
+        # The road network was only ever needed by the access test above, and it
+        # is the largest input geometry growth holds — every street of the ward.
+        # Released here rather than carried, unused, through clustering and the
+        # eleven Voronoi rounds that follow.
+        if road_geoms:
+            n_roads = len(road_geoms)
+            road_geoms.clear()
+            road_index = None
+            feedback.pushInfo(
+                f"Growth: released {n_roads} road feature(s) after the access check."
+            )
+        _release_memory("clustering", feedback)
 
         # ---- Phase A/B: CONSTRAINED AGGLOMERATIVE CLUSTERING (Ward linkage) ----
         # Bottom-up region building: every building starts as its own cluster and
@@ -1719,6 +1779,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
         feedback.pushInfo(
             f"Growth: agglomerative (Ward) clustering — {n_merges} merges → {n_clusters} clusters."
         )
+        _release_memory("the undersized-cluster pass", feedback)
 
         # HOME COUNT (min) + ≥3-buildings: flag survivors that stay undersized
         n_under = 0
@@ -1957,6 +2018,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                 break
         if compact_moves:
             feedback.pushInfo(f"Growth: compaction relocated {compact_moves} building(s) to rounder clusters.")
+        _release_memory("the Voronoi partition", feedback)
 
         clip_union = None
         if clip_lyr is not None:
