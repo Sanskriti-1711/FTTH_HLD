@@ -185,6 +185,48 @@ ORPHAN_BROKEN_SECONDS = int(os.environ.get("HLD_ORPHAN_BROKEN_SECONDS", "300"))
 # enough not to flood the platform log for an hour-long run.
 MEMORY_SAMPLE_SECONDS = int(os.environ.get("HLD_MEMORY_SAMPLE_SECONDS", "20"))
 
+# ── Keeping this instance awake while it is doing work ────────────────────
+# The free plan stops a service after 15 minutes with no INBOUND request, and a
+# design run makes none of its own: the engine polls the worker (outbound) and
+# the planner watches the results page from a browser.  Close that tab, or let
+# the watcher behind it die, and the engine is asleep mid-run.  Run b9f42467
+# (2026-11-02) went exactly that way: last results poll 09:16Z, engine shut down
+# 09:31Z, and the next request got a fresh instance whose in-memory run table
+# was empty and answered "Project not found" -- which reads like a pipeline
+# failure and discards the only record of how far the run had got.
+#
+# So while a run is in flight the engine asks for its own /health.  That is an
+# inbound request through the same router a browser hits, so it resets the idle
+# clock; it stops as soon as no run is active, because an idle engine may sleep
+# (that costs a cold start, not a run).
+SELF_PING_URL = (os.environ.get("HLD_SELF_PING_URL")
+                 or os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
+SELF_PING_SECONDS = max(60, int(os.environ.get("HLD_SELF_PING_SECONDS", "240")))
+
+
+def _self_ping_loop() -> None:
+    """Keep the instance awake for exactly as long as a run needs it."""
+    import urllib.request
+
+    while True:
+        time.sleep(SELF_PING_SECONDS)
+        try:
+            active = any(str(t.get("status") or "") in ("running", "queued")
+                         for t in list(tasks.values()))
+        except Exception:  # noqa: BLE001 - a keepalive cannot break the app
+            active = False
+        if not active:
+            continue
+        try:
+            with urllib.request.urlopen(SELF_PING_URL + "/health", timeout=30) as r:
+                r.read(64)
+        except Exception as exc:  # noqa: BLE001 - best effort by design
+            print(f"[keepalive] self-ping failed: {exc}", flush=True)
+
+
+if SELF_PING_URL:
+    threading.Thread(target=_self_ping_loop, name="self-ping", daemon=True).start()
+
 # Run qgis_process on a separate instance.  Unset means "run it here", which is
 # exactly the previous behaviour -- local development and any single-box
 # deployment keep working untouched, and the split is opt-in per deployment.
@@ -1122,7 +1164,21 @@ def _worker_failure_detail(project_id: str, job: str,
     carries no ``error`` and the run says only "exited with code 1".  Six tail
     lines fit in a run message and name the offending parameter.
     """
-    base = status.get("error") or f"qgis_process exited with code {code}"
+    # A killed child leaves a code and no message, and "exited with code -9" is
+    # not a diagnosis.  SIGKILL on a 512 MB container means the platform took
+    # the memory back, and the worker records the peak, so say both: the
+    # difference between "the run is broken" and "this area no longer fits".
+    peak_mb = (status.get("child") or status.get("memory") or {}).get("peak_rss_mb")
+    if status.get("error"):
+        base = status["error"]
+    elif code in (-9, 137):
+        base = ("qgis_process was killed by the platform (SIGKILL, exit code %s)%s "
+                "-- the instance ran out of memory. Nothing in the pipeline is "
+                "broken; this area needs more than the instance has."
+                % (code, (", peak %.0f MB" % peak_mb)
+                   if isinstance(peak_mb, (int, float)) else ""))
+    else:
+        base = f"qgis_process exited with code {code}"
     if status.get("error"):
         return base
     try:

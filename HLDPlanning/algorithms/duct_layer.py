@@ -16,6 +16,7 @@ Dependencies:
 - distribution step requires 'networkx' in the QGIS Python env.
   (On Linux: <qgis-python> -m pip install networkx)
 """
+import gc
 import heapq
 import math, os, time
 from collections import defaultdict
@@ -1228,6 +1229,11 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
         feedback.pushInfo(f"🩹 Healing gaps ≤ {heal_m} m …")
         healed = self._heal_graph(G, heal_m, feedback=feedback)
         feedback.pushInfo(f"📈 Graph: {G.number_of_nodes()} nodes / {G.number_of_edges()} edges (healed: {healed})")
+        # The densified geometries and the healing buckets are garbage by now and
+        # glibc will not hand their arenas back on its own: on a 512 MB instance
+        # that free-but-unusable memory is the difference between routing the
+        # ducts and being killed at 95 % of the cap.
+        gc.collect()
 
         # Node index for nearest-node snap (fast)
         node_layer = QgsVectorLayer(f"Point?crs={crs_t.authid()}", "_graph_nodes", "memory")
@@ -1240,6 +1246,13 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
             f["nid"] = i; feats.append(f); nid2node[i] = n
         if feats:
             prv.addFeatures(feats); node_layer.updateExtents()
+        # The provider and the index each own their copy of this geometry, so the
+        # Python list was pure duplication -- one QgsFeature per graph node.  The
+        # duct stage is the peak of the whole run (qgis_process peaked at 488 MB
+        # of a 512 MB instance on run b9f42467, 2026-11-02), so duplication here
+        # is memory taken from the design itself.
+        feats = []
+        gc.collect()
         idx_nodes = QgsSpatialIndex(node_layer.getFeatures())
 
         def nearest_node(pt_xy: QgsPointXY, radius: float, allowed=None):
