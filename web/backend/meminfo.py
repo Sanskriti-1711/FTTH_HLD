@@ -11,6 +11,7 @@ allocating anything themselves.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -46,6 +47,36 @@ def rss_mb(pid: Optional[int] = None) -> Optional[float]:
 def peak_rss_mb(pid: Optional[int] = None) -> Optional[float]:
     """Highest RSS the process has reached, in MB."""
     return _status_field(pid, "VmHWM:")
+
+
+def cpu_seconds(pid: Optional[int] = None) -> Optional[float]:
+    """Cumulative CPU time a process has burned, in seconds (None off Linux).
+
+    This is what tells a WORKING child from a wedged one.  A pipeline stage can
+    compute for many minutes without printing a line, so "no new log line" is
+    not evidence of a hang -- run f36f6017 (2026-11-02) was failed at 901 s
+    inside the duct stage's gap-healing pass while it was still working.  CPU
+    time is the signal that cannot be faked by silence: a running
+    ``qgis_process`` keeps adding to it, and a wedged one stops.
+
+    utime+stime from /proc/<pid>/stat, in clock ticks; the field offsets skip
+    the first two fields and the ``comm`` value, which may itself contain a
+    space or a parenthesis, so the split starts after the last ``)``.
+    """
+    try:
+        raw = (_PROC / str(pid if pid is not None else "self") / "stat").read_text()
+    except OSError:
+        return None
+    try:
+        fields = raw.rsplit(")", 1)[1].split()
+        ticks = float(fields[11]) + float(fields[12])
+    except (IndexError, ValueError):
+        return None
+    try:
+        hz = float(os.sysconf("SC_CLK_TCK"))
+    except (AttributeError, ValueError, OSError):
+        hz = 100.0
+    return round(ticks / hz, 2)
 
 
 def limit_mb() -> Optional[float]:

@@ -668,21 +668,39 @@ def _sweep_old_jobs() -> None:
 
 # ── HTTP ──────────────────────────────────────────────────────────────────
 
-def _child_memory() -> Any:
-    """The running qgis_process's memory, or None when no job is running.
+def _running_pid(job: Optional[Dict[str, Any]] = None) -> Optional[int]:
+    """The pid of a job's OWN qgis_process (of any running job when unknown).
+
+    Scoped to the job on purpose.  A job queued behind another one has no child
+    of its own, and if it reported the busy job's CPU the engine would read that
+    as its own progress -- which would quietly defeat both the "never started"
+    check and the stall guard.
+    """
+    if job is not None:
+        return job.get("pid") if job.get("state") == "running" else None
+    with _lock:
+        return next(
+            (entry.get("pid") for entry in _jobs.values()
+             if entry.get("state") == "running" and entry.get("pid")),
+            None,
+        )
+
+
+def _child_process(job: Optional[Dict[str, Any]] = None) -> Any:
+    """The running qgis_process's memory and CPU, or None when nothing runs.
 
     The worker's own RSS is a rounding error beside the child's: /health used to
     report 25 MB while the design was actually filling the container, so the one
     number readable during a run was the wrong one. The child's arenas cannot be
     released from out here -- this reports it so the ramp is visible before the
     kernel decides what to do about it.
+
+    ``cpu_seconds`` is what separates a WORKING child from a wedged one: the
+    duct stage's bridge and gap-healing passes print once and then compute for
+    many minutes, so the engine resets its stall guard on this number rather
+    than on log bytes alone.
     """
-    with _lock:
-        pid = next(
-            (job.get("pid") for job in _jobs.values()
-             if job.get("state") == "running" and job.get("pid")),
-            None,
-        )
+    pid = _running_pid(job)
     if not pid:
         return None
     return {
@@ -690,6 +708,7 @@ def _child_memory() -> Any:
         "rss_mb": meminfo.rss_mb(pid),
         "peak_rss_mb": meminfo.peak_rss_mb(pid),
         "limit_mb": meminfo.limit_mb(),
+        "cpu_seconds": meminfo.cpu_seconds(pid),
     }
 
 
@@ -732,7 +751,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {
                 "status": "ok",
                 "memory": meminfo.report(),
-                "child": _child_memory(),
+                "child": _child_process(),
                 "jobs": len(_jobs),
                 "executable": EXECUTABLE or shutil.which("qgis_process") or None,
             })
@@ -756,7 +775,8 @@ class Handler(BaseHTTPRequestHandler):
                 # The memory rides along so the engine can log the ramp without a
                 # second request every poll -- it already asks for this line.
                 self._send(200, {"lines": lines, "offset": offset, "state": state,
-                                 "memory": meminfo.report(), "child": _child_memory()})
+                                 "memory": meminfo.report(),
+                                 "child": _child_process(job)})
                 return
             if len(parts) == 3 and parts[2] == "result":
                 try:

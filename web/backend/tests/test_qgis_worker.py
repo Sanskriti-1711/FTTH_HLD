@@ -305,7 +305,7 @@ def test_a_job_that_stops_logging_fails_the_run_instead_of_hanging(
         main._run_command_remote("proj1", ["qgis_process", "run", "x"], project)
 
     text = str(exc.value)
-    assert "stopped reporting progress" in text
+    assert "stopped making progress" in text
     # The stage it died in is named, so the log says WHERE it hung.
     assert "Chamber Layer" in text
     # It fails on silence, not by waiting out the three-hour ceiling.
@@ -398,7 +398,7 @@ def test_a_job_that_keeps_logging_is_not_treated_as_hung(tmp_path, monkeypatch):
         if path.endswith("/result"):
             return b""
         polls["n"] += 1
-        if polls["n"] >= 12:
+        if polls["n"] >= 40:
             return b'{"state": "done", "exit_code": 0, "lines": [], "offset": 400}'
         return json.dumps({
             "state": "running",
@@ -409,15 +409,126 @@ def test_a_job_that_keeps_logging_is_not_treated_as_hung(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "QGIS_WORKER_URL", "http://worker")
     monkeypatch.setattr(main, "_worker_call", fake_call)
     monkeypatch.setattr(main, "QGIS_WORKER_POLL_S", 0.02)
-    # Shorter than the whole run takes, longer than a single poll's gap.
-    monkeypatch.setattr(main, "QGIS_STALL_S", 0.2)
+    # Shorter than the whole run takes, longer than a single poll's gap.  The
+    # earlier 0.2 s window sat too close to one poll's own cost on a loaded
+    # machine (a scheduling hiccup made the test fail 2 runs in 3, with a real
+    # inter-poll gap), so the run is 40 polls against a 0.5 s window instead --
+    # same assertion, 25x margin instead of 10x.
+    monkeypatch.setattr(main, "QGIS_STALL_S", 0.5)
     monkeypatch.setattr(main, "_persist_project_state", lambda *a, **k: None)
     monkeypatch.setattr(main, "_extract_into", lambda body, out: [])
 
     written = main._run_command_remote("proj1", ["qgis_process", "run", "x"], project)
 
     assert written == []
-    assert polls["n"] >= 12
+    assert polls["n"] >= 40
+
+
+def test_cpu_seconds_reads_the_child_tick_count(tmp_path, monkeypatch):
+    """utime+stime, at the right offsets, from /proc/<pid>/stat.
+
+    The guard's whole liveness signal is this number: if the offsets shifted it
+    would return a constant and every long pass would look wedged again. The comm
+    field can contain spaces AND parentheses ("qgis_process (x)"), which is why
+    the split starts after the LAST ")".
+    """
+    proc = tmp_path / "proc"
+    (proc / "self").mkdir(parents=True)
+    # state ppid pgrp session tty tpgid flags minflt cminflt majflt cmajflt
+    # utime stime ...  -- 250 + 150 ticks of CPU burned.
+    (proc / "self" / "stat").write_text(
+        "1234 (qgis_process (x)) R 1 1234 1234 0 -1 4194304 0 0 0 0 "
+        "250 150 0 0 20 0 1 0 123 456 789\n"
+    )
+    monkeypatch.setattr(worker.meminfo, "_PROC", proc)
+
+    hz = float(os.sysconf("SC_CLK_TCK")) if hasattr(os, "sysconf") else 100.0
+    assert worker.meminfo.cpu_seconds(None) == pytest.approx(400.0 / hz)
+
+
+def test_a_silent_job_that_keeps_burning_cpu_is_not_treated_as_hung(
+        tmp_path, monkeypatch):
+    """Silence is not a hang: a child that is adding CPU is working.
+
+    Run f36f6017 (2026-11-02) reached the Duct Layer, logged "Bridges added:
+    29434" and "Healing gaps <= 3.0 m", and was then failed 901 s later as hung
+    while the gap-healing pass was still computing. No stage can promise a line
+    every 900 s, but a running qgis_process cannot compute without burning CPU,
+    so the guard resets on the child's advance instead of on log bytes alone.
+    """
+    project = tmp_path / "proj1"
+    project.mkdir()
+    polls = {"n": 0}
+
+    def fake_call(path, data=None, method="GET", timeout=120):
+        if path == "/health":
+            return b'{"state": "ok"}'
+        if method in ("PUT", "POST"):
+            return b"{}"
+        if path.endswith("/result"):
+            return b""
+        polls["n"] += 1
+        if polls["n"] >= 20:
+            return b'{"state": "done", "exit_code": 0, "lines": [], "offset": 40}'
+        # Not one new line after the first poll, but the child is computing.
+        return json.dumps({
+            "state": "running",
+            "lines": ["\U0001fa79 Healing gaps <= 3.0 m"] if polls["n"] == 1 else [],
+            "offset": 40,
+            "child": {"pid": 4321, "rss_mb": 210.0,
+                      "cpu_seconds": 100.0 + polls["n"] * 0.5},
+        }).encode()
+
+    monkeypatch.setattr(main, "QGIS_WORKER_URL", "http://worker")
+    monkeypatch.setattr(main, "_worker_call", fake_call)
+    monkeypatch.setattr(main, "QGIS_WORKER_POLL_S", 0.02)
+    # Shorter than the whole run takes, longer than a single poll's gap.
+    monkeypatch.setattr(main, "QGIS_STALL_S", 0.2)
+    monkeypatch.setattr(main, "QGIS_CPU_ADVANCE_S", 0.05)
+    monkeypatch.setattr(main, "_persist_project_state", lambda *a, **k: None)
+    monkeypatch.setattr(main, "_extract_into", lambda body, out: [])
+
+    written = main._run_command_remote("proj1", ["qgis_process", "run", "x"], project)
+
+    assert written == []
+    assert polls["n"] >= 20
+
+
+def test_a_queued_jobs_stall_clock_is_not_reset_by_another_child(
+        tmp_path, monkeypatch):
+    """A job waiting for the slot must not inherit someone else's CPU burn.
+
+    The worker reports the child of THIS job, so a queued job reports none. If
+    it reported whatever child was running, the guard would treat another job's
+    work as this one's progress and never notice the slot was held.
+    """
+    project = tmp_path / "proj1"
+    project.mkdir()
+    polls = {"n": 0}
+
+    def fake_call(path, data=None, method="GET", timeout=120):
+        if path == "/health":
+            return b'{"state": "ok"}'
+        if method in ("PUT", "POST"):
+            return b"{}"
+        polls["n"] += 1
+        # Queued, with a decoy child that keeps burning CPU.
+        return json.dumps({
+            "state": "queued", "lines": [], "offset": 0,
+            "child": {"pid": 4321, "cpu_seconds": 100.0 + polls["n"]},
+        }).encode()
+
+    monkeypatch.setattr(main, "QGIS_WORKER_URL", "http://worker")
+    monkeypatch.setattr(main, "_worker_call", fake_call)
+    monkeypatch.setattr(main, "QGIS_WORKER_POLL_S", 0.02)
+    monkeypatch.setattr(main, "QGIS_WORKER_START_S", 0.2)
+    monkeypatch.setattr(main, "QGIS_CPU_ADVANCE_S", 0.05)
+    monkeypatch.setattr(main, "_persist_project_state", lambda *a, **k: None)
+
+    with pytest.raises(RuntimeError) as exc:
+        main._run_command_remote("proj1", ["qgis_process", "run", "x"], project)
+
+    assert "never started qgis_process" in str(exc.value)
 
 
 def _seed(job_id, state, *, idle_s, lines=()):

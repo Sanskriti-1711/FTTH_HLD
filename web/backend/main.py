@@ -250,10 +250,25 @@ QGIS_WORKER_MISS_S = float(os.environ.get("FTTH_QGIS_WORKER_MISS", "90"))
 # stack could say the run was wedged, and the earliest anything would have said
 # so was 12:10.
 #
-# 900 s is longer than any silent stretch a working pipeline produces (the
-# pipeline reports per stage, and the chamber stage now reports per rule), so it
-# ends a wedged run without touching a merely slow one. 0 disables it.
+# 900 s is longer than any silent stretch a working pipeline is SUPPOSED to
+# produce (the pipeline reports per stage, and the chamber stage reports per
+# rule), so it ends a wedged run without touching a merely slow one. 0 disables
+# it.  It is a backstop, not the main evidence: see QGIS_CPU_ADVANCE_S.
 QGIS_STALL_S = float(os.environ.get("FTTH_QGIS_STALL", "900"))
+# How much child CPU time counts as progress, so silence alone cannot fail a
+# working run.
+#
+# Run f36f6017 (2026-11-02) reached the Duct Layer at 01:52, printed
+# "Bridges added: 29434" and "Healing gaps <= 3.0 m" at 02:05, and was then
+# failed at 02:20 as hung -- 901 s of silence inside the gap-healing pass, which
+# was still computing.  No stage can promise a line every 900 s (one pass
+# compares every node with its neighbours over a 2,626-premise area on a slow
+# vCPU), but a running qgis_process cannot compute without burning CPU.  The
+# worker reports the child's cumulative utime+stime with every poll, so a child
+# that is still adding to it is working and the clock is reset; a child that has
+# stopped adding it is the wedge the guard exists for. 1 s is far below any
+# meaningful advance and far above clock-tick noise. 0 disables the reset.
+QGIS_CPU_ADVANCE_S = float(os.environ.get("FTTH_QGIS_CPU_ADVANCE", "1"))
 # How long a scheduled job may produce NOTHING before the run is failed.
 #
 # The stall guard above measures silence from a job that is RUNNING, and its
@@ -1193,6 +1208,10 @@ def _run_command_remote_job(project_id: str, cmd: Union[List[str], str],
     # in "running" for ever, so this -- not the job state -- is the only
     # evidence that the run is still doing work.
     last_output = time.time()
+    # The child's cumulative CPU seconds at the last poll that showed an advance
+    # (None until it reports one). This is what keeps a computing-but-quiet
+    # stage alive -- see QGIS_CPU_ADVANCE_S.
+    last_cpu: Optional[float] = None
     # Whether the job has said ANYTHING yet: a job queued behind another one
     # never starts qgis_process and writes no line at all, which is a different
     # failure from a running job falling silent (see QGIS_WORKER_START_S).
@@ -1259,6 +1278,22 @@ def _run_command_remote_job(project_id: str, cmd: Union[List[str], str],
                 if mem_rounds % 6 == 0:
                     gc.collect()
                     meminfo.trim()
+        # Progress the log cannot show: a child that is still burning CPU is
+        # working, even when its pass has nothing to say. Only a RUNNING job has
+        # a child of its own -- a worker older than this check reports whatever
+        # child it has, so requiring "running" keeps a queued job from inheriting
+        # another job's CPU burn.
+        child_cpu = ((batch.get("child") or {}).get("cpu_seconds")
+                     if state == "running" else None)
+        if QGIS_CPU_ADVANCE_S > 0 and isinstance(child_cpu, (int, float)):
+            if last_cpu is None:
+                last_cpu = float(child_cpu)
+            elif float(child_cpu) - last_cpu >= QGIS_CPU_ADVANCE_S:
+                last_cpu = float(child_cpu)
+                last_output = time.time()
+                # It demonstrably started: a queued job has no child to burn
+                # CPU, so this cannot mask a job still waiting for the slot.
+                started_output = True
         if not started_output and QGIS_WORKER_START_S > 0:
             waited = time.time() - started
             if waited > QGIS_WORKER_START_S:
@@ -1301,10 +1336,11 @@ def _run_command_remote_job(project_id: str, cmd: Union[List[str], str],
         if QGIS_STALL_S > 0 and silent_for > QGIS_STALL_S:
             stage_now = str((tasks.get(project_id) or {}).get("stage") or "unknown")
             raise RuntimeError(
-                f"qgis_process stopped reporting progress during the "
-                f"{stage_now} stage: no output for {int(silent_for)} s "
-                f"(limit {int(QGIS_STALL_S)} s). The run was stopped as hung "
-                f"rather than left to sit until the {int(timeout)} s ceiling."
+                f"qgis_process stopped making progress during the "
+                f"{stage_now} stage: no output and no CPU advance for "
+                f"{int(silent_for)} s (limit {int(QGIS_STALL_S)} s). The run "
+                f"was stopped as hung rather than left to sit until the "
+                f"{int(timeout)} s ceiling."
             )
         time.sleep(QGIS_WORKER_POLL_S)
 

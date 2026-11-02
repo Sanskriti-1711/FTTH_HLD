@@ -17,7 +17,7 @@ Dependencies:
   (On Linux: <qgis-python> -m pip install networkx)
 """
 import heapq
-import math, os
+import math, os, time
 from collections import defaultdict
 from qgis.PyQt.QtCore import QCoreApplication, QMetaType
 from qgis.core import (
@@ -53,6 +53,14 @@ except Exception:
 from ..utils.layer_ops import fix_geometries, reproject_if_needed, snap_layer, linemerge_layer
 from ..utils.string_utils import normalize_key
 from ..utils.geom_utils import geom_str_from_wkb
+
+# How often a long, per-item pass says where it is.  The engine fails a stage
+# after 900 s without a new log line (backend/main.py: QGIS_STALL_S), and the
+# graph bridge / gap-healing passes below compare every node with its neighbours
+# -- over a 2,626-premise area that is minutes of computing with nothing to
+# print.  Time-based rather than per N items, because one bucket or feature can
+# hold any number of items; 30 s leaves the guard a 30x margin.
+_HEARTBEAT_S = 30.0
 
 # -------------------------------
 # Helpers for the wrapper
@@ -896,11 +904,68 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
         return best[1]
 
     @staticmethod
-    def _bridge_intersections(G, A, B, step_m, edge_kind="link"):
+    def _heal_graph(G, heal_m, feedback=None):
+        """Join nodes closer than ``heal_m`` that are not already connected.
+
+        Bucket-and-neighbours: only the nine cells around a node can hold a point
+        within ``heal_m``, so this is linear in graph nodes rather than quadratic
+        in the network.  It is, however, minutes of comparing on a full ward and
+        it prints nothing until it finishes -- the exact shape the engine's 900 s
+        stall guard failed as a hang on run f36f6017 (2026-11-02).  So it beats
+        every _HEARTBEAT_S with the bucket it is on and the links it has made.
+
+        Returns the number of links added.
+        """
+        if not heal_m or heal_m <= 0:
+            return 0
+        t_heal = time.time()
+        beat_at = t_heal + _HEARTBEAT_S
+        cell = heal_m
+        buckets = _dd(list)
+        for (x, y) in G.nodes:
+            buckets[(int(x//cell), int(y//cell))].append((x, y))
+        nbrs = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,0),(0,1),(1,-1),(1,0),(1,1)]
+        healed = 0
+        seen = 0
+        for (ix, iy), grp in buckets.items():
+            for dx, dy in nbrs:
+                other = buckets.get((ix+dx, iy+dy), [])
+                for a in grp:
+                    for b in other:
+                        if a >= b: continue
+                        d = _math.hypot(a[0]-b[0], a[1]-b[1])
+                        if 0 < d <= heal_m and not G.has_edge(a, b):
+                            G.add_edge(a, b, weight=d, length=d, kind="link"); healed += 1
+            seen += 1
+            if feedback is not None and time.time() >= beat_at:
+                beat_at = time.time() + _HEARTBEAT_S
+                feedback.pushInfo(
+                    f"🩹 healing: {seen}/{len(buckets)} bucket(s), "
+                    f"{healed} link(s), {time.time() - t_heal:.0f}s")
+        return healed
+
+    @staticmethod
+    def _bridge_intersections(G, A, B, step_m, edge_kind="link", feedback=None):
         if A is None or B is None: return 0
         idxB = QgsSpatialIndex(B.getFeatures())
+        total = A.featureCount() if feedback is not None else 0
+        # The whole pass used to print nothing from its first feature to its last
+        # line, and on run f36f6017 (2026-11-02) that silence outlived the
+        # engine's 900 s stall guard: it failed a run that was welding crossings.
+        # A beat every _HEARTBEAT_S proves movement inside that window.
+        beat_at = time.time() + _HEARTBEAT_S
+
+        def _beat(done, welds):
+            nonlocal beat_at
+            if feedback is None or time.time() < beat_at:
+                return
+            beat_at = time.time() + _HEARTBEAT_S
+            feedback.pushInfo(
+                f"🔗 bridges ({edge_kind}): {done}/{total} feature(s), "
+                f"{welds} weld(s)")
+
         made = 0
-        for af in A.getFeatures():
+        for done, af in enumerate(A.getFeatures(), 1):
             ag = af.geometry()
             if not ag or ag.isEmpty(): continue
             ag_index = None
@@ -915,7 +980,12 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
                 if ag_index is None:
                     ag_index = AlgDistributionDucts._dense_segment_index(ag, step_m)
                 bg_index = AlgDistributionDucts._dense_segment_index(bg, step_m)
-                for pt in pts:
+                for _k, pt in enumerate(pts, 1):
+                    # One feature can be the whole footway network and carry
+                    # thousands of crossings, so the beat cannot live on the
+                    # outer loop alone.
+                    if _k % 25 == 0:
+                        _beat(done, made)
                     pxy = QgsPointXY(pt)
                     ends_a = AlgDistributionDucts._segment_endpoints_near_point(ag, pxy, step_m, ag_index)
                     ends_b = AlgDistributionDucts._segment_endpoints_near_point(bg, pxy, step_m, bg_index)
@@ -930,6 +1000,7 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
                             if AlgDistributionDucts._add_edge(
                                     G, (px, py), (ex, ey), w, edge_kind):
                                 made += 1
+            _beat(done, made)
         return made
     def _make_sink(self, p, key, context, feedback, fields, wkb, crs):
         """
@@ -1141,33 +1212,21 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
 
         # Bridge at intersections (each weld keeps its own kind)
         bridges  = self._bridge_intersections(G, left_t,  right_t, dense_m,
-                                              edge_kind="sidewalk")
+                                              edge_kind="sidewalk",
+                                              feedback=feedback)
         if tang_t:
-            bridges += self._bridge_intersections(G, left_t,  tang_t, dense_m)
-            bridges += self._bridge_intersections(G, right_t, tang_t, dense_m)
+            bridges += self._bridge_intersections(G, left_t,  tang_t, dense_m,
+                                                  feedback=feedback)
+            bridges += self._bridge_intersections(G, right_t, tang_t, dense_m,
+                                                 feedback=feedback)
             bridges += self._bridge_intersections(G, tang_t, tang_t, dense_m,
-                                                  edge_kind="trench")
+                                                  edge_kind="trench",
+                                                  feedback=feedback)
         feedback.pushInfo(f"🔗 Bridges added: {bridges}")
 
         # Heal small gaps
         feedback.pushInfo(f"🩹 Healing gaps ≤ {heal_m} m …")
-        healed = 0
-        if heal_m and heal_m > 0:
-            nodes = list(G.nodes)
-            cell = heal_m
-            buckets = _dd(list)
-            for (x, y) in nodes:
-                buckets[(int(x//cell), int(y//cell))].append((x, y))
-            nbrs = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,0),(0,1),(1,-1),(1,0),(1,1)]
-            for (ix, iy), grp in buckets.items():
-                for dx, dy in nbrs:
-                    other = buckets.get((ix+dx, iy+dy), [])
-                    for a in grp:
-                        for b in other:
-                            if a >= b: continue
-                            d = _math.hypot(a[0]-b[0], a[1]-b[1])
-                            if 0 < d <= heal_m and not G.has_edge(a, b):
-                                G.add_edge(a, b, weight=d, length=d, kind="link"); healed += 1
+        healed = self._heal_graph(G, heal_m, feedback=feedback)
         feedback.pushInfo(f"📈 Graph: {G.number_of_nodes()} nodes / {G.number_of_edges()} edges (healed: {healed})")
 
         # Node index for nearest-node snap (fast)
