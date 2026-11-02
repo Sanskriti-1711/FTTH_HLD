@@ -1583,6 +1583,11 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
         feedback.pushInfo(f"✅ Distribution ducts created: {total}")
         if total:
             if trench_present:
+                # This counts the SIDEWALK ROUTE this pass drew, before the
+                # caller rebases the geometry onto the trench, so it is not the
+                # published answer: `DuctLayer._restamp_trench_metrics` rewrites
+                # OFF_TRENCH_LEN_M / TRENCH_STATUS once the geometry that ships
+                # exists, and prints its own line.
                 feedback.pushInfo(
                     f"🧭 On the trench: {total - off_rows} of {total} duct(s) are "
                     f"drawn within {self.TRENCH_PROXIMITY_M:g} m of "
@@ -2872,6 +2877,91 @@ class DuctLayer(QgsProcessingAlgorithm):
             )
         return changed, unresolved
 
+    # The trench fields have to describe the geometry that SHIPS, and that
+    # geometry only exists after `_rebase_distribution_output` has moved the
+    # sidewalk route onto Final_Trenches. The routing pass stamps them earlier,
+    # against the line it drew, so the published layer used to carry counts of a
+    # geometry nobody sees: on the Mariendorf run the fields said 6,348 of 7,142
+    # ducts were off the trench while 97.6 % of the layer's 1,436 km sat within
+    # 5 cm of it. Restamping here is exact and needs no sampling: the off-trench
+    # length is the part of the duct the trench does not cover.
+    RESTAMP_PROXIMITY_M = 0.5
+
+    def _restamp_trench_metrics(self, output_uri, trench_lyr, context, feedback):
+        """Rewrite OFF_TRENCH_LEN_M / TRENCH_STATUS from the rebased geometry.
+
+        ``trench_lyr`` is the same tangent trench the routing pass measured
+        against, so the two readings are comparable; only the geometry they
+        describe differs. A duct covered by its trench reads 0.00 m and
+        "On trench"; a lead-in keeps its band up to the lead-in cap; anything
+        farther is flagged OFF TRENCH and stays visible rather than hidden.
+        """
+        if not output_uri or trench_lyr is None:
+            return 0
+        layer = QgsProcessingUtils.mapLayerFromString(str(output_uri), context)
+        if layer is None or not layer.isValid():
+            layer = QgsVectorLayer(str(output_uri), "duct_trench_metrics", "ogr")
+        if layer is None or not layer.isValid():
+            return 0
+        off_idx = layer.fields().indexFromName("OFF_TRENCH_LEN_M")
+        st_idx = layer.fields().indexFromName("TRENCH_STATUS")
+        if off_idx < 0 and st_idx < 0:
+            return 0
+        trench_geoms = {}
+        for tf in trench_lyr.getFeatures():
+            tg = tf.geometry()
+            if tg is not None and not tg.isEmpty():
+                trench_geoms[tf.id()] = tg
+        if not trench_geoms:
+            return 0
+        trench_idx = QgsSpatialIndex(trench_lyr.getFeatures())
+        band = self.RESTAMP_PROXIMITY_M
+        lead = AlgDistributionDucts.DEFAULT_LEAD_IN_M
+        total = on = changed = 0
+        off_total = 0.0
+        if not layer.isEditable():
+            layer.startEditing()
+        for f in layer.getFeatures():
+            g = f.geometry()
+            if g is None or g.isEmpty():
+                continue
+            total += 1
+            union = None
+            for fid in trench_idx.intersects(g.boundingBox().buffered(1.0)):
+                tg = trench_geoms.get(fid)
+                if tg is None:
+                    continue
+                union = tg if union is None else union.combine(tg)
+            off = g.length()
+            if union is not None:
+                try:
+                    off = max(0.0, off - g.intersection(union).length())
+                except Exception:
+                    pass
+            if off < 0.05:
+                off = 0.0
+            if off_idx >= 0:
+                f.setAttribute(off_idx, round(off, 2))
+            if st_idx >= 0:
+                f.setAttribute(st_idx, (
+                    "On trench" if off <= band else
+                    f"Lead-in {off:.1f} m off trench" if off <= lead else
+                    f"OFF TRENCH {off:.1f} m"))
+            layer.updateFeature(f)
+            changed += 1
+            off_total += off
+            if off <= band:
+                on += 1
+        if changed:
+            layer.commitChanges()
+        if feedback:
+            feedback.pushInfo(
+                f"🧭 Published trench status: {on} of {total} duct(s) lie on "
+                f"Final_Trenches; {total - on} are off by {off_total:,.1f} m in "
+                f"total. OFF_TRENCH_LEN_M / TRENCH_STATUS written from the "
+                f"rebased geometry.")
+        return changed
+
     def _trench_connector(self, corridor_lyr, a_xy, b_xy, tol_m=1.0,
                           detour_ref_m=None):
         """The trench path between two points: routed first, one feature second.
@@ -4027,6 +4117,12 @@ class DuctLayer(QgsProcessingAlgorithm):
             # sidewalk geometry with routes on the actual trench network.
             self._rebase_distribution_output(
                 out_distr_uri, net_lyr, context, feedback)
+            # ...and make the trench fields describe that rebased geometry. The
+            # routing pass stamped them against the sidewalk route it drew, so
+            # left alone they contradict the map (and say a duct is off the
+            # trench when it is sitting on it).
+            self._restamp_trench_metrics(out_distr_uri, final_tan or net_lyr,
+                                         context, feedback)
         except QgsProcessingException as e:
             try:
                 feedback.reportError(f"Distribution failed (Processing): {e}")
