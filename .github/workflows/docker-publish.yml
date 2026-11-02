@@ -27,6 +27,35 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
+      # Two failures can live here and they look identical from the dashboard
+      # ("the tag did not deploy"): a credential the API rejects, and Render's
+      # deploy endpoint answering 500.  The v1.7.56 run on 2026-11-02 went green
+      # through "Wait for the engine to be idle" and then failed at the deploy
+      # with `ftth_planning: deploy request returned 500: {"message":"internal
+      # server error"}` -- leaving 1.7.56 published on Docker Hub and running
+      # nowhere.  A 500 there is transient (the identical call succeeded by hand
+      # minutes later), which is why the deploy step below now retries it.  This
+      # preflight covers the other case before a 20-minute build is spent on it.
+      - name: Preflight the Render credential
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RENDER_API_KEY:-}" ]; then
+            echo "::error::RENDER_API_KEY is not set for this repository, so the image would be built but nothing would deploy it. Add it under Settings -> Secrets and variables -> Actions." >&2
+            exit 1
+          fi
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -m 20 \
+            -H "Authorization: Bearer $RENDER_API_KEY" \
+            -H 'Accept: application/json' \
+            'https://api.render.com/v1/services?limit=1')
+          if [ "$code" != "200" ]; then
+            echo "::error::RENDER_API_KEY was rejected by the Render API (HTTP $code). The build would succeed and the deploy would fail afterwards, so stopping now. Create a fresh key in the Render dashboard (Account Settings -> API Keys) and update this repository's secret." >&2
+            exit 1
+          fi
+          echo "Render credential accepted; building."
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -81,15 +110,13 @@ jobs:
       # Render cannot be told to watch a Docker Hub tag: `autoDeployTrigger:
       # checksum` is rejected by the API ("Invalid value for autoDeployTrigger:
       # checksum") and `commit` watches a git branch that an image-backed
-      # service does not have.  Re-pushing `:1.7.3` was measured on 2026-10-21 --
-      # both services sat on their previous deploy for eight minutes -- and that
-      # morning's release reached production only because the deploy was called
-      # by hand afterwards.  So the deploy is the last step here, where it cannot
-      # be forgotten.
+      # service does not have.  Both services also report `autoDeploy: no`
+      # today, so a pushed tag deploys nothing on its own.  Re-pushing `:1.7.3`
+      # was measured on 2026-10-21 -- both services sat on their previous
+      # deploy for eight minutes -- and that morning's release reached
+      # production only because the deploy was called by hand afterwards.  So
+      # the deploy is the last step here, where it cannot be forgotten.
       #
-      # Needs the repository secret RENDER_API_KEY (Render dashboard -> Account
-      # Settings -> API Keys -> Create API Key).  A tag push without it fails
-      # this step loudly rather than shipping an image nobody deploys.
       # A deploy REPLACES the container, and every run in flight goes with it:
       # the engine restarts, its thread is gone, and the run is reported as
       # "killed or restarted before this run wrote any output".  On 2026-10-21
@@ -140,14 +167,32 @@ jobs:
             service_id=${pair%%:*}
             service_name=${pair##*:}
             body=$(printf '{"imageUrl":"%s"}' "$IMAGE_REF")
-            code=$(curl -sS -o deploy.json -w '%{http_code}' -X POST \
-              -H "Authorization: Bearer $RENDER_API_KEY" \
-              -H 'Content-Type: application/json' \
-              -H 'Accept: application/json' \
-              -d "$body" \
-              "https://api.render.com/v1/services/$service_id/deploys")
+            # Render answers POST /deploys with a bare 500 "internal server
+            # error" while a service is settling from a previous deploy or a
+            # spin-down; it is transient, not a rejected request.  Failing on
+            # the first one cost the v1.7.56 release its deploy.  Retry those,
+            # but never retry an auth/not-found error -- that is the credential.
+            code=""
+            for attempt in $(seq 1 8); do
+              code=$(curl -sS -o deploy.json -w '%{http_code}' -X POST \
+                -H "Authorization: Bearer $RENDER_API_KEY" \
+                -H 'Content-Type: application/json' \
+                -H 'Accept: application/json' \
+                -d "$body" \
+                "https://api.render.com/v1/services/$service_id/deploys" || echo "000")
+              if [ "$code" = "201" ]; then
+                break
+              fi
+              case "$code" in
+                401|403|404)
+                  echo "::error::$service_name: the Render API rejected the deploy ($code): $(cat deploy.json). RENDER_API_KEY is wrong or lacks access to this service." >&2
+                  exit 1 ;;
+              esac
+              echo "$service_name: deploy POST returned $code on attempt $attempt/8: $(cat deploy.json) -- retrying in 20 s"
+              sleep 20
+            done
             if [ "$code" != "201" ]; then
-              echo "::error::$service_name: deploy request returned $code: $(cat deploy.json)" >&2
+              echo "::error::$service_name: deploy request never returned 201 (last: $code): $(cat deploy.json)" >&2
               exit 1
             fi
             deploy_id=$(python3 -c 'import json; d = json.load(open("deploy.json")); print((d.get("deploy") or d)["id"])')
@@ -160,7 +205,7 @@ jobs:
                 "https://api.render.com/v1/services/$service_id/deploys/$deploy_id" \
                 | python3 -c 'import json,sys; d = json.load(sys.stdin); print((d.get("deploy") or d).get("status", ""))')
               case "$status" in
-                live) echo "$service_name: live"; break ;;
+                live) break ;;
                 build_failed|update_failed|canceled|deactivated)
                   echo "::error::$service_name: deploy ended $status" >&2
                   exit 1 ;;
@@ -171,4 +216,18 @@ jobs:
               echo "::error::$service_name: deploy $deploy_id never reached live (last: $status)" >&2
               exit 1
             fi
+            # `live` only says the deploy finished.  It does not say it runs the
+            # image this tag built -- a deploy call that silently fell back to the
+            # previously pinned image also reports live.  Compare the ref the
+            # service is actually running.
+            ref=$(curl -sS \
+              -H "Authorization: Bearer $RENDER_API_KEY" \
+              -H 'Accept: application/json' \
+              "https://api.render.com/v1/services/$service_id/deploys/$deploy_id" \
+              | python3 -c 'import json,sys; d = json.load(sys.stdin); d = d.get("deploy") or d; print((d.get("image") or {}).get("ref", ""))')
+            if [ "$ref" != "$IMAGE_REF" ]; then
+              echo "::error::$service_name is live on '$ref', not '$IMAGE_REF'" >&2
+              exit 1
+            fi
+            echo "$service_name: live on $IMAGE_REF"
           done
