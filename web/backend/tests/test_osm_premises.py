@@ -2052,6 +2052,83 @@ def test_a_place_search_falls_back_to_the_point_only_for_a_postcode(monkeypatch)
     assert not calls["containing"]
 
 
+def _road_resolution(**over):
+    """A street address: Nominatim answers with the ROAD (a line), so the ladder
+    has no polygon of its own and falls through to the enclosing admin boundary."""
+    res = _dataset_resolution(
+        geometry={"type": "LineString",
+                  "coordinates": [[-1.936, 52.514], [-1.930, 52.516]]},
+        properties={
+            "display_name": "53 Carlyle Road, Lozells, Birmingham, B16 9BH",
+            "osm_type": "way", "osm_id": 25739630,
+            "category": "highway", "type": "residential",
+            "address": {"country_code": "gb", "city": "Birmingham"},
+        },
+    )
+    res.update(over)
+    return res
+
+
+_CITY_ADMIN = {
+    "geometry": {"type": "Polygon", "coordinates": [
+        [[-2.03, 52.38], [-1.72, 52.38], [-1.72, 52.60], [-2.03, 52.38]]]},
+    "display_name": "Birmingham, West Midlands, England, United Kingdom",
+    "addresstype": "city", "osm_type": "relation", "osm_id": 162378, "zoom": 12,
+}
+
+
+def test_a_street_address_narrows_by_point_when_the_name_cannot_match(monkeypatch):
+    """No dataset row is called "53 Carlyle road, B16 9BH, Birmingham", so the
+    name lookup misses and the ladder stays on the enclosing city -- measured
+    2026-11-02 as 522 km², which the OSM map API refuses outright and the run
+    died at area resolution.  The address has a point, so the ward containing it
+    is the answer the postcode path already gets."""
+    ward = _ward_record("E05011153", "Lozells")
+    calls = _stub_ladder(monkeypatch, _road_resolution(), admin=_CITY_ADMIN,
+                         by_name=None, containing=ward)
+
+    out = osm_source.resolve_area(
+        "53 Carlyle road, B16 9BH, Birmingham, United Kingdom", country_code="GB")
+
+    assert out["polygon_source"] == "dataset"
+    assert out["boundary_kind"] == "ward"
+    assert out["boundary_name"] == "Lozells"
+    assert calls["by_name"], "the name lookup is still tried first"
+    assert calls["containing"] == [("GB", -1.936, 52.514)]
+
+
+def test_a_bare_city_name_is_not_narrowed_by_its_centre(monkeypatch):
+    """Birmingham must stay Birmingham: a place name has no address point, and
+    whichever ward covers the city centre is not what the planner asked for."""
+    ward = _ward_record()
+    calls = _stub_ladder(monkeypatch, _road_resolution(), admin=_CITY_ADMIN,
+                         by_name=None, containing=ward)
+
+    out = osm_source.resolve_area("Birmingham, United Kingdom", country_code="GB")
+
+    assert out["polygon_source"] == "administrative"
+    assert not calls["containing"], "a place has no address point to narrow by"
+
+
+def test_the_point_fallback_leaves_a_real_osm_postcode_boundary_alone(monkeypatch):
+    """12105, Berlin: OSM HAS the postcode polygon, so a loaded DE ward must not
+    take a good boundary away -- with or without the postcode argument."""
+    ward = _ward_record("DE0001", "Some Ward")
+    result = _dataset_resolution(
+        geometry={"type": "Polygon", "coordinates": [
+            [[13.3, 52.4], [13.4, 52.4], [13.4, 52.5], [13.3, 52.4]]]},
+        properties={"display_name": "12105, Tempelhof, Berlin", "osm_type": "relation",
+                    "osm_id": 1105327, "category": "boundary", "type": "postal_code",
+                    "address": {"country_code": "de", "city": "Berlin"}},
+    )
+    calls = _stub_ladder(monkeypatch, result, by_name=None, containing=ward)
+
+    out = osm_source.resolve_area("12105, Berlin, Germany", country_code="DE")
+
+    assert out["polygon_source"] == "nominatim"
+    assert not calls["containing"], "a real postcode boundary left the ladder alone"
+
+
 def test_preview_says_which_dataset_area_a_postcode_landed_on(monkeypatch):
     _stub_area(monkeypatch, [_premise(1)], resolution={
         "input_type": "postcode", "polygon_source": "dataset",

@@ -3695,7 +3695,19 @@ def _run_area_pipeline(
         f"Premises: {built['premises']}; households: {households['total']} "
         f"({int(round(households.get('estimated_share', 0) * 100))}% estimated).",
     )
-    if built.get("polygon_source") != "nominatim":
+    if built.get("polygon_source") == "administrative":
+        # The ballooning rung: nothing smaller matched, so the design area is the
+        # whole enclosing boundary.  Say it in numbers -- this is the difference
+        # between an extract the OSM map API serves and one it refuses outright
+        # (Birmingham's city boundary is 522 km2 of envelope and fails outright).
+        _append(
+            project_id, "warning",
+            f"The area resolved to the whole {built.get('boundary_name') or 'administrative'} "
+            f"boundary ({built.get('area_km2')} km²) because no smaller boundary matched it. "
+            "The OSM fetch has to cover all of it and the map API refuses areas this size -- "
+            "narrow it to a postcode, a ward or a street.",
+        )
+    elif built.get("polygon_source") == "bbox":
         _append(
             project_id, "warning",
             "The area resolved to a bounding box, not a polygon — it is a rectangle and "

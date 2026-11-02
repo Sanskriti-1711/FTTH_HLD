@@ -2077,6 +2077,26 @@ def area_name_candidates(area: str) -> List[str]:
     return candidates
 
 
+def names_a_specific_address(area: str) -> bool:
+    """Does this label name ONE address rather than a place?
+
+    A postcode anywhere in the label ("53 Carlyle road, B16 9BH, Birmingham") or
+    a house number leading it ("53 Carlyle road, Birmingham") identifies a point,
+    so the dataset polygon containing that point is a defensible design area --
+    the same answer the postcode path already gets.  A place name has neither:
+    narrowing "Birmingham" to whichever ward covers its centre would be wrong,
+    so a place stays on the ladder it resolved to.
+    """
+    text = str(area or "").strip()
+    if not text:
+        return False
+    for part in (p.strip() for p in text.split(",")):
+        if part and looks_like_postcode(part):
+            return True
+    first = text.split(",")[0].strip()
+    return bool(re.match(r"^\d+\s+\S", first))
+
+
 def boundary_dataset_ingest(
     records: Iterable[Dict[str, Any]],
     source: str,
@@ -2594,6 +2614,26 @@ def resolve_area(area: str, refresh: bool = False, country_code: str = "",
             refined = boundary_dataset_by_name(
                 resolved_cc, area_name_candidates(search_area), within=polygon
             )
+            # A street ADDRESS is not a place name, so the name lookup cannot
+            # match: no dataset row is called "53 Carlyle road, B16 9BH,
+            # Birmingham".  Measured 2026-11-02: that label resolved to the
+            # 1.16 km2 Lozells ward when the caller passed the postcode, and to
+            # the 522 km2 city when it did not -- and a 522 km2 fetch is refused
+            # by the OSM map API outright, so the run died at area resolution.
+            # The address point is known, so the dataset polygon containing it is
+            # the answer the postcode path gets.  Gated exactly like that path:
+            # never over a real OSM postcode boundary, never over the object's own
+            # polygon, and never for a bare place name, which has no point to be
+            # narrowed by.
+            if (
+                refined is None
+                and source in ("administrative", "bbox")
+                and osm_postcode_boundary is not True
+                and names_a_specific_address(area)
+            ):
+                lat, lon = _best_point(best, geometry, bbox)
+                if lat is not None and lon is not None:
+                    refined = boundary_dataset_containing(resolved_cc, lon, lat)
         if refined:
             polygon = refined["geometry"]
             source = "dataset"
