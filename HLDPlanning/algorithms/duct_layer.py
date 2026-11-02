@@ -2886,6 +2886,10 @@ class DuctLayer(QgsProcessingAlgorithm):
     # 5 cm of it. Restamping here is exact and needs no sampling: the off-trench
     # length is the part of the duct the trench does not cover.
     RESTAMP_PROXIMITY_M = 0.5
+    # How far from a trench a duct still counts as covered by it.  The rebase
+    # snaps with REBASE_ON_TRENCH_TOL_M = 0.05 and the layer audit measured
+    # "on the trench" at 5 cm, so the published field uses the same yardstick.
+    RESTAMP_COVER_TOL_M = 0.05
 
     def _restamp_trench_metrics(self, output_uri, trench_lyr, context, feedback):
         """Rewrite OFF_TRENCH_LEN_M / TRENCH_STATUS from the rebased geometry.
@@ -2914,6 +2918,19 @@ class DuctLayer(QgsProcessingAlgorithm):
                 trench_geoms[tf.id()] = tg
         if not trench_geoms:
             return 0
+        # Coverage has a tolerance, and it must: subtracting a line from a line
+        # only removes exactly collinear overlap in GEOS, so a duct the rebase
+        # snapped 2 cm off the trench read as entirely uncovered.  The Birmingham
+        # run (2026-11-02) published "4 of 346 duct(s) lie on Final_Trenches"
+        # for a layer whose 346 routes had just been rebased onto it.  Buffering
+        # the trench first turns "covered" into "within 5 cm", which is what the
+        # 97.6 % figure on the Mariendorf run was measured with.
+        cover_geoms = {}
+        for fid, tg in trench_geoms.items():
+            try:
+                cover_geoms[fid] = tg.buffer(self.RESTAMP_COVER_TOL_M, 8)
+            except Exception:  # noqa: BLE001 - an unbufferable geometry is still usable raw
+                cover_geoms[fid] = tg
         trench_idx = QgsSpatialIndex(trench_lyr.getFeatures())
         band = self.RESTAMP_PROXIMITY_M
         lead = AlgDistributionDucts.DEFAULT_LEAD_IN_M
@@ -2928,10 +2945,10 @@ class DuctLayer(QgsProcessingAlgorithm):
             total += 1
             union = None
             for fid in trench_idx.intersects(g.boundingBox().buffered(1.0)):
-                tg = trench_geoms.get(fid)
-                if tg is None:
+                cg = cover_geoms.get(fid)
+                if cg is None:
                     continue
-                union = tg if union is None else union.combine(tg)
+                union = cg if union is None else union.combine(cg)
             off = g.length()
             if union is not None:
                 try:

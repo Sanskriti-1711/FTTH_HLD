@@ -125,7 +125,10 @@ def test_a_lead_in_keeps_its_band(tmp_path):
 
     assert algo._restamp_trench_metrics(src, trench, _context(), fb) == 1
     feat = next(QgsVectorLayer(src, "out", "ogr").getFeatures())
-    assert feat["OFF_TRENCH_LEN_M"] == pytest.approx(10.0, abs=0.05)
+    # 10 m of leg, minus the 5 cm the trench's coverage buffer reaches into it
+    # where the leg turns off the trench -- a tolerance bleeding 5 cm past the
+    # trench end is the price of reading a centimetre-off duct as on it.
+    assert feat["OFF_TRENCH_LEN_M"] == pytest.approx(9.95, abs=0.01)
     assert feat["TRENCH_STATUS"].startswith("Lead-in")
     assert "0 of 1 duct(s) lie on" in fb.text()
 
@@ -140,6 +143,42 @@ def test_a_duct_beyond_the_lead_in_cap_is_flagged_off(tmp_path):
 
     assert algo._restamp_trench_metrics(src, trench, _context(), fb) == 1
     feat = next(QgsVectorLayer(src, "out", "ogr").getFeatures())
-    assert feat["OFF_TRENCH_LEN_M"] == pytest.approx(42.0, abs=0.05)
+    assert feat["OFF_TRENCH_LEN_M"] == pytest.approx(41.95, abs=0.01)
     assert feat["TRENCH_STATUS"].startswith("OFF TRENCH")
     assert "off by 42.0 m" in fb.text()
+
+
+def test_a_duct_snapped_a_couple_of_centimetres_off_still_reads_as_on_it(tmp_path):
+    """Coverage is within 5 cm, not exact collinearity.
+
+    The rebase projects a broken route onto the trench point-wise, so its
+    vertices land on the trench while the chords run a centimetre or two beside
+    it.  Subtracting the trench line from that duct used to leave its whole
+    length behind, which is how the Birmingham run of 2026-11-02 published
+    "4 of 346 duct(s) lie on Final_Trenches" for a layer that had just been
+    rebased onto it.
+    """
+    algo = DuctLayer()
+    trench = _line_layer([[(0, 0), (100, 0)]])
+    src = _write_ducts(tmp_path / "dist.gpkg", [(0, 0.02), (100, 0.02)],
+                       100.0, "OFF TRENCH 100.0 m")
+    fb = _Fb()
+
+    assert algo._restamp_trench_metrics(src, trench, _context(), fb) == 1
+    feat = next(QgsVectorLayer(src, "out", "ogr").getFeatures())
+    assert feat["OFF_TRENCH_LEN_M"] <= 0.05
+    assert feat["TRENCH_STATUS"] == "On trench"
+    assert "1 of 1 duct(s) lie on" in fb.text()
+
+
+def test_a_duct_a_metre_beside_the_trench_is_still_off(tmp_path):
+    """The tolerance must not swallow a duct that genuinely is not on it."""
+    algo = DuctLayer()
+    trench = _line_layer([[(0, 0), (100, 0)]])
+    src = _write_ducts(tmp_path / "dist.gpkg", [(0, 1.0), (100, 1.0)], 0.0, "")
+    fb = _Fb()
+
+    assert algo._restamp_trench_metrics(src, trench, _context(), fb) == 1
+    feat = next(QgsVectorLayer(src, "out", "ogr").getFeatures())
+    assert feat["OFF_TRENCH_LEN_M"] == pytest.approx(100.0, abs=0.05)
+    assert feat["TRENCH_STATUS"].startswith("OFF TRENCH")
