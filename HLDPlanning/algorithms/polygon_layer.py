@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 import heapq
 import math
+import os
+import time
 
 from collections import Counter, defaultdict
 from statistics import median
@@ -96,6 +98,53 @@ def _release_memory(reason, feedback=None):
 # Half-width of the corridor cut out of built polygons along barriers [m].
 GROWTH_ROAD_HALF_WIDTH = 4.0
 
+# Visible gap between adjacent serving areas [m].  This used to be
+# `margin * 0.4` (= 9 m on the default 150 m neighbour rule), which is wider than
+# most streets: the inset ate a third of every polygon, and the member patch that
+# followed it rebuilt thin lobes and slivers (median area 791 m2, 15 polygons
+# under 200 m2).  The gap is a display choice, not a design constraint, so it is a
+# hairline now and the boundary itself does the separating.
+GROWTH_VISUAL_GAP_M = 2.0
+
+# REVIEW_WHY vocabulary — why a polygon carries REVIEW=1, so a flag is
+# actionable instead of a bare number. Emitted comma-joined on the polygon.
+REVIEW_CAP = "CAP"                      # the max-homes cap had to give
+REVIEW_BARRIER = "BARRIER"              # merged/absorbed across a barrier
+REVIEW_NO_NEIGHBOUR = "NO_NEIGHBOUR"    # no polygon to merge or attach into
+REVIEW_TINY = "TINY"                    # below the min band / fewer than 3 buildings
+REVIEW_FOOTPRINT = "FOOTPRINT"          # geometry fell back to member footprints
+REVIEW_CLIP = "CLIP"                    # clip would have removed the polygon
+REVIEW_GAP = "GAP"                      # closer than the gap to a neighbour, unexplained
+REVIEW_OTHER = "OTHER"                  # flagged without a recorded reason
+# How far the separation audit looks for a neighbour [m]. A polygon with no
+# neighbour inside this reach reports MIN_GAP_M = the probe (i.e. "at least").
+GROWTH_GAP_PROBE_M = 25.0
+
+# Border snapping: re-cut the final serving areas along the street network, so a
+# border between two polygons runs down the street between them instead of down
+# an arbitrary Voronoi midline. The union of the polygons is cut by the road
+# centrelines and each face is given back to the polygon it mostly overlaps, so
+# the result stays a disjoint partition; a cluster whose own buildings sit either
+# side of a street keeps both sides, because the street line dissolves when its
+# faces are unioned back. Set to False to keep the pure midline geometry.
+# Overridable per run (`POLY_SNAP_ROADS=0`) so the pass can be A/B-measured on
+# the same inputs without editing the algorithm.
+SNAP_BORDERS_TO_ROADS = os.environ.get("POLY_SNAP_ROADS", "1") not in ("0", "false", "False")
+
+# Faces below this area are cut debris (a corner clipped by two crossing roads)
+# and are left out of the rebuild rather than becoming a sliver in a polygon [m²].
+SNAP_MIN_FACE_M2 = 1.0
+
+# Interior rings smaller than this are clipping debris, not ground a neighbour
+# owns: road-node cuts left 12 such holes totalling 2 m2 on the Mariendorf layer
+# and they render as specks. A genuine courtyard is never this small [m²].
+SNAP_MIN_HOLE_M2 = 5.0
+
+# Safety cap on the snapping pass: a ward-scale road network is a few thousand
+# lines, so this only trips on pathological input, and it trips to the previous
+# geometry rather than to a very long split.
+SNAP_MAX_ROAD_LINES = 20000
+
 # Protective radius around premises [m]: a polygon may never claim ground closer
 # than this to ANOTHER cluster's premise, and its OWN members keep at least this
 # much geometry around them through the barrier-corridor cut.
@@ -118,6 +167,39 @@ ALPHA_MODE_LABELS = ["Manual", "Auto (k × median NN dist)"]
 ALPHA_MANUAL, ALPHA_AUTO = 0, 1
 
 XY_NAMES = {"x","X","y","Y","lon","Lng","lng","Lon","lat","Lat"}
+
+
+def _drop_tiny_holes(geom, min_hole_m2=SNAP_MIN_HOLE_M2):
+    """Return `geom` without interior rings below `min_hole_m2`.
+
+    Shapely geometry in, shapely geometry out. Used on the snapped serving areas:
+    the road-node cuts leave sub-metre slits that QGIS draws as specks, while any
+    hole that a neighbour really owns is far larger than the threshold.
+    """
+    if geom is None or geom.is_empty:
+        return geom
+    try:
+        from shapely.geometry import MultiPolygon, Polygon
+    except Exception:
+        return geom
+
+    def _clean(part):
+        if not part.interiors:
+            return part
+        keep = [r for r in part.interiors if Polygon(r).area >= min_hole_m2]
+        if len(keep) == len(part.interiors):
+            return part
+        return Polygon(part.exterior, keep)
+
+    gtype = geom.geom_type
+    if gtype == "Polygon":
+        out = _clean(geom)
+    elif gtype in ("MultiPolygon", "GeometryCollection"):
+        parts = [_clean(g) for g in geom.geoms if g.geom_type == "Polygon"]
+        out = MultiPolygon(parts) if parts else geom
+    else:
+        return geom
+    return out if not out.is_empty else geom
 
 
 class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
@@ -156,7 +238,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
             "Generate FDP/PDP serving-area polygons directly from the premises (Object) layer.\n"
             "Default method: Seeded Growth — a constrained agglomerative (Ward-linkage) clusterer groups "
             "nearby buildings into compact service clusters under the rules: "
-            "neighbour distance (150 m), 32–128 homes per polygon (nearest rule-compliant pair merged first), "
+            "neighbour distance (150 m), 64–192 homes per polygon (nearest rule-compliant pair merged first), "
             "barriers (restricted roads / railway / river / airport zones), 300 m service radius, "
             "road-access validation, no overlaps.\n"
             "Per polygon: exact homes/building counts, coverage area, demand density, and a recommended "
@@ -215,14 +297,14 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
             self.P_MIN_HH,
             self.tr("Growth: minimum homes per polygon"),
             type=QgsProcessingParameterNumber.Integer,
-            defaultValue=32, minValue=1
+            defaultValue=64, minValue=1
         ))
 
         self.addParameter(QgsProcessingParameterNumber(
             self.P_MAX_HH,
             self.tr("Growth: maximum homes per polygon"),
             type=QgsProcessingParameterNumber.Integer,
-            defaultValue=64, minValue=1
+            defaultValue=192, minValue=1
         ))
 
         self.addParameter(QgsProcessingParameterNumber(
@@ -343,6 +425,9 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                 ("SPL_64", QMetaType.Type.Int),           # count of 1:64 splitters
                 ("NO_ACCESS", QMetaType.Type.Int),       # members failing the road-access check
                 ("REVIEW", QMetaType.Type.Int),
+                ("REVIEW_WHY", QMetaType.Type.QString),   # CAP / BARRIER / TINY / NO_NEIGHBOUR / …
+                ("MIN_GAP_M", QMetaType.Type.Double),     # distance to nearest neighbour (≥ GROWTH_GAP_PROBE_M)
+                ("GAP_TO", QMetaType.Type.QString),       # POLYGON_ID of that nearest neighbour
             ]
         for name, qtype in extra:
             if out.indexOf(name) == -1:
@@ -357,7 +442,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
             # growth-builder fields (present only when that method ran)
             "CENTR_X", "CENTR_Y", "DENSITY", "SPLIT_SIZE", "SPLIT_CNT", "SPLIT_UTIL",
             "SPLIT_OK", "SPL_PLAN", "SPL_PORTS", "SPL_4", "SPL_8", "SPL_16", "SPL_32",
-            "SPL_64", "NO_ACCESS", "REVIEW",
+            "SPL_64", "NO_ACCESS", "REVIEW", "REVIEW_WHY", "MIN_GAP_M", "GAP_TO",
         }
         if group_name:
             keep.add(group_name)
@@ -734,7 +819,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
         # Build a spatial index of premises so each hull polygon gets correct
         # SUM_OBJECT (premises inside), HH (their homes) and a splitter plan —
         # not just a whole-group aggregate. NOTE: these methods draw geometric
-        # envelopes and do NOT enforce the 32–128 home cap or split into service
+        # envelopes and do NOT enforce the 64–192 home cap or split into service
         # areas; use Seeded Growth (default) for rule-compliant, capacity-sized
         # polygons. Attributes here are descriptive of whatever the hull covers.
         _legacy_hh_name = self._detect_hh_field(src.fields())
@@ -766,15 +851,15 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
         # Same rule as the growth path: a building's homes are counted once, not
         # once per address row.
         if _legacy_hh_name:
-            _legacy_by_building = {}
+            _legacy_rows = {}
             for _fid in _legacy_pt_hh:
-                _legacy_by_building.setdefault(
-                    _legacy_building_of.get(_fid, f"__row_{_fid}"), _legacy_pt_hh[_fid]
-                )
-            for _fid in _legacy_pt_hh:
-                _legacy_pt_hh[_fid] = _legacy_by_building[
-                    _legacy_building_of.get(_fid, f"__row_{_fid}")
-                ]
+                _legacy_rows.setdefault(
+                    _legacy_building_of.get(_fid, f"__row_{_fid}"), []).append(_fid)
+            for _fids in _legacy_rows.values():
+                _bh = max(0, int(_legacy_pt_hh[_fids[0]]))
+                _base, _extra = divmod(_bh, len(_fids))
+                for _i, _fid in enumerate(_fids):
+                    _legacy_pt_hh[_fid] = _base + (1 if _i < _extra else 0)
 
         # Index every usable premise (not just the last one of the loop, which is
         # all a feature added inside it could ever have reached).
@@ -1319,6 +1404,226 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
         return (barrier_geoms, barrier_index if barrier_geoms else None,
                 road_geoms, road_index if road_geoms else None)
 
+    def _cut_barrier_corridors(self, geom, member_pts, barrier_index, barrier_geoms):
+        """Cut the barrier corridor out of one serving polygon.
+
+        The Barrier Rule blocks the *merge* across a restricted road, railway,
+        river or airport boundary; this makes the barrier visible in the
+        geometry too, by removing a straight corridor `GROWTH_ROAD_HALF_WIDTH`
+        either side of every barrier the polygon touches. Each member's own
+        protective square is shielded, so a building geocoded right on the
+        barrier stays inside the polygon that serves it.
+
+        Returns the input unchanged when there is nothing to cut or the cut
+        fails — a barrier is never allowed to delete a serving area.
+        """
+        if geom is None or geom.isEmpty() or barrier_index is None:
+            return geom
+        try:
+            bids = barrier_index.intersects(geom.boundingBox())
+            if not bids:
+                return geom
+            corridor = QgsGeometry.unaryUnion(
+                [self._straight_buffer(barrier_geoms[x], GROWTH_ROAD_HALF_WIDTH)
+                 for x in bids]
+            )
+            own_shield = QgsGeometry.unaryUnion(
+                [self._square(q, GROWTH_MEMBER_PROTECT) for q in member_pts]
+            )
+            cut = geom.difference(corridor.difference(own_shield))
+            return cut if (cut is not None and not cut.isEmpty()) else geom
+        except Exception:  # noqa: BLE001 - a failed cut keeps the polygon
+            return geom
+
+    def _snap_borders_to_roads(self, geom_of_cluster, clusters, pts, crs, p, context, feedback):
+        """Re-cut the finalised serving areas along the street network.
+
+        A Voronoi border is the midline between two clusters, which reads as an
+        arbitrary line through the middle of a block. Here the union of the
+        polygons is cut by the road centrelines and every face is given back to
+        the polygon it mostly overlaps, so a border between two polygons lands on
+        the street between them.
+
+        A cluster whose own buildings sit either side of a street keeps both
+        sides — the pieces are unioned back within the cluster, so the street
+        line dissolves and the serving area is not split. The pass is
+        partition-preserving: faces are disjoint, a polygon can only lose ground
+        to another, and any polygon that would lose one of its members is left
+        exactly as it was. Every failure returns the input untouched.
+        """
+        if not SNAP_BORDERS_TO_ROADS or not geom_of_cluster:
+            return geom_of_cluster
+        lyr = self.parameterAsVectorLayer(p, self.P_BAR_ROADS, context)
+        if lyr is None or not lyr.isValid():
+            feedback.pushInfo("Growth: no road layer — borders stay on the Voronoi midlines.")
+            return geom_of_cluster
+        try:
+            import shapely
+            from shapely.ops import polygonize, unary_union
+            from shapely.strtree import STRtree
+        except Exception as exc:  # noqa: BLE001 - snapping is an enhancement
+            feedback.pushWarning(
+                f"Growth: border snapping unavailable ({exc}) — borders stay on the midlines.")
+            return geom_of_cluster
+        try:
+            polys = {}
+            for ci, g in geom_of_cluster.items():
+                if g is None or g.isEmpty():
+                    continue
+                w = shapely.from_wkt(g.asWkt())
+                if w is not None and not w.is_empty:
+                    polys[ci] = w
+            if len(polys) < 2:
+                return geom_of_cluster
+            total = unary_union(list(polys.values()))
+            if total.is_empty:
+                return geom_of_cluster
+
+            # Road centrelines over the built area, in the premises CRS.
+            minx, miny, maxx, maxy = total.bounds
+            rect = QgsRectangle(minx - 50.0, miny - 50.0, maxx + 50.0, maxy + 50.0)
+            xform = None
+            lyr_rect = rect
+            try:
+                if lyr.crs().isValid() and lyr.crs() != crs:
+                    xform = QgsCoordinateTransform(lyr.crs(), crs, context.transformContext())
+                    lyr_rect = QgsCoordinateTransform(
+                        crs, lyr.crs(), context.transformContext()).transformBoundingBox(rect)
+            except Exception:
+                xform, lyr_rect = None, None
+            req = QgsFeatureRequest().setFilterRect(lyr_rect) if lyr_rect is not None \
+                else QgsFeatureRequest()
+
+            lines = []
+            n_roads = 0
+            for f in lyr.getFeatures(req):
+                g = f.geometry()
+                if g is None or g.isEmpty():
+                    continue
+                g = QgsGeometry(g)
+                if xform is not None:
+                    try:
+                        g.transform(xform)
+                    except Exception:
+                        continue
+                parts = g.asGeometryCollection() if g.isMultipart() else [g]
+                for part in parts:
+                    if part is None or part.isEmpty():
+                        continue
+                    if QgsWkbTypes.geometryType(part.wkbType()) != QgsWkbTypes.LineGeometry:
+                        continue
+                    w = shapely.from_wkt(part.asWkt())
+                    if w is None or w.is_empty:
+                        continue
+                    if w.geom_type == "LineString":
+                        lines.append(w)
+                    elif w.geom_type in ("MultiLineString", "GeometryCollection"):
+                        lines.extend(x for x in w.geoms if x.geom_type == "LineString")
+                    n_roads += 1
+                    if len(lines) > SNAP_MAX_ROAD_LINES:
+                        feedback.pushWarning(
+                            f"Growth: border snapping skipped — {len(lines)} road line(s) is "
+                            f"over the {SNAP_MAX_ROAD_LINES} guard; borders stay on the midlines.")
+                        return geom_of_cluster
+            if not lines:
+                feedback.pushInfo("Growth: no road lines under the built area — borders stay on the midlines.")
+                return geom_of_cluster
+
+            _t0 = time.monotonic()
+            # `shapely.ops.split` refuses a MultiLineString splitter in shapely
+            # 2.0, and a ward road network is always many lines. Polygonize the
+            # noded linework of (polygon boundary + road lines clipped to the
+            # built area) instead: every closed face that comes back is bounded
+            # by roads wherever a road runs inside the area, which is what the
+            # split would have produced.
+            # The polygon boundary closes the planar graph, so a road that runs
+            # through the built area always closes a face with it; a road outside
+            # it closes nothing and is ignored by the overlap filter below.
+            faces = []
+            for f in polygonize(unary_union([total.boundary] + lines)):
+                if f.area < SNAP_MIN_FACE_M2:
+                    continue
+                try:
+                    if f.intersection(total).area <= 0.0:
+                        continue
+                except Exception:
+                    continue
+                faces.append(f)
+            if not faces:
+                feedback.pushInfo(
+                    "Growth: no road closes a face inside the built area — borders stay on the midlines.")
+                return geom_of_cluster
+
+            keys = list(polys)
+            tree = STRtree([polys[k] for k in keys])
+            # A face is given to the serving area that holds the BUILDINGS in it,
+            # not to the one that happens to cover most of its ground. Handing a
+            # whole block to the area with the larger share is what double-covered
+            # a neighbour: the block's border only follows a road, so the area
+            # whose houses were in that block kept its own geometry and the two
+            # overlapped by the block. 23 pairs / 34,913 m2 on the Mariendorf
+            # layer. A block that holds houses of two areas keeps the original
+            # border through it — that is the only line that leaves each house in
+            # its own polygon while still moving the other borders onto streets.
+            member_xy = {
+                k: [shapely.Point(pts[m].x(), pts[m].y()) for m in clusters[k]["members"]]
+                for k in keys
+            }
+            assign = {k: [] for k in keys}
+            contested = 0
+            for face in faces:
+                holders = [keys[int(idx)] for idx in tree.query(face)
+                           if member_xy[keys[int(idx)]] and
+                           any(face.intersects(q) for q in member_xy[keys[int(idx)]])]
+                if len(holders) > 1:
+                    for ci in holders:
+                        assign[ci].append(face.intersection(polys[ci]))
+                    contested += 1
+                elif len(holders) == 1:
+                    assign[holders[0]].append(face)
+                else:
+                    # No house in this face — spare ground or a road corridor.
+                    # Nobody's membership is at stake, so area majority is safe.
+                    best_ci, best_area = None, 0.0
+                    for idx in tree.query(face):
+                        ci = keys[int(idx)]
+                        inter = face.intersection(polys[ci]).area
+                        if inter > best_area:
+                            best_ci, best_area = ci, inter
+                    if best_ci is not None:
+                        assign[best_ci].append(face)
+
+            out = dict(geom_of_cluster)
+            snapped = 0
+            for ci, fs in assign.items():
+                fs = [g for g in fs if g is not None and not g.is_empty]
+                if not fs or not clusters[ci]["members"]:
+                    continue
+                merged = unary_union(fs)
+                if not merged.is_valid:
+                    merged = merged.buffer(0)
+                if merged.is_empty:
+                    continue
+                merged = _drop_tiny_holes(merged)
+                qg = QgsGeometry.fromWkt(merged.wkt)
+                if qg is None or qg.isEmpty():
+                    continue
+                members = [QgsGeometry.fromPointXY(pts[m]) for m in clusters[ci]["members"]]
+                if not all(qg.intersects(x) for x in members):
+                    continue          # keep the unsnapped geometry rather than lose a member
+                out[ci] = qg
+                snapped += 1
+            feedback.pushInfo(
+                f"Growth: borders snapped to the street network — {len(faces)} face(s) cut along "
+                f"{n_roads} road line(s); {snapped} polygon(s) re-bounded on road centrelines, "
+                f"{contested} block(s) shared by two areas kept their own border, "
+                f"in {time.monotonic() - _t0:.1f} s.")
+            return out
+        except Exception as exc:  # noqa: BLE001 - snapping never fails a run
+            feedback.pushWarning(
+                f"Growth: border snapping skipped ({exc}) — borders stay on the midlines.")
+            return geom_of_cluster
+
     def _parts_containing_members(self, geom, member_pts):
         """Keep only the polygon parts that contain at least one member premise."""
         if geom is None or geom.isEmpty():
@@ -1559,23 +1864,34 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
         # building's premises -- so the clubbing, the splitter plan and the
         # per-PDP threshold all see the real demand.
         if hh_name:
-            by_building = {}
+            rows_of = {}
             for fid in pts:
-                by_building.setdefault(
-                    building_of.get(fid, f"__row_{fid}"), hh_of[fid]
-                )
-            total_homes = sum(by_building.values())
-            if total_homes != sum(hh_of.values()):
+                rows_of.setdefault(building_of.get(fid, f"__row_{fid}"), []).append(fid)
+            homes_before = sum(hh_of.values())
+            # The building total is SHARED across its address rows, integer-exact:
+            # each row carries total/n (remainder to the first rows).  Writing the
+            # whole total onto every row (the previous rule) made a 6-address
+            # block of 85 homes read as 6 x 85 = 510 in every cluster sum -- the
+            # Mariendorf layer carried 12,954 homes where its own premises hold
+            # 7,465, a 1.74x over-count that inflated every polygon's demand.
+            for _fids in rows_of.values():
+                _bh = max(0, int(hh_of[_fids[0]]))
+                _n = len(_fids)
+                _base, _extra = divmod(_bh, _n)
+                for _i, _fid in enumerate(_fids):
+                    hh_of[_fid] = _base + (1 if _i < _extra else 0)
+            homes_after = sum(hh_of.values())
+            if homes_after != homes_before:
                 feedback.pushInfo(
-                    f"Growth: {total_homes} homes over {len(by_building)} building(s); "
-                    "households counted once per building."
+                    f"Growth: {homes_after} homes over {len(rows_of)} building(s) "
+                    f"({len(pts)} premises) — a building's households are shared across "
+                    f"its address rows, so summing premises no longer counts them "
+                    f"{homes_before / max(1, homes_after):.2f}x over."
                 )
-            for fid in pts:
-                hh_of[fid] = by_building[building_of.get(fid, f"__row_{fid}")]
             # Building identities were only needed for this sum; the addresses
             # themselves are what the ADDR_ID check uses further down.
             building_of.clear()
-            by_building.clear()
+            rows_of.clear()
 
         if not pts:
             raise QgsProcessingException("Growth: INPUT contains no usable premise geometries.")
@@ -1689,12 +2005,21 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                              "sx": pts[fid].x(), "sy": pts[fid].y()})
             assigned[fid] = ci
 
+        review_why = defaultdict(set)                  # cluster -> codes behind REVIEW=1
         merged_into = {}                               # child ci -> parent ci (see _resolve)
 
         def _resolve(ci):
             while ci in merged_into:
                 ci = merged_into[ci]
             return ci
+
+        def _flag(ci, code):
+            """Mark a cluster REVIEW=1 and record WHY (the code lands in REVIEW_WHY)."""
+            ci = _resolve(ci)
+            if not (0 <= ci < len(clusters)) or not clusters[ci]["members"]:
+                return
+            clusters[ci]["review"] = True
+            review_why[ci].add(code)
 
         def _undersized(ci):
             cl = clusters[ci]
@@ -1803,13 +2128,152 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
             if ci in merged_into or not clusters[ci]["members"]:
                 continue
             if _undersized(ci):
-                clusters[ci]["review"] = True
+                _flag(ci, REVIEW_TINY)
                 n_under += 1
         if n_under:
             feedback.pushWarning(
                 f"Growth: {n_under} cluster(s) stay below the minimum band "
                 f"({min_hh} homes / ≥3 buildings) — no rule-compliant merge available; REVIEW=1."
             )
+
+        # ---- Phase B.2b: HARD FLOOR — never ship a one-house polygon ----
+        # The Ward loop refuses any merge that breaks the cap, the service radius
+        # or a barrier, so a 1-3 home cluster can survive on its own and become a
+        # serving area with one house in it (full-area run: 4 polygons of ≤2
+        # premises, the smallest 3 homes). That polygon still costs a PDP, a
+        # splitter, a drop and its share of duct, so it is not a design, it is a
+        # leftover. Merge such a cluster into its nearest neighbour, relaxing the
+        # gates in a fixed order (room → capacity → any), and flag the receiver
+        # REVIEW=1 whenever the cap or a barrier had to give, so the compromise is
+        # visible instead of silent. A cluster with no neighbour at all keeps its
+        # own area and stays flagged.
+        _alive = [ci for ci in range(len(clusters))
+                  if ci not in merged_into and clusters[ci]["members"]]
+        _forced = 0
+        if len(_alive) > 1:
+            for ci in sorted(_alive, key=lambda c: clusters[c]["hh"]):
+                if ci in merged_into or not clusters[ci]["members"]:
+                    continue
+                if not _undersized(ci):
+                    continue
+                ca = clusters[ci]
+                na = len(ca["members"])
+                cx, cy = ca["sx"] / na, ca["sy"] / na
+                cands = []
+                for oci in range(len(clusters)):
+                    if oci == ci or oci in merged_into or not clusters[oci]["members"]:
+                        continue
+                    ob = clusters[oci]
+                    nb_n = len(ob["members"])
+                    ox, oy = ob["sx"] / nb_n, ob["sy"] / nb_n
+                    cands.append((math.hypot(cx - ox, cy - oy), oci))
+                cands.sort()
+                target, relaxed, relaxed_stage = None, False, None
+                for stage in ("room", "capacity", "any"):
+                    if target is not None:
+                        break
+                    for d, oci in cands:
+                        if d > 3.0 * neigh_dist:
+                            continue                       # keep the merge local
+                        if stage == "room" and (
+                                clusters[oci]["hh"] + ca["hh"] > max_hh
+                                or not _barrier_free_link(oci, ci)):
+                            continue
+                        if stage == "capacity" and not _barrier_free_link(oci, ci):
+                            continue
+                        target, relaxed, relaxed_stage = oci, stage != "room", stage
+                        break
+                if target is None:
+                    continue                               # genuinely isolated
+                ob = clusters[target]
+                if relaxed:
+                    _flag(target, REVIEW_CAP if relaxed_stage == "capacity"
+                          else REVIEW_BARRIER)
+                ob["members"].extend(ca["members"])
+                ob["hh"] += ca["hh"]
+                ob["sx"] += ca["sx"]
+                ob["sy"] += ca["sy"]
+                for mm in ca["members"]:
+                    assigned[mm] = target
+                merged_into[ci] = target
+                for nb in list(cl_adj.get(ci, ())):
+                    rnb = _resolve(nb)
+                    if rnb != target and clusters[rnb]["members"]:
+                        cl_adj[target].add(rnb)
+                        cl_adj[rnb].add(target)
+                ca["members"] = []
+                _forced += 1
+        if _forced:
+            feedback.pushWarning(
+                f"Growth: hard floor merged {_forced} undersized cluster(s) into their "
+                f"nearest neighbour so no polygon ships under {min_hh} homes; the "
+                "receiver carries REVIEW=1 where the cap or a barrier had to give.")
+
+        # ---- Phase B.2c: OVER-CAP REPAIR (split it, do not just flag it) ----
+        # Phase B.2b relaxes the cap to guarantee the minimum band, which can push
+        # a receiver above max_hh (measured: 284 homes against a 192 cap). A forced
+        # merge is the last resort, so try the remedy first: split the receiver
+        # into two serving areas along its own longest axis of spread, and accept
+        # the cut only when BOTH halves land inside the band. When no cut fits, the
+        # polygon keeps its area and stays REVIEW=1 with WHY=CAP.
+        _split_over = 0
+        for ci in [c for c in range(len(clusters))
+                   if c not in merged_into and clusters[c]["members"]
+                   and clusters[c]["hh"] > max_hh]:
+            ms = clusters[ci]["members"]
+            if len(ms) < 6:
+                continue                        # too few to make two ≥3 clusters
+            n = len(ms)
+            mx = sum(pts[m].x() for m in ms) / n
+            my = sum(pts[m].y() for m in ms) / n
+            sxx = sum((pts[m].x() - mx) ** 2 for m in ms)
+            syy = sum((pts[m].y() - my) ** 2 for m in ms)
+            sxy = sum((pts[m].x() - mx) * (pts[m].y() - my) for m in ms)
+            theta = 0.5 * math.atan2(2.0 * sxy, sxx - syy)
+            ux, uy = math.cos(theta), math.sin(theta)
+            ranked = sorted(((pts[m].x() - mx) * ux + (pts[m].y() - my) * uy, m)
+                            for m in ms)
+            hh_seq = [hh_of.get(m, 1) for _p, m in ranked]
+            total_hh = sum(hh_seq)
+            best = None
+            acc = 0
+            for k in range(1, len(ranked)):
+                acc += hh_seq[k - 1]
+                a_hh, b_hh = acc, total_hh - acc
+                if k < 3 or len(ranked) - k < 3:
+                    continue
+                if not (min_hh <= a_hh <= max_hh and min_hh <= b_hh <= max_hh):
+                    continue
+                key = abs(a_hh - b_hh)
+                if best is None or key < best[0]:
+                    best = (key, k, a_hh, b_hh)
+            if best is None:
+                _flag(ci, REVIEW_CAP)           # no band-legal cut — the cap still gives
+                continue
+            _k, a_hh, b_hh = best[1], best[2], best[3]
+            part_a = [m for _p, m in ranked[:_k]]
+            part_b = [m for _p, m in ranked[_k:]]
+            nj = len(clusters)
+            clusters.append({"members": part_b, "hh": b_hh, "review": False,
+                             "sx": sum(pts[m].x() for m in part_b),
+                             "sy": sum(pts[m].y() for m in part_b)})
+            clusters[ci]["members"] = part_a
+            clusters[ci]["hh"] = a_hh
+            clusters[ci]["sx"] = sum(pts[m].x() for m in part_a)
+            clusters[ci]["sy"] = sum(pts[m].y() for m in part_a)
+            for m in part_a:
+                assigned[m] = ci
+            for m in part_b:
+                assigned[m] = nj
+            cl_adj[nj] = set(cl_adj.get(ci, ()))
+            cl_adj[nj].add(ci)
+            cl_adj[ci].add(nj)
+            _split_over += 1
+        if _split_over:
+            feedback.pushInfo(
+                f"Growth: over-cap repair split {_split_over} forced-merge receiver(s) "
+                f"into two serving areas that both sit inside the {min_hh}–{max_hh} "
+                "homes band, instead of shipping a polygon above the cap.")
 
         # ---- Phase B.3: CAPACITY CONSOLIDATION (compactness-gated) ----
         # Ward links buildings within NEIGHBOR_DIST, so two small clusters separated
@@ -1892,6 +2356,8 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
             # dead for the "has members" checks the passes already make.
             clusters[b]["members"] = []
             clusters[a]["review"] = _undersized(a)
+            if clusters[a]["review"]:
+                _flag(a, REVIEW_TINY)
             n = len(clusters[a]["members"])
             ccx[a], ccy[a] = clusters[a]["sx"] / n, clusters[a]["sy"] / n
             crad[a] = _joint_max_radius(clusters[a]["members"])
@@ -1956,7 +2422,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                 for mm in clusters[ci]["members"]:
                     assigned[mm] = target
                 if clusters[target]["hh"] > max_hh:
-                    clusters[target]["review"] = True
+                    _flag(target, REVIEW_CAP)
                 merged_into[ci] = target
                 did += 1
             singleton_merges += did
@@ -2064,8 +2530,10 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
             if clusters[_r]["members"]:
                 owner[_fid] = _r
         margin = min(25.0, max(8.0, neigh_dist * 0.15))
-        # Visible gap between adjacent polygons — large enough to read at map scale.
-        visual_gap = max(2.0, margin * 0.4)
+        # Visible gap between adjacent polygons.  Small on purpose: a 9 m inset is
+        # wider than a street and the member patch below rebuilt the space it ate
+        # as thin lobes, which is where the slivers came from.
+        visual_gap = GROWTH_VISUAL_GAP_M
 
         # Voronoi (Thiessen) partition of every building, dissolved per cluster:
         # a TRUE spatial partition — cells are disjoint and each building lies in
@@ -2238,7 +2706,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                     clusters[nci]["sy"] += pts[m].y()
                     assigned[m] = nci
                     if clusters[nci]["hh"] > max_hh:
-                        clusters[nci]["review"] = True
+                        _flag(nci, REVIEW_CAP)
                     moved += 1
                 if not moved:
                     break
@@ -2293,19 +2761,10 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
             if abs(buf_m) > 0.0 and not geom.isEmpty():
                 geom = self._straight_buffer(geom, buf_m)
 
-            # Barrier Rule visible in geometry: cut a thin straight corridor,
-            # protecting a square around each own member so a building geocoded
-            # right on a barrier stays inside its polygon.
-            if barrier_index is not None and not geom.isEmpty():
-                bids = barrier_index.intersects(geom.boundingBox())
-                if bids:
-                    corridor = QgsGeometry.unaryUnion(
-                        [self._straight_buffer(barrier_geoms[x], GROWTH_ROAD_HALF_WIDTH) for x in bids]
-                    )
-                    own_shield = QgsGeometry.unaryUnion(
-                        [self._square(q, GROWTH_MEMBER_PROTECT) for q in member_pts]
-                    )
-                    geom = geom.difference(corridor.difference(own_shield))
+            # Barrier Rule visible in geometry: cut a straight corridor along every
+            # barrier this polygon touches, protecting each own member's square so
+            # a building geocoded right on a barrier stays inside its own polygon.
+            geom = self._cut_barrier_corridors(geom, member_pts, barrier_index, barrier_geoms)
 
             # ---- strict non-overlap safety net: subtract all previously emitted
             # geometry (Voronoi cells are already disjoint, so this is a no-op
@@ -2323,6 +2782,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                 if not emitted_geom.isEmpty() and geom is not None and not geom.isEmpty():
                     geom = geom.difference(emitted_geom)
                 review = True
+                _flag(ci, REVIEW_FOOTPRINT)
 
             # Tiny inward buffer so adjacent polygons read as separate at map
             # scale — but never push a member outside its own polygon (patch any
@@ -2351,6 +2811,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                         f"Growth: clip would remove polygon of cluster {ci} entirely — kept unclipped (REVIEW=1)."
                     )
                     review = True
+                    _flag(ci, REVIEW_CLIP)
                 else:
                     geom = clipped
 
@@ -2464,6 +2925,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                         target = ci                           # no reachable neighbour → own region
                         clusters[ci]["review"] = True
                         review_of[ci] = True
+                        _flag(ci, REVIEW_NO_NEIGHBOUR)
                     # grow the target polygon to cover the point with a SOLID
                     # connector (footprint + straight corridor to the nearest edge)
                     # so the result stays a single connected piece.
@@ -2513,6 +2975,7 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                     if clusters[target]["hh"] > max_hh:
                         clusters[target]["review"] = True
                         review_of[target] = True
+                        _flag(target, REVIEW_CAP)
                 changed += 1
                 rehomed += 1
             if not changed:
@@ -2522,6 +2985,319 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                 f"Growth: coverage pass re-homed {rehomed} premise(s) so every house sits inside a polygon."
             )
 
+        # ---- Phase D.2: OVER-CAP REPAIR AFTER COVERAGE ----
+        # The coverage guarantee can be FORCED to hand a premise to the only
+        # polygon able to take it, which pushes that polygon over the cap
+        # (measured: 284 homes against a 192 cap, REVIEW=1 and nothing else).
+        # Split those receivers here — before the street snap, the carve and the
+        # gap — so an over-cap area is not emitted at all: partition the members
+        # along the receiver's longest axis, keep a cut only when BOTH halves land
+        # inside the band, and rebuild each half as its own straight cap. Phases
+        # F and G then carve and separate the two halves like any other pair.
+        _post_split = 0
+        _post_uncut = 0
+        if geom_of_cluster:
+            for ci in [c for c in range(len(clusters))
+                       if c not in merged_into and clusters[c]["members"]
+                       and clusters[c]["hh"] > max_hh]:
+                _g = geom_of_cluster.get(ci)
+                if _g is None or _g.isEmpty() or ci not in emit_order:
+                    continue
+                ms = clusters[ci]["members"]
+                if len(ms) < 6:
+                    _post_uncut += 1
+                    continue
+                n = len(ms)
+                mx = sum(pts[m].x() for m in ms) / n
+                my = sum(pts[m].y() for m in ms) / n
+                sxx = sum((pts[m].x() - mx) ** 2 for m in ms)
+                syy = sum((pts[m].y() - my) ** 2 for m in ms)
+                sxy = sum((pts[m].x() - mx) * (pts[m].y() - my) for m in ms)
+                theta = 0.5 * math.atan2(2.0 * sxy, sxx - syy)
+                ux, uy = math.cos(theta), math.sin(theta)
+                ranked = sorted(((pts[m].x() - mx) * ux + (pts[m].y() - my) * uy, m)
+                                for m in ms)
+                hh_seq = [hh_of.get(m, 1) for _p, m in ranked]
+                total_hh = sum(hh_seq)
+                best = None
+                acc = 0
+                for k in range(1, len(ranked)):
+                    acc += hh_seq[k - 1]
+                    a_hh, b_hh = acc, total_hh - acc
+                    if k < 3 or len(ranked) - k < 3:
+                        continue
+                    if not (min_hh <= a_hh <= max_hh and min_hh <= b_hh <= max_hh):
+                        continue
+                    key = abs(a_hh - b_hh)
+                    if best is None or key < best[0]:
+                        best = (key, k, a_hh, b_hh)
+                if best is None:
+                    _post_uncut += 1
+                    continue
+                _k, a_hh, b_hh = best[1], best[2], best[3]
+                part_a = [m for _p, m in ranked[:_k]]
+                part_b = [m for _p, m in ranked[_k:]]
+                pa = [pts[m] for m in part_a]
+                pb = [pts[m] for m in part_b]
+                ga = self._parts_containing_members(self._straight_cap(pa, margin), pa)
+                gb = self._parts_containing_members(self._straight_cap(pb, margin), pb)
+                if (ga is None or ga.isEmpty() or gb is None or gb.isEmpty()
+                        or not all(ga.intersects(QgsGeometry.fromPointXY(q)) for q in pa)
+                        or not all(gb.intersects(QgsGeometry.fromPointXY(q)) for q in pb)):
+                    _post_uncut += 1
+                    continue
+                nj = len(clusters)
+                clusters.append({"members": part_b, "hh": b_hh, "review": False,
+                                 "sx": sum(q.x() for q in pb),
+                                 "sy": sum(q.y() for q in pb)})
+                clusters[ci]["members"] = part_a
+                clusters[ci]["hh"] = a_hh
+                clusters[ci]["sx"] = sum(q.x() for q in pa)
+                clusters[ci]["sy"] = sum(q.y() for q in pa)
+                for m in part_a:
+                    assigned[m] = ci
+                for m in part_b:
+                    assigned[m] = nj
+                geom_of_cluster[ci] = ga
+                geom_of_cluster[nj] = gb
+                emit_order.append(nj)
+                # The cap holds again, so the CAP flag the coverage pass set no
+                # longer applies to either half.
+                review_why[ci].discard(REVIEW_CAP)
+                review_of.pop(ci, None)
+                if not review_why[ci] and not _undersized(ci):
+                    clusters[ci]["review"] = False
+                review_why.setdefault(nj, set())
+                _post_split += 1
+        if _post_split:
+            feedback.pushInfo(
+                f"Growth: over-cap repair after coverage split {_post_split} "
+                f"receiver(s) that the coverage pass pushed above {max_hh} homes "
+                "into two areas inside the band.")
+        if _post_uncut:
+            feedback.pushInfo(
+                f"Growth: {_post_uncut} over-cap polygon(s) admit no band-legal cut "
+                f"({min_hh}–{max_hh} homes on both sides) — kept as they are, "
+                "REVIEW=1 with WHY=CAP.")
+
+        # ---- Phase E: BORDERS ON THE STREET NETWORK ----
+        # A border between two serving areas should run down the street between
+        # them, not down an arbitrary midline through a block: re-cut the final
+        # areas along the road centrelines. The coverage pass above can also grow
+        # a polygon back across a barrier to reach a member, so the barrier
+        # corridor is cut once more afterwards and stays a real edge.
+        if geom_of_cluster:
+            geom_of_cluster = self._snap_borders_to_roads(
+                geom_of_cluster, clusters, pts, src.sourceCrs(), p, context, feedback)
+            if barrier_index is not None:
+                for _ci in list(geom_of_cluster):
+                    _g = geom_of_cluster[_ci]
+                    if _g is None or _g.isEmpty() or not clusters[_ci]["members"]:
+                        continue
+                    geom_of_cluster[_ci] = self._cut_barrier_corridors(
+                        _g, [pts[m] for m in clusters[_ci]["members"]],
+                        barrier_index, barrier_geoms)
+            _release_memory("border snapping", feedback)
+
+        # ---- Phase F: EXACT DISJOINTNESS, the last geometric step ----
+        # The overlap guard in the build loop ran before the visual-gap patch and
+        # before the Douglas-Peucker simplify, both of which can put ground back
+        # into a neighbour (simplify moves edges outward by up to 11 m); the
+        # coverage pass then grows polygons again.  Overlaps survived all of that:
+        # 8 pairs / 721 m2 on the Mariendorf layer, with 7 premises inside two
+        # polygons.  Carve once here, largest serving area first, and only accept
+        # a carve that leaves every member inside its own polygon.
+        if geom_of_cluster:
+            _taken = QgsGeometry()
+            _owners = []           # (cluster index, geometry already taken)
+            _rehomed = 0
+            for _ci in sorted(geom_of_cluster,
+                              key=lambda c: clusters[c]["hh"], reverse=True):
+                _g = geom_of_cluster.get(_ci)
+                if _g is None or _g.isEmpty() or not clusters[_ci]["members"]:
+                    continue
+                if not _taken.isEmpty() and _g.intersects(_taken):
+                    _carved = _g.difference(_taken)
+                    if _carved is not None and not _carved.isEmpty():
+                        _mp = [pts[m] for m in clusters[_ci]["members"]]
+                        _kept = self._parts_containing_members(_carved, _mp)
+                        if _kept is not None and not _kept.isEmpty():
+                            # A premise sitting in the ground the carve removed
+                            # can only stay here if that ground is duplicated —
+                            # which is the overlap itself. Hand it to the polygon
+                            # that owns the ground instead, so both rules hold:
+                            # one premise, one polygon, and no double cover.
+                            _lost = [m for m in list(clusters[_ci]["members"])
+                                     if not _kept.intersects(
+                                         QgsGeometry.fromPointXY(pts[m]))]
+                            _moved = 0
+                            for _m in _lost:
+                                _ptg = QgsGeometry.fromPointXY(pts[_m])
+                                _to = next((oci for oci, og in _owners
+                                            if og is not None and not og.isEmpty()
+                                            and og.intersects(_ptg)), None)
+                                if _to is None:
+                                    continue
+                                clusters[_ci]["members"].remove(_m)
+                                clusters[_ci]["hh"] -= hh_of.get(_m, 1)
+                                if _m not in clusters[_to]["members"]:
+                                    clusters[_to]["members"].append(_m)
+                                    clusters[_to]["hh"] += hh_of.get(_m, 1)
+                                assigned[_m] = _to
+                                _moved += 1
+                                _rehomed += 1
+                            if _moved:
+                                _mp = [pts[m] for m in clusters[_ci]["members"]]
+                                _kept = (self._parts_containing_members(_carved, _mp)
+                                         if _mp else QgsGeometry())
+                            if _mp and (_kept is not None and not _kept.isEmpty()
+                                        and all(_kept.intersects(QgsGeometry.fromPointXY(q))
+                                                for q in _mp)):
+                                geom_of_cluster[_ci] = _kept
+                                _g = _kept
+                            elif not clusters[_ci]["members"]:
+                                # Nothing left to serve here: drop the area rather
+                                # than emit an empty sliver over a neighbour.
+                                geom_of_cluster[_ci] = QgsGeometry()
+                                _g = None
+                if _g is not None and not _g.isEmpty():
+                    try:
+                        _taken = _g if _taken.isEmpty() else _taken.combine(_g)
+                    except Exception:
+                        pass
+                    _owners.append((_ci, _g))
+            if _rehomed:
+                feedback.pushInfo(
+                    f"Growth: disjointness carve re-homed {_rehomed} premise(s) that sat "
+                    "in ground a neighbour owns, instead of keeping a double-covered strip.")
+            _release_memory("the disjointness carve", feedback)
+
+        # ---- Phase G: SEPARATION, the very last geometry step ----
+        # Phase F leaves neighbours EXACTLY adjacent (they share the carved line,
+        # 4,335.9 m of shared boundary on 12105), and the street snap re-bounds
+        # polygons onto the same road line, so the 2 m gap applied back in Phase C
+        # is gone by now. Shave the gap again here, after the carve, so every
+        # polygon is visibly its own block: two neighbours end up 2 × gap apart
+        # instead of glued together. A building sitting closer to the border than
+        # the gap keeps its own footprint square, so no premise is ever left
+        # outside — that is the only place two polygons can still come close.
+        _rescued_clusters = set()     # a member square forced the border back in
+        if geom_of_cluster and GROWTH_VISUAL_GAP_M > 0:
+            _shaved = 0
+            for _ci in list(geom_of_cluster):
+                _g = geom_of_cluster.get(_ci)
+                if _g is None or _g.isEmpty() or not clusters[_ci]["members"]:
+                    continue
+                _shrunk = _g.buffer(-GROWTH_VISUAL_GAP_M, 8)
+                if _shrunk is None or _shrunk.isEmpty():
+                    continue            # thinner than the gap — keep it as it is
+                _mp = [pts[m] for m in clusters[_ci]["members"]]
+                _hold = [_shrunk]
+                _rescued = False
+                # Only the point has to stay inside, so the rescue footprint is
+                # small on purpose: `GROWTH_MEMBER_PROTECT * 0.6` is 13 m, and two
+                # neighbours that both hug the same border then touch through
+                # their 26 m squares (2.26 m of contact on the full 212-polygon
+                # area). A 3 m half-square keeps the premise in and the gap out.
+                _keep_r = 3.0
+                for _m in _mp:
+                    if not _shrunk.intersects(QgsGeometry.fromPointXY(_m)):
+                        # Clip the rescue square to this polygon's own ground: an
+                        # unclipped square around an edge building reaches past
+                        # the border and re-creates the overlap the carve just
+                        # removed (5 pairs / 231 m2 when it was tried).
+                        _prot = self._square(_m, _keep_r)
+                        _prot = _prot.intersection(_g)
+                        if _prot is not None and not _prot.isEmpty():
+                            _hold.append(_prot)
+                            _rescued = True
+                if len(_hold) > 1:
+                    _shrunk = QgsGeometry.unaryUnion(_hold)
+                if _shrunk is not None and not _shrunk.isEmpty():
+                    geom_of_cluster[_ci] = _shrunk
+                    _shaved += 1
+                    if _rescued:
+                        _rescued_clusters.add(_ci)
+            if _shaved:
+                feedback.pushInfo(
+                    f"Growth: {_shaved} polygon(s) pulled in by {GROWTH_VISUAL_GAP_M:g} m "
+                    "so adjacent serving areas stay apart instead of sharing a border.")
+            _release_memory("the final separation gap", feedback)
+
+        # ---- Phase H: SEPARATION AUDIT — prove the gap, do not assume it ----
+        # Phase G pulls every polygon in by GROWTH_VISUAL_GAP_M, but a member that
+        # sits closer to the border than that keeps a rescue square so no premise
+        # is ever left outside. That square is clipped to the pre-shrink polygon,
+        # so it can reach back to the old shared line and two neighbours can end up
+        # closer than the gap. Instead of asserting separation, measure it: every
+        # polygon carries the distance to its nearest neighbour (MIN_GAP_M, capped
+        # at GROWTH_GAP_PROBE_M, so the maximum reads as "at least") and that
+        # neighbour's id (GAP_TO). A pair closer than the gap where NEITHER side
+        # was rescued is a real defect: REVIEW=1, WHY=GAP. A pair explained by a
+        # rescued member is reported in the log and not flagged.
+        # POLYGON_IDs are assigned first so a polygon can name its neighbour.
+        _next_serial = serial
+        for _ci in emit_order:
+            _g = geom_of_cluster.get(_ci)
+            if _g is None or _g.isEmpty() or not clusters[_ci]["members"]:
+                continue
+            poly_id_of_cluster.setdefault(_ci, "POLY%05d" % _next_serial)
+            _next_serial += 1
+
+        gap_of, gap_to_of = {}, {}
+        _unexplained_gap = 0
+        _worst_gap = None
+        _live_polys = [(ci, geom_of_cluster.get(ci)) for ci in emit_order]
+        _live_polys = [(ci, g) for ci, g in _live_polys
+                       if g is not None and not g.isEmpty() and clusters[ci]["members"]]
+        if len(_live_polys) > 1:
+            _gidx = QgsSpatialIndex()
+            for _ci, _g in _live_polys:
+                _gf = QgsFeature(_ci)
+                _gf.setGeometry(QgsGeometry(_g))
+                _gidx.addFeature(_gf)
+            _probe = max(GROWTH_GAP_PROBE_M, GROWTH_VISUAL_GAP_M * 4.0)
+            for _ci, _g in _live_polys:
+                _bb = _g.boundingBox()
+                _rect = QgsRectangle(_bb.xMinimum() - _probe, _bb.yMinimum() - _probe,
+                                     _bb.xMaximum() + _probe, _bb.yMaximum() + _probe)
+                _best_d, _best_j = _probe, None
+                for _nj in _gidx.intersects(_rect):
+                    if _nj == _ci:
+                        continue
+                    _ng = geom_of_cluster.get(_nj)
+                    if _ng is None or _ng.isEmpty():
+                        continue
+                    _d = float(_g.distance(_ng))
+                    if _d < _best_d:
+                        _best_d, _best_j = _d, _nj
+                gap_of[_ci] = round(min(_best_d, _probe), 2)
+                gap_to_of[_ci] = (poly_id_of_cluster.get(_best_j, "")
+                                  if _best_j is not None else "")
+                if _best_j is not None and _best_d < GROWTH_VISUAL_GAP_M - 1e-6:
+                    if _ci in _rescued_clusters or _best_j in _rescued_clusters:
+                        continue                       # a rescued member owns the contact
+                    _unexplained_gap += 1
+                    _flag(_ci, REVIEW_GAP)
+                    if _worst_gap is None or _best_d < _worst_gap[0]:
+                        _worst_gap = (_best_d, _ci, _best_j)
+            if _unexplained_gap and _worst_gap is not None:
+                feedback.pushWarning(
+                    f"Growth: gap audit — {_unexplained_gap} polygon(s) sit closer than "
+                    f"{GROWTH_VISUAL_GAP_M:g} m to a neighbour with no rescued member to "
+                    f"explain it (worst {_worst_gap[0]:.2f} m between "
+                    f"{poly_id_of_cluster.get(_worst_gap[1], '?')} and "
+                    f"{poly_id_of_cluster.get(_worst_gap[2], '?')}); REVIEW=1, WHY=GAP.")
+            elif gap_of:
+                _close = sum(1 for v in gap_of.values()
+                             if v < GROWTH_VISUAL_GAP_M - 1e-6)
+                feedback.pushInfo(
+                    f"Growth: gap audit — {len(gap_of)} polygon(s), min gap "
+                    f"{min(gap_of.values()):.2f} m; "
+                    + (f"{_close} pair(s) closer than {GROWTH_VISUAL_GAP_M:g} m, every one "
+                       "explained by a rescued edge member." if _close else
+                       "no pair closer than the gap."))
+
         # ---- EMIT the finalized polygons ----
         for ci in emit_order:
             geom = geom_of_cluster.get(ci)
@@ -2529,12 +3305,17 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                 continue
             cl = clusters[ci]
             member_pts = [pts[m] for m in cl["members"]]
-            review = review_of.get(ci, False) or len(cl["members"]) < 3 or cl["hh"] < min_hh
+            review = (review_of.get(ci, False) or bool(cl["review"])
+                      or len(cl["members"]) < 3 or cl["hh"] < min_hh)
+            if len(cl["members"]) < 3 or cl["hh"] < min_hh:
+                review_why[ci].add(REVIEW_TINY)
+            if review and not review_why.get(ci):
+                review_why[ci].add(REVIEW_OTHER)
 
             out = QgsFeature(fields_out)
             out.setGeometry(geom)
-            poly_id = f"POLY{serial:05d}"
-            serial += 1
+            poly_id = poly_id_of_cluster.get(ci) or ("POLY%05d" % serial)
+            serial = max(serial, int(poly_id[4:]) + 1)
             poly_id_of_cluster[ci] = poly_id
 
             cps = geom.pointOnSurface()
@@ -2572,6 +3353,9 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
                 ("SPL_64", counts.get(64, 0)),
                 ("NO_ACCESS", no_access),
                 ("REVIEW", 1 if review else 0),
+                ("REVIEW_WHY", ",".join(sorted(review_why.get(ci, ())))),
+                ("MIN_GAP_M", gap_of.get(ci, 0.0)),
+                ("GAP_TO", gap_to_of.get(ci, "")),
             ]:
                 if k in names:
                     out[k] = v

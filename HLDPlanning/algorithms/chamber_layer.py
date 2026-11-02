@@ -139,6 +139,17 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
         "DHH": ("Distribution Handhole", "600x600 mm"),
         "MH":  ("Manhole",               "1200x1200 mm"),
     }
+    # A PDP's enclosure follows its splitter plan instead of a fixed type. One
+    # 1:64 module plus its splice tray fits a distribution handhole; two or
+    # three modules need a walk-in manhole; four or more need a manhole plus an
+    # extension bay for the modules and trays. The module count comes from the
+    # PDP layer (SPLIT_CNT, planned by the polygon stage), so a 4×1:64 area no
+    # longer gets the same 600x600 box as a 1×1:64 one.
+    PDP_ENCLOSURE_BY_MODULES = (
+        (1,  "DHH", "600x600 mm"),
+        (3,  "MH",  "1200x1200 mm"),
+        (99, "MH",  "1200x1200 mm + 600x600 mm extension bay"),
+    )
     # Type per placement reason:
     #   PDP (splitter install + F2D) → DHH; HDD entry/exit → DHH;
     #   feeder-side branching junctions → MH; distribution/drop access,
@@ -441,6 +452,14 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
                     bk = list(kept[bid])
                     tag = ("PDP:" + str(equip)) if equip else "PDP"
                     bk[4] = (str(bk[4]) + ("; " if bk[4] else "") + tag)
+                    # The pit becomes the splitter location, so it carries the
+                    # PDP's splitter plan even though its civil type is the pit's.
+                    while len(bk) < 10:
+                        bk.append(0)
+                    if len(cand) > 8 and cand[8]:
+                        bk[8] = cand[8]
+                    if len(cand) > 9 and cand[9]:
+                        bk[9] = cand[9]
                     kept[bid] = tuple(bk)
                     merged_splitter += 1
                 break
@@ -933,7 +952,7 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
                         candidates.append((
                             px, py, 3, "Chamber", pid, 999,
                             self.MIN_STRUCTURE_SEPARATION_M,
-                            "Splitter/F2D (PDP)"))
+                            "Splitter/F2D (PDP)", 0, 0))
                 elif ntype == "BEND":
                     candidates.append((px, py, 2, "Manhole", "", 1,
                                        self.BEND_SPACING_M, "Designer bend"))
@@ -949,6 +968,19 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
         # Rule 1 + 3 — Chamber at every PDP (splitter location; feeder and
         # distribution meet there, so it doubles as the F2D transition point).
         if pdp_lyr is not None:
+            # The splitter plan decides the enclosure: read the module count (and
+            # the ports it provides) off the PDP layer so the civil design can
+            # size the structure to the equipment it actually houses.
+            f_mod = None
+            for nm in ("SPLIT_CNT", "SPLITTER_MODULE_COUNT"):
+                if pdp_lyr.fields().indexOf(nm) >= 0:
+                    f_mod = nm
+                    break
+            f_ports = None
+            for nm in ("SPL_PORTS", "SPLITTER_TOTAL_PORTS"):
+                if pdp_lyr.fields().indexOf(nm) >= 0:
+                    f_ports = nm
+                    break
             for f in pdp_lyr.getFeatures():
                 g = f.geometry()
                 if g is None or g.isEmpty():
@@ -960,8 +992,21 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
                 pid = ""
                 if f.fields().indexOf("PDP_ID") >= 0:
                     pid = str(f["PDP_ID"] or "")
+                modules = 0
+                if f_mod:
+                    try:
+                        modules = int(float(f[f_mod] or 0))
+                    except Exception:
+                        modules = 0
+                split_ports = 0
+                if f_ports:
+                    try:
+                        split_ports = int(float(f[f_ports] or 0))
+                    except Exception:
+                        split_ports = 0
                 candidates.append((pt.x(), pt.y(), 3, "Chamber", pid, 999,
-                                   self.MIN_STRUCTURE_SEPARATION_M, "Splitter/F2D (PDP)"))
+                                   self.MIN_STRUCTURE_SEPARATION_M, "Splitter/F2D (PDP)",
+                                   modules, split_ports))
         _lap("splitter locations (rule 1)")
 
         # Rule 7 — HDD entry/exit pits at used drill crossings.
@@ -1302,6 +1347,7 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
 
         counters = {"HH": 0, "DHH": 0, "MH": 0}
         reason_counts = {}
+        pdp_enclosure = {}      # "N module(s) → CODE" -> count
         written = 0
         _say(f"output: writing {len(kept)} structure(s)")
         for _i, cand in enumerate(kept, 1):
@@ -1314,19 +1360,34 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
                      f"{time.time() - t_stage:.1f}s")
             x, y, prio, ctype, equip, weight = cand[:6]
             reason = cand[7] if len(cand) > 7 else ""
+            modules = int(cand[8]) if len(cand) > 8 and cand[8] else 0
+            split_ports = int(cand[9]) if len(cand) > 9 and cand[9] else 0
             # ── Standard catalogue: HH / DHH / MH (fixed sizes) ──
             code = self.REASON_TYPE.get(reason, "HH")
             if reason in ("Branching junction", "Designer junction") and prio < 2:
                 code = "HH"  # distribution-level junctions stay handholes
+            # A splitter location is sized by the modules it houses, never by the
+            # one-size-fits-all PDP default — a 4×1:64 plan must not ship as a
+            # 600x600 handhole.
+            pdp_size = None
+            if reason == "Splitter/F2D (PDP)" and modules > 0:
+                for _cap, _code, _size in self.PDP_ENCLOSURE_BY_MODULES:
+                    if modules <= _cap:
+                        code, pdp_size = _code, _size
+                        break
             subtype = ("Bore" if reason in ("HDD pit", "Designer HDD pit")
                        else self.SUBTYPE_BY_CODE.get(code, "Handhole"))
             type_name, size_str = self.CHAMBER_CATALOGUE[code]
             counters[code] += 1
             reason_counts[reason] = reason_counts.get(reason, 0) + 1
+            if reason == "Splitter/F2D (PDP)" and modules > 0:
+                _key = f"{modules} module(s) → {code}"
+                pdp_enclosure[_key] = pdp_enclosure.get(_key, 0) + 1
             struct_id = f"{code}-{counters[code]:04d}"
             conn = self._count_ducts_near(duct_index, duct_geoms, x, y, self.CONN_RADIUS_M)
-            # Fixed catalogue sizes — no Small/Medium/Large buckets.
-            size = size_str
+            # Fixed catalogue sizes — no Small/Medium/Large buckets. A PDP's size
+            # is the splitter-plan size when the plan is known.
+            size = pdp_size or size_str
 
             feat = QgsFeature(out_fields)
             feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(x, y)))
@@ -1342,6 +1403,8 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
                 self.TRENCH_JOIN_M)
             feat[COMMON_FIELDS.CONN_DUCTS] = conn
             feat[COMMON_FIELDS.SIZE] = size
+            feat[COMMON_FIELDS.SPLIT_MODULES] = modules
+            feat[COMMON_FIELDS.SPLIT_PORTS] = split_ports
             feat[COMMON_FIELDS.EQUIPMENT] = (equip or "") + (("; " + reason) if reason else "")
             feat[COMMON_FIELDS.CAPACITY_USED] = 0
             feat[COMMON_FIELDS.CAPACITY_TOTAL] = conn
@@ -1395,6 +1458,10 @@ class ChamberLayerAlgorithm(QgsProcessingAlgorithm):
         feedback.pushInfo(self.tr(
             f"Chamber layer: {written} planned structures "
             f"(MH: {counters['MH']}, DHH: {counters['DHH']}, HH: {counters['HH']}).\n"
+            f"  Splitter enclosures: "
+            + (", ".join(f"{v} × {k}" for k, v in sorted(pdp_enclosure.items()))
+               if pdp_enclosure else "no PDP carried a splitter plan (SPLIT_CNT empty)")
+            + ".\n"
             f"  Placement reasons: {rc or 'none'}\n"
             f"  Structural nodes: {node_count} designer node(s) offered as "
             f"candidates (the duct/trench heuristics fill whatever the designer "

@@ -60,6 +60,8 @@ class COMMON_FIELDS:
     REASON = "REASON"                  # why this structure exists (rule that placed it)
     CONN_DUCTS = "CONN_DUCTS"
     SIZE = "SIZE"
+    SPLIT_MODULES = "SPLIT_MODULES"     # splitter modules this structure houses
+    SPLIT_PORTS = "SPLIT_PORTS"         # output ports those modules provide
     EQUIPMENT = "EQUIPMENT"             # associated equipment id (PDP/FAT)
     POLE_ID = "POLE_ID"                 # PL-0001
     POLE_TYPE = "POLE_TYPE"             # Utility | Telecom
@@ -117,6 +119,8 @@ THIN_PROFILES = {
         COMMON_FIELDS.PARENT_TRENCH,
         COMMON_FIELDS.CONN_DUCTS,
         COMMON_FIELDS.SIZE,
+        COMMON_FIELDS.SPLIT_MODULES,
+        COMMON_FIELDS.SPLIT_PORTS,
         COMMON_FIELDS.EQUIPMENT,
         COMMON_FIELDS.CAPACITY_USED,
         COMMON_FIELDS.CAPACITY_TOTAL,

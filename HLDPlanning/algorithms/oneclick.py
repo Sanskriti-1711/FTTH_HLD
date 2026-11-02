@@ -472,13 +472,20 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             self.tr("02 Polygon — Planning-first (force seeded-growth builder)"),
             defaultValue=False, optional=True
         ))
+        # 64-192 homes per polygon is the working band, not 32-128: on the
+        # Mariendorf 12105 layer (7,465 homes) the old band emitted 77 polygons
+        # with 2 over the cap and 8 flagged REVIEW, while 64-192 emits 50 with
+        # none over and none flagged — same premises, same 40-57-home splitter
+        # utilisation per 1:64, but 35 % fewer PDPs. The floor matters as much as
+        # the cap: at 32 a polygon could be a single 40-home block that no merge
+        # could legally absorb, so the count rose without serving anyone better.
         self.addParameter(QgsProcessingParameterNumber(
             self.P_POLY_MIN_HH, self.tr("02 Polygon — Growth: minimum homes per polygon"),
-            type=QgsProcessingParameterNumber.Integer, defaultValue=32, minValue=1
+            type=QgsProcessingParameterNumber.Integer, defaultValue=64, minValue=1
         ))
         self.addParameter(QgsProcessingParameterNumber(
             self.P_POLY_MAX_HH, self.tr("02 Polygon — Growth: maximum homes per polygon"),
-            type=QgsProcessingParameterNumber.Integer, defaultValue=128, minValue=1
+            type=QgsProcessingParameterNumber.Integer, defaultValue=192, minValue=1
         ))
         self.addParameter(QgsProcessingParameterNumber(
             self.P_POLY_NEIGH, self.tr("02 Polygon — Growth: neighbour distance rule [m]"),
