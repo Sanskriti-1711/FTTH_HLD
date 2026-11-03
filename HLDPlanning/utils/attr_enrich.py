@@ -4976,7 +4976,47 @@ class _SegmentGrid:
 
 
 def extend_feeder_ducts_along_cables(out_dir, feedback=None):
-    """Lay a feeder duct under every metre of feeder cable that has none.
+    """Lay a feeder duct under every metre of feeder cable that has none."""
+    return extend_ducts_along_cables(out_dir, feedback, tier="Feeder")
+
+
+def extend_distribution_ducts_along_cables(out_dir, feedback=None):
+    """Lay a distribution duct under every metre of distribution trunk cable.
+
+    Same rule as the feeder pass (D5: a duct contains the cable named for it),
+    and the same shape of defect. Distribution ducts come from the EMBEDDED
+    algorithm and `_rebase_distribution_output`, not from
+    `duct_layer._build_route_ducts` -- route-based distribution is disabled
+    (`USE_ROUTE_BASED_DISTRIBUTION = False`), so the containment union inside
+    that function never runs for this tier. Measured on run e31739ed
+    (2026-11-03, Berlin 12105 section, v1.7.60): 49.3 % of the 11,252 m of
+    distribution trunk cable lay within 5 cm of a distribution duct, while the
+    drop legs were 100 % on Drop_Ducts and the feeder cable 99.1 % on its own
+    duct -- the two tiers that DO go through the route builder.
+
+    Only the trunk is filled: a Drop/Garden cable belongs to Drop_Ducts, and
+    clubbing it in would pull a garden leg into the street duct.
+    """
+    return extend_ducts_along_cables(out_dir, feedback, tier="Distribution")
+
+
+# The two published tiers this pass knows how to fill. Each entry is
+# (duct layer, cable layer, cable types it owns, default catalogue profile).
+# The defaults only apply to a duct layer that states no profile of its own,
+# which cannot happen when it has ducts at all -- the first row's profile is
+# always adopted below -- so they are a last resort, not a design decision.
+_DUCT_FILL_TIERS = {
+    "Feeder": ("Feeder_Ducts.gpkg", "Feeder_Cable.gpkg", ("Feeder",),
+               {"DUCT_TYPE": _FEEDER_DUCT_TYPE, "WAYS": _FEEDER_DUCT_WAYS,
+                "DIAMETER_MM": _FEEDER_DUCT_DIAMETER_MM,
+                "color": _FEEDER_DUCT_COLOR}),
+    "Distribution": ("Distribution_Ducts.gpkg", "Distribution_Cable.gpkg",
+                     ("Distribution",), None),
+}
+
+
+def extend_ducts_along_cables(out_dir, feedback=None, tier="Feeder"):
+    """Lay a duct of ``tier`` under every metre of that tier's cable that has none.
 
     Returns the number of duct rows added. Reads the FINAL published cable and
     duct layers, so it must run after the chamber segmentation and the chamber
@@ -4986,8 +5026,12 @@ def extend_feeder_ducts_along_cables(out_dir, feedback=None):
     """
     if not out_dir or not os.path.isdir(out_dir):
         return 0
-    duct_path = os.path.join(out_dir, "Feeder_Ducts.gpkg")
-    cable_path = os.path.join(out_dir, "Feeder_Cable.gpkg")
+    spec = _DUCT_FILL_TIERS.get(tier)
+    if spec is None:
+        raise ValueError(f"unknown duct tier: {tier}")
+    duct_name, cable_name, cable_types, _defaults = spec
+    duct_path = os.path.join(out_dir, duct_name)
+    cable_path = os.path.join(out_dir, cable_name)
     if not (os.path.isfile(duct_path) and os.path.isfile(cable_path)):
         return 0
 
@@ -5003,6 +5047,11 @@ def extend_feeder_ducts_along_cables(out_dir, feedback=None):
     duct_coords = []
     profile = {"DUCT_TYPE": _FEEDER_DUCT_TYPE, "WAYS": _FEEDER_DUCT_WAYS,
                "DIAMETER_MM": _FEEDER_DUCT_DIAMETER_MM, "color": _FEEDER_DUCT_COLOR}
+    # A tier with no feeder profile of its own states its catalogue in the rows
+    # it already published; until one is read, keep only what it must have.
+    if _defaults is None:
+        profile = {"DUCT_TYPE": "2-Way HDPE", "WAYS": 2,
+                   "DIAMETER_MM": 50, "color": "#1e88e5"}
     # The tier's own catalogue profile, taken from the first published row that
     # states one — the new rows must read like the rows beside them.
     profiled = False
@@ -5037,13 +5086,13 @@ def extend_feeder_ducts_along_cables(out_dir, feedback=None):
         for f in clyr:
             if fld_ctype >= 0:
                 ctype = str(f.GetField(fld_ctype) or "").strip()
-                if ctype and ctype != "Feeder":
+                if ctype and ctype not in cable_types:
                     continue
             g = f.GetGeometryRef()
             if g is None or g.IsEmpty():
                 continue
             cables.append(({
-                "label": _cable_identity_label(clyr, f, "Feeder"),
+                "label": _cable_identity_label(clyr, f, tier),
                 "pdp": str(_get(clyr, f, "PDP_IDS") or _get(clyr, f, "pdp_ids") or ""),
                 "poly": str(_get(clyr, f, "POLYGON_ID") or _get(clyr, f, "polygon_id") or ""),
                 "mfg": str(_get(clyr, f, "MFG_ID") or _get(clyr, f, "mfg_id") or ""),
@@ -5176,8 +5225,8 @@ def extend_feeder_ducts_along_cables(out_dir, feedback=None):
     if not pieces:
         if feedback:
             feedback.pushInfo(
-                "  [duct] Feeder ducts: every feeder cable already rides a duct "
-                "(%d cable(s) checked)." % len(cables))
+                "  [duct] %s ducts: every %s cable already rides a duct "
+                "(%d cable(s) checked)." % (tier, tier.lower(), len(cables)))
         return 0
 
     # ── Cut each gap at the chambers, then write it as duct rows (D3/D11) ──
@@ -5303,11 +5352,12 @@ def extend_feeder_ducts_along_cables(out_dir, feedback=None):
 
     if feedback:
         feedback.pushInfo(
-            "  [duct] Feeder ducts: laid %s m of duct under feeder cable that had "
-            "none — %d piece(s) over %d of %d cable(s), 4-Way HDPE, cut at the "
-            "chambers. Every feeder cable now rides a duct."
-            % (format(round(uncovered_m, 1), ","), added, len(cables_filled),
-               len(cables)))
+            "  [duct] %s ducts: laid %s m of duct under %s cable that had "
+            "none — %d piece(s) over %d of %d cable(s), %s, cut at the "
+            "chambers. Every %s cable now rides a duct."
+            % (tier, format(round(uncovered_m, 1), ","), tier.lower(), added,
+               len(cables_filled), len(cables),
+               str(profile.get("DUCT_TYPE") or _FEEDER_DUCT_TYPE), tier.lower()))
     return added
 
 
@@ -6288,6 +6338,17 @@ def enrich_all(out_dir, feedback=None, roads_lyr=None):
         if feedback:
             feedback.pushWarning(
                 f"  [duct] Feeder cable coverage skipped: {exc}")
+    # ...and the same rule for the DISTRIBUTION trunk. Its ducts come from the
+    # embedded algorithm instead of the route builder, so nothing else enforces
+    # that a trunk cable lies in a distribution duct: on run e31739ed (v1.7.60)
+    # only 49.3 % of it did, while the tiers that DO use the route builder read
+    # 100 % (drop) and 99.1 % (feeder). Additive, exactly like the feeder pass.
+    try:
+        n += extend_distribution_ducts_along_cables(out_dir, feedback)
+    except Exception as exc:
+        if feedback:
+            feedback.pushWarning(
+                f"  [duct] Distribution cable coverage skipped: {exc}")
     # Every run states whether the ducts actually flow: one feeder chain from
     # the MFG to every PDP, and couplers sitting on the distribution duct.
     # A verification pass must never fail the run — nor hide the passes after
