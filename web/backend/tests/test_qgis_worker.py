@@ -777,6 +777,73 @@ def test_a_second_replacement_still_fails_the_run(tmp_path, monkeypatch):
     assert "lost this run" in str(exc.value)
 
 
+def test_a_rate_limited_worker_is_waited_out_not_declared_lost(tmp_path, monkeypatch):
+    """Run ae51a062 was failed after 90 s of HTTP 429 with its design running.
+
+    The 429 comes from the platform edge, not the worker: qgis_process keeps
+    designing, so the engine backs off and keeps the run instead of failing it.
+    """
+    project = tmp_path / "proj1"
+    project.mkdir()
+    polls = {"n": 0}
+
+    def fake_call(path, data=None, method="GET", timeout=120):
+        if path == "/health":
+            return b'{"state": "ok"}'
+        if method in ("PUT", "POST"):
+            return b"{}"
+        if path.endswith("/result"):
+            return b""
+        polls["n"] += 1
+        if polls["n"] == 1:
+            return b'{"state": "running", "lines": ["[design] working"], "offset": 10}'
+        if polls["n"] <= 4:
+            raise urllib.error.HTTPError(path, 429, "Too Many Requests", None, None)
+        return b'{"state": "done", "exit_code": 0, "lines": [], "offset": 10}'
+
+    main._task("proj1").update({"status": "running"})
+    monkeypatch.setattr(main, "QGIS_WORKER_URL", "http://worker")
+    monkeypatch.setattr(main, "_worker_call", fake_call)
+    monkeypatch.setattr(main, "QGIS_WORKER_POLL_S", 0.01)
+    monkeypatch.setattr(main, "QGIS_WORKER_RETRY_S", 0.01)
+    monkeypatch.setattr(main, "QGIS_WORKER_RATE_LIMIT_S", 30)
+    monkeypatch.setattr(main, "_persist_project_state", lambda *a, **k: None)
+    monkeypatch.setattr(main, "_extract_into", lambda body, out: [])
+
+    written = main._run_command_remote("proj1", ["qgis_process", "run", "x"], project)
+
+    assert written == []
+    # The job was never lost, so it is never restarted: one submission only.
+    assert polls["n"] >= 5
+
+
+def test_a_worker_that_keeps_rate_limiting_eventually_fails_the_run(tmp_path, monkeypatch):
+    project = tmp_path / "proj1"
+    project.mkdir()
+
+    def fake_call(path, data=None, method="GET", timeout=120):
+        if path == "/health":
+            return b'{"state": "ok"}'
+        if method in ("PUT", "POST"):
+            return b"{}"
+        if path.endswith("/result"):
+            return b""
+        raise urllib.error.HTTPError(path, 429, "Too Many Requests", None, None)
+
+    main._task("proj1").update({"status": "running"})
+    monkeypatch.setattr(main, "QGIS_WORKER_URL", "http://worker")
+    monkeypatch.setattr(main, "_worker_call", fake_call)
+    monkeypatch.setattr(main, "QGIS_WORKER_POLL_S", 0.01)
+    monkeypatch.setattr(main, "QGIS_WORKER_RETRY_S", 0.01)
+    monkeypatch.setattr(main, "QGIS_WORKER_RATE_LIMIT_S", 0.3)
+    monkeypatch.setattr(main, "_persist_project_state", lambda *a, **k: None)
+
+    with pytest.raises(RuntimeError) as exc:
+        main._run_command_remote("proj1", ["qgis_process", "run", "x"], project)
+
+    assert "refusing polls" in str(exc.value)
+
+
 def test_the_stop_endpoint_kills_the_worker_job(monkeypatch):
     killed = []
 

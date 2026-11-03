@@ -272,6 +272,12 @@ QGIS_WORKER_MAX_RETRY_S = float(os.environ.get("FTTH_QGIS_WORKER_MAX_RETRY", "30
 # a third attempt, and each attempt is a whole design.
 QGIS_WORKER_RESTART_ATTEMPTS = max(
     1, int(os.environ.get("FTTH_QGIS_WORKER_RESTART_ATTEMPTS", "2")))
+# How long repeated HTTP 429 from the worker's edge is tolerated before the run
+# is failed. A 429 is the EDGE refusing our poll, not the worker: qgis_process
+# keeps designing, so this window is deliberately much longer than the
+# lost-contact one. Run ae51a062 (2026-11-03) was failed 25 minutes in, at
+# "Object Layer 0 %", after 90 s of 429 while its design was still running.
+QGIS_WORKER_RATE_LIMIT_S = float(os.environ.get("FTTH_QGIS_WORKER_RATE_LIMIT", "900"))
 
 # One wake at a time. The run accepted earlier starts the wait and the job start
 # joins its flight; two independent probe loops doubled the request rate.
@@ -1301,6 +1307,10 @@ def _run_command_remote_job(project_id: str, cmd: Union[List[str], str],
 
     offset = 0
     lost_since = 0.0
+    # Consecutive rate-limited polls (drives the backoff) and when the blind
+    # stretch began, so the stall clock does not run while the job is invisible.
+    rate_strikes = 0
+    blind_since = 0.0
     # When the job last PRODUCED anything. A wedged qgis_process keeps its job
     # in "running" for ever, so this -- not the job state -- is the only
     # evidence that the run is still doing work.
@@ -1332,11 +1342,34 @@ def _run_command_remote_job(project_id: str, cmd: Union[List[str], str],
         try:
             batch = json.loads(_worker_call(f"{job}/log?offset={offset}", timeout=120) or b"{}")
             lost_since = 0.0
+            rate_strikes = 0
+            if blind_since:
+                # The job could not be seen while the edge refused polls, so
+                # that stretch is not silence from qgis_process: shift the
+                # stall clock forward by exactly the blind time.
+                last_output += time.time() - blind_since
+                blind_since = 0.0
         except (urllib.error.URLError, OSError, ValueError) as exc:
             # A worker restart mid-run is a lost job, not a hang, and its job
             # store says "unknown" on the next successful poll (below).  This
             # branch is for contact lost for longer than a platform hiccup.
             lost_since = lost_since or time.time()
+            # A 429 is the platform EDGE rate-limiting our polls. The worker has
+            # not gone anywhere and qgis_process is still designing, so it must
+            # not be read as a lost instance -- and the cure is fewer requests,
+            # not faster ones.
+            if getattr(exc, "code", None) == 429:
+                rate_strikes += 1
+                blind_since = blind_since or time.time()
+                if time.time() - lost_since >= QGIS_WORKER_RATE_LIMIT_S:
+                    raise RuntimeError(
+                        f"The QGIS worker's edge kept refusing polls for "
+                        f"{int(QGIS_WORKER_RATE_LIMIT_S)} s (HTTP 429): {exc}"
+                    ) from exc
+                delay = min(QGIS_WORKER_MAX_RETRY_S,
+                            QGIS_WORKER_RETRY_S * (2 ** min(rate_strikes, 4)))
+                time.sleep(max(QGIS_WORKER_POLL_S, delay))
+                continue
             if time.time() - lost_since >= QGIS_WORKER_MISS_S:
                 raise RuntimeError(
                     f"The QGIS worker stopped answering during this run for "
