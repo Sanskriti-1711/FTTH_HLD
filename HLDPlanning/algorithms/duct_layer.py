@@ -3436,6 +3436,10 @@ class DuctLayer(QgsProcessingAlgorithm):
         made = 0
         flag_cnt = 0
         uncovered = 0        # pseudo points no duct reached (see the pass below)
+        # Cable metres the corridor selection would have left with no duct
+        # under them (see the containment union in the bin loop).
+        contained_added = 0.0
+        contained_bins = 0
         for members in groups.values():
             # A corridor may carry more cables than the duct has ways: emit
             # several {ways}-way ducts along the same route, keeping cables
@@ -3468,6 +3472,9 @@ class DuctLayer(QgsProcessingAlgorithm):
                 ug = _uug(geoms)
                 if not ug or ug.isEmpty():
                     continue
+                # The cables this duct is built FROM.  Kept aside because every
+                # pass below may repoint `ug` at a different geometry.
+                cable_union = ug
                 # Distribution: strip the drop legs (footway → object) so they
                 # stay exclusively in the Drop_Ducts layer instead of being
                 # duplicated inside the distribution duct.
@@ -3515,6 +3522,30 @@ class DuctLayer(QgsProcessingAlgorithm):
                     # Drop_Ducts and must never extend a distribution duct.
                     ug = self._attach_taps(ug, tap_lyr, poly_set, tap_tol_m,
                                            feedback, corridor_lyr=corridor_lyr)
+                # ── A duct must CONTAIN the cables it is named for ────────
+                # A duct is derived from its cables, so it can never be
+                # shorter than them: _corridor_for selects trench SPANS, and
+                # every span that selection drops left cable with no duct
+                # under it.  Measured on run 0f2bc48d (2026-11-02, Lozells):
+                # 85.6 % of the distribution cable length sat within 5 cm of a
+                # duct, 57.9 % of the remainder was more than 10 m from any
+                # duct, and 108 of the 408 Distribution-tier trench spans
+                # carried less than half a duct.  Feeder and drop cables were
+                # already 99.8 % and 100 % on their ducts.  Uniting the cables
+                # back in makes containment hold by construction; the corridor
+                # still decides where the duct reaches beyond them (the drop
+                # taps), and the garden subtraction below still applies.
+                if cable_union is not None and not cable_union.isEmpty():
+                    try:
+                        short_of_cable = cable_union.difference(ug).length()
+                        merged = _uug([ug, cable_union])
+                        if merged is not None and not merged.isEmpty():
+                            ug = merged
+                            if short_of_cable > 0.5:
+                                contained_added += short_of_cable
+                                contained_bins += 1
+                    except Exception:
+                        pass
                 n_cab = len(cable_ids)
                 bins.append((ug, cable_ids, pdp_set, poly_set, n_cab))
                 if runs_sink is not None:
@@ -3738,6 +3769,12 @@ class DuctLayer(QgsProcessingAlgorithm):
             f"{len(bins)} duct feature(s) spanning a {corridor_len:,.1f} m "
             f"corridor, {agg_len:,.1f} m of duct material "
             f"({int(ways)} ways each, {agg_used} ways used).")
+        if contained_bins:
+            feedback.pushInfo(
+                f"  duct/cable containment: {contained_bins} duct(s) were "
+                f"shorter than their own cables and grew by "
+                f"{contained_added:,.1f} m so every cable runs through its "
+                f"duct (the corridor selection had dropped those spans).")
         if reuse_idx is not None:
             feedback.pushInfo(
                 f"  Brownfield: {reuse_counts['reused']} duct(s) wholly reuse an "
