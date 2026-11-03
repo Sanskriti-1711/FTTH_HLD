@@ -63,6 +63,16 @@ from ..utils.geom_utils import geom_str_from_wkb
 # hold any number of items; 30 s leaves the guard a 30x margin.
 _HEARTBEAT_S = 30.0
 
+# Above this many nodes in one 3 m cell, the cell is healed to CONNECTED rather
+# than complete: its pairs are then O(n) neighbours instead of O(n^2) tests. A
+# normal cell holds 1-3 nodes (a full ward averages 5), so this only fires on the
+# coincident-vertex clusters that made run b95f3713 crawl at 0.05 cells/s.
+_HEAL_DENSE_NODES = 256
+# How many candidates a dense cell's node may look at before giving up. Healing
+# needs ONE unjoined neighbour, not the closest one, so this bounds the dense
+# cell at O(n * HEAL_SCAN) whatever the cell holds.
+_HEAL_SCAN = 32
+
 # -------------------------------
 # Helpers for the wrapper
 # -------------------------------
@@ -905,6 +915,127 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
         return best[1]
 
     @staticmethod
+    def _heal_dense_cell(G, grp, heal_m):
+        """Connect a dense cell's nodes instead of completing them.
+
+        Every pair of nodes in one 3 m cell is a healing candidate, so a cell
+        holding n nodes costs n^2 distance tests. On a normal ward the cells are
+        sparse (measured here: 160,000 nodes / 31,500 cells heals in 6.4 s), but
+        a cluster of coincident vertices -- parallel duplicate rows, stacked
+        weld points -- puts thousands of them in ONE cell: measured 300 nodes
+        0.14 s, 1,200 3.8 s, 3,000 24 s. Run b95f3713 (2026-11-03) advanced 16
+        cells in 341 s while adding 20 links, i.e. those cells were thousands of
+        nodes that were already joined and the pass paid n^2 to find out.
+
+        Completing such a cell adds nothing the design can use: every one of
+        those edges is a sub-3 m link between vertices that already share a
+        component. Healing needs the cell CONNECTED, not complete, so each node
+        takes one edge to its nearest neighbour it is not already joined to. The
+        cell ends up one component either way; what goes away is the n^2 sweep.
+        """
+        sub = heal_m / 4.0
+        grid = _dd(list)
+        for p in grp:
+            grid[(int(p[0] // sub), int(p[1] // sub))].append(p)
+        added = 0
+        for a in grp:
+            ax, ay = a
+            cx, cy = int(ax // sub), int(ay // sub)
+            adj = G.adj[a]
+            best = None
+            # Expanding rings around this node's sub-cell. The scan is CAPPED:
+            # a cluster can be smaller than one sub-cell, so a ring is not a
+            # neighbourhood and walking all of it would be the same n^2 again
+            # (measured on 2,500 coincident nodes: 5.0 s uncapped, and the cell
+            # has nothing unjoined to give). Any candidate within heal_m is a
+            # valid healing link, so the first one is taken rather than the
+            # nearest -- which is what makes this O(n) instead of O(n^2).
+            for ring in (0, 1):
+                for dx in range(-ring, ring + 1):
+                    for dy in range(-ring, ring + 1):
+                        if ring and max(abs(dx), abs(dy)) != ring:
+                            continue
+                        seen = 0
+                        for b in grid.get((cx + dx, cy + dy), ()):
+                            seen += 1
+                            if seen > _HEAL_SCAN:
+                                break
+                            if b == a or b in adj:
+                                continue
+                            d = _math.hypot(ax - b[0], ay - b[1])
+                            if 0 < d <= heal_m and (best is None or d < best[0]):
+                                best = (d, b)
+                if best is not None:
+                    break
+            if best is not None:
+                G.add_edge(a, best[1], weight=best[0], length=best[0], kind="link")
+                added += 1
+        # Each node looked only at its OWN sub-cell, so the cell is now a set of
+        # sub-cell stars, not one component (measured on a 20 x 20 lattice: 16
+        # components). Join the stars along a deterministic spine -- every node
+        # here is inside one heal_m cell, so a representative pair is a legal
+        # healing link -- until the cell is one component again.
+        reps = [grid[key][0] for key in sorted(grid)]
+        for i in range(1, len(reps)):
+            a = reps[i]
+            for j in range(i - 1, -1, -1):
+                b = reps[j]
+                d = _math.hypot(a[0] - b[0], a[1] - b[1])
+                if 0 < d <= heal_m:
+                    if not G.has_edge(a, b):
+                        G.add_edge(a, b, weight=d, length=d, kind="link")
+                        added += 1
+                    break
+        # A spine is not a proof: what the stars left unjoined is fixed here, on
+        # the cell's OWN subgraph, so the cell always ends as one component.
+        # Skipped when this pass added nothing -- then the cell's connectivity
+        # is exactly what it arrived with, and walking a large adjacency to
+        # confirm that is the only way this step could get expensive.
+        if not added:
+            return 0
+        here = set(grp)
+        anchor = grp[0]
+        seen = {anchor}
+        stack = [anchor]
+        first = []
+        while stack:
+            u = stack.pop()
+            first.append(u)
+            for v in G.adj[u]:
+                if v in here and v not in seen:
+                    seen.add(v)
+                    stack.append(v)
+        for node in grp:
+            if node in seen:
+                continue
+            comp = []
+            stack = [node]
+            seen.add(node)
+            while stack:
+                u = stack.pop()
+                comp.append(u)
+                for v in G.adj[u]:
+                    if v in here and v not in seen:
+                        seen.add(v)
+                        stack.append(v)
+            # One link from this component into the anchor component, taken
+            # from the candidates that are actually within heal_m.
+            best = None
+            for a in comp[:16]:
+                for b in first[:64]:
+                    d = _math.hypot(a[0] - b[0], a[1] - b[1])
+                    if 0 < d <= heal_m and (best is None or d < best[0]):
+                        best = (d, a, b)
+                if best is not None:
+                    break
+            if best is not None:
+                G.add_edge(best[1], best[2], weight=best[0], length=best[0],
+                           kind="link")
+                added += 1
+                first.extend(comp)
+        return added
+
+    @staticmethod
     def _heal_graph(G, heal_m, feedback=None):
         """Join nodes closer than ``heal_m`` that are not already connected.
 
@@ -929,7 +1060,14 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
         healed = 0
         seen = 0
         for (ix, iy), grp in buckets.items():
+            dense = len(grp) > _HEAL_DENSE_NODES
             for dx, dy in nbrs:
+                # The cell's OWN pairs are the quadratic part, and the only part
+                # a dense cell makes expensive: a neighbour-cell pass is
+                # len(grp) x len(other), which stays linear in the far side.
+                if dense and dx == 0 and dy == 0:
+                    healed += AlgDistributionDucts._heal_dense_cell(G, grp, heal_m)
+                    continue
                 other = buckets.get((ix+dx, iy+dy), [])
                 for a in grp:
                     for b in other:
