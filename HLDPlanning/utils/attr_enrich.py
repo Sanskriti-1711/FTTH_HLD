@@ -5361,6 +5361,141 @@ def extend_ducts_along_cables(out_dir, feedback=None, tier="Feeder"):
     return added
 
 
+# ── Cable ALIGNED onto its duct ─────────────────────────────────────────────
+# A cable that is drawn as a straight run between two chambers cuts the CHORD of
+# the duct's curve: its vertices sit on the duct (measured: within 0.5 cm) while
+# the segments between them bow up to 46 cm off it. On run 94b42c68 (2026-11-03,
+# v1.7.61) that chord was the whole of what a 5 cm coverage test still counted as
+# un-ducted -- 2.6 % of the distribution trunk, in 11 cables, every one of them
+# 5-10 cm off for its metres between vertices. Projecting the interior of each
+# chord onto the duct's own line closes it without inventing a duct or moving a
+# single original vertex.
+_ALIGN_STEP_M = 1.0   # how often a cable is sampled along its own line
+_ALIGN_M = 0.5        # a sample this close to the duct IS the duct, and is moved there
+
+
+def align_cables_to_their_ducts(out_dir, feedback=None, tier="Distribution"):
+    """Make each ``tier`` cable follow the line of the duct that covers it.
+
+    Returns the number of cables whose geometry changed. Runs after
+    `extend_ducts_along_cables` (which guarantees a duct exists under every
+    metre) and before `stamp_duct_occupancy`, so occupancy is measured against
+    the aligned geometry.
+
+    Only the interior is touched: the first and last vertex stay exactly where
+    they were, because they are the cable's connection to a chamber or a PDP and
+    moving one would measure the cable off its own structure.
+    """
+    if not out_dir or not os.path.isdir(out_dir):
+        return 0
+    spec = _DUCT_FILL_TIERS.get(tier)
+    if spec is None:
+        raise ValueError(f"unknown duct tier: {tier}")
+    duct_name, cable_name, cable_types, _defaults = spec
+    duct_path = os.path.join(out_dir, duct_name)
+    cable_path = os.path.join(out_dir, cable_name)
+    if not (os.path.isfile(duct_path) and os.path.isfile(cable_path)):
+        return 0
+
+    # ── The ducts, as segments in a grid (read-only, closed before the write) ──
+    grid = _SegmentGrid(cell_m=5.0)
+    try:
+        rds = ogr.Open(duct_path, 0)
+        rlyr = rds.GetLayer(0) if rds is not None else None
+    except Exception:
+        rlyr = None
+    if rlyr is None:
+        return 0
+    for f in rlyr:
+        for coords in _line_parts(f.GetGeometryRef()):
+            grid.add("", coords)
+    rlyr = None
+    rds = None
+
+    # ── Densify each cable, project what is already on the duct, write back ──
+    changed = 0
+    seen = 0
+    moved = 0
+    worst = 0.0
+    try:
+        cds = ogr.Open(cable_path, 1)
+        clyr = cds.GetLayer(0) if cds is not None else None
+    except Exception:
+        clyr = None
+    if clyr is None:
+        return 0
+    fld_ctype = clyr.GetLayerDefn().GetFieldIndex("CABLE_TYPE")
+    clyr.StartTransaction()
+    for f in clyr:
+        if fld_ctype >= 0:
+            ctype = str(f.GetField(fld_ctype) or "").strip()
+            if ctype and ctype not in cable_types:
+                continue
+        seen += 1
+        geom = f.GetGeometryRef()
+        parts = _line_parts(geom)
+        if not parts:
+            continue
+        new_parts = []
+        here = 0
+        for coords in parts:
+            out = [coords[0]]
+            for (ax, ay), (bx, by) in zip(coords, coords[1:]):
+                seg = math.hypot(bx - ax, by - ay)
+                n = max(1, int(math.ceil(seg / _ALIGN_STEP_M)))
+                for k in range(1, n + 1):
+                    if k == n:
+                        out.append((bx, by))     # an original vertex is never moved
+                        continue
+                    t = k / n
+                    px = ax + (bx - ax) * t
+                    py = ay + (by - ay) * t
+                    _key, d, near = grid._nearest((px, py))
+                    if near is not None and 0 < d <= _ALIGN_M:
+                        out.append(near)
+                        here += 1
+                        worst = max(worst, d)
+                    else:
+                        out.append((px, py))
+            new_parts.append(out)
+        if here == 0:
+            continue
+        if geom.GetGeometryName().upper().startswith("MULTI") or len(new_parts) > 1:
+            rebuilt = ogr.Geometry(ogr.wkbMultiLineString)
+            for pts in new_parts:
+                line = ogr.Geometry(ogr.wkbLineString)
+                for x, y in pts:
+                    line.AddPoint_2D(x, y)
+                rebuilt.AddGeometry(line)
+        else:
+            rebuilt = ogr.Geometry(ogr.wkbLineString)
+            for x, y in new_parts[0]:
+                rebuilt.AddPoint_2D(x, y)
+        f.SetGeometry(rebuilt)
+        if clyr.SetFeature(f) == 0:
+            changed += 1
+            moved += here
+    try:
+        clyr.CommitTransaction()
+    except Exception:
+        pass
+    clyr = None
+    cds = None
+
+    if feedback:
+        if changed:
+            feedback.pushInfo(
+                "  [duct] %s cables: %d of %d cable(s) aligned onto the duct that "
+                "carries them (%d interior point(s) moved, worst %.0f cm) — a cable "
+                "no longer cuts the chord off its own duct."
+                % (tier, changed, seen, moved, worst * 100.0))
+        else:
+            feedback.pushInfo(
+                "  [duct] %s cables: every one already follows its duct "
+                "(%d cable(s) checked)." % (tier, seen))
+    return changed
+
+
 # ── Cable → duct occupancy ───────────────────────────────────────────────────
 # The duct stage runs BEFORE the cable stage (trench → chambers → ducts →
 # cables), so a duct cannot know which cables will be laid in it: the code that
@@ -6349,6 +6484,17 @@ def enrich_all(out_dir, feedback=None, roads_lyr=None):
         if feedback:
             feedback.pushWarning(
                 f"  [duct] Distribution cable coverage skipped: {exc}")
+    # ...and then make the trunk FOLLOW that duct. The fill above guarantees a
+    # duct under every metre; what a 5 cm test still counted was the straight
+    # chord a cable draws between two vertices across a duct that curves. This
+    # is geometry-only (interior points are projected onto the duct line; the
+    # endpoints and every attribute stay as they are).
+    try:
+        align_cables_to_their_ducts(out_dir, feedback)
+    except Exception as exc:
+        if feedback:
+            feedback.pushWarning(
+                f"  [duct] Distribution cable alignment skipped: {exc}")
     # Every run states whether the ducts actually flow: one feeder chain from
     # the MFG to every PDP, and couplers sitting on the distribution duct.
     # A verification pass must never fail the run — nor hide the passes after

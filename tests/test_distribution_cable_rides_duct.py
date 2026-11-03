@@ -172,3 +172,73 @@ def test_a_second_pass_adds_nothing(tmp_path):
     rows = _rows(os.path.join(d, "Distribution_Ducts.gpkg"))
     assert extend_distribution_ducts_along_cables(d) == 0
     assert _rows(os.path.join(d, "Distribution_Ducts.gpkg")) == rows
+
+
+# ── Alignment: the cable follows the duct's line, not a chord across it ──────
+
+def _aligned_fixture(tmp_path):
+    """A duct that bows gently away and a cable drawn as one straight chord.
+
+    The cable's ENDS are on the duct and its middle is 30 cm off it — the shape
+    run 94b42c68 showed in the field (vertices within 0.5 cm of the duct, the
+    straight runs between them 5-46 cm off). The bow stays inside the 0.5 m
+    projection radius, which is the whole point: the cable is in that duct's
+    corridor, it just does not follow its line.
+    """
+    import math
+    dome = []
+    for i in range(41):
+        t = i / 40.0
+        dome.append((200.0 * t, 0.30 * math.sin(math.pi * t)))
+    cable = [(0.0, 0.0), (200.0, 0.0)]
+    return _fixture(tmp_path, [_duct_row(dome)], [_cable_row(cable)])
+
+
+def test_a_cable_chord_is_pulled_onto_the_duct_curve(tmp_path):
+    from HLDPlanning.utils.attr_enrich import align_cables_to_their_ducts
+
+    d = _aligned_fixture(tmp_path)
+    # Measured at 5 cm: the fill pass's own 0.5 m corridor already counted this
+    # cable as covered, which is exactly why the chord survived it.
+    assert _off_duct(d, 0.05) > 150.0, "fixture should start off the duct"
+
+    changed = align_cables_to_their_ducts(d)
+
+    assert changed == 1
+    assert _off_duct(d, 0.05) < 2.0, "the chord should now follow the duct"
+    # Interior points were ADDED, so the cable still runs between its two ends.
+    assert _geoms(os.path.join(d, "Distribution_Cable.gpkg"))[0].GetPointCount() > 100
+
+
+def test_alignment_never_moves_an_endpoint(tmp_path):
+    from HLDPlanning.utils.attr_enrich import align_cables_to_their_ducts
+
+    d = _aligned_fixture(tmp_path)
+    before = _geoms(os.path.join(d, "Distribution_Cable.gpkg"))[0]
+    align_cables_to_their_ducts(d)
+    after = _geoms(os.path.join(d, "Distribution_Cable.gpkg"))[0]
+    b, a = before.GetPoints(), after.GetPoints()
+    assert a[0] == b[0] and a[-1] == b[-1]
+
+
+def test_a_cable_already_following_its_duct_is_untouched(tmp_path):
+    from HLDPlanning.utils.attr_enrich import align_cables_to_their_ducts
+
+    coords = [(0.0, 0.0), (50.0, 0.0), (100.0, 0.0)]
+    d = _fixture(tmp_path, [_duct_row(coords)], [_cable_row(coords)])
+
+    assert align_cables_to_their_ducts(d) == 0
+
+
+def test_a_drop_cable_is_not_aligned(tmp_path):
+    from HLDPlanning.utils.attr_enrich import align_cables_to_their_ducts
+
+    d = _aligned_fixture(tmp_path)
+    ds = ogr.Open(os.path.join(d, "Distribution_Cable.gpkg"), 1)
+    lyr = ds.GetLayer(0)
+    f = lyr.GetNextFeature()
+    f.SetField("CABLE_TYPE", "Drop")
+    lyr.SetFeature(f)
+    ds = None
+
+    assert align_cables_to_their_ducts(d) == 0
