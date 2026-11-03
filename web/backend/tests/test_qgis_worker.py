@@ -698,6 +698,85 @@ def test_an_unseen_job_is_submitted_again_instead_of_failing(tmp_path, monkeypat
     assert posts["n"] >= 2
 
 
+def test_a_replaced_worker_restarts_the_design_instead_of_failing(tmp_path, monkeypatch):
+    """Run b95f3713 died 65 minutes in because Render replaced the instance.
+
+    The job is gone, so the design cannot be resumed -- but the inputs are on
+    the engine's disk, so it can be started again on the new instance instead of
+    being reported to the planner as a failure after an hour of work.
+    """
+    project = tmp_path / "proj1"
+    project.mkdir()
+    posts = {"n": 0}
+    polls = {"n": 0}
+
+    def fake_call(path, data=None, method="GET", timeout=120):
+        if path == "/health":
+            return b'{"state": "ok"}'
+        if method in ("PUT", "POST"):
+            if method == "POST":
+                posts["n"] += 1
+            return b"{}"
+        if path.endswith("/result"):
+            return b""
+        polls["n"] += 1
+        # First attempt: work happens, then the instance is replaced.
+        if polls["n"] == 1:
+            return b'{"state": "running", "lines": ["[design] working"], "offset": 10}'
+        if polls["n"] == 2:
+            return b'{"state": "unknown", "lines": [], "offset": 10}'
+        # Second attempt, on the new instance, runs to the end.
+        if polls["n"] == 3:
+            return b'{"state": "running", "lines": [], "offset": 10}'
+        return b'{"state": "done", "exit_code": 0, "lines": [], "offset": 10}'
+
+    task = main._task("proj1")
+    task.update({"status": "running"})
+    monkeypatch.setattr(main, "QGIS_WORKER_URL", "http://worker")
+    monkeypatch.setattr(main, "_worker_call", fake_call)
+    monkeypatch.setattr(main, "QGIS_WORKER_POLL_S", 0.02)
+    monkeypatch.setattr(main, "QGIS_WORKER_RETRY_S", 0.01)
+    monkeypatch.setattr(main, "_persist_project_state", lambda *a, **k: None)
+    monkeypatch.setattr(main, "_extract_into", lambda body, out: [])
+
+    written = main._run_command_remote("proj1", ["qgis_process", "run", "x"], project)
+
+    assert written == []
+    # Submitted twice: once that was lost, once on the replacement instance.
+    assert posts["n"] >= 2
+    assert any("started again" in m["text"] for m in task["messages"])
+
+
+def test_a_second_replacement_still_fails_the_run(tmp_path, monkeypatch):
+    """Bounded: a run interrupted again is reported, not restarted for ever."""
+    project = tmp_path / "proj1"
+    project.mkdir()
+    polls = {"n": 0}
+
+    def fake_call(path, data=None, method="GET", timeout=120):
+        if path == "/health":
+            return b'{"state": "ok"}'
+        if method in ("PUT", "POST"):
+            return b"{}"
+        polls["n"] += 1
+        if polls["n"] == 1:
+            return b'{"state": "running", "lines": ["[design] working"], "offset": 10}'
+        return b'{"state": "unknown", "lines": [], "offset": 10}'
+
+    main._task("proj1").update({"status": "running"})
+    monkeypatch.setattr(main, "QGIS_WORKER_URL", "http://worker")
+    monkeypatch.setattr(main, "_worker_call", fake_call)
+    monkeypatch.setattr(main, "QGIS_WORKER_POLL_S", 0.02)
+    monkeypatch.setattr(main, "QGIS_WORKER_RETRY_S", 0.01)
+    monkeypatch.setattr(main, "_persist_project_state", lambda *a, **k: None)
+    monkeypatch.setattr(main, "QGIS_WORKER_RESTART_ATTEMPTS", 2)
+
+    with pytest.raises(RuntimeError) as exc:
+        main._run_command_remote("proj1", ["qgis_process", "run", "x"], project)
+
+    assert "lost this run" in str(exc.value)
+
+
 def test_the_stop_endpoint_kills_the_worker_job(monkeypatch):
     killed = []
 

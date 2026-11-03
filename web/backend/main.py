@@ -264,6 +264,14 @@ QGIS_WORKER_READY_S = float(os.environ.get("FTTH_QGIS_WORKER_READY", "60"))
 # itself a plausible cause of the HTTP 429 that killed run e105cf50.
 QGIS_WORKER_RETRY_S = float(os.environ.get("FTTH_QGIS_WORKER_RETRY", "5"))
 QGIS_WORKER_MAX_RETRY_S = float(os.environ.get("FTTH_QGIS_WORKER_MAX_RETRY", "30"))
+# How many times a run is started over after the worker instance holding it was
+# replaced. The design cannot resume mid-stage -- qgis_process died with the
+# instance -- so a retry is a full re-run from the inputs on the engine's disk.
+# 2 means "one automatic restart, then tell the planner", which is the useful
+# shape here: a second interruption in the same run is not going to be cured by
+# a third attempt, and each attempt is a whole design.
+QGIS_WORKER_RESTART_ATTEMPTS = max(
+    1, int(os.environ.get("FTTH_QGIS_WORKER_RESTART_ATTEMPTS", "2")))
 
 # One wake at a time. The run accepted earlier starts the wait and the job start
 # joins its flight; two independent probe loops doubled the request rate.
@@ -1214,15 +1222,48 @@ def _cancel_worker_job(project_id: str) -> None:
     )
 
 
+class _WorkerLost(RuntimeError):
+    """The worker no longer has this job: its instance was replaced.
+
+    Render recycles a free worker instance without warning and without any
+    deploy: run b95f3713 (2026-11-03) was 65 minutes into a section design when
+    the next poll answered "unknown", with no OOM, no server_failed event and
+    no deploy. The qgis_process child dies with its instance, so the design
+    cannot be resumed where it stopped -- but the OUTPUTS it never produced are
+    the only thing lost, and the inputs are still on the engine's disk.
+    """
+
+
 def _run_command_remote(project_id: str, cmd: Union[List[str], str],
                         output_dir: Path,
                         transfer: Optional[Tuple[Path, Tuple[str, ...]]] = None) -> List[str]:
-    """Run the pipeline on the worker, and never leave it holding the slot."""
-    try:
-        return _run_command_remote_job(project_id, cmd, output_dir, transfer=transfer)
-    except Exception:
-        _cancel_worker_job(project_id)
-        raise
+    """Run the pipeline on the worker, and never leave it holding the slot.
+
+    A replaced worker instance is retried rather than failed: the job is gone,
+    so the design is submitted again from the inputs on disk. Bounded by
+    QGIS_WORKER_RESTART_ATTEMPTS, because a run that keeps being interrupted is
+    not going to finish by being restarted for ever.
+    """
+    attempts = max(1, QGIS_WORKER_RESTART_ATTEMPTS)
+    for attempt in range(1, attempts + 1):
+        try:
+            return _run_command_remote_job(project_id, cmd, output_dir,
+                                           transfer=transfer)
+        except _WorkerLost as exc:
+            # Nothing to cancel: the worker that held the job no longer exists.
+            if attempt >= attempts:
+                raise
+            _append(
+                project_id, "warning",
+                f"{exc} The design is being started again from the inputs "
+                f"already on disk (attempt {attempt + 1} of {attempts}).",
+            )
+            time.sleep(min(QGIS_WORKER_MAX_RETRY_S,
+                           QGIS_WORKER_RETRY_S * attempt))
+        except Exception:
+            _cancel_worker_job(project_id)
+            raise
+    raise RuntimeError("the QGIS worker did not run this job")  # pragma: no cover
 
 
 def _run_command_remote_job(project_id: str, cmd: Union[List[str], str],
@@ -1377,9 +1418,10 @@ def _run_command_remote_job(project_id: str, cmd: Union[List[str], str],
                 time.sleep(QGIS_WORKER_POLL_S)
                 continue
             # The worker restarted and lost the job; its store starts empty, so
-            # polling would never end.  Say it and stop instead of hanging.
-            raise RuntimeError(
-                "The QGIS worker restarted and lost this run. Run it again."
+            # polling would never end. Say it, and let the caller decide: a
+            # replaced instance is retried (see _run_command_remote).
+            raise _WorkerLost(
+                "The QGIS worker restarted and lost this run."
             )
         if state in ("done", "failed", "canceled"):
             break
