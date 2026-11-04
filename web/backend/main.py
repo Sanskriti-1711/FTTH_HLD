@@ -271,7 +271,7 @@ QGIS_WORKER_MAX_RETRY_S = float(os.environ.get("FTTH_QGIS_WORKER_MAX_RETRY", "30
 # shape here: a second interruption in the same run is not going to be cured by
 # a third attempt, and each attempt is a whole design.
 QGIS_WORKER_RESTART_ATTEMPTS = max(
-    1, int(os.environ.get("FTTH_QGIS_WORKER_RESTART_ATTEMPTS", "2")))
+    1, int(os.environ.get("FTTH_QGIS_WORKER_RESTART_ATTEMPTS", "4")))
 # How long repeated HTTP 429 from the worker's edge is tolerated before the run
 # is failed. A 429 is the EDGE refusing our poll, not the worker: qgis_process
 # keeps designing, so this window is deliberately much longer than the
@@ -1361,10 +1361,16 @@ def _run_command_remote_job(project_id: str, cmd: Union[List[str], str],
             if getattr(exc, "code", None) == 429:
                 rate_strikes += 1
                 blind_since = blind_since or time.time()
-                if time.time() - lost_since >= QGIS_WORKER_RATE_LIMIT_S:
+                # If the job has already produced output before going quiet/rate-limited,
+                # a restart is the most likely cause and we must not burn 15 minutes
+                # of backoff before retrying -- let the restart be detected sooner.
+                limit = QGIS_WORKER_RATE_LIMIT_S
+                if started_output:
+                    limit = min(limit, max(QGIS_WORKER_MISS_S * 2, 180))
+                if time.time() - lost_since >= limit:
                     raise RuntimeError(
                         f"The QGIS worker's edge kept refusing polls for "
-                        f"{int(QGIS_WORKER_RATE_LIMIT_S)} s (HTTP 429): {exc}"
+                        f"{int(limit)} s (HTTP 429): {exc}"
                     ) from exc
                 delay = min(QGIS_WORKER_MAX_RETRY_S,
                             QGIS_WORKER_RETRY_S * (2 ** min(rate_strikes, 4)))
