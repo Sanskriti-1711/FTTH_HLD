@@ -73,6 +73,16 @@ _HEAL_DENSE_NODES = 256
 # cell at O(n * HEAL_SCAN) whatever the cell holds.
 _HEAL_SCAN = 32
 
+# How many densified segments of ONE feature may be indexed by the bridge pass.
+# A sidewalk or trench row can be the whole network in a single multipart line:
+# densified at the 2 m step that is >100k QgsFeature objects pushed into a
+# QgsSpatialIndex, built once per feature PAIR. Run 3b2e719b (2026-11-17) sat in
+# "bridges (sidewalk) 1/1" for 1 h 50 m with its child at 485 MB of a 512 MB
+# instance and 2.6 % CPU -- i.e. thrashing on the memory cap, not computing, and
+# the engine's CPU-advance rule kept it alive. Features over the cap are walked
+# directly (see _segment_endpoints_local) instead of indexed.
+_DENSE_INDEX_MAX_SEGMENTS = 4000
+
 # -------------------------------
 # Helpers for the wrapper
 # -------------------------------
@@ -879,6 +889,11 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
                 if a == b:
                     continue
                 fid += 1
+                if fid > _DENSE_INDEX_MAX_SEGMENTS:
+                    # Too big to index in a 512 MB process. Give the caller the
+                    # bounded path instead of a half-built index it would pay
+                    # for twice -- once in time, once in the memory cap.
+                    return None, None
                 f = QgsFeature()
                 f.setId(fid)
                 f.setGeometry(QgsGeometry.fromPolylineXY([a, b]))
@@ -892,7 +907,11 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
             index = AlgDistributionDucts._dense_segment_index(geom, step_m)
         idx, ends = index
         if not ends:
-            return None
+            # Either the geometry is empty or it was too big to index: find the
+            # lattice point around the crossing directly. Same answer within
+            # half a step, and it allocates nothing.
+            return AlgDistributionDucts._segment_endpoints_local(
+                geom, pt_xy, step_m)
         px, py = pt_xy.x(), pt_xy.y()
         # The point lies on the geometry (it is an intersection), so the
         # nearest densified segment is at most ~step_m/2 away; widen the box a
@@ -913,6 +932,42 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
                 break
             grow *= 5.0
         return best[1]
+
+    @staticmethod
+    def _segment_endpoints_local(geom, pt_xy, step_m):
+        """The densified lattice point nearest ``pt_xy``, without an index.
+
+        The indexed path materialises every densified segment of the feature,
+        which a whole-network row makes impossible in a 512 MB process (see
+        _DENSE_INDEX_MAX_SEGMENTS). The crossing point already lies ON the
+        geometry, so the lattice point it would have found is the position along
+        the line, rounded to the same ``step_m`` lattice ``densifyByDistance``
+        uses -- one C++ call, no allocation per vertex.
+        """
+        step = float(step_m or 0.0)
+        if step <= 0:
+            return None
+        try:
+            res = geom.closestSegmentWithContext(pt_xy)
+        except Exception:
+            return None
+        if not res or len(res) < 2 or res[1] is None:
+            return None
+        try:
+            along = float(geom.lineLocatePoint(
+                QgsGeometry.fromPointXY(QgsPointXY(res[1]))))
+        except Exception:
+            return None
+        if not along or along <= 0.0:
+            return None
+        try:
+            p = geom.interpolate(round(along / step) * step)
+        except Exception:
+            return None
+        if p is None or p.isEmpty():
+            return None
+        q = p.asPoint()
+        return ((q.x(), q.y()),)
 
     @staticmethod
     def _heal_dense_cell(G, grp, heal_m):
@@ -1109,6 +1164,9 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
             if not ag or ag.isEmpty(): continue
             ag_index = None
             for bid in idxB.intersects(ag.boundingBox()):
+                # One feature pair can be minutes of GEOS work on a whole-network
+                # row, so the beat lives here as well as on the point loop.
+                _beat(done, made)
                 bg = B.getFeature(bid).geometry()
                 if not bg or bg.isEmpty() or not ag.intersects(bg): continue
                 inter = ag.intersection(bg)

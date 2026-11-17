@@ -325,6 +325,19 @@ QGIS_STALL_S = float(os.environ.get("FTTH_QGIS_STALL", "900"))
 # stopped adding it is the wedge the guard exists for. 1 s is far below any
 # meaningful advance and far above clock-tick noise. 0 disables the reset.
 QGIS_CPU_ADVANCE_S = float(os.environ.get("FTTH_QGIS_CPU_ADVANCE", "1"))
+# How much of a core that advance has to be, or it is not progress.
+#
+# A process that has run out of memory still burns CPU: it faults, reclaims and
+# retries. Run 3b2e719b (2026-11-17) sat in the Duct Layer from 12:38 with its
+# child at 485 MB of a 512 MB cap, adding 1.6 s of CPU per minute (2.6 % of one
+# core) and nothing else, and because QGIS_CPU_ADVANCE_S only asked for 1 s of
+# advance at ANY interval the stall guard was reset every ~40 s and the run was
+# still "running" 110 minutes later. Real work in this pipeline is a busy
+# qgis_process: every measured pass burns most of a vCPU, and the slowest (gap
+# healing, 160k nodes in 6.4 s) is nowhere near 10 %. Below this rate the
+# advance is not counted, the silence clock keeps running and the run is failed
+# as the wedge it is. 0 disables the rate test and keeps the old behaviour.
+QGIS_CPU_RATE_MIN = float(os.environ.get("FTTH_QGIS_CPU_RATE_MIN", "0.10"))
 # How long a scheduled job may produce NOTHING before the run is failed.
 #
 # The stall guard above measures silence from a job that is RUNNING, and its
@@ -1319,6 +1332,9 @@ def _run_command_remote_job(project_id: str, cmd: Union[List[str], str],
     # (None until it reports one). This is what keeps a computing-but-quiet
     # stage alive -- see QGIS_CPU_ADVANCE_S.
     last_cpu: Optional[float] = None
+    # When that reading was taken, so a trickle of CPU can be told from real
+    # work by the RATE it arrives at (see QGIS_CPU_RATE_MIN).
+    last_cpu_at = time.time()
     # Whether the job has said ANYTHING yet: a job queued behind another one
     # never starts qgis_process and writes no line at all, which is a different
     # failure from a running job falling silent (see QGIS_WORKER_START_S).
@@ -1419,17 +1435,29 @@ def _run_command_remote_job(project_id: str, cmd: Union[List[str], str],
         # a child of its own -- a worker older than this check reports whatever
         # child it has, so requiring "running" keeps a queued job from inheriting
         # another job's CPU burn.
-        child_cpu = ((batch.get("child") or {}).get("cpu_seconds")
-                     if state == "running" else None)
+        child_stat = batch.get("child") or {}
+        child_cpu = child_stat.get("cpu_seconds") if state == "running" else None
         if QGIS_CPU_ADVANCE_S > 0 and isinstance(child_cpu, (int, float)):
+            cpu_now = float(child_cpu)
+            wall_now = time.time()
             if last_cpu is None:
-                last_cpu = float(child_cpu)
-            elif float(child_cpu) - last_cpu >= QGIS_CPU_ADVANCE_S:
-                last_cpu = float(child_cpu)
-                last_output = time.time()
-                # It demonstrably started: a queued job has no child to burn
-                # CPU, so this cannot mask a job still waiting for the slot.
-                started_output = True
+                last_cpu = cpu_now
+                last_cpu_at = wall_now
+            else:
+                advance = cpu_now - last_cpu
+                wall = max(wall_now - last_cpu_at, 1e-9)
+                # Advance at a rate, not merely an advance: a child pinned at the
+                # memory cap still adds a second of CPU now and then, and that
+                # must not read as progress.
+                if (advance >= QGIS_CPU_ADVANCE_S
+                        and (QGIS_CPU_RATE_MIN <= 0
+                             or advance / wall >= QGIS_CPU_RATE_MIN)):
+                    last_cpu = cpu_now
+                    last_cpu_at = wall_now
+                    last_output = wall_now
+                    # It demonstrably started: a queued job has no child to burn
+                    # CPU, so this cannot mask a job still waiting for the slot.
+                    started_output = True
         if not started_output and QGIS_WORKER_START_S > 0:
             waited = time.time() - started
             if waited > QGIS_WORKER_START_S:
@@ -1472,12 +1500,26 @@ def _run_command_remote_job(project_id: str, cmd: Union[List[str], str],
         silent_for = time.time() - last_output
         if QGIS_STALL_S > 0 and silent_for > QGIS_STALL_S:
             stage_now = str((tasks.get(project_id) or {}).get("stage") or "unknown")
+            # A child this close to its cap is not slow, it is out of memory:
+            # say which, so the next reader does not go looking for a slow pass.
+            mem_note = ""
+            try:
+                rss = float(child_stat.get("rss_mb") or 0)
+                cap = float(child_stat.get("limit_mb") or 0)
+                if rss and cap and rss >= 0.9 * cap:
+                    mem_note = (
+                        f" The QGIS child was at {rss:.0f} MB of a {cap:.0f} MB "
+                        f"instance, so it ran out of memory rather than "
+                        f"computing."
+                    )
+            except (TypeError, ValueError):
+                mem_note = ""
             raise RuntimeError(
                 f"qgis_process stopped making progress during the "
-                f"{stage_now} stage: no output and no CPU advance for "
+                f"{stage_now} stage: no output and no real CPU advance for "
                 f"{int(silent_for)} s (limit {int(QGIS_STALL_S)} s). The run "
                 f"was stopped as hung rather than left to sit until the "
-                f"{int(timeout)} s ceiling."
+                f"{int(timeout)} s ceiling.{mem_note}"
             )
         time.sleep(QGIS_WORKER_POLL_S)
 

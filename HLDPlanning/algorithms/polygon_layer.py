@@ -1712,9 +1712,22 @@ class PolygonLayerAlgorithm(QgsProcessingAlgorithm):
             miny = min(c[1] for c in coords)
             maxx = max(c[0] for c in coords)
             maxy = max(c[1] for c in coords)
-            envelope = shapely_box(minx - 100.0, miny - 100.0,
-                                   maxx + 100.0, maxy + 100.0)
-            vor = voronoi_polygons(mp, envelope=envelope)
+            clip = shapely_box(minx - 100.0, miny - 100.0,
+                               maxx + 100.0, maxy + 100.0)
+            # ``voronoi_polygons`` has never had an ``envelope`` keyword: the
+            # clip region is ``extend_to``. Passing ``envelope`` here raised a
+            # TypeError on EVERY partition of every run -- measured six times in
+            # one Polygon stage on the deployed 1.7.48 image (2026-11-17) -- so
+            # the whole stage fell back to QGIS Voronoi, which is slower AND
+            # skips the containment pairing below. The polygons production
+            # published were never built by the path this module is written
+            # around.
+            try:
+                vor = voronoi_polygons(mp, extend_to=clip)
+            except TypeError:
+                # A Shapely too old for a clip region at all: build the cells
+                # unclipped and let the dissolve below deal with them.
+                vor = voronoi_polygons(mp)
 
             cluster_cells = {}
             for i, fid in enumerate(ordered_fids):
