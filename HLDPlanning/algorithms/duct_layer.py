@@ -41,8 +41,7 @@ from qgis.core import (
 from qgis import processing
 from ..utils.geom import round_key_xy, geom_substring, edges_to_geom, path_len, is_prefix, lcp_len
 from ..utils.snap import snap_point_create_virtual
-from ..utils.graph import (add_edge, astar_with_parents, dijkstra_with_parents,
-                           reconstruct_path)
+from ..utils.graph import add_edge, dijkstra_with_parents, reconstruct_path
 from ..utils.style_utils import color_for_index, TRUNK_COLOR, apply_color_renderer, distribution_color
 from ..utils.fields import first_field_case_insensitive
 import math as _math
@@ -727,16 +726,6 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
     MAX_HH    = "MAX_HH_PER_DUCT"
     ADD_STYLE = "ADD_CATEGORIZED_STYLE"
 
-    # -- The trench is the ONLY geometry the duct may follow -------------
-    # The graph used to carry the footways beside the trench so a duct could
-    # still reach an endpoint the trench does not cover. That fallback is what
-    # leaves duct metres off the trench (measured 2026-11-08: 218.9 m of
-    # Distribution_Ducts, 1.25 %, 13 rows, worst 25.30 m), so it is now
-    # opt-in: with TRENCH_ONLY the graph is Final_Trenches alone, the lead-in
-    # chord is 0, and the sidewalks only label the side (L/R) of a duct.
-    TRENCH_ONLY = "TRENCH_ONLY"
-    DEFAULT_TRENCH_ONLY = True
-
     # ── Where a distribution duct is allowed to be ──────────────────────
     # The trench is the civil route: the duct is what goes IN it. This builder
     # used to add the trench as a third line network beside Sidewalk L/R and
@@ -807,7 +796,6 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
         self.addParameter(QgsProcessingParameterNumber(self.SNAP_M,  "Max snap distance to graph (m)", QgsProcessingParameterNumber.Double, defaultValue=50.0, minValue=0.1))
         self.addParameter(QgsProcessingParameterNumber(self.LEAD_IN_M, "Max lead-in off the trench (m)", QgsProcessingParameterNumber.Double, defaultValue=self.DEFAULT_LEAD_IN_M, minValue=0.0))
         self.addParameter(QgsProcessingParameterNumber(self.SIDEWALK_COST, "Sidewalk cost factor (trench = 1)", QgsProcessingParameterNumber.Double, defaultValue=self.DEFAULT_SIDEWALK_COST_FACTOR, minValue=1.0))
-        self.addParameter(QgsProcessingParameterBoolean(self.TRENCH_ONLY, "Follow Final_Trenches only (no sidewalk routing, no lead-in)", defaultValue=self.DEFAULT_TRENCH_ONLY))
         self.addParameter(QgsProcessingParameterNumber(self.MAX_HH,  "Max HH per duct", QgsProcessingParameterNumber.Integer, defaultValue=10, minValue=2, maxValue=100))
         self.addParameter(QgsProcessingParameterBoolean(self.ADD_STYLE,"Add categorized style to project", defaultValue=True))
         self.addParameter(QgsProcessingParameterFeatureSink(self.O_DUCTS, "Distribution_Ducts (per PDP; strict PDP match; ≤HH cap)", QgsProcessing.TypeVectorLine))
@@ -1292,11 +1280,6 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
         heal_m  = float(self.parameterAsDouble(p, self.HEAL_M,   context))
         snap_m  = float(self.parameterAsDouble(p, self.SNAP_M,   context))
         lead_in_m = float(self.parameterAsDouble(p, self.LEAD_IN_M, context))
-        trench_only = bool(self.parameterAsBool(p, self.TRENCH_ONLY, context))
-        if trench_only:
-            # A lead-in is a straight chord across the block to the trench --
-            # metres of duct that are, by definition, not in the trench.
-            lead_in_m = 0.0
         sidewalk_cost = float(self.parameterAsDouble(p, self.SIDEWALK_COST,
                                                      context))
         sidewalk_cost = max(1.0, sidewalk_cost)
@@ -1327,7 +1310,6 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
         # Build graph — TRENCH FIRST. The duct is what goes into the trench, so
         # the trench network is the route and the footways are the fallback.
         trench_present = bool(tang_t is not None and tang_t.featureCount() > 0)
-        trench_only_eff = bool(trench_only and trench_present)
         G = nx.Graph()
         if trench_present:
             feedback.pushInfo("🔧 Building the trench graph (primary) …")
@@ -1336,18 +1318,14 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
         # Every node the trench contributed: an endpoint may snap onto these
         # within the lead-in cap, and onto nothing else.
         trench_nodes = set(G.nodes) if trench_present else set()
-        if left_t and not trench_only_eff:
+        if left_t:
             self._add_lines_to_graph(G, left_t,  dense_m,
                                      edge_kind="sidewalk",
                                      weight_factor=sidewalk_cost)
-        if right_t and not trench_only_eff:
+        if right_t:
             self._add_lines_to_graph(G, right_t, dense_m,
                                      edge_kind="sidewalk",
                                      weight_factor=sidewalk_cost)
-        if trench_only_eff:
-            feedback.pushInfo(
-                "TRENCH_ONLY: the duct graph is Final_Trenches alone -- a "
-                "footway only labels the duct side, it never routes it.")
         if not trench_present:
             feedback.pushWarning(
                 "Distribution: no tangent trenches supplied — routing on the "
@@ -1431,17 +1409,14 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
             return off
 
         # Bridge at intersections (each weld keeps its own kind)
-        bridges = 0
-        if not trench_only_eff:
-            bridges = self._bridge_intersections(G, left_t,  right_t, dense_m,
-                                                 edge_kind="sidewalk",
-                                                 feedback=feedback)
+        bridges  = self._bridge_intersections(G, left_t,  right_t, dense_m,
+                                              edge_kind="sidewalk",
+                                              feedback=feedback)
         if tang_t:
-            if not trench_only_eff:
-                bridges += self._bridge_intersections(G, left_t,  tang_t, dense_m,
-                                                      feedback=feedback)
-                bridges += self._bridge_intersections(G, right_t, tang_t, dense_m,
-                                                     feedback=feedback)
+            bridges += self._bridge_intersections(G, left_t,  tang_t, dense_m,
+                                                  feedback=feedback)
+            bridges += self._bridge_intersections(G, right_t, tang_t, dense_m,
+                                                 feedback=feedback)
             bridges += self._bridge_intersections(G, tang_t, tang_t, dense_m,
                                                   edge_kind="trench",
                                                   feedback=feedback)
@@ -1527,15 +1502,9 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
             instead of cutting a chord across the block to reach the trench.
             """
             if trench_nodes:
-                # TRENCH_ONLY: the endpoint joins the trench or it is dropped.
-                # Falling back to the whole graph is what put the duct back on
-                # the footway, so in this mode there is no fallback.
-                n = nearest_node(pt_xy, snap_m if trench_only_eff else lead_in_m,
-                                 trench_nodes)
+                n = nearest_node(pt_xy, lead_in_m, trench_nodes)
                 if n is not None:
                     return n
-                if trench_only_eff:
-                    return None
             return nearest_node(pt_xy, snap_m)
 
         # Prepare output
@@ -1616,12 +1585,8 @@ class AlgDistributionDucts(QgsProcessingAlgorithm):
             pt = f.geometry().asPoint()
             n = attach_node(QgsPointXY(pt))
             if not n: continue
-            # lightweight connection PDP point to nearest node. TRENCH_ONLY
-            # skips it: the edge is zero length, but the coordinate it adds to
-            # the graph is a point that is not on the trench.
-            if not trench_only_eff:
-                G.add_edge(n, (pt.x(), pt.y()), weight=0.01, length=0.0,
-                           kind="stub")
+            # lightweight connection PDP point to nearest node
+            G.add_edge(n, (pt.x(), pt.y()), weight=0.01, length=0.0, kind="stub")
             pdp_map[pid] = (pt, n)
 
         if not pdp_map:
@@ -2035,99 +2000,6 @@ class DuctLayer(QgsProcessingAlgorithm):
             uid += 1
             made += 1
 
-        # ── the address a drop leg carries ────────────────────────────────
-        # A leg belongs to the PSEUDO HH at its footway end — one pseudo point
-        # per garden leg, and cable_layer groups on that same LAST vertex — so
-        # the pseudo's addr_id is the address the duct must name.  Taking the
-        # garden trench's own ``addr`` instead stamped some legs with a
-        # CO-LOCATED NEIGHBOUR's address (measured B16 8UU: 80 of 543 premises
-        # had a leg starting on them named after the building next door), which
-        # also left those premises UNSERVED in the register, whose verdict is
-        # ID-based.  Where several premises really do share one service point
-        # (a block of flats, two buildings on one corner) the leg names ALL of
-        # them, the same comma-joined convention the shared spines already use,
-        # so every premise ends up with a drop that names it.
-        PSEUDO_TOL_M = 1.0
-        CO_LOCATED_TOL_M = 0.75
-
-        def _pt_of(g):
-            if g is None or g.isEmpty():
-                return None
-            if QgsWkbTypes.geometryType(g.wkbType()) == QgsWkbTypes.PointGeometry:
-                return g.asPoint()
-            return g.centroid().asPoint()
-
-        def _point_index(layer, addr_flds):
-            """(spatial index, {fid: (point, addr, hh)}) for a point layer."""
-            idx = QgsSpatialIndex()
-            out = {}
-            if layer is None or not layer.isValid():
-                return None, out
-            f_a = first_field_case_insensitive(layer, addr_flds)
-            f_h = first_field_case_insensitive(layer, ["hh_id", "HH_ID"])
-            if not f_a and not f_h:
-                return None, out
-            for lf in layer.getFeatures():
-                pxy = _pt_of(lf.geometry())
-                if pxy is None:
-                    continue
-                tf = QgsFeature(lf.id())
-                tf.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(pxy)))
-                idx.addFeature(tf)
-                out[lf.id()] = (
-                    QgsGeometry.fromPointXY(QgsPointXY(pxy)),
-                    str(lf[f_a]).strip() if f_a and lf[f_a] not in (None, "") else "",
-                    str(lf[f_h]).strip() if f_h and lf[f_h] not in (None, "") else "",
-                )
-            return idx, out
-
-        def _near(idx, near, point, tol):
-            """Rows of ``near`` whose point is within ``tol`` of ``point``."""
-            if idx is None or point is None:
-                return []
-            pg = QgsGeometry.fromPointXY(QgsPointXY(point))
-            rect = QgsRectangle(point.x() - tol, point.y() - tol,
-                                point.x() + tol, point.y() + tol)
-            hits = []
-            for fid in idx.intersects(rect):
-                entry = near.get(fid)
-                if entry is None:
-                    continue
-                d = entry[0].distance(pg)
-                if d <= tol:
-                    hits.append((d, entry))
-            hits.sort(key=lambda h: h[0])
-            return hits
-
-        pseudo_idx, pseudo_pts = _point_index(
-            pseudo_lyr, ["addr_id", "ADDR_ID", "id"])
-        obj_idx, obj_pts = _point_index(
-            obj_lyr, ["ADDR_ID", "addr_id", "id"])
-
-        def _leg_address(g, fallback):
-            """The ADDR_ID(s) a drop duct names: its pseudo HH + co-located premises."""
-            if g is None or g.isEmpty():
-                return fallback
-            ln = g.asMultiPolyline()[0] if g.isMultipart() else g.asPolyline()
-            if not ln:
-                return fallback
-            names = []
-            hits = _near(pseudo_idx, pseudo_pts, ln[-1], PSEUDO_TOL_M)
-            if hits and hits[0][1][1]:
-                names.append(hits[0][1][1])
-            start = QgsPointXY(ln[0])
-            for _d, entry in _near(obj_idx, obj_pts, start, CO_LOCATED_TOL_M):
-                if entry[1]:
-                    names.append(entry[1])
-            if not names and fallback:
-                names.append(fallback)
-            seen, out = set(), []
-            for n in names:
-                if n.lower() not in seen:
-                    seen.add(n.lower())
-                    out.append(n)
-            return ",".join(out) if out else fallback
-
         # 1) Preferred: garden trenches (object → footway) carry the exact
         #    connection geometry plus the needed linkage attributes.
         if garden_lyr is not None and garden_lyr.featureCount() > 0:
@@ -2195,7 +2067,7 @@ class DuctLayer(QgsProcessingAlgorithm):
                                     g = QgsGeometry.fromPolylineXY([QgsPointXY(hpt), end_pt])
                 _add(
                     str(gf[f_pdp]) if f_pdp else None,
-                    _leg_address(g, str(gf[f_addr]) if f_addr else None),
+                    str(gf[f_addr]) if f_addr else None,
                     str(gf[f_hh]) if f_hh else None,
                     str(gf[f_poly]) if f_poly else None,
                     str(gf[f_mfg]) if f_mfg else None,
@@ -2743,12 +2615,7 @@ class DuctLayer(QgsProcessingAlgorithm):
             return None
         if ka == kb:
             return QgsGeometry.fromPolylineXY([pa, pb])
-        # A* towards ``kb`` rather than a flood from ``ka``: the edge weights
-        # are segment lengths, so the straight-line distance is a consistent
-        # heuristic and the path is still the shortest — but the search stops
-        # at the goal instead of visiting the whole 20 k-node trench for every
-        # chord, which was the bulk of the duct stage's runtime.
-        _dist, parent = astar_with_parents(ka, kb, adj, node_xy)
+        _dist, parent = dijkstra_with_parents(ka, adj)
         if kb not in parent:
             return None
         seg_path = reconstruct_path(parent, kb, ka)
@@ -2989,59 +2856,6 @@ class DuctLayer(QgsProcessingAlgorithm):
             out.append(QgsPointXY(p.x(), p.y()))
         return out
 
-    def _trench_index(self, trench_lyr):
-        """(QgsSpatialIndex, {fid: geometry}) for the trench, built ONCE.
-
-        The rebase, both restamps and the three on-trench passes all index the
-        same layer, and each used to build its own: six full reads of the
-        publish file per duct stage (13,162 spans / 23 MB on the 2026-11-12
-        run). The cache is keyed on the layer id + feature count so an edited
-        trench is still re-indexed.
-        """
-        key = None
-        try:
-            key = (id(trench_lyr), trench_lyr.id(), trench_lyr.featureCount())
-        except Exception:
-            key = None
-        cached = getattr(self, "_trench_index_cache", None)
-        if cached is not None and key is not None and cached[0] == key:
-            return cached[1], cached[2]
-        idx = QgsSpatialIndex()
-        geoms = {}
-        for tf in trench_lyr.getFeatures():
-            g = tf.geometry()
-            if g is None or g.isEmpty():
-                continue
-            geoms[tf.id()] = g
-            idx.addFeature(tf)
-        if key is not None:
-            self._trench_index_cache = (key, idx, geoms, None)
-        return idx, geoms
-
-    def _trench_cover(self, trench_lyr, trench_geoms):
-        """The trench buffered by RESTAMP_COVER_TOL_M, built once per layer."""
-        cached = getattr(self, "_trench_index_cache", None)
-        if cached is not None and len(cached) > 3 and cached[3] is not None:
-            return cached[3]
-        cover = {}
-        for fid, tg in trench_geoms.items():
-            try:
-                cover[fid] = tg.buffer(self.RESTAMP_COVER_TOL_M, 8)
-            except Exception:  # noqa: BLE001 - an unbufferable geometry is still usable raw
-                cover[fid] = tg
-        if cached is not None and len(cached) > 3:
-            self._trench_index_cache = (cached[0], cached[1], cached[2], cover)
-        return cover
-
-    # How often a silent loop reports that it is still working. The duct stage
-    # spent 45 min at 55 % with no message between "running distribution" and
-    # the first warning, so a slow pass was indistinguishable from a hang.
-    PROGRESS_EVERY = 250
-    # The same chord is walked again by every pass over the same ducts (rebase,
-    # restamp, three enforce tiers), so connectors are memoised. Capped so a
-    # full run cannot grow the cache without bound.
-    CONNECTOR_MEMO_MAX = 60000
-
     def _rebase_distribution_output(self, output_uri, trench_lyr, context, feedback):
         """Keep legacy PDP/pseudo grouping but draw every line on Final_Trenches.
 
@@ -3065,7 +2879,10 @@ class DuctLayer(QgsProcessingAlgorithm):
         # (45 PDPs × dozens of ducts × 2 endpoints), which is where the duct
         # stage spent its hour on Hagley. The index answers "which trenches
         # could be near this endpoint" in a handful of candidates.
-        trench_idx, trench_geoms = self._trench_index(trench_lyr)
+        trench_idx = QgsSpatialIndex(trench_lyr.getFeatures())
+        trench_geoms = {tf.id(): tf.geometry()
+                        for tf in trench_lyr.getFeatures()
+                        if tf.geometry() is not None and not tf.geometry().isEmpty()}
         SEARCH_R = 50.0
 
         def _nearest_trench_point(pt_xy):
@@ -3142,17 +2959,7 @@ class DuctLayer(QgsProcessingAlgorithm):
 
         if not layer.isEditable():
             layer.startEditing()
-        _total = layer.featureCount()
-        if feedback:
-            feedback.pushInfo(
-                "⚙️ Re-laying %d distribution duct(s) on Final_Trenches "
-                "(%d trench span(s)) …" % (_total, len(trench_geoms)))
-        for _n, f in enumerate(layer.getFeatures(), 1):
-            if feedback and _n % self.PROGRESS_EVERY == 0:
-                feedback.pushInfo(
-                    "  … re-lay %d/%d duct(s): %d routed, %d projected, "
-                    "%d for review" % (_n, _total, changed - projected,
-                                       projected, unresolved))
+        for f in layer.getFeatures():
             g = f.geometry()
             if g is None or g.isEmpty():
                 unresolved += 1
@@ -3307,7 +3114,11 @@ class DuctLayer(QgsProcessingAlgorithm):
         st_idx = layer.fields().indexFromName("TRENCH_STATUS")
         if off_idx < 0 and st_idx < 0:
             return 0
-        trench_idx, trench_geoms = self._trench_index(trench_lyr)
+        trench_geoms = {}
+        for tf in trench_lyr.getFeatures():
+            tg = tf.geometry()
+            if tg is not None and not tg.isEmpty():
+                trench_geoms[tf.id()] = tg
         if not trench_geoms:
             return 0
         # Coverage has a tolerance, and it must: subtracting a line from a line
@@ -3317,21 +3128,20 @@ class DuctLayer(QgsProcessingAlgorithm):
         # for a layer whose 346 routes had just been rebased onto it.  Buffering
         # the trench first turns "covered" into "within 5 cm", which is what the
         # 97.6 % figure on the Mariendorf run was measured with.
-        cover_geoms = self._trench_cover(trench_lyr, trench_geoms)
+        cover_geoms = {}
+        for fid, tg in trench_geoms.items():
+            try:
+                cover_geoms[fid] = tg.buffer(self.RESTAMP_COVER_TOL_M, 8)
+            except Exception:  # noqa: BLE001 - an unbufferable geometry is still usable raw
+                cover_geoms[fid] = tg
+        trench_idx = QgsSpatialIndex(trench_lyr.getFeatures())
         band = self.RESTAMP_PROXIMITY_M
         lead = AlgDistributionDucts.DEFAULT_LEAD_IN_M
         total = on = changed = 0
         off_total = 0.0
         if not layer.isEditable():
             layer.startEditing()
-        _total = layer.featureCount()
-        if feedback:
-            feedback.pushInfo(
-                "⚙️ Stamping %d duct(s) with their trench status …" % _total)
-        for _n, f in enumerate(layer.getFeatures(), 1):
-            if feedback and _n % self.PROGRESS_EVERY == 0:
-                feedback.pushInfo(
-                    "  … trench status %d/%d duct(s)" % (_n, _total))
+        for f in layer.getFeatures():
             g = f.geometry()
             if g is None or g.isEmpty():
                 continue
@@ -3372,176 +3182,9 @@ class DuctLayer(QgsProcessingAlgorithm):
                 f"rebased geometry.")
         return changed
 
-    # -- The trench is the only geometry a published duct may sit on ------
-    # A duct is what goes IN the trench: no deviation is allowed, exactly as a
-    # trench is not allowed to leave the road side. The previous pass CLIPPED
-    # the line to a 2 m band, which still shipped up to 2 m of duct away from
-    # the trench (B16 8UU: worst 1.97 m on Distribution_Ducts, 77 of 1 099
-    # samples beyond 1 m, 26 drop and 85 distribution samples beyond 0.30 m).
-    # The published line is now PROJECTED onto Final_Trenches and every chord
-    # the trench does not cover is replaced by the trench route between its
-    # ends, so what ships follows the trench itself (0.00-0.05 m, GEOS
-    # rounding). A row no trench reaches is dropped and counted, never left
-    # hanging beside the trench.
-    ON_TRENCH_TOL_M = 0.05
-    ON_TRENCH_DENSIFY_M = 2.0
-    ON_TRENCH_SEARCH_M = 50.0
-
-    def _enforce_on_trench(self, output_uri, trench_lyr, context, feedback,
-                           label="duct"):
-        """Draw one published duct layer exactly on Final_Trenches.
-
-        Returns ``(kept, dropped, metres_repaired)``. Applied to every tier
-        after the builders have run, so no duct geometry reaches a deliverable
-        while it is off Final_Trenches.
-        """
-        if not output_uri or trench_lyr is None or trench_lyr.featureCount() == 0:
-            return 0, 0, 0.0
-        layer = QgsProcessingUtils.mapLayerFromString(str(output_uri), context)
-        if layer is None or not layer.isValid():
-            layer = QgsVectorLayer(str(output_uri), "%s_ontrench" % label, "ogr")
-        if layer is None or not layer.isValid():
-            return 0, 0, 0.0
-        trench_idx, trench_geoms = self._trench_index(trench_lyr)
-        if not trench_geoms:
-            return 0, 0, 0.0
-        tol = self.ON_TRENCH_TOL_M
-
-        def _nearest(pt):
-            """(distance, QgsPointXY) of the closest point on the trench."""
-            pg = QgsGeometry.fromPointXY(QgsPointXY(pt.x(), pt.y()))
-            best = None
-            # A rectangle, not a buffered point: the buffer builds a GEOS
-            # polygon for every sample (one per 2 m of duct) and the index only
-            # ever uses its bounding box.
-            _s = self.ON_TRENCH_SEARCH_M
-            rect = QgsRectangle(pt.x() - _s, pt.y() - _s,
-                                pt.x() + _s, pt.y() + _s)
-            for fid in trench_idx.intersects(rect):
-                tg = trench_geoms.get(fid)
-                if tg is None:
-                    continue
-                near = tg.nearestPoint(pg)
-                if near is None or near.isEmpty():
-                    continue
-                np_ = (near.asPoint() if not near.isMultipart()
-                       else near.asMultiPoint()[0])
-                d = math.hypot(np_.x() - pt.x(), np_.y() - pt.y())
-                if best is None or d < best[0]:
-                    best = (d, np_)
-            return best
-
-        def _covered(a, b):
-            """Is the chord a→b covered by the trench within the tolerance?"""
-            L = math.hypot(b.x() - a.x(), b.y() - a.y())
-            n = max(2, int(L // 2.0) + 1)
-            for i in range(1, n):
-                t = i / float(n)
-                near = _nearest(QgsPointXY(a.x() + t * (b.x() - a.x()),
-                                           a.y() + t * (b.y() - a.y())))
-                if near is None or near[0] > tol:
-                    return False
-            return True
-
-        if not layer.isEditable():
-            layer.startEditing()
-        kept = dropped = 0
-        repaired = 0.0
-        _total = layer.featureCount()
-        if feedback:
-            feedback.pushInfo(
-                "⚙️ Drawing %s duct(s) onto Final_Trenches (%d span(s)) …"
-                % (label, len(trench_geoms)))
-        for _n, f in enumerate(layer.getFeatures(), 1):
-            if feedback and _n % self.PROGRESS_EVERY == 0:
-                feedback.pushInfo(
-                    "  … on-trench %s %d/%d: %d kept, %d dropped, "
-                    "%.0f m re-laid" % (label, _n, _total, kept, dropped,
-                                         repaired))
-            g = f.geometry()
-            if g is None or g.isEmpty():
-                layer.deleteFeature(f.id())
-                dropped += 1
-                continue
-            parts = g.asMultiPolyline() if g.isMultipart() else [g.asPolyline()]
-            out_parts = []
-            failed = False
-            for part in parts:
-                if len(part) < 2:
-                    continue
-                dense = []
-                for i in range(len(part) - 1):
-                    a, b = part[i], part[i + 1]
-                    dense.append(a)
-                    L = math.hypot(b.x() - a.x(), b.y() - a.y())
-                    n = max(1, int(L // self.ON_TRENCH_DENSIFY_M))
-                    for k in range(1, n):
-                        t = k / float(n)
-                        dense.append(QgsPointXY(a.x() + (b.x() - a.x()) * t,
-                                                a.y() + (b.y() - a.y()) * t))
-                dense.append(part[-1])
-                snapped = []
-                for pt in dense:
-                    near = _nearest(pt)
-                    if near is None:
-                        failed = True
-                        break
-                    q = near[1]
-                    if snapped and math.hypot(q.x() - snapped[-1].x(),
-                                              q.y() - snapped[-1].y()) < 1e-6:
-                        continue
-                    snapped.append(q)
-                if failed or len(snapped) < 2:
-                    failed = True
-                    break
-                fixed = [snapped[0]]
-                for a, b in zip(snapped, snapped[1:]):
-                    if _covered(a, b):
-                        fixed.append(b)
-                        continue
-                    # The trench does not cover this chord: walk the trench
-                    # instead of cutting the corner beside it.
-                    route = self._trench_connector(
-                        trench_lyr, (a.x(), a.y()), (b.x(), b.y()), tol_m=0.5)
-                    if route is None or route.isEmpty():
-                        failed = True
-                        break
-                    rp = (route.asMultiPolyline()[0] if route.isMultipart()
-                          else route.asPolyline())
-                    if (math.hypot(rp[0].x() - a.x(), rp[0].y() - a.y())
-                            > math.hypot(rp[-1].x() - a.x(),
-                                         rp[-1].y() - a.y())):
-                        rp = list(reversed(rp))
-                    fixed.extend(rp[1:])
-                    repaired += math.hypot(b.x() - a.x(), b.y() - a.y())
-                if failed:
-                    break
-                out_parts.append(fixed)
-            if failed or not out_parts:
-                repaired += g.length()
-                layer.deleteFeature(f.id())
-                dropped += 1
-                continue
-            newg = QgsGeometry.fromMultiPolylineXY(out_parts)
-            if newg is None or newg.isEmpty():
-                layer.deleteFeature(f.id())
-                dropped += 1
-                continue
-            f.setGeometry(newg)
-            layer.updateFeature(f)
-            kept += 1
-        layer.commitChanges()
-        if feedback and (dropped or repaired > 0.01):
-            feedback.pushInfo(
-                "%s ducts drawn on the trench: %d kept, %d dropped (no trench "
-                "reaches them), %.1f m of duct re-laid along Final_Trenches "
-                "(snap tol %.2f m)."
-                % (label, kept, dropped, repaired, tol))
-        return kept, dropped, repaired
-
     def _trench_connector(self, corridor_lyr, a_xy, b_xy, tol_m=1.0,
                           detour_ref_m=None):
-        """The trench path between two points: one feature first, routed second.
+        """The trench path between two points: routed first, one feature second.
 
         ``_trench_route`` follows the whole network (the general case);
         ``_trench_link`` clips a single feature (cheaper, and the only option if
@@ -3553,38 +3196,15 @@ class DuctLayer(QgsProcessingAlgorithm):
         ``_trench_route``): a full duct route passes the legacy route it
         replaces, a tap leaves it ``None`` and keeps the chord cap.
         """
-        # Order is a speed decision, not a correctness one: BOTH results lie on
-        # the trench, but ``_trench_link`` is an index lookup (~0.04 s on
-        # 13 k spans) while ``_trench_route`` runs a Dijkstra over the whole
-        # 20 k-node network (~0.7 s). Most chords belong to one feature — a
-        # duct re-laid along the trench it already follows — so linking first
-        # removes the routing from the common case and leaves it for the real
-        # crossroads, where no single feature carries both ends.
-        key = (id(corridor_lyr),
-               round(a_xy[0], 2), round(a_xy[1], 2),
-               round(b_xy[0], 2), round(b_xy[1], 2),
-               round(tol_m, 3),
-               None if detour_ref_m is None else round(detour_ref_m, 1))
-        memo = getattr(self, "_connector_memo", None)
-        if memo is None:
-            memo = self._connector_memo = {}
-        if key in memo:
-            hit = memo[key]
-            return None if hit is None else QgsGeometry(hit)
-        link = self._trench_link(corridor_lyr, a_xy, b_xy, tol_m,
-                                 detour_ref_m=detour_ref_m)
-        if link is not None:
-            if len(memo) < self.CONNECTOR_MEMO_MAX:
-                memo[key] = QgsGeometry(link)
-            return link
         try:
             route = self._trench_route(corridor_lyr, a_xy, b_xy, tol_m,
                                        detour_ref_m=detour_ref_m)
         except Exception:
             route = None
-        if len(memo) < self.CONNECTOR_MEMO_MAX:
-            memo[key] = None if route is None else QgsGeometry(route)
-        return route
+        if route is not None:
+            return route
+        return self._trench_link(corridor_lyr, a_xy, b_xy, tol_m,
+                                 detour_ref_m=detour_ref_m)
 
     def _trench_link(self, corridor_lyr, a_xy, b_xy, tol_m=1.0,
                      detour_ref_m=None):
@@ -3605,23 +3225,9 @@ class DuctLayer(QgsProcessingAlgorithm):
             straight = math.hypot(b_xy[0] - a_xy[0], b_xy[1] - a_xy[1])
         except Exception:
             straight = 0.0
-        # Only the trenches a point can reach within ``tol_m`` can carry it, so
-        # ask the shared index instead of scanning every span: this used to run
-        # a full 13,162-feature pass per uncovered chord, which is what turned
-        # the on-trench pass into hours.
-        idx, geoms = self._trench_index(corridor_lyr)
-        cand = None
-        for _xy in (a_xy, b_xy):
-            _rect = QgsRectangle(_xy[0] - tol_m, _xy[1] - tol_m,
-                                 _xy[0] + tol_m, _xy[1] + tol_m)
-            try:
-                near_ids = set(idx.intersects(_rect))
-            except Exception:
-                near_ids = set(geoms)
-            cand = near_ids if cand is None else (cand & near_ids)
         best = None
-        for fid in sorted(cand or ()):
-            g = geoms.get(fid)
+        for cf in corridor_lyr.getFeatures():
+            g = cf.geometry()
             if g is None or g.isEmpty():
                 continue
             try:
@@ -4690,9 +4296,6 @@ class DuctLayer(QgsProcessingAlgorithm):
             # AlgDistributionDucts): the cap and the cost live on the algorithm
             # so the plugin and the pipeline cannot drift apart.
             distr.LEAD_IN_M:    distr.DEFAULT_LEAD_IN_M,
-            # The trench is the only geometry a duct follows; the sidewalks
-            # still arrive for the L/R label but are not routed on.
-            distr.TRENCH_ONLY:  True,
             distr.SIDEWALK_COST: distr.DEFAULT_SIDEWALK_COST_FACTOR,
             distr.ADD_STYLE:    False,
             distr.O_DUCTS:      out_distr_uri,
@@ -4802,17 +4405,6 @@ class DuctLayer(QgsProcessingAlgorithm):
                 self.O_COUPLE: locals().get("out_coupler_id", None),
             }
 
-        # Every published tier is finally clipped onto Final_Trenches: the
-        # trench is the only geometry a duct follows.
-        _trench_ref = final_tan or net_lyr
-        for _uri, _lbl in ((out_feeder_uri, "feeder"),
-                           (out_distr_uri, "distribution"),
-                           (out_drop_uri, "drop")):
-            self._enforce_on_trench(_uri, _trench_ref, context, feedback,
-                                    label=_lbl)
-        self._restamp_trench_metrics(out_distr_uri, _trench_ref, context,
-                                     feedback)
-
         # Success: return URIs so Processing auto-loads the layer(s)
         # Only advertise a runs output when the file was actually written —
         # the feeder/distribution route builders are optional and legacy
@@ -4885,62 +4477,4 @@ except Exception:
 
 # Explicit exports for clarity in dir()/from-imports (typed to keep linters happy)
 from typing import List as _List  # noqa: F401
-def enforce_ducts_on_trench(paths, trench, context=None, feedback=None):
-    """Re-lay finished duct layers exactly on Final_Trenches.
-
-    Called once the duct stage has built AND segmented every tier. A later pass
-    can still add a tap to a coupler, or leave a stub at a chamber that stood a
-    metre or two beside the trench — and a duct is what goes IN the trench, so
-    no duct metre may be published beside it. Returns the metres re-laid.
-    """
-    if not trench:
-        return 0.0
-
-    def _resolve(ref, name):
-        """(uri, layer) for a path, a URI or an already-open layer."""
-        if ref is None:
-            return None, None
-        uri = ref if isinstance(ref, str) else (
-            getattr(ref, "source", lambda: None)() if not isinstance(ref, str)
-            else None)
-        if hasattr(ref, "fields") and not isinstance(ref, str):
-            lyr = ref
-            uri = uri or ref.source()
-        else:
-            lyr = None
-        if lyr is None and uri:
-            try:
-                lyr = QgsProcessingUtils.mapLayerFromString(str(uri), context)
-            except Exception:
-                lyr = None
-            if lyr is None or not lyr.isValid():
-                lyr = QgsVectorLayer(str(uri), name, "ogr")
-        return (uri, lyr if (lyr is not None and lyr.isValid()) else None)
-
-    _turi, tlyr = _resolve(trench, "final_trenches_ontrench")
-    if tlyr is None or tlyr.featureCount() == 0:
-        return 0.0
-    duct = DuctLayer()
-    total = 0.0
-    for ref in paths or ():
-        uri, lyr = _resolve(ref, "duct_ontrench")
-        if uri is None or lyr is None:
-            continue
-        try:
-            _kept, _dropped, moved = duct._enforce_on_trench(
-                uri, tlyr, context, feedback, label=lyr.name())
-        except Exception as exc:  # noqa: BLE001 - one tier must not stop the rest
-            if feedback:
-                feedback.pushWarning(
-                    "Duct on-trench pass failed for %s: %s" % (lyr.name(), exc))
-            continue
-        total += float(moved or 0.0)
-        try:
-            duct._restamp_trench_metrics(uri, tlyr, context, feedback)
-        except Exception:
-            pass
-    return total
-
-
-__all__: _List[str] = ["AlgFeederDuctsNoSplit", "AlgDistributionDucts",
-                       "DuctLayer", "AlgDucts", "enforce_ducts_on_trench"]
+__all__: _List[str] = ["AlgFeederDuctsNoSplit", "AlgDistributionDucts", "DuctLayer", "AlgDucts"]
