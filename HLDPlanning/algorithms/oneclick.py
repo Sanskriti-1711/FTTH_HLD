@@ -472,20 +472,22 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             self.tr("02 Polygon — Planning-first (force seeded-growth builder)"),
             defaultValue=False, optional=True
         ))
-        # 64-192 homes per polygon is the working band, not 32-128: on the
-        # Mariendorf 12105 layer (7,465 homes) the old band emitted 77 polygons
-        # with 2 over the cap and 8 flagged REVIEW, while 64-192 emits 50 with
-        # none over and none flagged — same premises, same 40-57-home splitter
-        # utilisation per 1:64, but 35 % fewer PDPs. The floor matters as much as
-        # the cap: at 32 a polygon could be a single 40-home block that no merge
-        # could legally absorb, so the count rose without serving anyone better.
+        # 128-384 homes per polygon. The layer read as "very small and too many
+        # polygons, and a cable run for every one" on the Mariendorf run: the
+        # 64-home cap of 29 Oct published 59 servicing areas at a 50-home median
+        # for 2,916 homes, and each area carries its own distribution duct and
+        # cable. Raising the band roughly halves that count for the same
+        # premises while still fitting whole 1:64 splitters (384 = 6 x 64).
+        # The floor matters as much as the cap: a low cap lets a polygon be a
+        # single block that no merge could legally absorb, so the count rises
+        # without serving anyone better.
         self.addParameter(QgsProcessingParameterNumber(
             self.P_POLY_MIN_HH, self.tr("02 Polygon — Growth: minimum homes per polygon"),
-            type=QgsProcessingParameterNumber.Integer, defaultValue=64, minValue=1
+            type=QgsProcessingParameterNumber.Integer, defaultValue=128, minValue=1
         ))
         self.addParameter(QgsProcessingParameterNumber(
             self.P_POLY_MAX_HH, self.tr("02 Polygon — Growth: maximum homes per polygon"),
-            type=QgsProcessingParameterNumber.Integer, defaultValue=192, minValue=1
+            type=QgsProcessingParameterNumber.Integer, defaultValue=384, minValue=1
         ))
         self.addParameter(QgsProcessingParameterNumber(
             self.P_POLY_NEIGH, self.tr("02 Polygon — Growth: neighbour distance rule [m]"),
@@ -831,6 +833,205 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             (label, source.featureCount(), written)
         )
         return out
+
+    # How close a duct has to lie to a trench span to count as "this span
+    # carries it". The duct is built ON the trench graph, so a real duct shares
+    # the span's geometry; the tolerance only absorbs the vertex densification
+    # the duct stage does.
+    DUCT_COVER_M = 0.75
+    # Share of a span's length a duct must run along for the span to be dug.
+    DUCT_COVER_SHARE = 0.2
+
+    @staticmethod
+    def _sample_line(geom, step: float = 2.0):
+        """Points every ``step`` metres along a line geometry (both parts)."""
+        parts = geom.asMultiPolyline() if geom.isMultipart() else [geom.asPolyline()]
+        pts = []
+        for part in parts:
+            for a, b in zip(part, part[1:]):
+                seg = ((b.x() - a.x()) ** 2 + (b.y() - a.y()) ** 2) ** 0.5
+                n = max(1, int(seg // step))
+                for i in range(n + 1):
+                    t = i / float(n)
+                    pts.append(QgsPointXY(a.x() + t * (b.x() - a.x()),
+                                          a.y() + t * (b.y() - a.y())))
+        return pts
+
+    def _ductless_pass(self, layer, duct_index, duct_geoms, path=None):
+        """Delete the spans of ``layer`` that carry no duct, in place.
+
+        Returns ``(kept, removed, removed_m, by_tier, removed_rows)``.
+
+        In place, through an explicitly opened + edited + COMMITTED layer. Two
+        earlier shapes of this both failed: writing a second GeoPackage and
+        moving it over the output lost the layer name (readers ask for
+        ``Final_Trenches`` by name), and leaving the delete uncommitted left a
+        ``.gpkg-journal`` and took qgis_process down at the end of run
+        b16plots20261109av when the enrichment pass reopened the same file.
+
+        Garden drop legs are always kept: a garden span IS the customer
+        connection and the Drop_Ducts layer is built FROM it.
+        """
+        view = layer
+        if path:
+            view = QgsVectorLayer(path, "prune", "ogr")
+            if not view.isValid():
+                return layer.featureCount(), 0, 0.0, {}, []
+        fields = view.fields()
+        f_len = fields.indexFromName("length_m")
+        f_tier = fields.indexFromName("TRENCH_TIER")
+        drop_ids, removed_rows, by_tier = [], [], {}
+        n_keep = 0
+        drop_m = 0.0
+        for feat in view.getFeatures():
+            geom = feat.geometry()
+            if geom is None or geom.isEmpty():
+                continue
+            tier = str(feat[f_tier]) if f_tier >= 0 else ""
+            covered = tier == "Garden"
+            if not covered:
+                # COVERAGE, not contact: a duct that merely touches one end of
+                # a chamber-to-chamber span does not flow through it, so a span
+                # is kept only when a duct runs along at least
+                # ``DUCT_COVER_SHARE`` of its length. Sampling every 2 m is what
+                # measures that; the intersects() test kept a 60 m span that a
+                # duct clipped for its last metre.
+                pts = self._sample_line(geom)
+                hits = 0
+                for pt in pts:
+                    rect = QgsRectangle(pt.x() - self.DUCT_COVER_M,
+                                        pt.y() - self.DUCT_COVER_M,
+                                        pt.x() + self.DUCT_COVER_M,
+                                        pt.y() + self.DUCT_COVER_M)
+                    for did in duct_index.intersects(rect):
+                        if duct_geoms[did].distance(QgsGeometry.fromPointXY(pt)) \
+                                <= self.DUCT_COVER_M:
+                            hits += 1
+                            break
+                covered = hits >= self.DUCT_COVER_SHARE * len(pts)
+            if covered:
+                n_keep += 1
+                continue
+            drop_ids.append(feat.id())
+            removed_rows.append((feat.attributes(), QgsGeometry(geom)))
+            try:
+                drop_m += float(feat[f_len] or 0.0) if f_len >= 0 else 0.0
+            except Exception:
+                pass
+            by_tier[tier] = by_tier.get(tier, 0) + 1
+        if drop_ids:
+            try:
+                view.startEditing()
+                view.deleteFeatures(drop_ids)
+                if not view.commitChanges():
+                    raise RuntimeError("commitChanges() returned False")
+            except Exception:
+                # A refused commit means the file is not ours to change: keep
+                # every span rather than claim a pruning that did not happen.
+                return n_keep, 0, 0.0, {}, []
+            try:
+                view.reload()
+            except Exception:
+                pass
+        view.updateExtents()
+        return n_keep, len(drop_ids), drop_m, by_tier, removed_rows
+
+    @staticmethod
+    def _rows_layer(layer, rows, name):
+        """Memory layer holding the removed spans, for the review file."""
+        wkb = ("MultiLineString" if QgsWkbTypes.isMultiType(layer.wkbType())
+               else "LineString")
+        out = QgsVectorLayer(
+            "%s?crs=%s" % (wkb, layer.crs().authid()), name, "memory")
+        out.dataProvider().addAttributes(list(layer.fields()))
+        out.updateFields()
+        for attrs, geom in rows:
+            nf = QgsFeature(out.fields())
+            nf.setGeometry(geom)
+            nf.setAttributes(attrs)
+            out.dataProvider().addFeature(nf)
+        out.updateExtents()
+        return out
+
+    def _prune_ductless_trenches(self, results, out_dir, context, feedback):
+        """Remove designed trench spans that carry no duct.
+
+        Operator rule (2026-11-09): "trenches are only dug if any ducts, cables
+        are flowing through it; if not then we don't need those". The duct stage
+        is the first point in the cascade that knows where ducts actually go,
+        so the spans that carry none are removed here — before the cable is
+        planned on what is left and before the BOQ bills an excavation nobody
+        needs. The legacy stage already worked this way (Final_Trenches merges
+        feeder/distribution/garden plus only the USED drills); this is the same
+        rule applied to the designer's spans. What is removed is published to
+        ``Trenches_Removed_No_Duct.gpkg`` so the decision is reviewable.
+        """
+        ducts = results.get("ducts") or {}
+        duct_geoms = []
+        for key in (self._DU_OUT_FEEDER, self._DU_OUT_DIST, self._DU_OUT_DROP):
+            lyr = self._fast_resolve(ducts.get(key), context)
+            if lyr is None or lyr.featureCount() == 0:
+                continue
+            for feat in lyr.getFeatures():
+                g = feat.geometry()
+                if g is not None and not g.isEmpty():
+                    # COPY: a feature's geometry dies with the feature when
+                    # the iterator moves on, and a dangling geometry in this
+                    # list crashes qgis_process (no Python exception). PyQGIS
+                    # copies on construction; there is no clone().
+                    duct_geoms.append(QgsGeometry(g))
+        if not duct_geoms:
+            feedback.pushWarning(self.tr(
+                "Trench basis: no duct geometry to test the design against — "
+                "every span is kept (nothing can be proven ductless)."))
+            return
+        # addFeature with an explicit id: PyQGIS exposes no addGeometry on this
+        # build, and the ids returned by intersects() index into duct_geoms.
+        duct_index = QgsSpatialIndex()
+        for i, g in enumerate(duct_geoms):
+            f = QgsFeature()
+            f.setGeometry(g)
+            f.setId(i)
+            duct_index.addFeature(f)
+
+        src = self._fast_resolve(results.get("trenches"), context)
+        if src is None or src.featureCount() == 0:
+            return
+        final_val = results.get("trenches")
+        final_path = (final_val if isinstance(final_val, str)
+                      and os.path.isfile(final_val) else None)
+        n_keep, n_drop, drop_m, by_tier, removed_rows = self._ductless_pass(
+            src, duct_index, duct_geoms, path=final_path)
+        if n_drop == 0:
+            feedback.pushInfo(self.tr(
+                "Trench basis: all %d designed span(s) carry a duct — nothing "
+                "to remove.") % n_keep)
+            return
+        feedback.pushInfo(self.tr(
+            "Trench basis: %d span(s) carry no duct and are removed (%.0f m; "
+            "%s) — %d span(s) with a duct remain.").format(
+                n_drop, drop_m,
+                ", ".join("%s %d" % kv for kv in sorted(by_tier.items())) or "unknown tier",
+                n_keep))
+        if out_dir and removed_rows:
+            self._save_layer_to_gpkg(
+                self._rows_layer(src, removed_rows, "removed_no_duct"),
+                "Trenches_Removed_No_Duct.gpkg", out_dir, context, feedback)
+        # The tier layers are what the cable stage follows, so the same test is
+        # applied to them (Garden is untouched — see _ductless_pass).
+        for key in ("feeder", "distribution"):
+            val = results.get(key)
+            tier_src = self._fast_resolve(val, context)
+            if tier_src is None or tier_src.featureCount() == 0:
+                continue
+            tier_path = (val if isinstance(val, str) and os.path.isfile(val)
+                         else None)
+            _k, t_nd, _m, _t, _rows = self._ductless_pass(
+                tier_src, duct_index, duct_geoms, path=tier_path)
+            if t_nd:
+                feedback.pushInfo(self.tr(
+                    "Trench basis: {0} span(s) removed from {1} (no duct)."
+                ).format(t_nd, key))
 
     def _fast_resolve(self, val, context):
         """Fast layer existence check without loading features.
@@ -1180,6 +1381,10 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
     def run_duct_layer(self, parameters, results, context, feedback):
         params = {
             self._DU_NETWORK: results.get("trenches"),
+            # The same trench layer, named as the design surface for the
+            # distribution duct too: Final_Trenches is the only geometry the
+            # duct stage may follow (duct_layer.TRENCH_ONLY).
+            self._DU_FINAL_TAN: results.get("trenches"),
             self._DU_MFG: results.get("mfg"),
             self._DU_PDP: results.get("pdp"),
             self._DU_OBJECTS: results.get("objects"),
@@ -1244,8 +1449,29 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
                 out_dir, "Feeder_Ducts_Runs.gpkg")
             params[self._DU_DIST_RUNS] = os.path.join(
                 out_dir, "Distribution_Ducts_Runs.gpkg")
-        return processing.run(ALG.DUCT, params, context=context, feedback=feedback,
-                              is_child_algorithm=True)
+        res = processing.run(ALG.DUCT, params, context=context, feedback=feedback,
+                             is_child_algorithm=True)
+        # A duct is what goes IN the trench, so no duct metre may be published
+        # beside it. The duct stage builds and segments the lines in one go, and
+        # a tap added at the end (to a coupler) or a stub left at a chamber that
+        # stood a metre beside the trench still shipped off it: B16 8UU published
+        # 74 of 1 068 distribution parts up to 1.96 m away. Re-lay all three
+        # tiers on Final_Trenches here, after segmentation, and say what moved.
+        try:
+            from .duct_layer import enforce_ducts_on_trench
+            _moved = enforce_ducts_on_trench(
+                [params.get(self._DU_OUT_FEEDER), params.get(self._DU_OUT_DIST),
+                 params.get(self._DU_OUT_DROP)],
+                params.get(self._DU_NETWORK), context=context, feedback=feedback)
+            if _moved:
+                feedback.pushInfo(self.tr(
+                    "Duct on-trench pass: {0:,.1f} m of duct re-laid along "
+                    "Final_Trenches — every published duct metre now follows "
+                    "the trench.").format(_moved))
+        except Exception as exc:  # noqa: BLE001 - never fail the stage on this
+            feedback.pushWarning(
+                self.tr("Duct on-trench pass skipped: {0}").format(exc))
+        return res
 
     def run_chamber_layer(self, parameters, results, context, feedback):
         """Stage 7: plan civil chambers from duct junctions + PDPs."""
@@ -1284,9 +1510,12 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             "INPUT_PDP": results.get("pdp"),
             "INPUT_TANGENT_CROSSINGS": tangents,
             "INPUT_TRENCHES": results.get("trenches"),
-            # No Trench_Nodes layer: chambers come from trench intersections
-            # and the duct/PDP rules only.
-            "INPUT_TRENCH_NODES": None,
+            # The designer's structural nodes are the primary chamber
+            # candidates (pits, PDPs, bends, junctions, pulls). When the trench
+            # stage published them this run, they are handed over; without them
+            # the stage falls back to trench intersections and duct/PDP rules.
+            "INPUT_TRENCH_NODES": self._fast_resolve(
+                results.get("trench_nodes"), context),
             "INPUT_AOI": self._fast_resolve(results.get("aoi"), context),
             "INPUT_BUILDINGS": self.parameterAsVectorLayer(parameters, self.P_BUILDINGS, context),
             "OUT_CHAMBERS": self._dest(parameters, self.OUT_CHAMBERS, context),
@@ -1544,6 +1773,91 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
                 "Duct Layer", "; ".join(problems) + "."
             ))
 
+    # ── Memory pressure: a finished stage is cache, not data ────────────────
+    # Each stage writes its layers into out_dir as it completes, so the
+    # project's copy of a finished stage is a cache of a file that still exists
+    # and can be re-opened by path.  On the 512 MB worker the Duct Layer was
+    # killed at 483 MB (Render server_failed, oomKilled 512Mi, 2026-11-17
+    # 16:40Z) with ~390 MB already resident from the earlier stages.  Past
+    # MEM_SOFT_MB the pipeline evicts those finished-stage copies and trims the
+    # malloc arenas before the next stage starts; below MEM_TRIM_MB it does
+    # nothing at all.
+    #
+    # What is never touched: any layer a run parameter points at (the user's
+    # inputs) and any layer whose source is not a file inside out_dir (memory
+    # layers hold data that was never written).  A evicted layer is simply read
+    # back from its GeoPackage by the next stage, so no quality data is lost.
+    MEM_TRIM_MB = 240.0
+    MEM_SOFT_MB = 400.0
+
+    def _reclaim_memory(self, stage, feedback, parameters=None, out_dir=None):
+        """Evict finished-stage layer caches, then hand arenas back to the OS."""
+        try:
+            from ..utils.mem import release_memory, rss_mb
+        except Exception:  # noqa: BLE001 - housekeeping never fails a run
+            return None
+        try:
+            before = rss_mb()
+        except Exception:  # noqa: BLE001
+            return None
+        if before is None or before < self.MEM_TRIM_MB:
+            return before
+        try:
+            soft = float(os.environ.get("QGIS_MEM_SOFT_MB") or self.MEM_SOFT_MB)
+        except Exception:  # noqa: BLE001
+            soft = self.MEM_SOFT_MB
+        dropped = []
+        if before >= soft and out_dir:
+            try:
+                from qgis.core import QgsProject
+            except Exception:  # noqa: BLE001
+                QgsProject = None
+            protected = set()
+            for val in (parameters or {}).values():
+                for cand in (val, getattr(val, "source", None)):
+                    try:
+                        lid = cand.id()
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if lid:
+                        protected.add(lid)
+            root = os.path.normcase(os.path.abspath(out_dir)) + os.sep
+            if QgsProject is not None:
+                for lid, lyr in QgsProject.instance().mapLayers().items():
+                    if lid in protected:
+                        continue
+                    try:
+                        src = (lyr.source() or "").split("|")[0].strip()
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if not src:
+                        continue
+                    try:
+                        full = os.path.normcase(os.path.abspath(src))
+                    except Exception:  # noqa: BLE001
+                        continue
+                    # Only this run's own written outputs are evictable.
+                    if not full.startswith(root) or not os.path.isfile(full):
+                        continue
+                    dropped.append(lid)
+                if dropped:
+                    try:
+                        QgsProject.instance().removeMapLayers(dropped)
+                    except Exception:  # noqa: BLE001
+                        dropped = []
+        stats = release_memory(stage)
+        after = (stats or {}).get("rss_mb")
+        try:
+            feedback.pushInfo(
+                "  [memory] {}: rss {} → {} MB, evicted {} finished-stage "
+                "cache layer(s), trim={}".format(
+                    stage, before, after, len(dropped),
+                    (stats or {}).get("trimmed"))
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return after
+
     def _save_layer_to_gpkg(self, val, fname, out_dir, context, feedback):
         """
         Save a layer (string ID, file path, or QgsMapLayer object) to GPKG.
@@ -1719,6 +2033,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         results["polygons"] = self._save_layer_to_gpkg(
             results["polygons"], "Polygons.gpkg", out_dir, context, feedback)
         feedback.pushInfo(self.tr("  [timing] Polygon output save: {:.3f}s".format(time.time() - t_save)))
+        self._reclaim_memory("Polygon Layer", feedback, parameters, out_dir)
 
         if feedback.isCanceled():
             return {}
@@ -1804,6 +2119,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
                 results["mfg_service_areas"], "MFG_Service_Areas.gpkg",
                 out_dir, context, feedback)
         feedback.pushInfo(self.tr("  [timing] Network output saves: {:.3f}s".format(time.time() - t_save)))
+        self._reclaim_memory("Network Layer", feedback, parameters, out_dir)
 
         if feedback.isCanceled():
             return {}
@@ -1852,9 +2168,45 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
         results["aerial_drops"] = self._save_layer_to_gpkg(
             tr.get(self._TR_AERIAL_DROPS), "Aerial_Drops.gpkg", out_dir,
             context, feedback)
+        # The designer's structural nodes. Published here so the chamber stage
+        # can use them as its primary candidates instead of re-deriving chambers
+        # from trench intersections alone.
+        results["trench_nodes"] = self._save_layer_to_gpkg(
+            tr.get(self._TR_TRENCH_NODES), "Trench_Nodes.gpkg", out_dir,
+            context, feedback)
+
+        # ── Seal the trench runs into ONE connected geometry ────────────────
+        # Spans that meet only "close enough" are separate geometries: an
+        # endpoint a few centimetres off the run it joins, or landing on that
+        # run's interior instead of on a vertex. On the map that reads as one
+        # network; as geometry it is dozens of pieces, so a dissolve, a BOQ
+        # query or a construction package that asks "is this one trench?" gets
+        # the wrong answer. Collapse those endpoints onto one node, T-node the
+        # junctions, and extend the free end of a genuinely detached piece into
+        # the main run. Nothing is re-routed: only vertices move (<= 0.5 m),
+        # except that one free end.
+        if results.get("trenches"):
+            try:
+                from ..utils.trench_seal import seal_path, seal_qgis_layer
+                _t = results["trenches"]
+                if isinstance(_t, str):
+                    # the stage writes GPKG; seal_path also takes GeoJSON
+                    _seal = seal_path(_t, log=lambda m: feedback.pushInfo(m))
+                else:
+                    _seal = seal_qgis_layer(_t, feedback=feedback)
+                    results["trenches"] = self._save_layer_to_gpkg(
+                        _t, "Final_Trenches.gpkg", out_dir, context, feedback)
+                feedback.pushInfo(
+                    "🔗 Trench network sealed: %d span(s), %d connected "
+                    "component(s), %d vertex(es) moved, %d end(s) extended."
+                    % (_seal["spans"], _seal["components"], _seal["moved"],
+                       _seal["grown"]))
+            except Exception as exc:  # sealing must never kill the pipeline
+                feedback.pushWarning("Trench seal skipped: %s" % exc)
 
         if feedback.isCanceled():
             return {}
+        self._reclaim_memory("Trench Layer", feedback, parameters, out_dir)
         # --- Chamber Layer (civil structures) ---
         # Phase C cascade order (TRENCH_DESIGN.md §6.1): trench → chambers →
         # ducts → cables. Chambers come directly after the trench design
@@ -1904,6 +2256,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
 
         if feedback.isCanceled():
             return {}
+        self._reclaim_memory("Chamber Layer", feedback, parameters, out_dir)
         # --- Duct Layer ---
         steps.setCurrentStep(6)
         feedback.pushInfo(self.tr("[85%] Running Duct Layer"))
@@ -1952,8 +2305,12 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             results["ducts"][self._DU_OUT_COUPLE] = self._save_layer_to_gpkg(
                 cp, "Coupleurs.gpkg", out_dir, context, feedback)
 
+        # A trench is only dug because something runs through it.
+        self._prune_ductless_trenches(results, out_dir, context, feedback)
+
         if feedback.isCanceled():
             return {}
+        self._reclaim_memory("Duct Layer", feedback, parameters, out_dir)
         # --- Cable Layer (planned last: pulled where the civil work is) ---
         # Last in the cascade — chambers are placed and ducts are laid inside
         # the designed spans before a cable is planned. The route tree is still
@@ -2023,6 +2380,7 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
 
         if feedback.isCanceled():
             return {}
+        self._reclaim_memory("Cable Layer", feedback, parameters, out_dir)
         # --- Pole + Aerial Drop stages: OPT-IN (aerial zones requested) ---
         # Aerial conversion is exception-based per the planning document and
         # ONLY runs when the engineer/planner explicitly supplies aerial
@@ -2121,6 +2479,57 @@ class EndToEndPipelineAlgorithm(QgsProcessingAlgorithm):
             feedback.pushInfo(self.tr(
                 "  [timing] Attribute enrichment: {:.3f}s".format(time.time() - t_enrich)
             ))
+            # ── the enrichment pass is the LAST writer of duct geometry ────
+            # Segments, taps and chamber stubs are rewritten there, so a duct
+            # can still end a metre or two beside Final_Trenches after the duct
+            # stage's own pass. Re-lay all three tiers on the FINISHED files, so
+            # what is published is the trench geometry itself: B16 8UU measured
+            # 76 distribution parts up to 1.96 m off before this.
+            try:
+                from .duct_layer import enforce_ducts_on_trench
+                _moved = enforce_ducts_on_trench(
+                    [os.path.join(out_dir, f) for f in (
+                        "Feeder_Ducts.gpkg", "Distribution_Ducts.gpkg",
+                        "Drop_Ducts.gpkg")],
+                    os.path.join(out_dir, "Final_Trenches.gpkg"),
+                    context=context, feedback=feedback)
+                feedback.pushInfo(self.tr(
+                    "Duct on-trench pass (final): {0:,.1f} m re-laid along "
+                    "Final_Trenches after enrichment.").format(_moved))
+            except Exception as exc:  # noqa: BLE001 - never fail the run on this
+                feedback.pushWarning(
+                    self.tr("Duct on-trench pass (final) skipped: %s") % exc)
+            # ── and the regions are still ONE duct each ────────────────────
+            # The clip and the duplicate-merge inside the enrichment fold or
+            # drop a row wherever another row already covers it, and this
+            # on-trench pass drops any row no trench reaches — all of which can
+            # cut a join laid earlier. This is the LAST writer of duct geometry,
+            # so the joins and coupler taps are laid on the rows that publish.
+            try:
+                attr_enrich.retag_duct_polygons(out_dir, feedback)
+                _laid = attr_enrich.stitch_distribution_regions(out_dir, feedback)
+                if _laid:
+                    feedback.pushInfo(self.tr(
+                        "Distribution continuity stitch (final): %d link(s) laid "
+                        "on the published rows.") % _laid)
+            except Exception as exc:  # noqa: BLE001 - never fail the run on this
+                feedback.pushWarning(
+                    self.tr("Distribution continuity stitch (final) skipped: %s")
+                    % exc)
+            # ── and every published duct still has a name of its own ───────
+            # The stitch adds region links after the CBT tier has run, and those
+            # rows carry no duct_uid. Fill them here so the published layer never
+            # holds a duct that no attribute can point at.
+            try:
+                _named = attr_enrich.fill_duct_uids(
+                    os.path.join(out_dir, "Distribution_Ducts.gpkg"), feedback)
+                if _named:
+                    feedback.pushInfo(self.tr(
+                        "Duct ids filled (final): %d published row(s) named.")
+                        % _named)
+            except Exception as exc:  # noqa: BLE001 - never fail the run on this
+                feedback.pushWarning(
+                    self.tr("Duct id fill (final) skipped: %s") % exc)
 
         feedback.pushInfo(self.tr(
             "[timing] Total pipeline: {:.3f}s".format(time.time() - t_pipeline)
